@@ -1,6 +1,13 @@
-//! DataFusion integration point for the copied Fluss Rust client.
+// SPDX-License-Identifier: Apache-2.0
+//! Bounded DataFusion source for Fluss append-only log tables.
 //!
-//! Fluss already decodes scan results into Arrow `RecordBatch` values.
-//! A `TableProvider` must be built on a *correct bounded read*: the client's
-//! `LimitBatchScanner` returns at most N rows per bucket, not a full KV table.
-//! Do not register it as an unrestricted table scan.
+//! Fluss already decodes log reads into Arrow `RecordBatch` values. This
+//! adapter registers a table explicitly and captures end offsets when the
+//! physical plan executes; filters and limits stay in DataFusion. KV tables
+//! and partitioned tables are rejected rather than misrepresented.
+
+mod catalog;
+mod log_table;
+
+pub use catalog::FlussCatalog;
+pub use log_table::FlussLogTable;

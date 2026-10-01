@@ -1,4 +1,4 @@
-# Fluss connectors scaffold
+# Fluss connectors
 
 This repository contains source copies of the working Fluss Java and Rust
 clients, plus a small workspace for engine integrations. The client Rust
@@ -9,7 +9,7 @@ Python binding. No second Fluss protocol implementation is planned.
 clients/
   java/                    Fluss Maven reactor (build with ./mvnw -pl fluss-client -am)
   rust/                    Fluss Rust workspace and bindings/python
-crates/fluss-datafusion/    DataFusion adapter scaffold (not yet a TableProvider)
+crates/fluss-datafusion/    Bounded DataFusion source for append-only log tables
 python/fluss_connectors/   Small DuckDB/Polars/pandas adapters for Arrow results
 docs/reading-semantics.md  Contracts to satisfy before claiming full scans
 ```
@@ -56,6 +56,33 @@ Its limit is **per bucket**, not a complete current-state table scan. It
 requires the Fluss bootstrap, CA, SASL user and password in the environment;
 no credentials are stored in this repository.
 
-Native DataFusion table registration and unrestricted Fluss scans are **not**
-implemented yet. In particular, a limited per-bucket scan is not a full
-primary-key table read; see [reading semantics](docs/reading-semantics.md).
+## DataFusion (append-only log tables)
+
+`FlussLogTable::open` registers an explicit, non-partitioned Fluss log table
+in DataFusion. `FlussCatalog::load` discovers database/table names once and
+allows SQL such as `fluss.lab_spark.demo_log` (reload the catalog after DDL).
+KV tables remain visible in that catalog but return an explicit unsupported
+error if queried. Execution captures each bucket's latest offset once, streams
+Arrow batches from the earliest **retained** offsets until those stopping
+offsets, and errors on timeout rather than claiming a partial result is
+complete. Filters, projections and global limits remain
+DataFusion's responsibility; no Fluss filter/limit pushdown is claimed. Each
+query opens a new finite read. KV and partitioned tables are rejected.
+
+With the isolated lab running and its ignored `.env` in `../lab/`:
+
+```bash
+uv run --env-file ../lab/.env cargo run -p fluss-datafusion --example query -- lab_spark demo_log
+```
+
+For the isolated lab integration test (COUNT, exact SQL filter, projection,
+and rejection of a KV table):
+
+```bash
+uv run --env-file ../lab/.env cargo test -p fluss-datafusion --test live_log_sql -- --ignored
+```
+
+The source currently runs one execution partition across the table's buckets;
+it does not promise a globally atomic snapshot across buckets. A limited
+per-bucket scan is not a full primary-key table read; see
+[reading semantics](docs/reading-semantics.md).

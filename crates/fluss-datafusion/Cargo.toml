@@ -1,12 +1,15 @@
 [package]
 name = "fluss-datafusion"
 version = "0.1.0"
-description = "DataFusion adapter scaffold for the Apache Fluss Rust client"
+description = "Bounded DataFusion log-table source for Apache Fluss"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 arrow = "59.2"
-datafusion = { version = "55.1", default-features = false }
-fluss-rs = { path = "../../clients/rust/crates/fluss" }
+async-trait = "0.1"
+datafusion = { version = "55.1", default-features = false, features = ["sql"] }
+fluss-rs = { path = "../../clients/rust/crates/fluss", features = ["storage-s3"] }
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
