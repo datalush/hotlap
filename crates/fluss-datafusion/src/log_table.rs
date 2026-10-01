@@ -13,6 +13,7 @@ use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use fluss::client::{
@@ -22,9 +23,8 @@ use fluss::client::{
 use fluss::metadata::{TableBucket, TablePath};
 use fluss::rpc::message::OffsetSpec;
 
+use crate::metrics::{FlussScanExec, PartitionMetrics, ReaderLifetime};
 use crate::offsets::{Capture, OffsetCaptures, Offsets, validate_offsets};
-
-const MAX_SCAN_PARTITIONS: i32 = 8;
 
 /// Append-only log table with bounded, parallel physical scan partitions.
 pub struct FlussLogTable {
@@ -34,6 +34,7 @@ pub struct FlussLogTable {
     table_id: i64,
     buckets: i32,
     timeout: Duration,
+    max_partitions: Option<usize>,
 }
 
 impl FlussLogTable {
@@ -73,7 +74,19 @@ impl FlussLogTable {
             table_id,
             buckets,
             timeout,
+            max_partitions: None,
         })
+    }
+
+    /// Cap physical partitions; the default uses DataFusion's target partitions.
+    pub fn with_max_partitions(mut self, max_partitions: usize) -> Result<Self> {
+        if max_partitions == 0 {
+            return Err(DataFusionError::Plan(
+                "Fluss max partitions must be positive".into(),
+            ));
+        }
+        self.max_partitions = Some(max_partitions);
+        Ok(self)
     }
 }
 
@@ -89,7 +102,7 @@ impl TableProvider for FlussLogTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -103,8 +116,12 @@ impl TableProvider for FlussLogTable {
             None => Arc::clone(&self.schema),
         };
         let captures = Arc::new(OffsetCaptures::default());
-        let partitions: Vec<Arc<dyn PartitionStream>> = bucket_groups(self.buckets)
-            .into_iter()
+        let target = state.config_options().execution.target_partitions.max(1);
+        let parallelism = self.max_partitions.map_or(target, |max| target.min(max));
+        let groups = bucket_groups(self.buckets, parallelism);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let partitions: Vec<Arc<dyn PartitionStream>> = groups
+            .iter()
             .enumerate()
             .map(|(index, bucket_ids)| {
                 Arc::new(FlussPartition {
@@ -115,21 +132,17 @@ impl TableProvider for FlussLogTable {
                     projection: projection.cloned(),
                     table_id: self.table_id,
                     buckets: self.buckets,
-                    bucket_ids,
+                    bucket_ids: bucket_ids.clone(),
                     index,
                     captures: Arc::clone(&captures),
+                    metrics: metrics.clone(),
                     timeout: self.timeout,
                 }) as Arc<dyn PartitionStream>
             })
             .collect();
-        Ok(Arc::new(StreamingTableExec::try_new(
-            projected_schema,
-            partitions,
-            None,
-            [],
-            false,
-            None,
-        )?))
+        let inner =
+            StreamingTableExec::try_new(projected_schema, partitions, None, [], false, None)?;
+        Ok(Arc::new(FlussScanExec::new(inner, metrics, groups)))
     }
 }
 
@@ -144,6 +157,7 @@ struct FlussPartition {
     bucket_ids: Vec<i32>,
     index: usize,
     captures: Arc<OffsetCaptures>,
+    metrics: ExecutionPlanMetricsSet,
     timeout: Duration,
 }
 
@@ -170,6 +184,8 @@ impl PartitionStream for FlussPartition {
 
     fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
         let schema = Arc::clone(&self.schema);
+        let metrics = PartitionMetrics::new(&self.metrics, self.index, &self.bucket_ids);
+        let lifetime = ReaderLifetime::new(metrics.active_streams.clone());
         let state = ReadState {
             source: FlussPartition {
                 connection: Arc::clone(&self.connection),
@@ -182,6 +198,7 @@ impl PartitionStream for FlussPartition {
                 bucket_ids: self.bucket_ids.clone(),
                 index: self.index,
                 captures: Arc::clone(&self.captures),
+                metrics: self.metrics.clone(),
                 timeout: self.timeout,
             },
             reader: None,
@@ -189,6 +206,8 @@ impl PartitionStream for FlussPartition {
             capture: self.captures.for_partition(&ctx, self.index),
             // Keep the execution identity alive until this stream finishes.
             _context: ctx,
+            _lifetime: lifetime,
+            metrics,
         };
         let stream = futures::stream::try_unfold(state, |mut state| async move {
             if state.reader.is_none() {
@@ -200,25 +219,35 @@ impl PartitionStream for FlussPartition {
             }
             loop {
                 let remaining = state.remaining()?;
-                let result = tokio::time::timeout(
-                    remaining,
-                    state
-                        .reader
-                        .as_mut()
-                        .expect("reader initialized")
-                        .next_batch_with_timeout(remaining),
-                )
-                .await
-                .map_err(|_| expired())?
-                .map_err(fluss_error)?;
+                let result = {
+                    let _read_timer = state.metrics.read_time.timer();
+                    tokio::time::timeout(
+                        remaining,
+                        state
+                            .reader
+                            .as_mut()
+                            .expect("reader initialized")
+                            .next_batch_with_timeout(remaining),
+                    )
+                    .await
+                    .map_err(|_| expired())?
+                    .map_err(fluss_error)?
+                };
                 match result {
                     RecordBatchReadOutcome::Batch(batch) => {
                         let batch = batch.into_batch();
+                        let decoded_bytes = batch.get_array_memory_size();
+                        state.metrics.arrow_decoded_bytes.add(decoded_bytes);
+                        state.metrics.peak_batch_bytes.set_max(decoded_bytes);
                         let batch = if state.source.projection.as_ref().is_some_and(Vec::is_empty) {
                             batch.project(&[])?
                         } else {
                             batch
                         };
+                        let bytes = batch.get_array_memory_size();
+                        state.metrics.arrow_output_bytes.add(bytes);
+                        state.metrics.output_rows.add(batch.num_rows());
+                        state.metrics.output_batches.add(1);
                         return Ok(Some((batch, state)));
                     }
                     RecordBatchReadOutcome::TimedOut => continue,
@@ -236,6 +265,8 @@ struct ReadState {
     deadline: Instant,
     capture: Capture,
     _context: Arc<TaskContext>,
+    _lifetime: ReaderLifetime,
+    metrics: PartitionMetrics,
 }
 
 impl ReadState {
@@ -303,6 +334,7 @@ impl ReadState {
     }
 
     async fn capture_offsets(&self) -> Result<Offsets> {
+        let _timer = self.metrics.capture_time.timer();
         let admin = self.source.connection.get_admin().map_err(fluss_error)?;
         let buckets: Vec<i32> = (0..self.source.buckets).collect();
         let offsets = admin
@@ -313,8 +345,8 @@ impl ReadState {
     }
 }
 
-fn bucket_groups(buckets: i32) -> Vec<Vec<i32>> {
-    let count = buckets.min(MAX_SCAN_PARTITIONS) as usize;
+fn bucket_groups(buckets: i32, parallelism: usize) -> Vec<Vec<i32>> {
+    let count = (buckets as usize).min(parallelism.max(1));
     let mut groups = vec![Vec::new(); count];
     for bucket in 0..buckets {
         groups[bucket as usize % count].push(bucket);
@@ -341,11 +373,13 @@ mod tests {
     use super::bucket_groups;
 
     #[test]
-    fn grouping_covers_each_bucket_once_and_caps_parallelism() {
-        let groups = bucket_groups(19);
+    fn grouping_covers_each_bucket_once_at_requested_parallelism() {
+        let groups = bucket_groups(19, 8);
         assert_eq!(groups.len(), 8);
         let mut buckets: Vec<_> = groups.into_iter().flatten().collect();
         buckets.sort_unstable();
         assert_eq!(buckets, (0..19).collect::<Vec<_>>());
+        assert_eq!(bucket_groups(2, 1), vec![vec![0, 1]]);
+        assert_eq!(bucket_groups(2, 20), vec![vec![0], vec![1]]);
     }
 }

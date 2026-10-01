@@ -19,8 +19,10 @@ in the engine. Keep projection, limits, and partitions honest about these
 semantics.
 
 The first DataFusion provider supports **non-partitioned append-only logs**
-only. Up to eight physical partitions each read a group of buckets, sharing
-one offset capture per execution. Each bucket starts at its earliest
+only. The physical partition count is the minimum of Fluss buckets,
+DataFusion's target parallelism and an optional positive connector cap;
+each reads a group of buckets. They share one offset capture per execution.
+Each bucket starts at its earliest
 **retained** offset; reusing the physical source plan with a new TaskContext
 captures new offsets. The bounded read
 finishes or fails with an explicit error on timeout. Offsets are collected
@@ -28,6 +30,19 @@ per bucket, not as a transactional cross-bucket snapshot. Non-empty SQL
 projections are requested from the Fluss scanner; zero-column `COUNT(*)`
 still fetches full rows before stripping columns locally. Exact filtering
 and global SQL limits remain DataFusion operations.
+Partitions that start after other partitions finish retain the shared offsets.
+Cancelled offset initialization can be retried by a different partition before
+any rows are delivered. Missing/invalid offsets or a late partition failure
+produce an error, not a complete result. Concurrent queries require distinct
+`TaskContext` instances; using one context for overlapping executions of the
+same physical plan cannot distinguish the two queries.
+`EXPLAIN ANALYZE` reports Arrow decoded/output bytes and peak decoded batch
+size, not network bytes or process memory. Time metrics measure offset capture
+and waiting for read batches; they are not an end-to-end latency budget.
+`fluss_active_partition_streams` tracks source stream lifetimes, including
+failed and cancelled reads, and is zero after each source query completes.
+The peak-batch gauge does not include buffers held by DataFusion operators
+upstream of the scan.
 The read-only catalog discovers names once; reload it after creating tables.
 It does not reinterpret KV changelogs as the current table state.
 

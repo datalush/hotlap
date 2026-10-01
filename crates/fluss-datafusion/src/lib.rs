@@ -8,6 +8,7 @@
 
 mod catalog;
 mod log_table;
+mod metrics;
 mod offsets;
 
 pub use catalog::FlussCatalog;

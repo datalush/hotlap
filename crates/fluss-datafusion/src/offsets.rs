@@ -99,6 +99,69 @@ mod tests {
         assert!(Arc::ptr_eq(a.as_ref().unwrap(), b.as_ref().unwrap()));
     }
 
+    #[tokio::test]
+    async fn cancelled_initializer_can_be_replaced_by_another_partition() {
+        let registry = OffsetCaptures::default();
+        let context = Arc::new(TaskContext::default());
+        let first = registry.for_partition(&context, 0);
+        let second = registry.for_partition(&context, 1);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_in_task = Arc::clone(&started);
+        let task = tokio::spawn(async move {
+            first
+                .get_or_init(|| async {
+                    started_in_task.notify_one();
+                    std::future::pending::<Result<Offsets, String>>().await
+                })
+                .await;
+        });
+        started.notified().await;
+        task.abort();
+        let _ = task.await;
+        let replacement = second
+            .get_or_init(|| async { Ok(Arc::new(HashMap::from([(0, 1), (1, 2)]))) })
+            .await;
+        assert_eq!(replacement.as_ref().unwrap()[&1], 2);
+    }
+
+    #[tokio::test]
+    async fn distinct_concurrent_queries_do_not_share_stopping_offsets() {
+        let registry = OffsetCaptures::default();
+        let a = Arc::new(TaskContext::default());
+        let b = Arc::new(TaskContext::default());
+        let first = registry.for_partition(&a, 0);
+        let second = registry.for_partition(&b, 0);
+        let (a, b) = tokio::join!(
+            first.get_or_init(|| async { Ok(Arc::new(HashMap::from([(0, 1)]))) }),
+            second.get_or_init(|| async { Ok(Arc::new(HashMap::from([(0, 3)]))) }),
+        );
+        assert_eq!(a.as_ref().unwrap()[&0], 1);
+        assert_eq!(b.as_ref().unwrap()[&0], 3);
+    }
+
+    #[tokio::test]
+    async fn offset_capture_error_is_shared_without_partial_fallback() {
+        let registry = OffsetCaptures::default();
+        let context = Arc::new(TaskContext::default());
+        let first = registry.for_partition(&context, 0);
+        let second = registry.for_partition(&context, 1);
+        let attempted = AtomicUsize::new(0);
+        let failure = first
+            .get_or_init(|| async {
+                attempted.fetch_add(1, Ordering::SeqCst);
+                Err("bucket 1 has no latest offset".into())
+            })
+            .await;
+        let other = second
+            .get_or_init(|| async {
+                attempted.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(HashMap::new()))
+            })
+            .await;
+        assert_eq!(attempted.load(Ordering::SeqCst), 1);
+        assert_eq!(failure.as_ref().unwrap_err(), other.as_ref().unwrap_err());
+    }
+
     #[test]
     fn missing_or_negative_bucket_offsets_never_look_like_a_complete_scan() {
         assert!(validate_offsets(HashMap::from([(0, 10)]), 2).is_err());

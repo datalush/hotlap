@@ -58,6 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?
     .show()
     .await?;
+    ctx.sql("EXPLAIN ANALYZE SELECT COUNT(*) FROM log")
+        .await?
+        .show()
+        .await?;
     drop(ctx);
     connection.close(Duration::from_secs(5)).await?;
     Ok(())
