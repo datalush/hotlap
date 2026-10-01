@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, Int64Array, StringArray};
+use arrow::record_batch::RecordBatch;
 use datafusion::common::DataFusionError;
 use datafusion::physical_plan::collect as collect_plan;
 use datafusion::physical_plan::common::collect as collect_stream;
-use datafusion::physical_plan::metrics::MetricValue;
+use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use fluss::client::FlussConnection;
@@ -18,11 +19,13 @@ use fluss::row::GenericRow;
 use fluss::rpc::message::OffsetSpec;
 use fluss_datafusion::{FlussCatalog, FlussLogTable};
 
-#[tokio::test]
-#[ignore = "requires native-sni and FLUSS_* credentials; run with --ignored"]
-async fn bounded_sql_and_kv_rejection_against_native_sni() -> Result<(), Box<dyn std::error::Error>>
-{
-    let connection = Arc::new(
+type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
+const DATABASE: &str = "lab_spark";
+const LOG: &str = "demo_log";
+const SCAN_TIMEOUT: Duration = Duration::from_secs(45);
+
+async fn connect() -> TestResult<Arc<FlussConnection>> {
+    Ok(Arc::new(
         FlussConnection::new(Config {
             bootstrap_servers: std::env::var("FLUSS_BOOTSTRAP")?,
             security_ssl_enabled: true,
@@ -33,109 +36,158 @@ async fn bounded_sql_and_kv_rejection_against_native_sni() -> Result<(), Box<dyn
             ..Config::default()
         })
         .await?,
-    );
-    let ctx = SessionContext::new();
-    ctx.register_table(
-        "log",
-        Arc::new(
-            FlussLogTable::open(
-                Arc::clone(&connection),
-                TablePath::new("lab_spark", "demo_log"),
-                Duration::from_secs(45),
-            )
-            .await?,
-        ),
-    )?;
+    ))
+}
 
-    let count = ctx.sql("SELECT COUNT(*) FROM log").await?.collect().await?;
-    let total = count[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0);
-    assert!(total > 0);
-    let limited_df = ctx.sql("SELECT * FROM log LIMIT 1").await?;
-    let limited_plan = limited_df.create_physical_plan().await?;
-    fn source_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+async fn register_log(
+    ctx: &SessionContext,
+    connection: &Arc<FlussConnection>,
+    name: &str,
+    timeout: Duration,
+) -> TestResult<()> {
+    let table = FlussLogTable::open(
+        Arc::clone(connection),
+        TablePath::new(DATABASE, name),
+        timeout,
+    )
+    .await?;
+    ctx.register_table("log", Arc::new(table))?;
+    Ok(())
+}
+
+fn source_plan(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    fn find(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
         if plan.name() == "FlussScanExec" {
             return Some(Arc::clone(plan));
         }
-        plan.children().into_iter().find_map(source_plan)
+        plan.children().into_iter().find_map(find)
     }
-    let limited_source = source_plan(&limited_plan).expect("LIMIT has a Fluss source");
-    let limited = collect_plan(limited_plan, Arc::new(limited_df.task_ctx())).await?;
-    assert_eq!(
-        limited.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-        1
-    );
-    let rows_after_limit = limited_source.metrics().unwrap().output_rows().unwrap_or(0);
+    find(plan).expect("SQL must plan a Fluss stream")
+}
+
+fn single_count(batches: &[RecordBatch]) -> i64 {
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT(*) returns Int64")
+        .value(0)
+}
+
+async fn count_sql(ctx: &SessionContext, sql: &str) -> TestResult<i64> {
+    Ok(single_count(&ctx.sql(sql).await?.collect().await?))
+}
+
+async fn explain_text(ctx: &SessionContext, sql: &str) -> TestResult<String> {
+    let batches = ctx.sql(sql).await?.collect().await?;
+    Ok(batches
+        .iter()
+        .map(|batch| {
+            let plans = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("EXPLAIN plan is a string");
+            (0..plans.len())
+                .map(|i| plans.value(i))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn metric(metrics: &MetricsSet, name: &str) -> usize {
+    metrics
+        .sum_by_name(name)
+        .expect("metric must be registered")
+        .as_usize()
+}
+
+#[tokio::test]
+#[ignore = "requires native-sni and FLUSS_* credentials; run with --ignored"]
+async fn bounded_sql_and_kv_rejection_against_native_sni() -> TestResult<()> {
+    let connection = connect().await?;
+    let ctx = SessionContext::new();
+    register_log(&ctx, &connection, LOG, SCAN_TIMEOUT).await?;
+
+    let total = check_log_sql(&ctx).await?;
+    check_source_projection(&ctx).await?;
+    check_parallelism(&connection, total).await?;
+    check_explain_metrics(&ctx).await?;
+    check_catalog(&ctx, &connection, total).await?;
+    check_timeout_and_kv(&connection).await?;
+
+    drop(ctx);
+    connection.close(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
+async fn check_log_sql(ctx: &SessionContext) -> TestResult<i64> {
+    let total = count_sql(ctx, "SELECT COUNT(*) FROM log").await?;
+    assert!(total > 0);
+
+    let df = ctx.sql("SELECT * FROM log LIMIT 1").await?;
+    let plan = df.create_physical_plan().await?;
+    let source = source_plan(&plan);
+    let limited = collect_plan(plan, Arc::new(df.task_ctx())).await?;
+    assert_eq!(limited.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let rows_after_limit = source.metrics().unwrap().output_rows().unwrap_or(0);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
-        limited_source.metrics().unwrap().output_rows(),
+        source.metrics().unwrap().output_rows(),
         Some(rows_after_limit)
     );
     assert_eq!(
-        limited_source
-            .metrics()
-            .unwrap()
-            .sum_by_name("fluss_active_partition_streams")
-            .unwrap()
-            .as_usize(),
-        0,
-        "LIMIT must release source partitions"
+        metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
+        0
     );
-    let after_limit = ctx.sql("SELECT COUNT(*) FROM log").await?.collect().await?;
-    assert_eq!(
-        after_limit[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0),
-        total,
-        "a limited read must not consume the next query's scanner"
-    );
+    assert_eq!(count_sql(ctx, "SELECT COUNT(*) FROM log").await?, total);
+
     let filtered = ctx
         .sql("SELECT value FROM log WHERE id = 1")
         .await?
         .collect()
         .await?;
-    let values: Vec<String> = filtered
+    let values: Vec<_> = filtered
         .iter()
         .flat_map(|batch| {
             assert_eq!(batch.num_columns(), 1);
-            let column = batch
+            let values = batch
                 .column(0)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
             (0..batch.num_rows())
-                .map(|row| column.value(row).to_owned())
+                .map(|row| values.value(row).to_owned())
                 .collect::<Vec<_>>()
         })
         .collect();
-    assert!(!values.is_empty());
-    assert!(values.iter().all(|value| value == "hola"));
+    assert!(!values.is_empty() && values.iter().all(|value| value == "hola"));
+    Ok(total)
+}
 
-    let projected = ctx
+async fn check_source_projection(ctx: &SessionContext) -> TestResult<()> {
+    let plan = ctx
         .sql("SELECT value FROM log")
         .await?
         .create_physical_plan()
         .await?;
-    let source = source_plan(&projected).expect("SQL must plan a Fluss stream");
-    let schema = source.schema();
-    assert_eq!(schema.fields().len(), 1);
-    assert_eq!(schema.field(0).name(), "value");
+    let source = source_plan(&plan);
+    assert_eq!(source.schema().fields().len(), 1);
+    assert_eq!(source.schema().field(0).name(), "value");
     assert_eq!(source.output_partitioning().partition_count(), 2);
+    Ok(())
+}
 
+async fn check_parallelism(connection: &Arc<FlussConnection>, total: i64) -> TestResult<()> {
     for (target, cap, expected) in [(1, None, 1), (2, None, 2), (16, None, 2), (16, Some(1), 1)] {
-        let tuned =
+        let ctx =
             SessionContext::new_with_config(SessionConfig::new().with_target_partitions(target));
         let table = FlussLogTable::open(
-            Arc::clone(&connection),
-            TablePath::new("lab_spark", "demo_log"),
-            Duration::from_secs(45),
+            Arc::clone(connection),
+            TablePath::new(DATABASE, LOG),
+            SCAN_TIMEOUT,
         )
         .await?;
         let table = if let Some(cap) = cap {
@@ -143,53 +195,24 @@ async fn bounded_sql_and_kv_rejection_against_native_sni() -> Result<(), Box<dyn
         } else {
             table
         };
-        tuned.register_table("log", Arc::new(table))?;
-        let source = source_plan(
-            &tuned
-                .sql("SELECT value FROM log")
-                .await?
-                .create_physical_plan()
-                .await?,
-        )
-        .unwrap();
-        assert_eq!(source.output_partitioning().partition_count(), expected);
-        let count = tuned
-            .sql("SELECT COUNT(*) FROM log")
+        ctx.register_table("log", Arc::new(table))?;
+        let plan = ctx
+            .sql("SELECT value FROM log")
             .await?
-            .collect()
+            .create_physical_plan()
             .await?;
         assert_eq!(
-            count[0]
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0),
-            total
+            source_plan(&plan).output_partitioning().partition_count(),
+            expected
         );
+        assert_eq!(count_sql(&ctx, "SELECT COUNT(*) FROM log").await?, total);
     }
+    Ok(())
+}
 
-    let explain = ctx
-        .sql("EXPLAIN ANALYZE SELECT COUNT(*) FROM log")
-        .await?
-        .collect()
-        .await?;
-    let text = explain
-        .iter()
-        .map(|batch| {
-            let plans = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            (0..plans.len())
-                .map(|i| plans.value(i))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    for metric in [
+async fn check_explain_metrics(ctx: &SessionContext) -> TestResult<()> {
+    let text = explain_text(ctx, "EXPLAIN ANALYZE SELECT COUNT(*) FROM log").await?;
+    for name in [
         "FlussScanExec",
         "fluss_buckets_assigned",
         "arrow_decoded_bytes",
@@ -200,149 +223,97 @@ async fn bounded_sql_and_kv_rejection_against_native_sni() -> Result<(), Box<dyn
         "fluss_active_partition_streams",
     ] {
         assert!(
-            text.contains(metric),
-            "EXPLAIN ANALYZE missing {metric}: {text}"
+            text.contains(name),
+            "EXPLAIN ANALYZE missing {name}: {text}"
         );
     }
-    let verbose = ctx
-        .sql("EXPLAIN ANALYZE VERBOSE SELECT COUNT(*) FROM log")
-        .await?
-        .collect()
-        .await?;
-    let verbose = verbose
-        .iter()
-        .map(|batch| {
-            let plans = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            (0..plans.len())
-                .map(|i| plans.value(i))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let verbose = explain_text(ctx, "EXPLAIN ANALYZE VERBOSE SELECT COUNT(*) FROM log").await?;
     assert!(verbose.contains("buckets=0") && verbose.contains("buckets=1"));
+    Ok(())
+}
 
-    let catalog = FlussCatalog::load(Arc::clone(&connection), Duration::from_secs(45)).await?;
+async fn check_catalog(
+    ctx: &SessionContext,
+    connection: &Arc<FlussConnection>,
+    total: i64,
+) -> TestResult<()> {
+    let catalog = FlussCatalog::load(Arc::clone(connection), SCAN_TIMEOUT).await?;
     ctx.register_catalog("fluss", Arc::new(catalog));
-    let catalog_count = ctx
-        .sql("SELECT COUNT(*) FROM fluss.lab_spark.demo_log")
-        .await?
-        .collect()
-        .await?;
     assert_eq!(
-        catalog_count[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0),
+        count_sql(ctx, "SELECT COUNT(*) FROM fluss.lab_spark.demo_log").await?,
         total
     );
+    Ok(())
+}
 
-    let short_ctx = SessionContext::new();
-    short_ctx.register_table(
-        "tight",
-        Arc::new(
-            FlussLogTable::open(
-                Arc::clone(&connection),
-                TablePath::new("lab_spark", "demo_log"),
-                Duration::from_nanos(1),
-            )
-            .await?,
-        ),
-    )?;
-    let short_df = short_ctx.sql("SELECT COUNT(*) FROM tight").await?;
-    let short_plan = short_df.create_physical_plan().await?;
-    let short_source = source_plan(&short_plan).unwrap();
-    let timeout = collect_plan(short_plan, Arc::new(short_df.task_ctx()))
+async fn check_timeout_and_kv(connection: &Arc<FlussConnection>) -> TestResult<()> {
+    let ctx = SessionContext::new();
+    register_log(&ctx, connection, LOG, Duration::from_nanos(1)).await?;
+    let df = ctx.sql("SELECT COUNT(*) FROM log").await?;
+    let plan = df.create_physical_plan().await?;
+    let source = source_plan(&plan);
+    let error = collect_plan(plan, Arc::new(df.task_ctx()))
         .await
         .expect_err("expired scan must fail instead of returning a partial count");
-    assert!(timeout.to_string().contains("timed out"));
+    assert!(error.to_string().contains("timed out"));
     assert_eq!(
-        short_source
-            .metrics()
-            .unwrap()
-            .sum_by_name("fluss_active_partition_streams")
-            .unwrap()
-            .as_usize(),
-        0,
-        "a failed scan must release its partitions"
+        metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
+        0
     );
-    drop(short_ctx);
 
     let error = FlussLogTable::open(
-        Arc::clone(&connection),
-        TablePath::new("lab_spark", "demo"),
+        Arc::clone(connection),
+        TablePath::new(DATABASE, "demo"),
         Duration::from_secs(2),
     )
     .await
     .expect_err("KV tables must not be treated as append-only logs");
     assert!(matches!(error, DataFusionError::Plan(_)));
-    drop(ctx);
-    connection.close(Duration::from_secs(5)).await?;
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires native-sni and FLUSS_* credentials; run with --ignored"]
-async fn empty_log_and_new_offsets_on_each_query() -> Result<(), Box<dyn std::error::Error>> {
-    let connection = Arc::new(
-        FlussConnection::new(Config {
-            bootstrap_servers: std::env::var("FLUSS_BOOTSTRAP")?,
-            security_ssl_enabled: true,
-            security_ssl_ca_file: Some(std::env::var("FLUSS_CA_FILE")?),
-            security_protocol: "sasl".into(),
-            security_sasl_username: std::env::var("FLUSS_USER")?,
-            security_sasl_password: std::env::var("FLUSS_PASSWORD")?,
-            ..Config::default()
-        })
-        .await?,
+async fn empty_log_and_new_offsets_on_each_query() -> TestResult<()> {
+    let connection = connect().await?;
+    let path = create_empty_log(&connection).await?;
+    let admin = connection.get_admin()?;
+    let ctx = SessionContext::new();
+    register_log(&ctx, &connection, path.table(), SCAN_TIMEOUT).await?;
+    let df = ctx.sql("SELECT * FROM log").await?;
+    let source = source_plan(&df.create_physical_plan().await?);
+
+    check_late_partition(&connection, &path, &admin, &df, &source).await?;
+    check_batch_metrics(&source.metrics().unwrap());
+    assert_eq!(
+        count_sql(&ctx, "SELECT COUNT(*) FROM log WHERE id = 8").await?,
+        1
     );
+
+    drop(ctx);
+    check_failure_after_first_partition(&admin, &path, &df, &source).await?;
+    connection.close(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
+async fn create_empty_log(connection: &Arc<FlussConnection>) -> TestResult<TablePath> {
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
-    let path = TablePath::new("lab_spark", format!("datafusion_test_{suffix}"));
-    let admin = connection.get_admin()?;
+    let path = TablePath::new(DATABASE, format!("datafusion_test_{suffix}"));
     let descriptor = TableDescriptor::builder()
         .schema(Schema::builder().column("id", DataTypes::int()).build()?)
         .distributed_by(Some(2), vec!["id".to_string()])
         .build()?;
-    admin.create_table(&path, &descriptor, false).await?;
+    connection
+        .get_admin()?
+        .create_table(&path, &descriptor, false)
+        .await?;
+    Ok(path)
+}
 
-    let ctx = SessionContext::new();
-    ctx.register_table(
-        "log",
-        Arc::new(
-            FlussLogTable::open(
-                Arc::clone(&connection),
-                path.clone(),
-                Duration::from_secs(45),
-            )
-            .await?,
-        ),
-    )?;
-    let df = ctx.sql("SELECT * FROM log").await?;
-    let plan = df.create_physical_plan().await?;
-    fn source_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
-        if plan.name() == "FlussScanExec" {
-            return Some(Arc::clone(plan));
-        }
-        plan.children().into_iter().find_map(source_plan)
-    }
-    let source = source_plan(&plan).expect("SQL must plan a Fluss stream");
-    assert_eq!(source.output_partitioning().partition_count(), 2);
-    let count = collect_plan(Arc::clone(&source), Arc::new(df.task_ctx())).await?;
-    assert_eq!(count.iter().map(|batch| batch.num_rows()).sum::<usize>(), 0);
-
-    let delayed_context = Arc::new(df.task_ctx());
-    let early = collect_stream(source.execute(0, Arc::clone(&delayed_context))?).await?;
-    assert!(early.is_empty());
-
-    let table = connection.get_table(&path).await?;
+async fn append_rows(connection: &Arc<FlussConnection>, path: &TablePath) -> TestResult<()> {
+    let table = connection.get_table(path).await?;
     let writer = table.new_append()?.create_writer()?;
     for id in 0..512 {
         let mut row = GenericRow::new(1);
@@ -353,64 +324,71 @@ async fn empty_log_and_new_offsets_on_each_query() -> Result<(), Box<dyn std::er
         }
     }
     writer.flush().await?;
+    Ok(())
+}
+
+async fn check_late_partition(
+    connection: &Arc<FlussConnection>,
+    path: &TablePath,
+    admin: &fluss::client::FlussAdmin,
+    df: &datafusion::dataframe::DataFrame,
+    source: &Arc<dyn ExecutionPlan>,
+) -> TestResult<()> {
+    assert_eq!(source.output_partitioning().partition_count(), 2);
+    let empty = collect_plan(Arc::clone(source), Arc::new(df.task_ctx())).await?;
+    assert_eq!(empty.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    let delayed = Arc::new(df.task_ctx());
+    assert!(
+        collect_stream(source.execute(0, Arc::clone(&delayed))?)
+            .await?
+            .is_empty()
+    );
+
+    append_rows(connection, path).await?;
     let offsets = admin
-        .list_offsets(&path, &[0, 1], OffsetSpec::Latest)
+        .list_offsets(path, &[0, 1], OffsetSpec::Latest)
         .await?;
     assert!(offsets[&0] > 0 && offsets[&1] > 0);
-    let late = collect_stream(source.execute(1, delayed_context)?).await?;
     assert!(
-        late.is_empty(),
-        "a late partition must retain the original offsets"
+        collect_stream(source.execute(1, delayed)?)
+            .await?
+            .is_empty()
     );
-    // Reuse the physical plan after writes. A fresh TaskContext represents a
-    // new execution and must not reuse the first execution's stopping offsets.
-    let count = collect_plan(Arc::clone(&source), Arc::new(df.task_ctx())).await?;
-    assert_eq!(
-        count.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-        512
-    );
-    let metrics = source.metrics().unwrap();
+    let fresh = collect_plan(Arc::clone(source), Arc::new(df.task_ctx())).await?;
+    assert_eq!(fresh.iter().map(RecordBatch::num_rows).sum::<usize>(), 512);
+    Ok(())
+}
+
+fn check_batch_metrics(metrics: &MetricsSet) {
     let batches = metrics
         .sum(|m| matches!(m.value(), MetricValue::OutputBatches(_)))
         .unwrap()
         .as_usize();
-    let decoded_bytes = metrics
-        .sum_by_name("arrow_decoded_bytes")
-        .unwrap()
-        .as_usize();
-    let peak_bytes = metrics
-        .sum_by_name("fluss_peak_decoded_arrow_batch_bytes")
-        .unwrap()
-        .as_usize();
+    let decoded = metric(metrics, "arrow_decoded_bytes");
+    let peak = metric(metrics, "fluss_peak_decoded_arrow_batch_bytes");
     assert!(
         batches > 2,
         "expected several streamed batches, got {batches}"
     );
-    assert!(peak_bytes > 0 && peak_bytes < decoded_bytes);
-    let count = ctx
-        .sql("SELECT COUNT(*) FROM log WHERE id = 8")
-        .await?
-        .collect()
-        .await?;
-    assert_eq!(
-        count[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0),
-        1
+    assert!(peak > 0 && peak < decoded);
+}
+
+async fn check_failure_after_first_partition(
+    admin: &fluss::client::FlussAdmin,
+    path: &TablePath,
+    df: &datafusion::dataframe::DataFrame,
+    source: &Arc<dyn ExecutionPlan>,
+) -> TestResult<()> {
+    let context = Arc::new(df.task_ctx());
+    assert!(
+        !collect_stream(source.execute(0, Arc::clone(&context))?)
+            .await?
+            .is_empty()
     );
-    drop(table);
-    drop(ctx);
-    let failure_context = Arc::new(df.task_ctx());
-    let before_failure = collect_stream(source.execute(0, Arc::clone(&failure_context))?).await?;
-    assert!(!before_failure.is_empty());
-    admin.drop_table(&path, false).await?;
-    let failed_partition = collect_stream(source.execute(1, failure_context)?)
+    admin.drop_table(path, false).await?;
+    let error = collect_stream(source.execute(1, context)?)
         .await
         .expect_err("a late bucket failure must not look like a complete read");
-    assert!(!failed_partition.to_string().is_empty());
-    connection.close(Duration::from_secs(5)).await?;
+    assert!(!error.to_string().is_empty());
     Ok(())
 }

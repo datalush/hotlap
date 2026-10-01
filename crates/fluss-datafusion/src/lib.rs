@@ -7,9 +7,11 @@
 //! and partitioned tables are rejected rather than misrepresented.
 
 mod catalog;
+mod execution;
 mod log_table;
 mod metrics;
 mod offsets;
+mod scan;
 
 pub use catalog::FlussCatalog;
 pub use log_table::FlussLogTable;
