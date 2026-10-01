@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! TableProvider and deferred, finite Arrow stream for an append-only Fluss table.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,11 +16,17 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use fluss::client::{
-    EARLIEST_OFFSET, FlussConnection, RecordBatchLogReader, RecordBatchReadOutcome,
+    BoundedLogReadRange, EARLIEST_OFFSET, FlussConnection, RecordBatchLogReader,
+    RecordBatchReadOutcome,
 };
-use fluss::metadata::TablePath;
+use fluss::metadata::{TableBucket, TablePath};
+use fluss::rpc::message::OffsetSpec;
 
-/// Append-only log table exposed to DataFusion SQL as one finite partition.
+use crate::offsets::{Capture, OffsetCaptures, Offsets, validate_offsets};
+
+const MAX_SCAN_PARTITIONS: i32 = 8;
+
+/// Append-only log table with bounded, parallel physical scan partitions.
 pub struct FlussLogTable {
     connection: Arc<FlussConnection>,
     path: TablePath,
@@ -57,6 +62,9 @@ impl FlussLogTable {
             .schema();
         let table_id = info.table_id;
         let buckets = info.get_num_buckets();
+        if buckets < 1 {
+            return Err(DataFusionError::Plan("Fluss table has no buckets".into()));
+        }
         drop(table);
         Ok(Self {
             connection,
@@ -94,19 +102,29 @@ impl TableProvider for FlussLogTable {
             Some(indices) => Arc::new(self.schema.project(indices)?),
             None => Arc::clone(&self.schema),
         };
-        let source = FlussPartition {
-            connection: Arc::clone(&self.connection),
-            path: self.path.clone(),
-            schema: Arc::clone(&projected_schema),
-            full_schema: Arc::clone(&self.schema),
-            projection: projection.cloned(),
-            table_id: self.table_id,
-            buckets: self.buckets,
-            timeout: self.timeout,
-        };
+        let captures = Arc::new(OffsetCaptures::default());
+        let partitions: Vec<Arc<dyn PartitionStream>> = bucket_groups(self.buckets)
+            .into_iter()
+            .enumerate()
+            .map(|(index, bucket_ids)| {
+                Arc::new(FlussPartition {
+                    connection: Arc::clone(&self.connection),
+                    path: self.path.clone(),
+                    schema: Arc::clone(&projected_schema),
+                    full_schema: Arc::clone(&self.schema),
+                    projection: projection.cloned(),
+                    table_id: self.table_id,
+                    buckets: self.buckets,
+                    bucket_ids,
+                    index,
+                    captures: Arc::clone(&captures),
+                    timeout: self.timeout,
+                }) as Arc<dyn PartitionStream>
+            })
+            .collect();
         Ok(Arc::new(StreamingTableExec::try_new(
             projected_schema,
-            vec![Arc::new(source)],
+            partitions,
             None,
             [],
             false,
@@ -123,6 +141,9 @@ struct FlussPartition {
     projection: Option<Vec<usize>>,
     table_id: i64,
     buckets: i32,
+    bucket_ids: Vec<i32>,
+    index: usize,
+    captures: Arc<OffsetCaptures>,
     timeout: Duration,
 }
 
@@ -147,7 +168,7 @@ impl PartitionStream for FlussPartition {
         &self.schema
     }
 
-    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+    fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
         let schema = Arc::clone(&self.schema);
         let state = ReadState {
             source: FlussPartition {
@@ -158,10 +179,16 @@ impl PartitionStream for FlussPartition {
                 projection: self.projection.clone(),
                 table_id: self.table_id,
                 buckets: self.buckets,
+                bucket_ids: self.bucket_ids.clone(),
+                index: self.index,
+                captures: Arc::clone(&self.captures),
                 timeout: self.timeout,
             },
             reader: None,
             deadline: Instant::now() + self.timeout,
+            capture: self.captures.for_partition(&ctx, self.index),
+            // Keep the execution identity alive until this stream finishes.
+            _context: ctx,
         };
         let stream = futures::stream::try_unfold(state, |mut state| async move {
             if state.reader.is_none() {
@@ -207,6 +234,8 @@ struct ReadState {
     source: FlussPartition,
     reader: Option<RecordBatchLogReader>,
     deadline: Instant,
+    capture: Capture,
+    _context: Arc<TaskContext>,
 }
 
 impl ReadState {
@@ -218,6 +247,16 @@ impl ReadState {
     }
 
     async fn start(&self) -> Result<RecordBatchLogReader> {
+        let offsets = self
+            .capture
+            .get_or_init(|| async {
+                self.capture_offsets()
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .as_ref()
+            .map_err(|error| DataFusionError::Execution(error.clone()))?;
         let table = self
             .source
             .connection
@@ -248,18 +287,39 @@ impl ReadState {
                 "Fluss table schema changed; plan again".into(),
             ));
         }
-        let offsets: HashMap<i32, i64> = (0..self.source.buckets)
-            .map(|bucket| (bucket, EARLIEST_OFFSET))
+        let ranges = self
+            .source
+            .bucket_ids
+            .iter()
+            .map(|&bucket| BoundedLogReadRange {
+                bucket: TableBucket::new(self.source.table_id, bucket),
+                starting_offset: EARLIEST_OFFSET,
+                stopping_offset: offsets[&bucket],
+            })
             .collect();
-        scanner
-            .subscribe_buckets(&offsets)
-            .await
-            .map_err(fluss_error)?;
-        let admin = self.source.connection.get_admin().map_err(fluss_error)?;
-        RecordBatchLogReader::new_until_latest(scanner, &admin)
+        RecordBatchLogReader::new_from_ranges(scanner, ranges)
             .await
             .map_err(fluss_error)
     }
+
+    async fn capture_offsets(&self) -> Result<Offsets> {
+        let admin = self.source.connection.get_admin().map_err(fluss_error)?;
+        let buckets: Vec<i32> = (0..self.source.buckets).collect();
+        let offsets = admin
+            .list_offsets(&self.source.path, &buckets, OffsetSpec::Latest)
+            .await
+            .map_err(fluss_error)?;
+        validate_offsets(offsets, self.source.buckets)
+    }
+}
+
+fn bucket_groups(buckets: i32) -> Vec<Vec<i32>> {
+    let count = buckets.min(MAX_SCAN_PARTITIONS) as usize;
+    let mut groups = vec![Vec::new(); count];
+    for bucket in 0..buckets {
+        groups[bucket as usize % count].push(bucket);
+    }
+    groups
 }
 
 fn expired() -> DataFusionError {
@@ -273,5 +333,19 @@ fn fluss_error(error: fluss::error::Error) -> DataFusionError {
 impl fmt::Display for FlussLogTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "FlussLogTable({})", self.path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bucket_groups;
+
+    #[test]
+    fn grouping_covers_each_bucket_once_and_caps_parallelism() {
+        let groups = bucket_groups(19);
+        assert_eq!(groups.len(), 8);
+        let mut buckets: Vec<_> = groups.into_iter().flatten().collect();
+        buckets.sort_unstable();
+        assert_eq!(buckets, (0..19).collect::<Vec<_>>());
     }
 }

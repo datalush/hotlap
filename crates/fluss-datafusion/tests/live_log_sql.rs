@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use arrow::array::{Int64Array, StringArray};
 use datafusion::common::DataFusionError;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::collect as collect_plan;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionContext;
 use fluss::client::FlussConnection;
 use fluss::config::Config;
@@ -98,15 +99,17 @@ async fn bounded_sql_and_kv_rejection_against_native_sni() -> Result<(), Box<dyn
         .await?
         .create_physical_plan()
         .await?;
-    fn source_schema(plan: &Arc<dyn ExecutionPlan>) -> Option<arrow::datatypes::SchemaRef> {
+    fn source_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
         if plan.name() == "StreamingTableExec" {
-            return Some(plan.schema());
+            return Some(Arc::clone(plan));
         }
-        plan.children().into_iter().find_map(source_schema)
+        plan.children().into_iter().find_map(source_plan)
     }
-    let schema = source_schema(&projected).expect("SQL must plan a Fluss stream");
+    let source = source_plan(&projected).expect("SQL must plan a Fluss stream");
+    let schema = source.schema();
     assert_eq!(schema.fields().len(), 1);
     assert_eq!(schema.field(0).name(), "value");
+    assert_eq!(source.output_partitioning().partition_count(), 2);
 
     let catalog = FlussCatalog::load(Arc::clone(&connection), Duration::from_secs(45)).await?;
     ctx.register_catalog("fluss", Arc::new(catalog));
@@ -197,16 +200,18 @@ async fn empty_log_and_new_offsets_on_each_query() -> Result<(), Box<dyn std::er
             .await?,
         ),
     )?;
-    let count = ctx.sql("SELECT COUNT(*) FROM log").await?.collect().await?;
-    assert_eq!(
-        count[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0),
-        0
-    );
+    let df = ctx.sql("SELECT * FROM log").await?;
+    let plan = df.create_physical_plan().await?;
+    fn source_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        if plan.name() == "StreamingTableExec" {
+            return Some(Arc::clone(plan));
+        }
+        plan.children().into_iter().find_map(source_plan)
+    }
+    let source = source_plan(&plan).expect("SQL must plan a Fluss stream");
+    assert_eq!(source.output_partitioning().partition_count(), 2);
+    let count = collect_plan(Arc::clone(&source), Arc::new(df.task_ctx())).await?;
+    assert_eq!(count.iter().map(|batch| batch.num_rows()).sum::<usize>(), 0);
 
     let table = connection.get_table(&path).await?;
     let writer = table.new_append()?.create_writer()?;
@@ -216,16 +221,10 @@ async fn empty_log_and_new_offsets_on_each_query() -> Result<(), Box<dyn std::er
         writer.append(&row)?;
     }
     writer.flush().await?;
-    let count = ctx.sql("SELECT COUNT(*) FROM log").await?.collect().await?;
-    assert_eq!(
-        count[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0),
-        2
-    );
+    // Reuse the physical plan after writes. A fresh TaskContext represents a
+    // new execution and must not reuse the first execution's stopping offsets.
+    let count = collect_plan(source, Arc::new(df.task_ctx())).await?;
+    assert_eq!(count.iter().map(|batch| batch.num_rows()).sum::<usize>(), 2);
     let count = ctx
         .sql("SELECT COUNT(*) FROM log WHERE id = 8")
         .await?

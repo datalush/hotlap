@@ -19,9 +19,10 @@ in the engine. Keep projection, limits, and partitions honest about these
 semantics.
 
 The first DataFusion provider supports **non-partitioned append-only logs**
-only. It captures stopping offsets at execution time for one read of the
-table's buckets and starts at each bucket's earliest **retained** offset;
-another execution captures new offsets. The bounded read
+only. Up to eight physical partitions each read a group of buckets, sharing
+one offset capture per execution. Each bucket starts at its earliest
+**retained** offset; reusing the physical source plan with a new TaskContext
+captures new offsets. The bounded read
 finishes or fails with an explicit error on timeout. Offsets are collected
 per bucket, not as a transactional cross-bucket snapshot. Non-empty SQL
 projections are requested from the Fluss scanner; zero-column `COUNT(*)`

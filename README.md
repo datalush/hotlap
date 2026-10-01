@@ -85,7 +85,9 @@ and rejection of a KV table):
 uv run --env-file ../lab/.env cargo test -p fluss-datafusion --test live_log_sql -- --ignored
 ```
 
-The source currently runs one execution partition across the table's buckets;
-it does not promise a globally atomic snapshot across buckets. A limited
+The source distributes buckets across up to eight DataFusion execution
+partitions. They share **one** capture of latest offsets for each query;
+reusing a physical source plan with a new TaskContext captures new offsets.
+This is not a globally atomic snapshot across buckets. A limited
 per-bucket scan is not a full primary-key table read; see
 [reading semantics](docs/reading-semantics.md).

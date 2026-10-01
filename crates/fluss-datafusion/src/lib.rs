@@ -8,6 +8,7 @@
 
 mod catalog;
 mod log_table;
+mod offsets;
 
 pub use catalog::FlussCatalog;
 pub use log_table::FlussLogTable;
