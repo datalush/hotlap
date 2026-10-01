@@ -88,18 +88,26 @@ impl TableProvider for FlussLogTable {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // No filter/limit pushdown: the log scanner's batch pruning is inexact,
         // and a per-bucket limit would not be a correct global SQL LIMIT.
+        // An empty projection (COUNT(*)) still reads rows: Fluss rejects an
+        // empty column projection, so strip columns from Arrow batches later.
+        let projected_schema = match projection {
+            Some(indices) => Arc::new(self.schema.project(indices)?),
+            None => Arc::clone(&self.schema),
+        };
         let source = FlussPartition {
             connection: Arc::clone(&self.connection),
             path: self.path.clone(),
-            schema: Arc::clone(&self.schema),
+            schema: Arc::clone(&projected_schema),
+            full_schema: Arc::clone(&self.schema),
+            projection: projection.cloned(),
             table_id: self.table_id,
             buckets: self.buckets,
             timeout: self.timeout,
         };
         Ok(Arc::new(StreamingTableExec::try_new(
-            Arc::clone(&self.schema),
+            projected_schema,
             vec![Arc::new(source)],
-            projection,
+            None,
             [],
             false,
             None,
@@ -111,6 +119,8 @@ struct FlussPartition {
     connection: Arc<FlussConnection>,
     path: TablePath,
     schema: SchemaRef,
+    full_schema: SchemaRef,
+    projection: Option<Vec<usize>>,
     table_id: i64,
     buckets: i32,
     timeout: Duration,
@@ -144,6 +154,8 @@ impl PartitionStream for FlussPartition {
                 connection: Arc::clone(&self.connection),
                 path: self.path.clone(),
                 schema: Arc::clone(&schema),
+                full_schema: Arc::clone(&self.full_schema),
+                projection: self.projection.clone(),
                 table_id: self.table_id,
                 buckets: self.buckets,
                 timeout: self.timeout,
@@ -174,7 +186,13 @@ impl PartitionStream for FlussPartition {
                 .map_err(fluss_error)?;
                 match result {
                     RecordBatchReadOutcome::Batch(batch) => {
-                        return Ok(Some((batch.into_batch(), state)));
+                        let batch = batch.into_batch();
+                        let batch = if state.source.projection.as_ref().is_some_and(Vec::is_empty) {
+                            batch.project(&[])?
+                        } else {
+                            batch
+                        };
+                        return Ok(Some((batch, state)));
                     }
                     RecordBatchReadOutcome::TimedOut => continue,
                     RecordBatchReadOutcome::Finished => return Ok(None),
@@ -212,11 +230,20 @@ impl ReadState {
                 "Fluss table topology changed; plan again".into(),
             ));
         }
-        let scanner = table
-            .new_scan()
+        let scan = table.new_scan();
+        let scan = match self.source.projection.as_deref() {
+            Some(indices) if !indices.is_empty() => scan.project(indices).map_err(fluss_error)?,
+            _ => scan,
+        };
+        let scanner = scan
             .create_record_batch_log_scanner()
             .map_err(fluss_error)?;
-        if scanner.schema() != self.source.schema {
+        let expected_schema = if self.source.projection.as_ref().is_some_and(Vec::is_empty) {
+            &self.source.full_schema
+        } else {
+            &self.source.schema
+        };
+        if scanner.schema() != *expected_schema {
             return Err(DataFusionError::Execution(
                 "Fluss table schema changed; plan again".into(),
             ));

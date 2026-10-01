@@ -65,9 +65,11 @@ KV tables remain visible in that catalog but return an explicit unsupported
 error if queried. Execution captures each bucket's latest offset once, streams
 Arrow batches from the earliest **retained** offsets until those stopping
 offsets, and errors on timeout rather than claiming a partial result is
-complete. Filters, projections and global limits remain
-DataFusion's responsibility; no Fluss filter/limit pushdown is claimed. Each
-query opens a new finite read. KV and partitioned tables are rejected.
+complete. DataFusion's required non-empty projection is pushed to Fluss;
+`COUNT(*)` still fetches rows because Fluss cannot scan zero columns. Filters
+and global limits remain DataFusion's responsibility; no Fluss filter/limit
+pushdown is claimed. Each query opens a new finite read. KV and partitioned
+tables are rejected.
 
 With the isolated lab running and its ignored `.env` in `../lab/`:
 
@@ -75,7 +77,8 @@ With the isolated lab running and its ignored `.env` in `../lab/`:
 uv run --env-file ../lab/.env cargo run -p fluss-datafusion --example query -- lab_spark demo_log
 ```
 
-For the isolated lab integration test (COUNT, exact SQL filter, projection,
+For the isolated lab integration tests (empty log, new writes visible on the
+next execution, COUNT, source projection, exact SQL filter, timeout failure,
 and rejection of a KV table):
 
 ```bash

@@ -23,8 +23,10 @@ only. It captures stopping offsets at execution time for one read of the
 table's buckets and starts at each bucket's earliest **retained** offset;
 another execution captures new offsets. The bounded read
 finishes or fails with an explicit error on timeout. Offsets are collected
-per bucket, not as a transactional cross-bucket snapshot. Filtering, SQL
-limits and projection are performed by DataFusion over the source batches.
+per bucket, not as a transactional cross-bucket snapshot. Non-empty SQL
+projections are requested from the Fluss scanner; zero-column `COUNT(*)`
+still fetches full rows before stripping columns locally. Exact filtering
+and global SQL limits remain DataFusion operations.
 The read-only catalog discovers names once; reload it after creating tables.
 It does not reinterpret KV changelogs as the current table state.
 
