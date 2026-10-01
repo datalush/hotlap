@@ -13,7 +13,7 @@ use datafusion::logical_expr::TableType;
 use fluss::client::FlussConnection;
 use fluss::metadata::TablePath;
 
-use crate::FlussLogTable;
+use crate::{FlussKvTable, FlussLogTable};
 
 /// Read-only catalog. Reload it to discover databases/tables created later.
 pub struct FlussCatalog {
@@ -21,7 +21,7 @@ pub struct FlussCatalog {
 }
 
 impl FlussCatalog {
-    /// List names once, without reading rows or treating a KV table as a log.
+    /// List names once, without reading rows. Resolve log/KV types on lookup.
     pub async fn load(connection: Arc<FlussConnection>, timeout: Duration) -> Result<Self> {
         if timeout.is_zero() {
             return Err(DataFusionError::Plan(
@@ -103,13 +103,22 @@ impl SchemaProvider for FlussSchema {
         if !self.tables.contains(name) {
             return Ok(None);
         }
-        let table = FlussLogTable::open(
-            Arc::clone(&self.connection),
-            TablePath::new(&self.database, name),
-            self.timeout,
-        )
-        .await?;
-        Ok(Some(Arc::new(table)))
+        let path = TablePath::new(&self.database, name);
+        let is_kv = self
+            .connection
+            .get_table(&path)
+            .await
+            .map_err(fluss_error)?
+            .has_primary_key();
+        if is_kv {
+            Ok(Some(Arc::new(
+                FlussKvTable::open(Arc::clone(&self.connection), path, self.timeout).await?,
+            )))
+        } else {
+            Ok(Some(Arc::new(
+                FlussLogTable::open(Arc::clone(&self.connection), path, self.timeout).await?,
+            )))
+        }
     }
 
     fn table_exist(&self, name: &str) -> bool {

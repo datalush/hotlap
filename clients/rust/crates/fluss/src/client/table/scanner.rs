@@ -20,6 +20,7 @@ use crate::client::connection::FlussConnection;
 use crate::client::credentials::SecurityTokenManager;
 use crate::client::metadata::Metadata;
 use crate::client::table::batch_scanner::LimitBatchScanner;
+use crate::client::table::kv_scanner::KvBatchScanner;
 use crate::client::table::log_fetch_buffer::{
     CompletedFetch, DefaultCompletedFetch, FetchErrorAction, FetchErrorContext, FetchErrorLogLevel,
     FetchResult, LogFetchBuffer, NO_FILTERED_END_OFFSET, RemotePendingFetch,
@@ -219,6 +220,45 @@ impl<'a> TableScan<'a> {
             self.projected_fields,
             table_bucket,
             limit,
+        ))
+    }
+
+    /// Opens a bounded, server-side snapshot scan for one KV bucket. The first
+    /// request runs when the caller asks for its first Arrow batch. No SQL
+    /// filter or row limit is pushed into this scan.
+    pub fn create_kv_batch_scanner(self, bucket: TableBucket) -> Result<KvBatchScanner> {
+        self.reject_filter("KvBatchScanner")?;
+        self.reject_limit("KvBatchScanner")?;
+        if !self.table_info.has_primary_key() {
+            return Err(Error::UnsupportedOperation {
+                message: "KV snapshot scans require a primary-key table".into(),
+            });
+        }
+        if bucket.table_id() != self.table_info.table_id
+            || bucket.partition_id().is_some()
+            || bucket.bucket_id() < 0
+            || bucket.bucket_id() >= self.table_info.get_num_buckets()
+        {
+            return Err(Error::IllegalArgument {
+                message: format!("Invalid KV scan bucket: {bucket}"),
+            });
+        }
+        let latest = SchemaInfo::new(
+            self.table_info.get_schema().clone(),
+            self.table_info.get_schema_id(),
+        );
+        let getter = Arc::new(ClientSchemaGetter::new(
+            self.table_info.table_path.clone(),
+            self.conn.get_admin()?,
+            latest,
+        ));
+        Ok(KvBatchScanner::new(
+            self.conn.get_connections(),
+            self.metadata,
+            self.table_info,
+            getter,
+            self.projected_fields,
+            bucket,
         ))
     }
 

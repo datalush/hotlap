@@ -18,9 +18,10 @@ The Java and Rust trees are source copies of the `fluss-clients` checkout at
 `dc427e1290847b4a569b6745fcb87b256292bf6a`. Their original Apache 2.0
 license headers, LICENSE, and NOTICE files are retained. No build outputs,
 local credentials, or Git history were copied into these trees. Changes in
-the copied Rust client are limited to exposing its existing TLS settings in
-`bindings/python/src/config.rs` and making its bounded reader recognize
-offset progress when server-side pruning returns no batches.
+the copied Rust client expose its existing TLS settings in
+`bindings/python/src/config.rs`, recognize offset progress when server-side
+pruning returns no batches, and provide a paginated `ScanKv` snapshot reader
+using its existing value-record-to-Arrow decoder.
 
 ## Validate the scaffold
 
@@ -56,13 +57,14 @@ Its limit is **per bucket**, not a complete current-state table scan. It
 requires the Fluss bootstrap, CA, SASL user and password in the environment;
 no credentials are stored in this repository.
 
-## DataFusion (append-only log tables)
+## DataFusion (logs and primary-key tables)
 
-`FlussLogTable::open` registers an explicit, non-partitioned Fluss log table
-in DataFusion. `FlussCatalog::load` discovers database/table names once and
-allows SQL such as `fluss.lab_spark.demo_log` (reload the catalog after DDL).
-KV tables remain visible in that catalog but return an explicit unsupported
-error if queried. Execution captures each bucket's latest offset once, streams
+`FlussLogTable::open` and `FlussKvTable::open` register non-partitioned tables
+explicitly. `FlussCatalog::load` discovers database/table names once and
+selects the appropriate provider, allowing SQL such as
+`fluss.lab_spark.demo_log` or a KV table (reload the catalog after DDL).
+
+For **logs**, execution captures each bucket's latest offset once, streams
 Arrow batches from the earliest **retained** offsets until those stopping
 offsets, and errors on timeout rather than claiming a partial result is
 complete. DataFusion's required non-empty projection is pushed to Fluss;
@@ -71,7 +73,17 @@ complete. DataFusion's required non-empty projection is pushed to Fluss;
 batches; pushdown is **Inexact** and DataFusion always evaluates the full
 filter again. `OR`, unsupported expressions and out-of-range literals stay
 in DataFusion. Global limits are not pushed per bucket. Each query opens a
-new finite read. KV and partitioned tables are rejected.
+new finite read.
+
+For **KV**, the server opens an isolated RocksDB snapshot for each bucket's
+`ScanKv` session. The Rust reader paginates and decodes every live row,
+including upserts and deletions, into Arrow. Each execution opens fresh
+sessions. SQL filters and limits are applied by DataFusion; nonempty column
+projections are pushed into the Arrow decoder. There is no single
+transactional snapshot shared between buckets: sessions start when each
+bucket is first read, so concurrent writes may be visible in some buckets
+but not others. A failure, expired session or timeout fails the query rather
+than returning an incomplete table. Partitioned tables remain unsupported.
 
 To see actual pruning, enable batch statistics **when creating the log table**
 with `table.statistics.columns: id` (or `*`). Existing batches written without
@@ -88,14 +100,15 @@ uv run --env-file ../lab/.env cargo run -p fluss-datafusion --example query -- l
 For the isolated lab integration tests (empty log, new writes visible on the
 next execution, COUNT, source projection, exact SQL filter, configurable
 parallelism, several batches, metrics, timeout failure, LIMIT cancellation,
-and rejection of a KV table):
+KV state after upserts and deletions, pagination, and catalog dispatch):
 
 ```bash
 uv run --env-file ../lab/.env cargo test -p fluss-datafusion --test live_log_sql -- --ignored
 ```
 
-The source uses `min(buckets, DataFusion target_partitions)`, optionally capped
-with `FlussLogTable::with_max_partitions(n)` (positive `n` only). They share
+The sources use `min(buckets, DataFusion target_partitions)`, optionally capped
+with `FlussLogTable::with_max_partitions(n)` or
+`FlussKvTable::with_max_partitions(n)` (positive `n` only). Log partitions share
 **one** capture of latest offsets for each query;
 reusing a physical source plan with a new TaskContext captures new offsets.
 Concurrent executions of that plan must use distinct `TaskContext` instances

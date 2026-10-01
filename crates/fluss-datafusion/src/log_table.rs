@@ -172,7 +172,7 @@ impl fmt::Display for FlussLogTable {
     }
 }
 
-fn bucket_groups(buckets: i32, parallelism: usize) -> Vec<Vec<i32>> {
+pub(crate) fn bucket_groups(buckets: i32, parallelism: usize) -> Vec<Vec<i32>> {
     let count = (buckets as usize).min(parallelism.max(1));
     let mut groups = vec![Vec::new(); count];
     for bucket in 0..buckets {

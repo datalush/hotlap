@@ -180,7 +180,7 @@ async fn run_limit_scan(pending: &PendingScan, bucket: &TableBucket) -> Result<S
             &pending.table_info,
             &pending.schema_getter,
             projected,
-            raw,
+            raw.into(),
             limit,
         )
         .await?;
@@ -283,11 +283,11 @@ fn create_log_read_context_resolver(
 /// Decode a KV limit-scan [`ValueRecordBatch`] into a single Arrow
 /// `RecordBatch`, decoding each record by its own schema id and projecting onto
 /// the current schema.
-async fn decode_kv_batch(
+pub(super) async fn decode_kv_batch(
     table_info: &TableInfo,
     schema_getter: &ClientSchemaGetter,
     projected_fields: Option<&[usize]>,
-    raw: Vec<u8>,
+    raw: Bytes,
     limit: usize,
 ) -> Result<RecordBatch> {
     // No records: return an empty (projected) batch.
@@ -306,7 +306,7 @@ async fn decode_kv_batch(
             source: None,
         })?;
 
-    let batch = ValueRecordBatch::new(Bytes::from(raw));
+    let batch = ValueRecordBatch::new(raw);
     let ranges = batch.value_ranges()?;
 
     // Collect the distinct schema ids present, then build one decoder per id

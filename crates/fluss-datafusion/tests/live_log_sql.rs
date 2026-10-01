@@ -17,7 +17,7 @@ use fluss::config::Config;
 use fluss::metadata::{DataTypes, Schema, TableDescriptor, TablePath};
 use fluss::row::GenericRow;
 use fluss::rpc::message::OffsetSpec;
-use fluss_datafusion::{FlussCatalog, FlussLogTable};
+use fluss_datafusion::{FlussCatalog, FlussKvTable, FlussLogTable};
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 const DATABASE: &str = "datafusion_tests";
@@ -110,7 +110,7 @@ fn metric(metrics: &MetricsSet, name: &str) -> usize {
 
 #[tokio::test]
 #[ignore = "requires native-sni and FLUSS_* credentials; run with --ignored"]
-async fn bounded_sql_and_kv_rejection_against_native_sni() -> TestResult<()> {
+async fn bounded_log_and_kv_sql_against_native_sni() -> TestResult<()> {
     let connection = connect().await?;
     let (log_path, kv_path) = create_known_tables(&connection).await?;
     let ctx = SessionContext::new();
@@ -121,7 +121,8 @@ async fn bounded_sql_and_kv_rejection_against_native_sni() -> TestResult<()> {
         check_parallelism(&connection, log_path.table(), total).await?;
         check_explain_metrics(&ctx).await?;
         check_catalog(&ctx, &connection, &log_path, total).await?;
-        check_timeout_and_kv(&connection, &log_path, &kv_path).await
+        check_timeout_and_kv(&connection, &log_path, &kv_path).await?;
+        check_kv_sql(&ctx, &connection, &log_path, &kv_path).await
     }
     .await;
 
@@ -160,6 +161,7 @@ async fn create_known_tables(
         .schema(
             Schema::builder()
                 .column("id", DataTypes::int())
+                .column("value", DataTypes::string())
                 .primary_key(vec!["id"])?
                 .build()?,
         )
@@ -191,6 +193,171 @@ async fn create_known_tables(
         return Err(error);
     }
     Ok((log, kv))
+}
+
+async fn check_kv_sql(
+    ctx: &SessionContext,
+    connection: &Arc<FlussConnection>,
+    log_path: &TablePath,
+    kv_path: &TablePath,
+) -> TestResult<()> {
+    assert!(
+        FlussKvTable::open(Arc::clone(connection), log_path.clone(), SCAN_TIMEOUT)
+            .await
+            .is_err(),
+        "KV scans must reject append-only logs"
+    );
+    let table = FlussKvTable::open(Arc::clone(connection), kv_path.clone(), SCAN_TIMEOUT).await?;
+    ctx.register_table("kv", Arc::new(table))?;
+    assert_eq!(count_sql(ctx, "SELECT COUNT(*) FROM kv").await?, 0);
+
+    let writer = connection
+        .get_table(kv_path)
+        .await?
+        .new_upsert()?
+        .create_writer()?;
+    for id in 0..64 {
+        let mut row = GenericRow::new(2);
+        row.set_field(0, id);
+        row.set_field(1, format!("value-{id}"));
+        writer.upsert(&row)?;
+    }
+    writer.flush().await?;
+    assert_eq!(count_sql(ctx, "SELECT COUNT(*) FROM kv").await?, 64);
+
+    let mut update = GenericRow::new(2);
+    update.set_field(0, 3_i32);
+    update.set_field(1, "updated");
+    writer.upsert(&update)?;
+    for id in [4_i32, 61_i32] {
+        let mut key = GenericRow::new(2);
+        key.set_field(0, id);
+        writer.delete(&key)?;
+    }
+    writer.flush().await?;
+    assert_eq!(count_sql(ctx, "SELECT COUNT(*) FROM kv").await?, 62);
+    assert_eq!(
+        count_sql(ctx, "SELECT COUNT(*) FROM kv WHERE id = 4").await?,
+        0
+    );
+    assert_eq!(
+        count_sql(ctx, "SELECT COUNT(*) FROM kv WHERE id = 61").await?,
+        0
+    );
+    assert_eq!(
+        count_sql(
+            ctx,
+            "SELECT COUNT(*) FROM kv WHERE id = 3 AND value = 'updated'"
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        count_sql(ctx, "SELECT COUNT(*) FROM kv WHERE id > 60").await?,
+        2
+    );
+
+    let projected = ctx.sql("SELECT value FROM kv WHERE id = 3").await?;
+    let plan = projected.create_physical_plan().await?;
+    let source = source_plan(&plan);
+    assert_eq!(
+        source.schema().fields().len(),
+        2,
+        "residual filter needs the id column"
+    );
+    let rows = collect_plan(plan, Arc::new(projected.task_ctx())).await?;
+    let values: Vec<_> = rows
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|row| values.value(row).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(values, ["updated"]);
+
+    assert_eq!(
+        count_sql(
+            ctx,
+            &format!("SELECT COUNT(*) FROM fluss.{DATABASE}.{}", kv_path.table()),
+        )
+        .await?,
+        62,
+        "catalog must dispatch KV tables to the KV provider"
+    );
+    for (target, expected) in [(1, 1), (8, 2)] {
+        let query =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(target));
+        query.register_table(
+            "kv",
+            Arc::new(
+                FlussKvTable::open(Arc::clone(connection), kv_path.clone(), SCAN_TIMEOUT).await?,
+            ),
+        )?;
+        let plan = query
+            .sql("SELECT * FROM kv")
+            .await?
+            .create_physical_plan()
+            .await?;
+        assert_eq!(
+            source_plan(&plan).output_partitioning().partition_count(),
+            expected
+        );
+        assert_eq!(count_sql(&query, "SELECT COUNT(*) FROM kv").await?, 62);
+    }
+
+    // The snapshot may span more than one ScanKv response. Count every row,
+    // including continuations; dropping a limited scan must not poison the next.
+    let large = "x".repeat(350_000);
+    for id in 64..72 {
+        let mut row = GenericRow::new(2);
+        row.set_field(0, id);
+        row.set_field(1, format!("{id}-{large}"));
+        writer.upsert(&row)?;
+    }
+    writer.flush().await?;
+    let all = ctx.sql("SELECT * FROM kv").await?;
+    let plan = all.create_physical_plan().await?;
+    let batches = collect_plan(plan, Arc::new(all.task_ctx())).await?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 70);
+    assert!(
+        batches.len() > 2,
+        "KV snapshot must span multiple RPC pages"
+    );
+    let limited = ctx
+        .sql("SELECT id FROM kv LIMIT 1")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(limited.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(count_sql(ctx, "SELECT COUNT(*) FROM kv").await?, 70);
+
+    let timed = SessionContext::new();
+    timed.register_table(
+        "kv",
+        Arc::new(
+            FlussKvTable::open(
+                Arc::clone(connection),
+                kv_path.clone(),
+                Duration::from_nanos(1),
+            )
+            .await?,
+        ),
+    )?;
+    assert!(
+        timed
+            .sql("SELECT COUNT(*) FROM kv")
+            .await?
+            .collect()
+            .await
+            .is_err()
+    );
+    Ok(())
 }
 
 async fn check_log_sql(ctx: &SessionContext) -> TestResult<i64> {

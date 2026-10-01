@@ -10,10 +10,22 @@ complete current view of a primary-key table. A log scanner yields changes,
 not the current state of a primary-key table. Do not expose either as an
 unqualified `read_table()` or an unrestricted SQL table.
 
-Before adding a **primary-key** DataFusion `TableProvider`, define its bounded
-full scan, deletion semantics, snapshot/log merge, cancellation, and the
-consistency actually guaranteed between buckets. The existing append-only
-log source relies on the client's bounded offset reader. Its predicate
+The **primary-key** provider uses the server's `ScanKv` RPC, not a limited
+preview or a changelog reconstruction. Each bucket's server-side RocksDB
+snapshot supplies every live row; upserts and deletes are reflected in that
+state. Continuations reuse the same snapshot session. No external snapshot
+files or snapshot/log merge are needed for this online scan. A session error
+never silently starts a new snapshot; cancellation closes known sessions
+best-effort, with server TTL for an interrupted initial open. A query timeout
+fails rather than claiming partial results. Each bucket opens its snapshot
+when it is first read; there is **no transactionally consistent cross-bucket
+snapshot** during concurrent writes, nor a snapshot retained across queries.
+Only non-partitioned KV tables are supported. No filter or global SQL limit is
+pushed into `ScanKv`; DataFusion evaluates them exactly. Non-empty projections
+are applied by the Arrow decoder after reading value records, and `COUNT(*)`
+still decodes full rows. A changed schema or bucket layout requires replanning.
+
+The append-only log source relies on the client's bounded offset reader. Its predicate
 pushdown only prunes batches, so filters must still be evaluated exactly
 in the engine. Only representable `Int32`/`Int64` comparisons are translated;
 conjuncts may be pushed independently because DataFusion retains the whole
@@ -22,8 +34,8 @@ needs `table.statistics.columns` set before writing for those batches to
 carry useful pruning statistics. Keep projection, limits, and partitions
 honest about these semantics.
 
-The first DataFusion provider supports **non-partitioned append-only logs**
-only. The physical partition count is the minimum of Fluss buckets,
+The log provider supports **non-partitioned append-only logs**. Both providers
+use the minimum of Fluss buckets,
 DataFusion's target parallelism and an optional positive connector cap;
 each reads a group of buckets. They share one offset capture per execution.
 Each bucket starts at its earliest
@@ -52,7 +64,7 @@ failed and cancelled reads, and is zero after each source query completes.
 The peak-batch gauge does not include buffers held by DataFusion operators
 upstream of the scan.
 The read-only catalog discovers names once; reload it after creating tables.
-It does not reinterpret KV changelogs as the current table state.
+It selects the log or KV provider from the table's primary-key metadata.
 
 The Python adapters take **already bounded** PyArrow tables/readers from the
 existing binding: DuckDB registers them for local SQL; Polars and pandas
