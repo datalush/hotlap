@@ -1,0 +1,12 @@
+[package]
+name = "fluss-datafusion"
+version = "0.1.0"
+description = "DataFusion adapter scaffold for the Apache Fluss Rust client"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arrow = "59.2"
+datafusion = { version = "55.1", default-features = false }
+fluss-rs = { path = "../../clients/rust/crates/fluss" }

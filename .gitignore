@@ -1,0 +1,29 @@
+# Rust, Maven, and Python build outputs (also inside the copied clients)
+target/
+**/target/
+.venv/
+**/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Local credentials/configuration; .env.example is safe to share
+.env
+.env.*
+!.env.example
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+
+# Imported Google Storage test fixture contains a PEM private key (not needed
+# to build the Java client); keep it out of the new repository.
+/clients/java/fluss-filesystems/fluss-fs-gs/src/test/resources/fake-service-account.json

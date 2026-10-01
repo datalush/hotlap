@@ -1,0 +1,2 @@
+# Empty tab-separated cells at line ends are significant in dependency reports.
+**/DEPENDENCIES.rust.tsv whitespace=-trailing-space
