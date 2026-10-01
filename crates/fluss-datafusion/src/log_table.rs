@@ -9,7 +9,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result};
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::streaming::StreamingTableExec;
@@ -17,6 +17,7 @@ use fluss::client::FlussConnection;
 use fluss::metadata::TablePath;
 
 use crate::execution::FlussScanExec;
+use crate::filter;
 use crate::offsets::OffsetCaptures;
 use crate::scan::ScanSpec;
 
@@ -106,14 +107,31 @@ impl TableProvider for FlussLogTable {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if filter::translate(filter, &self.schema).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Exact filters and global limits remain DataFusion's responsibility.
+        // Fluss prunes whole batches; DataFusion retains exact filters and
+        // global limits. Do not push a SQL limit into each bucket.
         let schema = self.projected_schema(projection)?;
         let groups = bucket_groups(self.buckets, self.parallelism(state));
         let metrics = ExecutionPlanMetricsSet::new();
@@ -123,6 +141,11 @@ impl TableProvider for FlussLogTable {
             schema: Arc::clone(&schema),
             full_schema: Arc::clone(&self.schema),
             projection: projection.cloned(),
+            filter: fluss::predicate::Predicate::and_all(
+                filters
+                    .iter()
+                    .filter_map(|expr| filter::translate(expr, &self.schema)),
+            ),
             table_id: self.table_id,
             buckets: self.buckets,
             timeout: self.timeout,

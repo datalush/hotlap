@@ -481,13 +481,17 @@ impl RecordBatchLogReader {
             }
 
             let scan_batches = self.scanner.poll(timeout - elapsed).await?;
-
-            if scan_batches.is_empty() {
-                return Ok(RecordBatchReadOutcome::TimedOut);
-            }
-
-            let completed =
+            let empty = scan_batches.is_empty();
+            let mut completed =
                 filter_batches(scan_batches, &mut self.stopping_offsets, &mut self.buffer);
+            // Server-side predicate pruning can advance a bucket past its
+            // stop offset without returning any batches, including the last
+            // batch. The scanner's consumed offset is authoritative after
+            // `poll`: batches it returned have already been buffered above.
+            completed.extend(finish_scanned_ranges(
+                self.scanner.get_subscribed_buckets(),
+                &mut self.stopping_offsets,
+            ));
 
             // Use the `_sync` unsubscribe variants here: the active-reader
             // guard rejects calls to the async `unsubscribe*` methods, but
@@ -503,6 +507,12 @@ impl RecordBatchLogReader {
                 } else {
                     self.scanner.unsubscribe_sync(tb.bucket_id());
                 }
+            }
+            if empty && self.stopping_offsets.is_empty() {
+                return Ok(RecordBatchReadOutcome::Finished);
+            }
+            if empty {
+                return Ok(RecordBatchReadOutcome::TimedOut);
             }
         }
     }
@@ -536,6 +546,23 @@ impl RecordBatchLogReader {
             handle,
         }
     }
+}
+
+/// Complete buckets whose fetched offset passed the stop despite pruned data.
+fn finish_scanned_ranges(
+    subscriptions: Vec<(TableBucket, i64)>,
+    stopping_offsets: &mut HashMap<TableBucket, i64>,
+) -> Vec<TableBucket> {
+    subscriptions
+        .into_iter()
+        .filter_map(|(bucket, consumed)| {
+            let stop = stopping_offsets.get(&bucket).copied()?;
+            (consumed >= stop).then(|| {
+                stopping_offsets.remove(&bucket);
+                bucket
+            })
+        })
+        .collect()
 }
 
 /// Best-effort cleanup when the reader is dropped before all buckets reach
@@ -1016,6 +1043,19 @@ mod tests {
 
     fn bucket(id: i32) -> TableBucket {
         TableBucket::new(1, id)
+    }
+
+    #[test]
+    fn pruned_tail_completes_only_buckets_that_reached_the_stop() {
+        let mut stops = HashMap::from([(bucket(0), 10), (bucket(1), 8)]);
+        let complete = finish_scanned_ranges(vec![(bucket(0), 10), (bucket(1), 7)], &mut stops);
+        assert_eq!(complete, vec![bucket(0)]);
+        assert_eq!(stops, HashMap::from([(bucket(1), 8)]));
+        assert_eq!(
+            finish_scanned_ranges(vec![(bucket(1), 8)], &mut stops),
+            vec![bucket(1)]
+        );
+        assert!(stops.is_empty());
     }
 
     #[test]

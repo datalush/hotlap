@@ -18,11 +18,14 @@ use fluss::client::{
     RecordBatchLogScanner, RecordBatchReadOutcome,
 };
 use fluss::metadata::{TableBucket, TablePath};
+use fluss::predicate::Predicate;
 use fluss::record::ScanBatch;
 use fluss::rpc::message::OffsetSpec;
 
 use crate::metrics::{PartitionMetrics, ReaderLifetime};
 use crate::offsets::{Capture, OffsetCaptures, Offsets, validate_offsets};
+
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Immutable inputs shared by the physical partitions of one planned scan.
 pub(crate) struct ScanSpec {
@@ -31,6 +34,7 @@ pub(crate) struct ScanSpec {
     pub(crate) schema: SchemaRef,
     pub(crate) full_schema: SchemaRef,
     pub(crate) projection: Option<Vec<usize>>,
+    pub(crate) filter: Option<Predicate>,
     pub(crate) table_id: i64,
     pub(crate) buckets: i32,
     pub(crate) timeout: Duration,
@@ -147,6 +151,9 @@ impl ReadState {
 
     async fn poll_reader(&mut self) -> Result<RecordBatchReadOutcome> {
         let remaining = self.remaining()?;
+        // Inspect scanner progress regularly even when every fetched batch
+        // was pruned. The total query deadline still bounds this loop.
+        let poll_wait = remaining.min(POLL_INTERVAL);
         let result = {
             let _timer = self.metrics.read_time.timer();
             tokio::time::timeout(
@@ -154,7 +161,7 @@ impl ReadState {
                 self.reader
                     .as_mut()
                     .expect("reader initialized")
-                    .next_batch_with_timeout(remaining),
+                    .next_batch_with_timeout(poll_wait),
             )
             .await
             .map_err(|_| expired())?
@@ -222,6 +229,10 @@ impl ReadState {
         let scan = match self.source.spec.projection.as_deref() {
             Some(indices) if !indices.is_empty() => scan.project(indices).map_err(fluss_error)?,
             _ => scan,
+        };
+        let scan = match &self.source.spec.filter {
+            Some(predicate) => scan.filter(predicate.clone()).map_err(fluss_error)?,
+            None => scan,
         };
         let scanner = scan
             .create_record_batch_log_scanner()

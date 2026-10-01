@@ -8,6 +8,7 @@
 
 mod catalog;
 mod execution;
+mod filter;
 mod log_table;
 mod metrics;
 mod offsets;

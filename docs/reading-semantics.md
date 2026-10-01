@@ -15,8 +15,12 @@ full scan, deletion semantics, snapshot/log merge, cancellation, and the
 consistency actually guaranteed between buckets. The existing append-only
 log source relies on the client's bounded offset reader. Its predicate
 pushdown only prunes batches, so filters must still be evaluated exactly
-in the engine. Keep projection, limits, and partitions honest about these
-semantics.
+in the engine. Only representable `Int32`/`Int64` comparisons are translated;
+conjuncts may be pushed independently because DataFusion retains the whole
+expression. `OR` and lossy numeric conversions are not pushed. A log table
+needs `table.statistics.columns` set before writing for those batches to
+carry useful pruning statistics. Keep projection, limits, and partitions
+honest about these semantics.
 
 The first DataFusion provider supports **non-partitioned append-only logs**
 only. The physical partition count is the minimum of Fluss buckets,
@@ -30,6 +34,10 @@ per bucket, not as a transactional cross-bucket snapshot. Non-empty SQL
 projections are requested from the Fluss scanner; zero-column `COUNT(*)`
 still fetches full rows before stripping columns locally. Exact filtering
 and global SQL limits remain DataFusion operations.
+When every trailing batch is pruned, the scanner's consumed offset advances
+even though it yields no Arrow batches. The bounded reader checks that
+progress and completes once each captured stopping offset is reached;
+DataFusion polls in short intervals while preserving the overall timeout.
 Partitions that start after other partitions finish retain the shared offsets.
 Cancelled offset initialization can be retried by a different partition before
 any rows are delivered. Missing/invalid offsets or a late partition failure

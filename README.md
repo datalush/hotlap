@@ -17,10 +17,10 @@ docs/reading-semantics.md  Contracts to satisfy before claiming full scans
 The Java and Rust trees are source copies of the `fluss-clients` checkout at
 `dc427e1290847b4a569b6745fcb87b256292bf6a`. Their original Apache 2.0
 license headers, LICENSE, and NOTICE files are retained. No build outputs,
-local credentials, or Git history were copied into these trees. The only
-change inside a copied client is in `clients/rust/bindings/python/src/config.rs`:
-the Python `Config` now accepts the TLS settings already supported by its
-underlying Rust client.
+local credentials, or Git history were copied into these trees. Changes in
+the copied Rust client are limited to exposing its existing TLS settings in
+`bindings/python/src/config.rs` and making its bounded reader recognize
+offset progress when server-side pruning returns no batches.
 
 ## Validate the scaffold
 
@@ -66,10 +66,18 @@ error if queried. Execution captures each bucket's latest offset once, streams
 Arrow batches from the earliest **retained** offsets until those stopping
 offsets, and errors on timeout rather than claiming a partial result is
 complete. DataFusion's required non-empty projection is pushed to Fluss;
-`COUNT(*)` still fetches rows because Fluss cannot scan zero columns. Filters
-and global limits remain DataFusion's responsibility; no Fluss filter/limit
-pushdown is claimed. Each query opens a new finite read. KV and partitioned
-tables are rejected.
+`COUNT(*)` still fetches rows because Fluss cannot scan zero columns. Simple
+`Int32`/`Int64` comparisons and safe `AND` clauses can prune Fluss record
+batches; pushdown is **Inexact** and DataFusion always evaluates the full
+filter again. `OR`, unsupported expressions and out-of-range literals stay
+in DataFusion. Global limits are not pushed per bucket. Each query opens a
+new finite read. KV and partitioned tables are rejected.
+
+To see actual pruning, enable batch statistics **when creating the log table**
+with `table.statistics.columns: id` (or `*`). Existing batches written without
+statistics cannot be pruned retroactively. The integration tests create their
+own tables in `datafusion_tests` and remove them afterward; their fully
+pruned query finishes without exhausting the overall timeout.
 
 With the isolated lab running and its ignored `.env` in `../lab/`:
 

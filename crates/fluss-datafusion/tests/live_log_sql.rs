@@ -20,12 +20,11 @@ use fluss::rpc::message::OffsetSpec;
 use fluss_datafusion::{FlussCatalog, FlussLogTable};
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
-const DATABASE: &str = "lab_spark";
-const LOG: &str = "demo_log";
+const DATABASE: &str = "datafusion_tests";
 const SCAN_TIMEOUT: Duration = Duration::from_secs(45);
 
 async fn connect() -> TestResult<Arc<FlussConnection>> {
-    Ok(Arc::new(
+    let connection = Arc::new(
         FlussConnection::new(Config {
             bootstrap_servers: std::env::var("FLUSS_BOOTSTRAP")?,
             security_ssl_enabled: true,
@@ -36,7 +35,12 @@ async fn connect() -> TestResult<Arc<FlussConnection>> {
             ..Config::default()
         })
         .await?,
-    ))
+    );
+    connection
+        .get_admin()?
+        .create_database(DATABASE, None, true)
+        .await?;
+    Ok(connection)
 }
 
 async fn register_log(
@@ -108,24 +112,90 @@ fn metric(metrics: &MetricsSet, name: &str) -> usize {
 #[ignore = "requires native-sni and FLUSS_* credentials; run with --ignored"]
 async fn bounded_sql_and_kv_rejection_against_native_sni() -> TestResult<()> {
     let connection = connect().await?;
+    let (log_path, kv_path) = create_known_tables(&connection).await?;
     let ctx = SessionContext::new();
-    register_log(&ctx, &connection, LOG, SCAN_TIMEOUT).await?;
-
-    let total = check_log_sql(&ctx).await?;
-    check_source_projection(&ctx).await?;
-    check_parallelism(&connection, total).await?;
-    check_explain_metrics(&ctx).await?;
-    check_catalog(&ctx, &connection, total).await?;
-    check_timeout_and_kv(&connection).await?;
+    let result = async {
+        register_log(&ctx, &connection, log_path.table(), SCAN_TIMEOUT).await?;
+        let total = check_log_sql(&ctx).await?;
+        check_source_projection(&ctx).await?;
+        check_parallelism(&connection, log_path.table(), total).await?;
+        check_explain_metrics(&ctx).await?;
+        check_catalog(&ctx, &connection, &log_path, total).await?;
+        check_timeout_and_kv(&connection, &log_path, &kv_path).await
+    }
+    .await;
 
     drop(ctx);
+    let admin = connection.get_admin()?;
+    let log_cleanup = admin.drop_table(&log_path, true).await;
+    let kv_cleanup = admin.drop_table(&kv_path, true).await;
+    result?;
+    log_cleanup?;
+    kv_cleanup?;
     connection.close(Duration::from_secs(5)).await?;
     Ok(())
 }
 
+async fn create_known_tables(
+    connection: &Arc<FlussConnection>,
+) -> TestResult<(TablePath, TablePath)> {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let log = TablePath::new(DATABASE, format!("log_{suffix}"));
+    let kv = TablePath::new(DATABASE, format!("kv_{suffix}"));
+    let admin = connection.get_admin()?;
+    let log_schema = Schema::builder()
+        .column("run_id", DataTypes::string())
+        .column("id", DataTypes::int())
+        .column("value", DataTypes::string())
+        .build()?;
+    let log_descriptor = TableDescriptor::builder()
+        .schema(log_schema)
+        .distributed_by(Some(2), vec!["id".to_string()])
+        .property("table.statistics.columns", "id")
+        .build()?;
+    admin.create_table(&log, &log_descriptor, false).await?;
+    let kv_descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .primary_key(vec!["id"])?
+                .build()?,
+        )
+        .distributed_by(Some(2), vec!["id".to_string()])
+        .build()?;
+    if let Err(error) = admin.create_table(&kv, &kv_descriptor, false).await {
+        admin.drop_table(&log, true).await?;
+        return Err(Box::new(error));
+    }
+    let write_result: TestResult<()> = async {
+        let table = connection.get_table(&log).await?;
+        let writer = table.new_append()?.create_writer()?;
+        for run in 0..3 {
+            for (id, value) in [(1, "hola"), (2, "desde"), (3, "pyspark")] {
+                let mut row = GenericRow::new(3);
+                row.set_field(0, format!("fixture-{run}"));
+                row.set_field(1, id);
+                row.set_field(2, value);
+                writer.append(&row)?;
+            }
+            writer.flush().await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = write_result {
+        let _ = admin.drop_table(&log, true).await;
+        let _ = admin.drop_table(&kv, true).await;
+        return Err(error);
+    }
+    Ok((log, kv))
+}
+
 async fn check_log_sql(ctx: &SessionContext) -> TestResult<i64> {
     let total = count_sql(ctx, "SELECT COUNT(*) FROM log").await?;
-    assert!(total > 0);
+    assert_eq!(total, 9);
 
     let df = ctx.sql("SELECT * FROM log LIMIT 1").await?;
     let plan = df.create_physical_plan().await?;
@@ -180,13 +250,17 @@ async fn check_source_projection(ctx: &SessionContext) -> TestResult<()> {
     Ok(())
 }
 
-async fn check_parallelism(connection: &Arc<FlussConnection>, total: i64) -> TestResult<()> {
+async fn check_parallelism(
+    connection: &Arc<FlussConnection>,
+    name: &str,
+    total: i64,
+) -> TestResult<()> {
     for (target, cap, expected) in [(1, None, 1), (2, None, 2), (16, None, 2), (16, Some(1), 1)] {
         let ctx =
             SessionContext::new_with_config(SessionConfig::new().with_target_partitions(target));
         let table = FlussLogTable::open(
             Arc::clone(connection),
-            TablePath::new(DATABASE, LOG),
+            TablePath::new(DATABASE, name),
             SCAN_TIMEOUT,
         )
         .await?;
@@ -235,20 +309,29 @@ async fn check_explain_metrics(ctx: &SessionContext) -> TestResult<()> {
 async fn check_catalog(
     ctx: &SessionContext,
     connection: &Arc<FlussConnection>,
+    path: &TablePath,
     total: i64,
 ) -> TestResult<()> {
     let catalog = FlussCatalog::load(Arc::clone(connection), SCAN_TIMEOUT).await?;
     ctx.register_catalog("fluss", Arc::new(catalog));
     assert_eq!(
-        count_sql(ctx, "SELECT COUNT(*) FROM fluss.lab_spark.demo_log").await?,
+        count_sql(
+            ctx,
+            &format!("SELECT COUNT(*) FROM fluss.{DATABASE}.{}", path.table())
+        )
+        .await?,
         total
     );
     Ok(())
 }
 
-async fn check_timeout_and_kv(connection: &Arc<FlussConnection>) -> TestResult<()> {
+async fn check_timeout_and_kv(
+    connection: &Arc<FlussConnection>,
+    log: &TablePath,
+    kv: &TablePath,
+) -> TestResult<()> {
     let ctx = SessionContext::new();
-    register_log(&ctx, connection, LOG, Duration::from_nanos(1)).await?;
+    register_log(&ctx, connection, log.table(), Duration::from_nanos(1)).await?;
     let df = ctx.sql("SELECT COUNT(*) FROM log").await?;
     let plan = df.create_physical_plan().await?;
     let source = source_plan(&plan);
@@ -261,13 +344,9 @@ async fn check_timeout_and_kv(connection: &Arc<FlussConnection>) -> TestResult<(
         0
     );
 
-    let error = FlussLogTable::open(
-        Arc::clone(connection),
-        TablePath::new(DATABASE, "demo"),
-        Duration::from_secs(2),
-    )
-    .await
-    .expect_err("KV tables must not be treated as append-only logs");
+    let error = FlussLogTable::open(Arc::clone(connection), kv.clone(), Duration::from_secs(2))
+        .await
+        .expect_err("KV tables must not be treated as append-only logs");
     assert!(matches!(error, DataFusionError::Plan(_)));
     Ok(())
 }
@@ -279,19 +358,24 @@ async fn empty_log_and_new_offsets_on_each_query() -> TestResult<()> {
     let path = create_empty_log(&connection).await?;
     let admin = connection.get_admin()?;
     let ctx = SessionContext::new();
-    register_log(&ctx, &connection, path.table(), SCAN_TIMEOUT).await?;
-    let df = ctx.sql("SELECT * FROM log").await?;
-    let source = source_plan(&df.create_physical_plan().await?);
-
-    check_late_partition(&connection, &path, &admin, &df, &source).await?;
-    check_batch_metrics(&source.metrics().unwrap());
-    assert_eq!(
-        count_sql(&ctx, "SELECT COUNT(*) FROM log WHERE id = 8").await?,
-        1
-    );
-
+    let result = async {
+        register_log(&ctx, &connection, path.table(), SCAN_TIMEOUT).await?;
+        let df = ctx.sql("SELECT * FROM log").await?;
+        let source = source_plan(&df.create_physical_plan().await?);
+        check_late_partition(&connection, &path, &admin, &df, &source).await?;
+        check_batch_metrics(&source.metrics().unwrap());
+        check_filter_pushdown(&ctx).await?;
+        assert_eq!(
+            count_sql(&ctx, "SELECT COUNT(*) FROM log WHERE id = 8").await?,
+            1
+        );
+        check_failure_after_first_partition(&admin, &path, &df, &source).await
+    }
+    .await;
     drop(ctx);
-    check_failure_after_first_partition(&admin, &path, &df, &source).await?;
+    let cleanup = admin.drop_table(&path, true).await;
+    result?;
+    cleanup?;
     connection.close(Duration::from_secs(5)).await?;
     Ok(())
 }
@@ -302,8 +386,14 @@ async fn create_empty_log(connection: &Arc<FlussConnection>) -> TestResult<Table
         .as_nanos();
     let path = TablePath::new(DATABASE, format!("datafusion_test_{suffix}"));
     let descriptor = TableDescriptor::builder()
-        .schema(Schema::builder().column("id", DataTypes::int()).build()?)
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("optional", DataTypes::int())
+                .build()?,
+        )
         .distributed_by(Some(2), vec!["id".to_string()])
+        .property("table.statistics.columns", "id")
         .build()?;
     connection
         .get_admin()?
@@ -316,8 +406,11 @@ async fn append_rows(connection: &Arc<FlussConnection>, path: &TablePath) -> Tes
     let table = connection.get_table(path).await?;
     let writer = table.new_append()?.create_writer()?;
     for id in 0..512 {
-        let mut row = GenericRow::new(1);
+        let mut row = GenericRow::new(2);
         row.set_field(0, id);
+        if id % 2 == 0 {
+            row.set_field(1, id);
+        }
         writer.append(&row)?;
         if id % 32 == 31 {
             writer.flush().await?;
@@ -371,6 +464,70 @@ fn check_batch_metrics(metrics: &MetricsSet) {
         "expected several streamed batches, got {batches}"
     );
     assert!(peak > 0 && peak < decoded);
+}
+
+async fn check_filter_pushdown(ctx: &SessionContext) -> TestResult<()> {
+    let all = ctx.sql("SELECT * FROM log").await?;
+    let full_plan = all.create_physical_plan().await?;
+    let full_source = source_plan(&full_plan);
+    let full_rows = collect_plan(full_plan, Arc::new(all.task_ctx())).await?;
+    assert_eq!(
+        full_rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        512
+    );
+    let full_bytes = metric(&full_source.metrics().unwrap(), "arrow_decoded_bytes");
+
+    // Pruning every batch, including the last, must complete without timeout.
+    let none = ctx.sql("SELECT * FROM log WHERE id > 1000").await?;
+    let plan = none.create_physical_plan().await?;
+    let source = source_plan(&plan);
+    let rows = collect_plan(plan, Arc::new(none.task_ctx())).await?;
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    let pruned_bytes = metric(&source.metrics().unwrap(), "arrow_decoded_bytes");
+    assert!(
+        pruned_bytes < full_bytes,
+        "filter failed to prune: {pruned_bytes} >= {full_bytes}"
+    );
+
+    let range = ctx
+        .sql("SELECT * FROM log WHERE id >= 100 AND id < 200")
+        .await?;
+    let range_plan = range.create_physical_plan().await?;
+    let range_source = source_plan(&range_plan);
+    let range_rows = collect_plan(range_plan, Arc::new(range.task_ctx())).await?;
+    assert_eq!(
+        range_rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        100
+    );
+    assert!(metric(&range_source.metrics().unwrap(), "arrow_decoded_bytes") < full_bytes);
+    assert_eq!(
+        count_sql(
+            ctx,
+            "SELECT COUNT(*) FROM log WHERE id >= 100 AND id < 200 AND optional IS NULL"
+        )
+        .await?,
+        50,
+        "DataFusion must apply the unsupported IS NULL conjunct exactly"
+    );
+
+    // Outside the column's Int32 range: no lossy literal narrowing or unsafe
+    // pushdown. DataFusion still evaluates the SQL expression exactly.
+    let outside = ctx.sql("SELECT * FROM log WHERE id > 2147483648").await?;
+    let outside_plan = outside.create_physical_plan().await?;
+    let outside_source = source_plan(&outside_plan);
+    let outside_rows = collect_plan(outside_plan, Arc::new(outside.task_ctx())).await?;
+    assert_eq!(
+        outside_rows
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        0
+    );
+    assert_eq!(
+        metric(&outside_source.metrics().unwrap(), "arrow_decoded_bytes"),
+        full_bytes
+    );
+    Ok(())
 }
 
 async fn check_failure_after_first_partition(
