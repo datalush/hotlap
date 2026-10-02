@@ -27,6 +27,7 @@ const DEFAULT_WRITER_DYNAMIC_BATCH_SIZE_MIN: i32 = 256 * 1024;
 const DEFAULT_WRITER_DYNAMIC_BATCH_SIZE_ENABLED: bool = true;
 const DEFAULT_RETRIES: i32 = i32::MAX;
 const DEFAULT_PREFETCH_NUM: usize = 4;
+const DEFAULT_REMOTE_MAX_PENDING_SEGMENTS: usize = 8_192;
 const DEFAULT_DOWNLOAD_THREADS: usize = 3;
 const DEFAULT_SCANNER_REMOTE_LOG_READ_CONCURRENCY: usize = 4;
 const DEFAULT_MAX_POLL_RECORDS: usize = 500;
@@ -98,6 +99,12 @@ pub struct Config {
     /// Default: 4 (matching Java CLIENT_SCANNER_REMOTE_LOG_PREFETCH_NUM)
     #[arg(long, default_value_t = DEFAULT_PREFETCH_NUM)]
     pub scanner_remote_log_prefetch_num: usize,
+
+    /// Maximum number of remote segments queued or held by one scanner.
+    /// Exceeding this limit fails the scan rather than buffering unbounded
+    /// remote download requests. Default: 8192.
+    #[arg(long, default_value_t = DEFAULT_REMOTE_MAX_PENDING_SEGMENTS)]
+    pub scanner_remote_log_max_pending_segments: usize,
 
     /// Maximum concurrent remote log downloads
     /// Default: 3 (matching Java REMOTE_FILE_DOWNLOAD_THREAD_NUM)
@@ -252,6 +259,10 @@ impl std::fmt::Debug for Config {
                 &self.scanner_remote_log_prefetch_num,
             )
             .field(
+                "scanner_remote_log_max_pending_segments",
+                &self.scanner_remote_log_max_pending_segments,
+            )
+            .field(
                 "remote_file_download_thread_num",
                 &self.remote_file_download_thread_num,
             )
@@ -325,6 +336,7 @@ impl Default for Config {
             writer_dynamic_batch_size_min: DEFAULT_WRITER_DYNAMIC_BATCH_SIZE_MIN,
             writer_bucket_no_key_assigner: NoKeyAssigner::Sticky,
             scanner_remote_log_prefetch_num: DEFAULT_PREFETCH_NUM,
+            scanner_remote_log_max_pending_segments: DEFAULT_REMOTE_MAX_PENDING_SEGMENTS,
             remote_file_download_thread_num: DEFAULT_DOWNLOAD_THREADS,
             scanner_remote_log_read_concurrency: DEFAULT_SCANNER_REMOTE_LOG_READ_CONCURRENCY,
             scanner_log_max_poll_records: DEFAULT_MAX_POLL_RECORDS,
@@ -402,6 +414,9 @@ impl Config {
     pub fn validate_scanner(&self) -> Result<(), String> {
         if self.scanner_remote_log_prefetch_num == 0 {
             return Err("scanner_remote_log_prefetch_num must be > 0".to_string());
+        }
+        if self.scanner_remote_log_max_pending_segments == 0 {
+            return Err("scanner_remote_log_max_pending_segments must be > 0".into());
         }
         if self.scanner_remote_log_read_concurrency == 0 {
             return Err("scanner_remote_log_read_concurrency must be > 0".to_string());
@@ -604,6 +619,15 @@ mod tests {
     fn test_scanner_remote_log_prefetch_num_zero() {
         let config = Config {
             scanner_remote_log_prefetch_num: 0,
+            ..Config::default()
+        };
+        assert!(config.validate_scanner().is_err());
+    }
+
+    #[test]
+    fn test_scanner_remote_log_max_pending_segments_zero() {
+        let config = Config {
+            scanner_remote_log_max_pending_segments: 0,
             ..Config::default()
         };
         assert!(config.validate_scanner().is_err());

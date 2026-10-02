@@ -202,11 +202,17 @@ impl LogFetchBuffer {
     /// Add a pending fetch to the buffer
     pub fn pend(&self, pending_fetch: Box<dyn PendingFetch>) {
         let table_bucket = pending_fetch.table_bucket().clone();
+        let completed = pending_fetch.is_completed();
         self.pending_fetches
             .lock()
-            .entry(table_bucket)
+            .entry(table_bucket.clone())
             .or_default()
             .push_back(pending_fetch);
+        // The download may finish before the callback sees this insertion.
+        // Either the callback or this check must move it to the ready queue.
+        if completed {
+            self.try_complete(&table_bucket);
+        }
     }
 
     /// Try to complete pending fetches in order, converting them to completed fetches

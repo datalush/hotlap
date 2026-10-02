@@ -242,9 +242,11 @@ impl LogFetcher {
             // (similar to Java's downloadFuture.onComplete)
             // This must be done before creating RemotePendingFetch to avoid move issues
             let table_bucket = table_bucket.clone();
-            let log_fetch_buffer_clone = log_fetch_buffer.clone();
+            let weak_buffer = Arc::downgrade(&log_fetch_buffer);
             download_future.on_complete(move || {
-                log_fetch_buffer_clone.try_complete(&table_bucket);
+                if let Some(buffer) = weak_buffer.upgrade() {
+                    buffer.try_complete(&table_bucket);
+                }
             });
 
             let pending_fetch = RemotePendingFetch::new(

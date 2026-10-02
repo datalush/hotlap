@@ -29,17 +29,32 @@ bucket**, not an atomic cross-bucket snapshot.
   rejects larger scans instead of silently omitting buckets. Use
   `with_max_assigned_buckets` to choose a deliberate larger budget.
 
+## Verified in a separate Docker server profile
+
+The ignored `remote_retention` test uses the Fluss 1.0 server image, a local
+filesystem shared with its tabletserver, 120-byte log segments and one-second
+tiering/retention checks. It verifies the **actual remote-download byte
+counter** while DataFusion returns exactly the projected and filtered rows.
+With a stalled remote consumer it checks the four-file prefetch bound, stable
+DataFusion reservation and cleanup of temporary files after cancellation.
+With `table.log.ttl` changed from disabled to two seconds mid-read, the
+original execution fails instead of returning an incomplete result; a new
+query returns exactly the rows still retained. A one-segment pending-request
+budget also fails a large remote scan rather than silently truncating it.
+
 ## Runtime limits to configure
 
 The default DataFusion memory pool is unbounded. Supply a bounded
 `RuntimeEnv` memory pool, set `target_partitions` (and optionally
 `with_max_partitions`), and choose a positive scan timeout. A reservation
 covers **one decoded source batch per active stream**; it does not include
-Fluss's compressed fetch buffer, remote prefetch, or memory held by downstream
+Fluss's compressed fetch buffer, remote prefetch or memory held by downstream
 operators. Set the Rust client's `scanner_log_fetch_max_bytes`,
-`scanner_log_fetch_max_bytes_for_bucket` and remote-log prefetch settings for
-the deployment's budget. A single oversized server record can exceed a fetch
-size hint before the pool rejects its decoded Arrow batch.
+`scanner_log_fetch_max_bytes_for_bucket`,
+`scanner_remote_log_prefetch_num` (downloaded file slots) and
+`scanner_remote_log_max_pending_segments` (outstanding request cap, default
+8192) for the deployment's budget. A single oversized server record can
+exceed a fetch size hint before the pool rejects its decoded Arrow batch.
 
 The source uses the Rust client copied in this repository. The Rust integration
 pins DataFusion 55.1 and Arrow 59 in `Cargo.lock`. The currently published
@@ -69,14 +84,18 @@ KUBECONFIG=/tmp/opencode/native-sni.kubeconfig CARGO_BUILD_JOBS=2 uv run --no-sy
 
 The second command restarts **only** a tabletserver pod in `k3d-native-sni`.
 
+Run the independent Docker storage profile separately from the native-sni
+tests (both may bind port 9123):
+
+```bash
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 cargo test -p fluss-datafusion --test remote_retention -- --ignored
+```
+
 ## Remaining verification before a general production claim
 
-The laboratory tests do not yet force a log segment to move from local to
-remote storage while a query crosses the boundary, nor do they exercise the
-server's TTL eviction of a log segment during a query. The bounded reader's
-offset and out-of-range safeguards are tested, but those storage transitions
-need an isolated server profile with short segments and retention intervals.
-Long-duration load tests should measure fetch-buffer/prefetch memory (which
-the DataFusion reservation does not cover), simultaneous queries and
+The Docker test uses a local filesystem for remote segments; it does not yet
+verify the same transition against the intended S3 backend. Long-duration
+load tests should measure compressed fetch-buffer memory (which the DataFusion
+reservation does not cover), temporary disk usage, simultaneous queries and
 coordinator failover. Reproduce them against the exact server, client and
 storage profile intended for deployment.

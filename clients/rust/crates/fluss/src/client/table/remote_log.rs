@@ -30,14 +30,12 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
+    sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     time::Duration,
 };
 
 #[cfg(test)]
-use std::{
-    env,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -672,6 +670,8 @@ type CompletionCallback = Box<dyn Fn() + Send + Sync>;
 pub struct RemoteLogDownloadFuture {
     result: Arc<Mutex<Option<Result<RemoteLogFile>>>>,
     completion_callbacks: Arc<Mutex<Vec<CompletionCallback>>>,
+    worker: tokio::task::AbortHandle,
+    pending_slots: Option<Arc<AtomicUsize>>,
 }
 
 impl RemoteLogDownloadFuture {
@@ -683,7 +683,7 @@ impl RemoteLogDownloadFuture {
         let callbacks_clone = Arc::clone(&completion_callbacks);
 
         // Spawn a task to wait for the download and update result, then call callbacks
-        tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             let download_result = match receiver.await {
                 Ok(Ok(path)) => Ok(path),
                 Ok(Err(e)) => Err(e),
@@ -713,7 +713,14 @@ impl RemoteLogDownloadFuture {
         Self {
             result,
             completion_callbacks,
+            worker: worker.abort_handle(),
+            pending_slots: None,
         }
+    }
+
+    fn with_pending_slot(mut self, slots: Arc<AtomicUsize>) -> Self {
+        self.pending_slots = Some(slots);
+        self
     }
 
     /// Register a callback to be called when download completes (similar to Java's onComplete)
@@ -771,6 +778,17 @@ impl RemoteLogDownloadFuture {
     }
 }
 
+impl Drop for RemoteLogDownloadFuture {
+    fn drop(&mut self) {
+        // A cancelled scanner must close the one-shot receiver. The download
+        // coordinator can then skip queued segments and release permits/files.
+        self.worker.abort();
+        if let Some(slots) = &self.pending_slots {
+            slots.fetch_sub(1, AtomicOrdering::AcqRel);
+        }
+    }
+}
+
 /// Downloader for remote log segment files.
 ///
 /// # Shutdown behavior
@@ -780,12 +798,15 @@ impl RemoteLogDownloadFuture {
 /// won't wait for completion. Pending futures will fail.
 pub struct RemoteLogDownloader {
     request_sender: Option<mpsc::UnboundedSender<RemoteLogDownloadRequest>>,
+    pending_slots: Arc<AtomicUsize>,
+    max_pending_segments: usize,
 }
 
 impl RemoteLogDownloader {
     pub(crate) fn new(
         local_log_dir: TempDir,
         max_prefetch_segments: usize,
+        max_pending_segments: usize,
         max_concurrent_downloads: usize,
         remote_log_read_concurrency: usize,
         credentials_rx: CredentialsReceiver,
@@ -797,18 +818,36 @@ impl RemoteLogDownloader {
             remote_log_read_concurrency,
         });
 
-        Self::new_with_fetcher(
+        Self::new_with_fetcher_and_limit(
             fetcher,
             max_prefetch_segments,
+            max_pending_segments,
             max_concurrent_downloads,
             metrics,
         )
     }
 
     /// Create a RemoteLogDownloader with a custom fetcher (for testing).
+    #[cfg(test)]
     pub(crate) fn new_with_fetcher(
         fetcher: Arc<dyn RemoteLogFetcher>,
         max_prefetch_segments: usize,
+        max_concurrent_downloads: usize,
+        metrics: Arc<ScannerMetrics>,
+    ) -> Result<Self> {
+        Self::new_with_fetcher_and_limit(
+            fetcher,
+            max_prefetch_segments,
+            8_192,
+            max_concurrent_downloads,
+            metrics,
+        )
+    }
+
+    fn new_with_fetcher_and_limit(
+        fetcher: Arc<dyn RemoteLogFetcher>,
+        max_prefetch_segments: usize,
+        max_pending_segments: usize,
         max_concurrent_downloads: usize,
         metrics: Arc<ScannerMetrics>,
     ) -> Result<Self> {
@@ -830,6 +869,8 @@ impl RemoteLogDownloader {
 
         Ok(Self {
             request_sender: Some(request_sender),
+            pending_slots: Arc::new(AtomicUsize::new(0)),
+            max_pending_segments,
         })
     }
 
@@ -840,6 +881,22 @@ impl RemoteLogDownloader {
         segment: &RemoteLogSegment,
     ) -> RemoteLogDownloadFuture {
         let (result_sender, result_receiver) = oneshot::channel();
+
+        if self
+            .pending_slots
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |pending| {
+                (pending < self.max_pending_segments).then_some(pending + 1)
+            })
+            .is_err()
+        {
+            let _ = result_sender.send(Err(Error::BufferExhausted {
+                message: format!(
+                    "Remote log scanner has {} pending segments (configured limit)",
+                    self.max_pending_segments
+                ),
+            }));
+            return RemoteLogDownloadFuture::new(result_receiver);
+        }
 
         let request = RemoteLogDownloadRequest {
             segment: segment.clone(),
@@ -852,6 +909,7 @@ impl RemoteLogDownloader {
         // Send to coordinator (non-blocking)
         if let Some(ref sender) = self.request_sender {
             if sender.send(request).is_err() {
+                self.pending_slots.fetch_sub(1, AtomicOrdering::AcqRel);
                 // Coordinator is gone - immediately fail the future
                 let (error_sender, error_receiver) = oneshot::channel();
                 let _ = error_sender.send(Err(Error::UnexpectedError {
@@ -863,6 +921,7 @@ impl RemoteLogDownloader {
         }
 
         RemoteLogDownloadFuture::new(result_receiver)
+            .with_pending_slot(Arc::clone(&self.pending_slots))
     }
 }
 
@@ -1005,6 +1064,7 @@ mod tests {
 
     /// Simplified fake fetcher for testing
     struct FakeFetcher {
+        directory: Arc<TempDir>,
         completion_gate: Arc<Notify>,
         in_flight: Arc<AtomicUsize>,
         max_seen_in_flight: Arc<AtomicUsize>,
@@ -1015,6 +1075,7 @@ mod tests {
     impl FakeFetcher {
         fn new(fail_count: usize, auto_complete: bool) -> Self {
             Self {
+                directory: Arc::new(TempDir::with_prefix("fluss-test-remote-").unwrap()),
                 completion_gate: Arc::new(Notify::new()),
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_seen_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -1051,6 +1112,7 @@ mod tests {
             let fail_count = self.fail_count.clone();
             let segment_id = request.segment().segment_id.clone();
             let auto_complete = self.auto_complete;
+            let directory = Arc::clone(&self.directory);
 
             Box::pin(async move {
                 // Track in-flight
@@ -1084,13 +1146,13 @@ mod tests {
                     })
                 } else {
                     let fake_data = vec![1, 2, 3, 4];
-                    let temp_dir = env::temp_dir();
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_nanos();
-                    let file_path =
-                        temp_dir.join(format!("fake_segment_{segment_id}_{timestamp}.log"));
+                    let file_path = directory
+                        .path()
+                        .join(format!("{segment_id}_{timestamp}.log"));
                     tokio::fs::write(&file_path, &fake_data).await?;
 
                     Ok(FetchResult {
@@ -1292,6 +1354,46 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn pending_segment_budget_releases_on_cancellation() {
+        let fake_fetcher = Arc::new(FakeFetcher::new(100, false));
+        let downloader = RemoteLogDownloader::new_with_fetcher_and_limit(
+            fake_fetcher.clone(),
+            1,
+            1,
+            1,
+            metrics(),
+        )
+        .unwrap();
+        let bucket = create_table_bucket(1, 0);
+        let first_seg = create_segment("first", 0, 1000, bucket.clone());
+        let second_seg = create_segment("second", 100, 1000, bucket.clone());
+        let first = downloader.request_remote_log("dir", &first_seg);
+        let second = downloader.request_remote_log("dir", &second_seg);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !second.is_done() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            second
+                .take_remote_log_file()
+                .unwrap_err()
+                .to_string()
+                .contains("pending segments")
+        );
+        assert_eq!(downloader.pending_slots.load(AtomicOrdering::SeqCst), 1);
+        drop(first);
+        assert_eq!(downloader.pending_slots.load(AtomicOrdering::SeqCst), 0);
+        let third = downloader.request_remote_log("dir", &second_seg);
+        assert_eq!(downloader.pending_slots.load(AtomicOrdering::SeqCst), 1);
+        drop(third);
+        assert_eq!(downloader.pending_slots.load(AtomicOrdering::SeqCst), 0);
+        fake_fetcher.release_all();
     }
 
     #[tokio::test]
