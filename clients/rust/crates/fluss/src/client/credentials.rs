@@ -23,6 +23,8 @@ use log::{debug, info, warn};
 use parking_lot::RwLock;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, watch};
@@ -41,15 +43,42 @@ const DEFAULT_NON_EXPIRING_REFRESH_INTERVAL: Duration = Duration::from_secs(7 * 
 
 /// Type alias for credentials properties receiver
 /// - `None` = not yet fetched, should wait
-/// - `Some(HashMap)` = fetched (may be empty if no auth needed)
-pub type CredentialsReceiver = watch::Receiver<Option<HashMap<String, String>>>;
+/// - `Some(RemoteCredentials)` = fetched (props may be empty if no auth needed)
+pub type CredentialsReceiver = watch::Receiver<Option<RemoteCredentials>>;
 
-#[derive(Debug, Deserialize)]
+/// Fluss's token expiration must accompany its properties. If refresh fails,
+/// a scanner can wait for a new token instead of using an expired one.
+#[derive(Clone)]
+pub struct RemoteCredentials {
+    pub properties: HashMap<String, String>,
+    pub expires_at_ms: Option<i64>,
+}
+
+impl RemoteCredentials {
+    pub(crate) fn is_valid_at(&self, now_ms: i64) -> bool {
+        self.expires_at_ms.is_none_or(|expires| expires > now_ms)
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(try_from = "WireCredentials")]
 struct Credentials {
     access_key_id: String,
     access_key_secret: String,
     security_token: Option<String>,
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("access_key_id", &"[REDACTED]")
+            .field("access_key_secret", &"[REDACTED]")
+            .field(
+                "security_token",
+                &self.security_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -153,13 +182,13 @@ fn build_remote_fs_props(
 /// Uses `tokio::sync::watch` channel to broadcast token updates to consumers.
 /// Consumers can subscribe by calling `subscribe()` to get a receiver.
 ///
-/// The channel value is `Option<HashMap>`:
+/// The channel value is `Option<RemoteCredentials>`:
 /// - `None` = not yet fetched, consumers should wait
-/// - `Some(HashMap)` = fetched (may be empty if no auth needed)
+/// - `Some(RemoteCredentials)` = fetched (props may be empty if no auth needed)
 ///
 /// # Example
 /// ```ignore
-/// let manager = SecurityTokenManager::new(rpc_client, metadata);
+/// let manager = SecurityTokenManager::new(rpc_client, metadata, Duration::from_secs(30));
 /// let credentials_rx = manager.subscribe();
 /// manager.start();
 ///
@@ -171,10 +200,11 @@ pub struct SecurityTokenManager {
     metadata: Arc<Metadata>,
     token_renewal_ratio: f64,
     renewal_retry_backoff: Duration,
+    token_fetch_timeout: Duration,
     /// Watch channel sender for broadcasting token updates
-    credentials_tx: watch::Sender<Option<HashMap<String, String>>>,
+    credentials_tx: watch::Sender<Option<RemoteCredentials>>,
     /// Watch channel receiver (kept to allow cloning for new subscribers)
-    credentials_rx: watch::Receiver<Option<HashMap<String, String>>>,
+    credentials_rx: CredentialsReceiver,
     /// Handle to the background refresh task
     task_handle: RwLock<Option<JoinHandle<()>>>,
     /// Sender to signal shutdown
@@ -182,13 +212,18 @@ pub struct SecurityTokenManager {
 }
 
 impl SecurityTokenManager {
-    pub fn new(rpc_client: Arc<RpcClient>, metadata: Arc<Metadata>) -> Self {
+    pub fn new(
+        rpc_client: Arc<RpcClient>,
+        metadata: Arc<Metadata>,
+        token_fetch_timeout: Duration,
+    ) -> Self {
         let (credentials_tx, credentials_rx) = watch::channel(None);
         Self {
             rpc_client,
             metadata,
             token_renewal_ratio: DEFAULT_TOKEN_RENEWAL_RATIO,
             renewal_retry_backoff: DEFAULT_RENEWAL_RETRY_BACKOFF,
+            token_fetch_timeout,
             credentials_tx,
             credentials_rx,
             task_handle: RwLock::new(None),
@@ -218,6 +253,7 @@ impl SecurityTokenManager {
         let metadata = Arc::clone(&self.metadata);
         let token_renewal_ratio = self.token_renewal_ratio;
         let renewal_retry_backoff = self.renewal_retry_backoff;
+        let token_fetch_timeout = self.token_fetch_timeout;
         let credentials_tx = self.credentials_tx.clone();
 
         let handle = tokio::spawn(async move {
@@ -226,6 +262,7 @@ impl SecurityTokenManager {
                 metadata,
                 token_renewal_ratio,
                 renewal_retry_backoff,
+                token_fetch_timeout,
                 credentials_tx,
                 shutdown_rx,
             )
@@ -252,20 +289,36 @@ impl SecurityTokenManager {
         metadata: Arc<Metadata>,
         token_renewal_ratio: f64,
         renewal_retry_backoff: Duration,
-        credentials_tx: watch::Sender<Option<HashMap<String, String>>>,
+        token_fetch_timeout: Duration,
+        credentials_tx: watch::Sender<Option<RemoteCredentials>>,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
         info!("Starting token refresh loop");
 
         loop {
             // Fetch token and send to channel
-            let result = Self::fetch_token(&rpc_client, &metadata).await;
+            let Some(result) = Self::await_token(
+                Self::fetch_token(&rpc_client, &metadata),
+                token_fetch_timeout,
+                &mut shutdown_rx,
+            )
+            .await
+            else {
+                info!("Token refresh loop received shutdown while fetching");
+                break;
+            };
 
             let next_delay = match result {
                 Ok((props, expiration_time)) => {
                     // Send credentials via watch channel (Some indicates fetched)
-                    if let Err(e) = credentials_tx.send(Some(props)) {
-                        debug!("No active subscribers for credentials update: {e:?}");
+                    if credentials_tx
+                        .send(Some(RemoteCredentials {
+                            properties: props,
+                            expires_at_ms: expiration_time,
+                        }))
+                        .is_err()
+                    {
+                        debug!("No active subscribers for credentials update");
                     }
 
                     // Calculate next renewal delay based on expiration time
@@ -302,9 +355,28 @@ impl SecurityTokenManager {
         }
     }
 
+    async fn await_token<F, T>(
+        fetch: F,
+        timeout: Duration,
+        shutdown: &mut oneshot::Receiver<()>,
+    ) -> Option<Result<T>>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        tokio::select! {
+            fetched = tokio::time::timeout(timeout, fetch) => Some(fetched.unwrap_or_else(|_| {
+                Err(Error::IoUnexpectedError {
+                    message: "Timed out requesting Fluss remote storage credentials".into(),
+                    source: std::io::ErrorKind::TimedOut.into(),
+                })
+            })),
+            _ = shutdown => None,
+        }
+    }
+
     /// Fetch token from server.
     /// Returns the props and expiration time if available.
-    async fn fetch_token(
+    pub(crate) async fn fetch_token(
         rpc_client: &Arc<RpcClient>,
         metadata: &Arc<Metadata>,
     ) -> Result<(HashMap<String, String>, Option<i64>)> {
@@ -382,6 +454,55 @@ impl Drop for SecurityTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_credentials_never_exposes_access_keys_or_session_tokens() {
+        let credentials = Credentials {
+            access_key_id: "access-id-test".into(),
+            access_key_secret: "secret-test-value".into(),
+            security_token: Some("session-token-test".into()),
+        };
+        let output = format!("{credentials:?}");
+        for secret in ["access-id-test", "secret-test-value", "session-token-test"] {
+            assert!(!output.contains(secret));
+        }
+        assert!(output.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn hung_token_refresh_is_bounded_and_cancellable() {
+        let (_sender, mut shutdown) = oneshot::channel();
+        let error = SecurityTokenManager::await_token(
+            std::future::pending::<Result<()>>(),
+            Duration::from_millis(20),
+            &mut shutdown,
+        )
+        .await
+        .expect("timeout must deliver a fetch error")
+        .expect_err("hung token RPC must not wait indefinitely");
+        assert!(
+            matches!(error, Error::IoUnexpectedError { source, .. } if source.kind() == std::io::ErrorKind::TimedOut)
+        );
+
+        let (sender, mut shutdown) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            SecurityTokenManager::await_token(
+                std::future::pending::<Result<()>>(),
+                Duration::from_secs(60),
+                &mut shutdown,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(sender.send(()).is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("shutdown must preempt blocked token fetch")
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn credentials_accept_either_token_name_or_both_when_equal() {

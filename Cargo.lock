@@ -1704,6 +1704,7 @@ dependencies = [
  "futures",
  "metrics",
  "metrics-util",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

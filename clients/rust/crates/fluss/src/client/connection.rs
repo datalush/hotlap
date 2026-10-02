@@ -29,6 +29,8 @@ use crate::metadata::PhysicalTablePath;
 use crate::rpc::RpcClient;
 use crate::rpc::transport::TlsConfig;
 use parking_lot::RwLock;
+#[cfg(feature = "integration_tests")]
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -161,6 +163,18 @@ impl FlussConnection {
             .read()
             .as_ref()
             .and_then(|c| c.estimated_batch_size_for_table(table_path))
+    }
+
+    /// Fetch the server-issued token so isolated tests can check its effective
+    /// S3 permissions. Never enabled by the production connector build.
+    #[cfg(feature = "integration_tests")]
+    pub async fn remote_storage_credentials_for_test(&self) -> Result<HashMap<String, String>> {
+        let (props, _) = crate::client::credentials::SecurityTokenManager::fetch_token(
+            &self.network_connects,
+            &self.metadata,
+        )
+        .await?;
+        Ok(props)
     }
 
     /// Gets or creates a lookup client for batched lookup operations.

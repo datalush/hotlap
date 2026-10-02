@@ -31,6 +31,11 @@ bucket**, not an atomic cross-bucket snapshot.
   fails. After dropping and recreating a table with the same name, old log
   and KV plans reject the new table identity. Concurrent executions of one
   physical log source with distinct TaskContexts return complete results.
+- An ignored failover test in the isolated native-sni lab restarts only the
+  active coordinator while a bounded log stream is open. The original stream
+  completes with every captured bucket row or fails; once cluster health is
+  Green, a fresh scan returns all 512 rows. A separate test rejects an
+  untrusted TLS CA without displaying the SASL password.
 - An execution-time budget (default 16,384 selected partition/bucket pairs)
   rejects larger scans instead of silently omitting buckets. Use
   `with_max_assigned_buckets` to choose a deliberate larger budget.
@@ -56,6 +61,29 @@ it. Remote request slots are released on cancellation, and temporary S3
 credentials received as either `security_token` or `session_token` are passed
 to OpenDAL as its S3 `session_token` property. If both names are present with
 different values, the client rejects them without logging either token.
+The credential manager publishes Fluss's token expiration with each update.
+If refresh fails and the previous token expires, new remote downloads wait
+up to `scanner_remote_log_operation_timeout_ms` for a valid replacement;
+the manager also bounds its own token-fetch RPC with this setting, and
+shutdown interrupts a blocked fetch. Credentials' `Debug` output redacts
+access keys and session tokens. Readers never send the stale token to
+OpenDAL. The scanner's overall DataFusion
+timeout still bounds the full read, including credential waits and retries.
+Unit tests inject temporary OpenDAL failures, confirm recovery within the
+configured retry budget and a subsequent successful read, then separately
+exercise the exhausted budget and a blocked credential refresh.
+The RustFS lab also has a bucket-scoped `fluss-read` IAM **user** and policy:
+its direct and assumed credentials read but cannot write (403). This user is
+not the Fluss server's uploader. RustFS accepts `RoleArn` for compatibility,
+but sessions signed with server root keys still inherit root permissions
+unless the `AssumeRole` call also carries an inline `Policy`. The fork's
+`develop` server now accepts optional `s3.assumed.role.policy`; without it,
+behavior is unchanged. An **unpublished local image** overlaid with the
+patched S3 plugin successfully uploaded log segments and issued tokens that
+read a real RustFS object but were denied PutObject and DeleteObject; the
+DataFusion S3/TTL scan passed. The existing published `.5` image still issues
+unrestricted root-derived sessions. Configure the policy on a released
+server image before claiming least privilege in production.
 The remote downloader reports a missing segment as an incomplete scan (the
 object may have expired or been removed); it preserves the storage error as
 the cause without assuming that TTL was the reason. Permanent storage errors
@@ -89,7 +117,8 @@ potential in-flight chunk data **per scanner**. This is a sizing input, not
 a strict process-memory bound: decompression, fetch responses and OpenDAL's
 internal allocations are additional. Set
 `scanner_remote_log_operation_timeout_ms` (default 30000ms) for individual
-remote reader/open/read operations; this is not a query-wide timeout.
+remote reader/open/read operations and credential fetch/wait; this is not a
+query-wide timeout.
 `scanner_remote_log_max_retries` controls retries *after* the first attempt
 (default 10; `0` means one attempt). `scanner_remote_log_retry_backoff_base_ms`
 and `scanner_remote_log_retry_backoff_max_ms` configure exponential backoff
@@ -121,11 +150,13 @@ With the isolated native-sni lab running and ignored credentials in
 `../lab/.env`:
 
 ```bash
-CARGO_BUILD_JOBS=2 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test live_log_sql -- --ignored
+CARGO_BUILD_JOBS=2 KUBECONFIG=/tmp/opencode/native-sni.kubeconfig uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test live_log_sql -- --ignored --test-threads=1
 KUBECONFIG=/tmp/opencode/native-sni.kubeconfig CARGO_BUILD_JOBS=2 uv run --no-sync --env-file ../lab/.env cargo test --manifest-path clients/rust/Cargo.toml -p fluss-rs --lib client::table::kv_scanner::tests::leader_restart_invalidates_snapshot_without_restarting_reader -- --ignored
 ```
 
-The second command restarts **only** a tabletserver pod in `k3d-native-sni`.
+The first command restarts **only** the active coordinator pod for its failover
+test; the second restarts **only** a tabletserver pod. Both require the isolated
+`k3d-native-sni` context and wait for recovery.
 
 Run the independent Docker storage profile separately from the native-sni
 tests (both may bind port 9123):
@@ -134,6 +165,13 @@ tests (both may bind port 9123):
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 cargo test -p fluss-datafusion --test remote_retention datafusion_reads_remote_and_rejects_lost_retention -- --ignored
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_reads_and_expires_rustfs_s3 -- --ignored
 ```
+
+With a locally built server image containing the optional STS policy support,
+run `FLUSS_IMAGE=fluss-sts-policy FLUSS_VERSION=develop FLUSS_STS_READONLY_POLICY=1`
+before the second command. This enables a policy limited to the test's unique
+prefix and verifies **the token returned by Fluss**, including a successful
+GetObject and denied PutObject/DeleteObject. Running the same local image
+without the flag exercises the backward-compatible default.
 
 ## Reference resource-pressure profile
 
@@ -180,6 +218,12 @@ acceptance criterion.
 The measured profile is evidence for this **Rust, Docker Fluss, RustFS**
 configuration, not a strict bound on every transient allocation or another
 deployment. Compressed fetch buffers and OpenDAL remain outside the DataFusion
-pool; an Arrow batch is decoded before the pool can reserve it. Coordinator
-failover, other resource profiles and the eventual Python-FFI path (if needed)
-still require separate acceptance evidence.
+pool; an Arrow batch is decoded before the pool can reserve it. The native-sni
+coordinator failover test covers a live two-coordinator lab, not the Docker
+profile's single coordinator. Simulated temporary OpenDAL errors and synthetic
+credential refreshes verify the client policies; real S3 fault injection and
+STS renewal across an actual expiry are still unverified. The current Fluss
+server's root-signed STS sessions must be restricted before claiming least
+privilege. Other
+resource profiles and the eventual Python-FFI path (if needed) also require
+separate acceptance evidence.

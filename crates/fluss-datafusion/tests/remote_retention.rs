@@ -46,7 +46,7 @@ fn datafusion_reads_remote_and_rejects_lost_retention() -> TestResult<()> {
                 let remote = tempfile::tempdir()?;
                 builder = builder.with_remote_data_dir(remote.path().canonicalize()?);
                 let cluster = builder.build().await;
-                let result = check_remote_scan(&cluster, &snapshotter).await;
+                let result = check_remote_scan(&cluster, &snapshotter, None).await;
                 drop(cluster);
                 result
             })
@@ -67,6 +67,23 @@ fn datafusion_reads_and_expires_rustfs_s3() -> TestResult<()> {
     std::env::var("FLUSS_IMAGE")?;
     std::env::var("FLUSS_VERSION")?;
     let (conf, mut test_objects) = rustfs_profile()?;
+    let mut conf = conf;
+    let verify_readonly = std::env::var("FLUSS_STS_READONLY_POLICY").as_deref() == Ok("1");
+    if verify_readonly {
+        conf.insert(
+            "s3.assumed.role.policy".into(),
+            serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+                     "Resource": [format!("arn:aws:s3:::{}", test_objects.bucket)]},
+                    {"Effect": "Allow", "Action": ["s3:GetObject"],
+                     "Resource": [format!("arn:aws:s3:::{}/{}/*", test_objects.bucket, test_objects.prefix)]}
+                ]
+            })
+            .to_string(),
+        );
+    }
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     metrics::with_local_recorder(&recorder, || {
@@ -78,7 +95,12 @@ fn datafusion_reads_and_expires_rustfs_s3() -> TestResult<()> {
                     FlussTestingClusterBuilder::new_with_cluster_conf("datafusion-s3", &conf)
                         .with_port(9323);
                 let cluster = builder.build().await;
-                let result = check_remote_scan(&cluster, &snapshotter).await;
+                let result = check_remote_scan(
+                    &cluster,
+                    &snapshotter,
+                    verify_readonly.then_some(&test_objects),
+                )
+                .await;
                 drop(cluster);
                 let cleanup = test_objects.cleanup();
                 result?;
@@ -133,6 +155,124 @@ fn rustfs_profile() -> TestResult<(HashMap<String, String>, S3TestPrefix)> {
         ("s3.assumed.role.sts.endpoint".into(), endpoint),
     ]);
     Ok((conf, test_objects))
+}
+
+async fn verify_fluss_issued_token(
+    connection: &Arc<FlussConnection>,
+    profile: &S3TestPrefix,
+) -> TestResult<()> {
+    let credentials = connection.remote_storage_credentials_for_test().await?;
+    let get_field = |name: &str| -> TestResult<&str> {
+        credentials
+            .get(name)
+            .map(String::as_str)
+            .ok_or_else(|| format!("Fluss token has no {name}").into())
+    };
+    let access_key = get_field("access_key_id")?;
+    let secret_key = get_field("secret_access_key")?;
+    let session_token = get_field("session_token")?;
+
+    let prefix = format!("{}/log/", profile.prefix);
+    let listing = s3_command(
+        &profile.endpoint,
+        &profile.access,
+        &profile.secret,
+        &[
+            "s3api",
+            "list-objects-v2",
+            "--bucket",
+            &profile.bucket,
+            "--prefix",
+            &prefix,
+            "--query",
+            "Contents[?Size > `0`]|[0].Key",
+            "--output",
+            "text",
+        ],
+    )?;
+    if !listing.status.success() {
+        return Err(
+            "Could not identify an existing Fluss remote object for STS verification".into(),
+        );
+    }
+    let object = String::from_utf8(listing.stdout)?.trim().to_string();
+    if object.is_empty() || object == "None" {
+        return Err("Fluss has no uploaded remote object under its test prefix".into());
+    }
+    let run = |args: &[&str]| -> std::io::Result<std::process::Output> {
+        std::process::Command::new("aws")
+            .env("AWS_ACCESS_KEY_ID", access_key)
+            .env("AWS_SECRET_ACCESS_KEY", secret_key)
+            .env("AWS_SESSION_TOKEN", session_token)
+            .env("AWS_DEFAULT_REGION", "us-east-1")
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .args(["--endpoint-url", &profile.endpoint])
+            .args(args)
+            .output()
+    };
+    let read = run(&[
+        "s3api",
+        "get-object",
+        "--bucket",
+        &profile.bucket,
+        "--key",
+        &object,
+        "/dev/null",
+    ])?;
+    if !read.status.success() {
+        return Err("STS token returned by Fluss could not read its remote log object".into());
+    }
+    let write_key = format!("{}/token-write-probe", profile.prefix);
+    let body = tempfile::NamedTempFile::new()?;
+    std::fs::write(body.path(), b"write probe")?;
+    let body_path = body.path().to_str().ok_or("non-UTF8 temp path")?;
+    let write = run(&[
+        "s3api",
+        "put-object",
+        "--bucket",
+        &profile.bucket,
+        "--key",
+        &write_key,
+        "--body",
+        body_path,
+    ])?;
+    if write.status.success() {
+        let _ = s3_command(
+            &profile.endpoint,
+            &profile.access,
+            &profile.secret,
+            &[
+                "s3api",
+                "delete-object",
+                "--bucket",
+                &profile.bucket,
+                "--key",
+                &write_key,
+            ],
+        );
+        return Err("STS token returned by Fluss unexpectedly wrote to RustFS".into());
+    }
+    let write_error = String::from_utf8_lossy(&write.stderr);
+    if !write_error.contains("AccessDenied") {
+        return Err(format!(
+            "Fluss token PutObject failed with {:?}, expected AccessDenied",
+            write.status,
+        )
+        .into());
+    }
+    let delete = run(&[
+        "s3api",
+        "delete-object",
+        "--bucket",
+        &profile.bucket,
+        "--key",
+        &write_key,
+    ])?;
+    if delete.status.success() || !String::from_utf8_lossy(&delete.stderr).contains("AccessDenied")
+    {
+        return Err("STS token returned by Fluss unexpectedly permits deletion".into());
+    }
+    Ok(())
 }
 
 #[test]
@@ -725,6 +865,7 @@ impl Drop for S3TestPrefix {
 async fn check_remote_scan(
     cluster: &fluss_test_cluster::FlussTestingCluster,
     snapshotter: &Snapshotter,
+    verify_readonly: Option<&S3TestPrefix>,
 ) -> TestResult<()> {
     let connection = Arc::new(cluster.get_fluss_connection().await);
     let path = TablePath::new("fluss", format!("df_remote_{}", std::process::id()));
@@ -766,6 +907,9 @@ async fn check_remote_scan(
         .await?;
     let result = async {
         read_tiered_table(&connection, &path, snapshotter).await?;
+        if let Some(profile) = verify_readonly {
+            verify_fluss_issued_token(&connection, profile).await?;
+        }
         check_pending_limit(cluster, &path).await
     }
     .await;

@@ -87,8 +87,11 @@ impl LogFetcher {
         let log_fetch_buffer = Arc::new(LogFetchBuffer::new(Arc::clone(&resolver)));
 
         // Create security token manager for background token refresh
-        let security_token_manager =
-            Arc::new(SecurityTokenManager::new(conns.clone(), metadata.clone()));
+        let security_token_manager = Arc::new(SecurityTokenManager::new(
+            conns.clone(),
+            metadata.clone(),
+            std::time::Duration::from_millis(config.scanner_remote_log_operation_timeout_ms),
+        ));
 
         // Subscribe to credentials updates and pass to remote log downloader
         let credentials_rx = security_token_manager.subscribe();

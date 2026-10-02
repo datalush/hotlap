@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Optional isolated-lab integration: run with FLUSS_* from ../lab/.env.
 
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +18,8 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use fluss::client::FlussConnection;
 use fluss::config::Config;
 use fluss::metadata::{
-    AddColumn, AlterTableChanges, ColumnPositionType, DataTypes, JsonSerde, PartitionSpec, Schema,
-    TableBucket, TableDescriptor, TablePath,
+    AddColumn, AlterTableChanges, ClusterHealthStatus, ColumnPositionType, DataTypes, JsonSerde,
+    PartitionSpec, Schema, TableBucket, TableDescriptor, TablePath,
 };
 use fluss::row::GenericRow;
 use fluss::rpc::message::OffsetSpec;
@@ -1586,6 +1587,228 @@ async fn check_concurrent_reexecution(
         metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
         0
     );
+    Ok(())
+}
+
+fn isolated_kubectl(kubeconfig: &str, args: &[&str]) -> TestResult<String> {
+    let output = Command::new("kubectl")
+        .env("KUBECONFIG", kubeconfig)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+#[tokio::test]
+#[ignore = "requires native-sni and FLUSS_*; checks CA validation without mutating the cluster"]
+async fn native_tls_rejects_untrusted_ca_without_exposing_credentials() -> TestResult<()> {
+    let password = std::env::var("FLUSS_PASSWORD")?;
+    let config = Config {
+        bootstrap_servers: std::env::var("FLUSS_BOOTSTRAP")?,
+        security_ssl_enabled: true,
+        security_ssl_ca_file: None, // native-sni's private CA must be supplied explicitly
+        security_protocol: "sasl".into(),
+        security_sasl_username: std::env::var("FLUSS_USER")?,
+        security_sasl_password: password.clone(),
+        ..Config::default()
+    };
+    assert!(!format!("{config:?}").contains(&password));
+    let error = match FlussConnection::new(config).await {
+        Err(error) => error,
+        Ok(connection) => {
+            connection.close(Duration::from_secs(5)).await?;
+            return Err("native-sni TLS accepted a client without its private CA".into());
+        }
+    };
+    let message = error.to_string();
+    assert!(
+        message.to_ascii_lowercase().contains("tls")
+            || message.to_ascii_lowercase().contains("certificate"),
+        "{message}"
+    );
+    assert!(
+        !message.contains(&password),
+        "connection error exposed the SASL secret"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires native-sni KUBECONFIG and FLUSS_*; restarts only its active coordinator pod"]
+async fn coordinator_failover_keeps_or_rejects_an_open_bounded_log_scan() -> TestResult<()> {
+    let kubeconfig = std::env::var("KUBECONFIG")?;
+    if isolated_kubectl(&kubeconfig, &["config", "current-context"])?.as_str() != "k3d-native-sni" {
+        return Err("failover test requires the isolated k3d-native-sni context".into());
+    }
+    let connection = connect().await?;
+    let admin = connection.get_admin()?;
+    let path = create_empty_log(&connection).await?;
+    let result: TestResult<()> = async {
+        append_rows(&connection, &path).await?;
+        let earliest = admin
+            .list_offsets(&path, &[0], OffsetSpec::Earliest)
+            .await?[&0];
+        let latest = admin.list_offsets(&path, &[0], OffsetSpec::Latest).await?[&0];
+        assert!(
+            latest - earliest > 1,
+            "the paused bucket needs multiple batches"
+        );
+        let mut config = connection.config().clone();
+        config.scanner_log_max_poll_records = 1;
+        let read_connection = Arc::new(FlussConnection::new(config).await?);
+        let ctx = SessionContext::new();
+        register_log(&ctx, &read_connection, path.table(), SCAN_TIMEOUT).await?;
+        let query = ctx.sql("SELECT id FROM log").await?;
+        let source = source_plan(&query.create_physical_plan().await?);
+        let mut stream = source.execute(0, Arc::new(query.task_ctx()))?;
+        let first = stream.next().await.expect("first pre-failover batch")?;
+        if first.num_rows() == 0 || first.num_rows() as i64 >= latest - earliest {
+            return Err(format!(
+                "scan must pause before bucket completion, first batch had {} rows",
+                first.num_rows()
+            )
+            .into());
+        }
+        let coordinator_id = connection
+            .get_metadata()
+            .get_cluster()
+            .get_coordinator_server()
+            .ok_or("no active Fluss coordinator in metadata")?
+            .id();
+        if ![0, 1].contains(&coordinator_id) {
+            return Err(format!("unexpected isolated coordinator id: {coordinator_id}").into());
+        }
+        let pod = format!("native-coordinator-{coordinator_id}");
+        let other = format!("native-coordinator-{}", 1 - coordinator_id);
+        isolated_kubectl(
+            &kubeconfig,
+            &[
+                "-n",
+                "native-test",
+                "wait",
+                "--for=condition=Ready",
+                &format!("pod/{other}"),
+                "--timeout=15s",
+            ],
+        )?;
+        let uid = isolated_kubectl(
+            &kubeconfig,
+            &[
+                "-n",
+                "native-test",
+                "get",
+                "pod",
+                &pod,
+                "-o",
+                "jsonpath={.metadata.uid}",
+            ],
+        )?;
+        isolated_kubectl(
+            &kubeconfig,
+            &["-n", "native-test", "delete", "pod", &pod, "--wait=false"],
+        )?;
+
+        // A scan opened before failover may finish from its tabletserver or
+        // fail explicitly. It may not report success with missing offsets.
+        let first_ids = first.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let mut seen: Vec<i32> = (0..first_ids.len()).map(|index| first_ids.value(index)).collect();
+        let ongoing = tokio::time::timeout(Duration::from_secs(45), async {
+            while let Some(next) = stream.next().await {
+                let batch = next?;
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                seen.extend((0..ids.len()).map(|index| ids.value(index)));
+            }
+            Ok::<(), DataFusionError>(())
+        })
+        .await;
+        drop(stream);
+
+        // Always wait for the exact replacement pod and Green health before
+        // evaluating the in-flight result or attempting a new query.
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                if isolated_kubectl(
+                    &kubeconfig,
+                    &[
+                        "-n",
+                        "native-test",
+                        "get",
+                        "pod",
+                        &pod,
+                        "-o",
+                        "jsonpath={.metadata.uid}",
+                    ],
+                )
+                .is_ok_and(|current| current != uid)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await?;
+        isolated_kubectl(
+            &kubeconfig,
+            &[
+                "-n",
+                "native-test",
+                "wait",
+                "--for=condition=Ready",
+                &format!("pod/{pod}"),
+                "--timeout=120s",
+            ],
+        )?;
+        tokio::time::timeout(Duration::from_secs(90), async {
+            while admin
+                .get_cluster_health()
+                .await
+                .ok()
+                .is_none_or(|health| health.status != ClusterHealthStatus::Green)
+            {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await?;
+        let fresh_count = tokio::time::timeout(Duration::from_secs(90), async {
+            loop {
+                if let Ok(count) = count_sql(&ctx, "SELECT COUNT(*) FROM log").await {
+                    break count;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }).await.map_err(|_| "fresh bounded query did not recover within 90s of coordinator failover")?;
+        if fresh_count != 512 {
+            return Err(format!("fresh query returned {fresh_count} instead of 512 rows").into());
+        }
+        match ongoing? {
+            Ok(()) => {
+                let observed = seen.len();
+                seen.sort_unstable();
+                seen.dedup();
+                if seen.len() != observed || seen.len() as i64 != latest - earliest {
+                    return Err(format!("old scan lost or duplicated bucket offsets: expected {}, got {observed} rows ({} distinct)", latest - earliest, seen.len()).into());
+                }
+            }
+            Err(error) => assert!(!error.to_string().is_empty()),
+        }
+        read_connection.close(Duration::from_secs(5)).await?;
+        Ok(())
+    }
+    .await;
+    let cleanup = admin.drop_table(&path, true).await;
+    result?;
+    cleanup?;
+    connection.close(Duration::from_secs(5)).await?;
     Ok(())
 }
 

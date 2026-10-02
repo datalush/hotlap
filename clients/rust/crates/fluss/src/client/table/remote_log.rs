@@ -32,11 +32,9 @@ use std::{
     pin::Pin,
     sync::Arc,
     sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(test)]
-use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -421,6 +419,44 @@ struct ProductionFetcher {
     streaming_options: StreamingReadOptions,
 }
 
+async fn current_remote_credentials(
+    receiver: &mut CredentialsReceiver,
+    timeout: Duration,
+) -> Result<HashMap<String, String>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        // Mark this version seen before waiting. Otherwise an expired token
+        // that has already been published can make changed() spin forever.
+        let received = receiver.borrow_and_update().clone();
+        if let Some(credentials) = received {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| Error::UnexpectedError {
+                    message: "System clock is before the Unix epoch".into(),
+                    source: Some(Box::new(error)),
+                })?
+                .as_millis() as i64;
+            if credentials.is_valid_at(now_ms) {
+                return Ok(credentials.properties);
+            }
+            log::warn!("Remote storage credentials have expired; awaiting refresh");
+        }
+        let changed = tokio::time::timeout_at(deadline, receiver.changed())
+            .await
+            .map_err(|_| Error::IoUnexpectedError {
+                message: "Timed out waiting for valid remote storage credentials".into(),
+                source: io::ErrorKind::TimedOut.into(),
+            })?;
+        if let Err(error) = changed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("credentials manager shut down before credentials were obtained: {error}"),
+            )
+            .into());
+        }
+    }
+}
+
 impl ProductionFetcher {
     fn fetch_impl<'a>(
         &self,
@@ -446,42 +482,8 @@ impl ProductionFetcher {
                 remote_log_tablet_dir, segment.segment_id, offset_prefix
             );
 
-            // Get credentials from watch channel, waiting if not yet fetched
-            // - None = not yet fetched, wait
-            // - Some(props) = fetched (may be empty if no auth needed)
-            let remote_fs_props = {
-                let maybe_props = credentials_rx.borrow().clone();
-                match maybe_props {
-                    Some(props) => props,
-                    None => {
-                        // Credentials not yet fetched, wait for first update
-                        log::info!("Waiting for credentials to be available...");
-                        // If the sender side has been dropped (e.g. during shutdown),
-                        // this will return an error. Surface that as a proper error
-                        // instead of silently falling back to empty credentials.
-                        if let Err(e) = credentials_rx.changed().await {
-                            let io_err = io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                format!(
-                                    "credentials manager shut down before credentials were obtained: {e}"
-                                ),
-                            );
-                            return Err(io_err.into());
-                        }
-                        // After a successful change notification, credentials should be set.
-                        // If they are still missing, treat this as an error instead of
-                        // defaulting to an empty map (which could break auth flows).
-                        credentials_rx
-                            .borrow()
-                            .clone()
-                            .ok_or_else(|| Error::UnexpectedError {
-                                message: "credentials not available after watch notification"
-                                    .to_string(),
-                                source: None,
-                            })?
-                    }
-                }
-            };
+            let remote_fs_props =
+                current_remote_credentials(&mut credentials_rx, streaming_options.timeout).await?;
 
             // Stream to disk without materializing the whole remote file.
             let file_path = RemoteLogDownloader::download_file(
@@ -1520,6 +1522,152 @@ mod tests {
                     .into())
             })
         }
+    }
+
+    struct RecoveringStorageFetcher {
+        attempts: Arc<AtomicUsize>,
+        directory: Arc<TempDir>,
+    }
+
+    impl RemoteLogFetcher for RecoveringStorageFetcher {
+        fn fetch(
+            &self,
+            request: &RemoteLogDownloadRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<FetchResult>> + Send>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            let path = self.directory.path().join(&request.segment.segment_id);
+            Box::pin(async move {
+                if attempt < 2 {
+                    return Err(opendal::Error::new(
+                        opendal::ErrorKind::Unexpected,
+                        "simulated S3 503",
+                    )
+                    .set_temporary()
+                    .into());
+                }
+                tokio::fs::write(&path, [1_u8, 2, 3, 4]).await?;
+                Ok(FetchResult {
+                    file_path: path,
+                    file_size: 4,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_storage_failure_recovers_then_a_fresh_read_succeeds() -> Result<()> {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let fetcher = Arc::new(RecoveringStorageFetcher {
+            attempts: Arc::clone(&attempts),
+            directory: Arc::new(TempDir::new()?),
+        });
+        let downloader = RemoteLogDownloader::new_with_fetcher_and_retry(
+            fetcher,
+            1,
+            2,
+            64 * 1024,
+            1,
+            RemoteRetryPolicy {
+                max_retries: 2,
+                backoff_base_ms: 1,
+                backoff_max_ms: 1,
+            },
+            metrics(),
+        )?;
+        let bucket = create_table_bucket(1, 0);
+        for (id, expected_attempts) in [("first", 3), ("next", 4)] {
+            let future =
+                downloader.request_remote_log("dir", &create_segment(id, 0, 0, bucket.clone()));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !future.is_done() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("temporary failures must recover within retry budget");
+            let file = future.take_remote_log_file()?;
+            assert_eq!(tokio::fs::read(&file.file_path).await?, [1, 2, 3, 4]);
+            drop(file);
+            drop(future);
+            assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while downloader.pending_slots.load(AtomicOrdering::SeqCst) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("finished download must release its request slot");
+            assert_eq!(downloader.prefetch_bytes.load(AtomicOrdering::SeqCst), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_credentials_wait_is_bounded_when_refresh_stalls() -> Result<()> {
+        let (credentials_tx, credentials_rx) = tokio::sync::watch::channel(None);
+        let _keep_manager_running = credentials_tx;
+        let fetcher = ProductionFetcher {
+            credentials_rx,
+            local_log_dir: Arc::new(TempDir::new()?),
+            streaming_options: StreamingReadOptions {
+                chunk_size: 1_024,
+                concurrency: 1,
+                timeout: Duration::from_millis(20),
+            },
+        };
+        let request = create_request(create_segment("waiting", 0, 0, create_table_bucket(1, 0)));
+        let error = tokio::time::timeout(Duration::from_secs(1), fetcher.fetch(&request))
+            .await
+            .expect("credentials wait must have an effective deadline")
+            .expect_err("credentials must not silently default to no auth");
+        assert!(
+            matches!(error, Error::IoUnexpectedError { source, .. } if source.kind() == io::ErrorKind::TimedOut)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_remote_credentials_wait_for_refresh_without_reusing_stale_keys() -> Result<()>
+    {
+        use crate::client::credentials::RemoteCredentials;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let previous = RemoteCredentials {
+            properties: HashMap::from([("access_key_id".into(), "stale-secret".into())]),
+            expires_at_ms: Some(now + 100),
+        };
+        let (sender, mut receiver) = tokio::sync::watch::channel(Some(previous));
+        let still_valid =
+            current_remote_credentials(&mut receiver, Duration::from_millis(15)).await?;
+        assert_eq!(
+            still_valid.get("access_key_id").map(String::as_str),
+            Some("stale-secret")
+        );
+        // The manager failed to publish a replacement. Once expired, a new
+        // read waits for the watch to change instead of using the old keys.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let error = current_remote_credentials(&mut receiver, Duration::from_millis(15))
+            .await
+            .expect_err("an expired token cannot be used after refresh failure");
+        assert!(
+            matches!(&error, Error::IoUnexpectedError { source, .. } if source.kind() == io::ErrorKind::TimedOut)
+        );
+        assert!(!error.to_string().contains("stale-secret"));
+
+        let refreshed = RemoteCredentials {
+            properties: HashMap::from([("access_key_id".into(), "fresh-key".into())]),
+            expires_at_ms: Some(now + 60_000),
+        };
+        assert!(sender.send(Some(refreshed)).is_ok());
+        let current = current_remote_credentials(&mut receiver, Duration::from_millis(50)).await?;
+        assert_eq!(
+            current.get("access_key_id").map(String::as_str),
+            Some("fresh-key")
+        );
+        Ok(())
     }
 
     async fn check_storage_retry_policy(
