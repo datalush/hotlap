@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Log scanner configuration, runtime, fetch and bucket status.
-
 //! Poll lifetime guard and time-between-polls instrumentation.
 
-use super::*;
+use super::{
+    Arc, AtomicI64, Duration, Instant, JoinHandle, LogScannerInner, MissedTickBehavior, Ordering,
+    ScannerMetrics, SystemTime, UNIX_EPOCH, warn,
+};
 
 /// Snapshot state used to derive the scanner poll-timing metrics.
 ///
@@ -121,4 +122,91 @@ pub(super) fn spawn_last_poll_seconds_ago_ticker(
             emit_last_poll_seconds_ago_once(&last_poll_unix_ms, &metrics);
         }
     })
+}
+
+impl LogScannerInner {
+    fn record_poll_start(&self) {
+        let now = Instant::now();
+        // Compute under the lock; emit the metric outside the critical
+        // section so a user-installed recorder cannot stall the next poll.
+        let (between_ms, overlap) = {
+            let mut state = self.poll_state.lock();
+            let overlap = state.poll_start_at.is_some();
+            debug_assert!(
+                !overlap,
+                "concurrent poll() detected on the same scanner; \
+                 LogScanner / RecordBatchLogScanner are single-consumer \
+                 (see LogScannerImpl.acquire() for Java parity)"
+            );
+            let between_ms = match state.last_poll_at {
+                Some(prev) => now.duration_since(prev).as_secs_f64() * 1000.0,
+                None => 0.0,
+            };
+            state.time_between_poll_ms = between_ms;
+            state.last_poll_at = Some(now);
+            state.poll_start_at = Some(now);
+            (between_ms, overlap)
+        };
+        if overlap {
+            warn!(
+                "concurrent poll() detected on scanner; single-consumer \
+                 contract violated, poll-timing metrics will be inaccurate \
+                 until the overlap clears"
+            );
+        }
+        self.metrics.record_time_between_poll_ms(between_ms);
+
+        // Publish the wall-clock timestamp the ticker uses to compute
+        // `last_poll_seconds_ago`. Use `SystemTime` rather than `Instant`
+        // because the ticker needs an absolute clock to diff against
+        // `SystemTime::now()` at arbitrary moments. `Release` pairs with the
+        // ticker's `Acquire` load. If the system clock is somehow before
+        // `UNIX_EPOCH` (vanishingly rare; pre-1970 wall clock), we keep the
+        // existing value so we never publish a negative timestamp that would
+        // produce a bogus gauge reading on the next tick.
+        if let Ok(unix_ms) = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+        {
+            self.last_poll_unix_ms.store(unix_ms, Ordering::Release);
+        }
+    }
+
+    /// Computes `poll_idle_ratio = poll_time / (poll_time + between_time)`.
+    /// On the first poll, `between_time` is 0 so the ratio is 1.0
+    /// (poll-bound).
+    ///
+    /// Orphan call: if no matching `record_poll_start` is in flight,
+    /// emits a `log::warn!` (single-consumer contract may have been
+    /// violated, e.g. in release builds where the start-side
+    /// `debug_assert!` is compiled out) and skips the metric update.
+    fn record_poll_end(&self) {
+        let now = Instant::now();
+        // Compute under the lock; emit metric / warn outside the critical
+        // section so neither the user-installed recorder nor the logger
+        // can stall the next poll.
+        let (orphan, ratio) = {
+            let mut state = self.poll_state.lock();
+            match state.poll_start_at.take() {
+                None => (true, None),
+                Some(start) => {
+                    let poll_time_ms = now.duration_since(start).as_secs_f64() * 1000.0;
+                    let total = poll_time_ms + state.time_between_poll_ms;
+                    let r = (total > 0.0).then_some(poll_time_ms / total);
+                    (false, r)
+                }
+            }
+        };
+        if orphan {
+            warn!(
+                "record_poll_end called without a matching record_poll_start; \
+                 single-consumer contract may have been violated, idle ratio \
+                 for this poll is not emitted"
+            );
+            return;
+        }
+        if let Some(r) = ratio {
+            self.metrics.record_poll_idle_ratio(r);
+        }
+    }
 }

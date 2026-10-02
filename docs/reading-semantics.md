@@ -79,9 +79,14 @@ omitting its extra buckets. Each query has a finite timeout.
 `EXPLAIN ANALYZE` identifies log versus KV scans, table and projected
 columns, optional log batch predicate and partition pruning. Partition
 counts describe discovered and selected partitions (recorded once, not once
-per physical stream). KV reports opened nonempty sessions, received Arrow
-pages, and first-page latency (which includes request and decoding). These
-are not network-byte or server-only snapshot-opening measurements.
+per physical stream, regardless of which stream starts first).
+`fluss_buckets_assigned` counts actual selected partition/bucket pairs assigned
+to executed streams, including empty ranges. KV counts server-confirmed
+sessions and successful `ScanKv` RPC responses (including empty pages), not
+Arrow output batches. First-page latency includes request and decoding.
+Projection is identified as `server` for logs, `decoder` for KV, or
+`full_rows_for_count` for a zero-column scan. These are not network-byte or
+server-only snapshot-opening measurements.
 
 The read-only catalog discovers names once; reload it after creating tables.
 It selects the log or KV provider from the table's primary-key metadata.

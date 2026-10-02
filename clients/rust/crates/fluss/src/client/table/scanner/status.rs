@@ -17,7 +17,7 @@
 
 //! Per-bucket subscription positions and high-watermarks.
 
-use super::*;
+use super::{Arc, FairBucketStatusMap, HashMap, RwLock, TableBucket};
 
 pub struct LogScannerStatus {
     bucket_status_map: Arc<RwLock<FairBucketStatusMap<BucketScanStatus>>>,

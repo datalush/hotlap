@@ -144,8 +144,13 @@ impl TableProvider for FlussKvTable {
             ));
         }
         let description = format!(
-            "kind=kv_snapshot, table={}, projected_columns={:?}, partition_pruning={partition_filter:?}",
+            "kind=kv_snapshot, table={}, projection={}, projected_columns={:?}, partition_pruning={partition_filter:?}",
             self.path,
+            if projection.is_some_and(Vec::is_empty) {
+                "full_rows_for_count"
+            } else {
+                "decoder"
+            },
             schema
                 .fields()
                 .iter()

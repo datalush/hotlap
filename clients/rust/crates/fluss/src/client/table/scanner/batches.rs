@@ -17,7 +17,7 @@
 
 //! Consume completed fetches as Arrow record batches.
 
-use super::*;
+use super::{CompletedFetch, FetchResult, LogFetcher, Result, ScanBatch, warn};
 
 impl LogFetcher {
     /// Collect completed fetches as ScanBatches (with bucket and offset metadata)
@@ -117,7 +117,7 @@ impl LogFetcher {
         }
     }
 
-    pub(super) fn fetch_batches_from_fetch(
+    fn fetch_batches_from_fetch(
         &self,
         next_in_line_fetch: &mut Box<dyn CompletedFetch>,
         max_batches: usize,

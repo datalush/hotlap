@@ -17,7 +17,13 @@
 
 //! Process fetch responses, including errors, remote segments and pruned ranges.
 
-use super::*;
+use super::{
+    ApiError, Arc, DefaultCompletedFetch, ErrorResponse, FetchErrorLogLevel, FetchLogRequest,
+    FetchLogResponse, FetchResponseContext, FlussError, HashSet, LogFetchBuffer, LogFetcher,
+    LogRecordsBatches, Metadata, NO_FILTERED_END_OFFSET, PhysicalTablePath, ReadContextResolver,
+    RemoteLogDownloader, RemoteLogFetchInfo, RemotePendingFetch, TableBucket, debug, warn,
+};
+use prost::Message;
 
 impl LogFetcher {
     pub(super) async fn handle_fetch_failure(
@@ -191,7 +197,7 @@ impl LogFetcher {
 
     /// Drops a filtered end offset that would move the bucket backwards, since
     /// the server is only ever meant to report a range it has already scanned.
-    pub(super) fn validate_filtered_end_offset(
+    fn validate_filtered_end_offset(
         filtered_end_offset: Option<i64>,
         fetch_offset: i64,
         table_bucket: &TableBucket,
@@ -208,7 +214,7 @@ impl LogFetcher {
         }
     }
 
-    pub(super) fn pending_remote_fetches(
+    fn pending_remote_fetches(
         remote_log_downloader: Arc<RemoteLogDownloader>,
         log_fetch_buffer: Arc<LogFetchBuffer>,
         resolver: Arc<ReadContextResolver>,

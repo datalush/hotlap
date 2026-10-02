@@ -33,6 +33,15 @@ use crate::rpc::{RpcClient, ServerConnection};
 
 const BATCH_SIZE_BYTES: i32 = 1024 * 1024;
 
+/// Successful server responses and snapshot sessions observed by this reader.
+/// One response can contain zero rows, and Arrow decoding can yield multiple
+/// batches from other sources, so these are counted at the RPC boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvScanStats {
+    pub pages_received: usize,
+    pub sessions_opened: usize,
+}
+
 /// Streams the live rows of a KV bucket as Arrow batches. The server fixes a
 /// RocksDB snapshot on the first request. Abandoning or failing a scan closes
 /// its session (or lets the server's TTL reclaim an in-flight open request).
@@ -49,6 +58,7 @@ pub struct KvBatchScanner {
     finished: bool,
     in_flight: bool,
     failed: bool,
+    stats: KvScanStats,
 }
 
 impl KvBatchScanner {
@@ -73,7 +83,13 @@ impl KvBatchScanner {
             finished: false,
             in_flight: false,
             failed: false,
+            stats: KvScanStats::default(),
         }
+    }
+
+    /// Cumulative counters for completed RPCs, including empty responses.
+    pub fn stats(&self) -> KvScanStats {
+        self.stats
     }
 
     /// Fetches one nonempty batch or the end of this bucket's snapshot. An
@@ -144,6 +160,10 @@ impl KvBatchScanner {
             self.in_flight = true;
             let response = connection.request(request).await?;
             check_response(&response)?;
+            self.stats.pages_received += 1;
+            if self.sequence == 0 && response.scanner_id.is_some() {
+                self.stats.sessions_opened += 1;
+            }
             let more = response.has_more_results.unwrap_or(false);
             if more {
                 self.scanner_id =
@@ -217,6 +237,11 @@ impl Drop for KvBatchScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::FlussConnection;
+    use crate::config::Config;
+    use crate::metadata::{DataTypes, Schema, TableDescriptor, TablePath};
+    use crate::row::GenericRow;
+    use std::time::Duration;
 
     #[test]
     fn expired_or_moved_session_fails_instead_of_mixing_snapshots() {
@@ -230,5 +255,84 @@ mod tests {
             assert!(matches!(error, Error::FlussAPIError { .. }));
             assert!(error.to_string().contains("session is no longer valid"));
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires native-sni and FLUSS_* credentials; run with --ignored"]
+    async fn server_closed_session_fails_without_restarting_snapshot()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let connection = FlussConnection::new(Config {
+            bootstrap_servers: std::env::var("FLUSS_BOOTSTRAP")?,
+            security_ssl_enabled: true,
+            security_ssl_ca_file: Some(std::env::var("FLUSS_CA_FILE")?),
+            security_protocol: "sasl".into(),
+            security_sasl_username: std::env::var("FLUSS_USER")?,
+            security_sasl_password: std::env::var("FLUSS_PASSWORD")?,
+            ..Config::default()
+        })
+        .await?;
+        let admin = connection.get_admin()?;
+        admin
+            .create_database("datafusion_tests", None, true)
+            .await?;
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let path = TablePath::new("datafusion_tests", format!("kv_loss_{suffix}"));
+        admin
+            .create_table(
+                &path,
+                &TableDescriptor::builder()
+                    .schema(
+                        Schema::builder()
+                            .column("id", DataTypes::int())
+                            .column("value", DataTypes::string())
+                            .primary_key(vec!["id"])?
+                            .build()?,
+                    )
+                    .distributed_by(Some(1), vec!["id".into()])
+                    .build()?,
+                false,
+            )
+            .await?;
+
+        let check: std::result::Result<(), Box<dyn std::error::Error>> = async {
+            let table = connection.get_table(&path).await?;
+            let writer = table.new_upsert()?.create_writer()?;
+            let payload = "x".repeat(350_000);
+            for id in 0..8 {
+                let mut row = GenericRow::new(2);
+                row.set_field(0, id);
+                row.set_field(1, format!("{id}-{payload}"));
+                writer.upsert(&row)?;
+            }
+            writer.flush().await?;
+            let bucket = TableBucket::new(table.get_table_info().table_id, 0);
+            let mut scanner = table.new_scan().create_kv_batch_scanner(bucket.clone())?;
+            let first = scanner.next_batch().await?.expect("first page");
+            assert!(first.num_rows() < 8);
+            let pages = scanner.stats().pages_received;
+            let id = scanner.scanner_id.clone().expect("server session is open");
+            let server = scanner.connection.as_ref().unwrap();
+            server.request(ScanKvRequest::new(Some(id), None, None, None, Some(true))).await?;
+            let error = scanner.next_batch().await.expect_err("the server removed the session");
+            assert!(matches!(error, Error::FlussAPIError { ref api_error } if api_error.code == FlussError::UnknownScannerId.code()));
+            assert_eq!(scanner.stats().pages_received, pages);
+            assert!(scanner.next_batch().await.is_err(), "must never restart silently");
+            drop(scanner);
+
+            let mut fresh = table.new_scan().create_kv_batch_scanner(bucket)?;
+            let mut count = 0;
+            while let Some(batch) = fresh.next_batch().await? {
+                count += batch.num_rows();
+            }
+            assert_eq!(count, 8);
+            Ok(())
+        }.await;
+        let cleanup = admin.drop_table(&path, true).await;
+        check?;
+        cleanup?;
+        connection.close(Duration::from_secs(5)).await?;
+        Ok(())
     }
 }

@@ -22,7 +22,7 @@ use fluss::predicate::Predicate;
 use fluss::record::ScanBatch;
 use fluss::rpc::message::OffsetSpec;
 
-use crate::metrics::{PartitionMetrics, ReaderLifetime};
+use crate::metrics::{PartitionMetrics, ReaderLifetime, ReportOnce};
 use crate::offsets::{Capture, OffsetCaptures, Offsets, SharedCaptures, validate_offsets};
 use crate::partitions::{self, PartitionFilter};
 
@@ -31,6 +31,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) struct PartitionedOffsets {
     discovered: usize,
     partitions: Vec<(i64, Offsets)>,
+    reported: ReportOnce,
 }
 
 /// Immutable inputs shared by the physical partitions of one planned scan.
@@ -292,14 +293,13 @@ impl ReadState {
         } else {
             None
         };
-        Ok(match partitions {
+        let ranges: Vec<BoundedLogReadRange> = match partitions {
             Some(snapshot) => {
-                if self.source.index == 0 {
-                    self.metrics.partitions_discovered.add(snapshot.discovered);
-                    self.metrics
-                        .partitions_selected
-                        .add(snapshot.partitions.len());
-                }
+                self.metrics.record_discovery(
+                    &snapshot.reported,
+                    snapshot.discovered,
+                    snapshot.partitions.len(),
+                );
                 snapshot
                     .partitions
                     .iter()
@@ -331,7 +331,9 @@ impl ReadState {
                     })
                     .collect()
             }
-        })
+        };
+        self.metrics.buckets_assigned.add(ranges.len());
+        Ok(ranges)
     }
 
     async fn capture_partitioned_offsets(&self) -> Result<PartitionedOffsets> {
@@ -366,6 +368,7 @@ impl ReadState {
         Ok(PartitionedOffsets {
             discovered,
             partitions: captured,
+            reported: ReportOnce::default(),
         })
     }
 

@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Log scanner configuration, runtime, fetch and bucket status.
-
 //! Public record and Arrow batch scanner operations.
 
-use super::*;
+use super::{
+    Arc, Duration, Error, HashMap, LogScanner, PartitionId, RecordBatchLogScanner, Result,
+    ScanBatch, ScanRecords, SchemaRef, TableBucket, TableId, TablePath, from_ref,
+};
 
 impl LogScanner {
     pub async fn poll(&self, timeout: Duration) -> Result<ScanRecords> {

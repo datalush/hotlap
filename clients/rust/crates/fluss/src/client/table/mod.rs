@@ -39,7 +39,7 @@ mod upsert;
 
 pub use append::{AppendWriter, TableAppend};
 pub use batch_scanner::LimitBatchScanner;
-pub use kv_scanner::KvBatchScanner;
+pub use kv_scanner::{KvBatchScanner, KvScanStats};
 pub use lookup::{LookupResult, Lookuper, PrefixKeyLookuper, TableLookup, TablePrefixLookup};
 pub use reader::{
     BoundedCollectOutcome, BoundedLogReadRange, RecordBatchLogReader, RecordBatchReadOutcome,

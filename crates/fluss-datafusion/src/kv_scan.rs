@@ -136,23 +136,25 @@ impl KvReadState {
                 self.next_bucket += 1;
             }
             let remaining = self.remaining()?;
+            let before = self.reader.as_ref().unwrap().stats();
             let batch = {
                 let _timer = self.metrics.read_time.timer();
                 let _opening = self
                     .first_page
                     .then(|| self.metrics.kv_first_page_time.timer());
-                tokio::time::timeout(remaining, self.reader.as_mut().unwrap().next_batch())
-                    .await
-                    .map_err(|_| expired())?
-                    .map_err(fluss_error)?
+                tokio::time::timeout(remaining, self.reader.as_mut().unwrap().next_batch()).await
             };
-            if self.first_page && batch.is_some() {
-                self.metrics.kv_sessions_opened.add(1);
-            }
+            let after = self.reader.as_ref().unwrap().stats();
+            self.metrics
+                .kv_sessions_opened
+                .add(after.sessions_opened - before.sessions_opened);
+            self.metrics
+                .kv_pages_received
+                .add(after.pages_received - before.pages_received);
+            let batch = batch.map_err(|_| expired())?.map_err(fluss_error)?;
             self.first_page = false;
             match batch {
                 Some(batch) => {
-                    self.metrics.kv_pages_received.add(1);
                     self.metrics.record_decoded_batch(&batch);
                     let output = if self
                         .partition
@@ -206,14 +208,11 @@ impl KvReadState {
         };
         self.buckets = Some(match partitions {
             Some(partitions) => {
-                if self.partition.index == 0 {
-                    self.metrics
-                        .partitions_discovered
-                        .add(partitions.discovered);
-                    self.metrics
-                        .partitions_selected
-                        .add(partitions.selected.len());
-                }
+                self.metrics.record_discovery(
+                    &partitions.reported,
+                    partitions.discovered,
+                    partitions.selected.len(),
+                );
                 partitions
                     .selected
                     .iter()
@@ -235,6 +234,9 @@ impl KvReadState {
                 .map(|&bucket| TableBucket::new(spec.table_id, bucket))
                 .collect(),
         });
+        self.metrics
+            .buckets_assigned
+            .add(self.buckets.as_ref().unwrap().len());
         Ok(())
     }
 

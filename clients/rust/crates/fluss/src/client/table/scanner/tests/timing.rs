@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use prost::Message;
 
 /// Exercises the `PollGuard` lifecycle across two consecutive
 /// `record_poll_start` calls. Asserts both poll-timing gauges are

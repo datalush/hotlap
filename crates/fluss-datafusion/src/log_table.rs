@@ -160,8 +160,13 @@ impl TableProvider for FlussLogTable {
                 .filter_map(|expr| filter::translate(expr, &self.schema)),
         );
         let description = format!(
-            "kind=log, table={}, projected_columns={:?}, batch_pruning={predicate:?}, partition_pruning={partition_filter:?}",
+            "kind=log, table={}, projection={}, projected_columns={:?}, batch_pruning={predicate:?}, partition_pruning={partition_filter:?}",
             self.path,
+            if projection.is_some_and(Vec::is_empty) {
+                "full_rows_for_count"
+            } else {
+                "server"
+            },
             schema
                 .fields()
                 .iter()

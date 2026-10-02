@@ -17,7 +17,26 @@
 
 //! Validate table/scan options and construct the appropriate scanner.
 
-use super::*;
+use super::{
+    Arc, ClientSchemaGetter, Error, FlussConnection, KvBatchScanner, LimitBatchScanner, LogFormat,
+    LogScanner, LogScannerInner, Metadata, PbPredicate, Predicate, RecordBatchLogScanner, Result,
+    SchemaInfo, TableBucket, TableInfo, TablePath, UnsupportedOperation, to_pb_predicate,
+};
+
+pub struct TableScan<'a> {
+    conn: &'a FlussConnection,
+    table_info: TableInfo,
+    metadata: Arc<Metadata>,
+    /// Column indices to project. None means all columns, Some(vec) means only the specified columns (non-empty).
+    projected_fields: Option<Vec<usize>>,
+    /// Whether to align evolved schemas back to the scanner creation schema.
+    fixed_schema: bool,
+    /// Optional row limit. When set, callers may construct a [`BatchScanner`] for a one-shot bounded scan.
+    limit: Option<i32>,
+    /// Filter pushed down to the server, encoded eagerly so that an unresolvable
+    /// column is reported by [`Self::filter`] rather than at scanner creation.
+    filter: Option<PbPredicate>,
+}
 
 impl<'a> TableScan<'a> {
     pub fn new(conn: &'a FlussConnection, table_info: TableInfo, metadata: Arc<Metadata>) -> Self {

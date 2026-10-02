@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Execution-time partition discovery and safe string-equality pruning.
 
+use crate::metrics::ReportOnce;
 use std::collections::HashSet;
 
 use arrow::datatypes::{DataType, Schema};
@@ -71,6 +72,7 @@ fn collect_equalities(
 pub(crate) struct PartitionSelection {
     pub(crate) discovered: usize,
     pub(crate) selected: Vec<PartitionInfo>,
+    pub(crate) reported: ReportOnce,
 }
 
 pub(crate) async fn discover(
@@ -100,6 +102,7 @@ pub(crate) async fn discover(
     Ok(PartitionSelection {
         discovered,
         selected: partitions,
+        reported: ReportOnce::default(),
     })
 }
 

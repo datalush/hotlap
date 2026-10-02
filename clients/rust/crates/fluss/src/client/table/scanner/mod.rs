@@ -18,7 +18,8 @@
 //! Log scanners: [`TableScan`] configures them, [`LogScanner`] reads records and
 //! [`RecordBatchLogScanner`] reads Arrow batches. Implementations live in
 //! `builder`, `api`/`runtime`, `requests`/`responses`/`records`/`batches`,
-//! `poll_timing`, and `status` so each read path can be followed independently.
+//! `subscriptions`/`polling`, `poll_timing`, and `status` so each read path can
+//! be followed independently.
 
 use crate::client::ClientSchemaGetter;
 use crate::client::connection::FlussConnection;
@@ -53,7 +54,6 @@ use crate::{PartitionId, TableId};
 use arrow_schema::SchemaRef;
 use log::{debug, warn};
 use parking_lot::{Mutex, RwLock};
-use prost::Message;
 use std::{
     collections::{HashMap, HashSet},
     slice::from_ref,
@@ -71,14 +71,17 @@ mod batches;
 mod builder;
 mod fetch;
 mod poll_timing;
+mod polling;
 mod records;
 mod requests;
 mod responses;
 mod runtime;
 mod status;
+mod subscriptions;
 #[cfg(test)]
 mod tests;
 
+pub use builder::TableScan;
 #[cfg(test)]
 use builder::{
     validate_limit_scan_fixed_schema, validate_scan_support, validate_scan_support_inner,
@@ -87,21 +90,6 @@ use builder::{
 use poll_timing::emit_last_poll_seconds_ago_once;
 use poll_timing::{PollGuard, PollState, spawn_last_poll_seconds_ago_ticker};
 use status::LogScannerStatus;
-
-pub struct TableScan<'a> {
-    conn: &'a FlussConnection,
-    table_info: TableInfo,
-    metadata: Arc<Metadata>,
-    /// Column indices to project. None means all columns, Some(vec) means only the specified columns (non-empty).
-    projected_fields: Option<Vec<usize>>,
-    /// Whether to align evolved schemas back to the scanner creation schema.
-    fixed_schema: bool,
-    /// Optional row limit. When set, callers may construct a [`BatchScanner`] for a one-shot bounded scan.
-    limit: Option<i32>,
-    /// Filter pushed down to the server, encoded eagerly so that an unresolvable
-    /// column is reported by [`Self::filter`] rather than at scanner creation.
-    filter: Option<PbPredicate>,
-}
 
 pub struct LogScanner {
     inner: Arc<LogScannerInner>,

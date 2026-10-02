@@ -17,13 +17,14 @@
 
 //! Resolve bucket leaders, build fetch requests and dispatch their RPCs.
 
-use super::*;
+use super::{
+    Arc, Error, FetchLogRequest, FetchResponseContext, FlussError, HashMap, HashSet, Instant,
+    LogFetcher, PbFetchLogReqForBucket, PbFetchLogReqForTable, Result, RpcError, TableBucket,
+    debug, message, warn,
+};
 
 impl LogFetcher {
-    pub(super) async fn check_and_update_metadata(
-        &self,
-        table_buckets: &[TableBucket],
-    ) -> Result<()> {
+    async fn check_and_update_metadata(&self, table_buckets: &[TableBucket]) -> Result<()> {
         let mut partition_ids = Vec::new();
         let mut need_update = false;
 
@@ -259,7 +260,7 @@ impl LogFetcher {
         }
     }
 
-    pub(super) fn fetchable_buckets(&self) -> Vec<TableBucket> {
+    fn fetchable_buckets(&self) -> Vec<TableBucket> {
         // Get buckets that are not already in the buffer
         let buffered = self.log_fetch_buffer.buffered_buckets();
         let buffered_set: HashSet<TableBucket> = buffered.into_iter().collect();
@@ -267,7 +268,7 @@ impl LogFetcher {
             .fetchable_buckets(|tb| !buffered_set.contains(tb))
     }
 
-    pub(super) fn get_table_bucket_leader(&self, tb: &TableBucket) -> Option<i32> {
+    fn get_table_bucket_leader(&self, tb: &TableBucket) -> Option<i32> {
         let cluster = self.metadata.get_cluster();
         cluster.leader_for(tb).map(|leader| leader.id())
     }

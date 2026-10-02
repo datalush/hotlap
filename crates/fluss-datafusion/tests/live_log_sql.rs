@@ -433,6 +433,8 @@ async fn check_kv_snapshot(connection: &Arc<FlussConnection>, path: &TablePath) 
         pages.push(batch);
     }
     assert!(pages.len() > 1);
+    assert_eq!(reader.stats().sessions_opened, 1);
+    assert_eq!(reader.stats().pages_received, pages.len());
     let mut ids = Vec::new();
     for page in pages {
         let keys = page
@@ -658,6 +660,7 @@ async fn check_partitioned_sql(
         let metrics = source.metrics().unwrap();
         assert_eq!(metric(&metrics, "fluss_partitions_discovered"), 2);
         assert_eq!(metric(&metrics, "fluss_partitions_selected"), 1);
+        assert_eq!(metric(&metrics, "fluss_buckets_assigned"), 2);
         if table == "pkv" {
             assert!(metric(&metrics, "kv_sessions_opened") > 0);
             assert!(metric(&metrics, "kv_pages_received") > 0);
@@ -668,6 +671,14 @@ async fn check_partitioned_sql(
         )
         .await?;
         assert!(explain.contains(kind), "missing scan kind in {explain}");
+        assert!(
+            explain.contains(if table == "pkv" {
+                "projection=decoder"
+            } else {
+                "projection=server"
+            }),
+            "missing projection location in {explain}"
+        );
         assert!(explain.contains("projected_columns"));
         assert!(explain.contains("fluss_partitions_selected"));
         if table == "pkv" {
@@ -675,8 +686,30 @@ async fn check_partitioned_sql(
         }
     }
 
-    // The physical plans are already registered, but new executions discover
-    // newly created partitions. Dropped partitions disappear on the next run.
+    // Reuse exactly the same physical sources, not just the same providers.
+    // Start partition 1 first: discovery metrics must not depend on stream 0.
+    let log_df = ctx.sql("SELECT * FROM plog").await?;
+    let log_source = source_plan(&log_df.create_physical_plan().await?);
+    let kv_df = ctx.sql("SELECT * FROM pkv").await?;
+    let kv_source = source_plan(&kv_df.create_physical_plan().await?);
+    let delayed_log = Arc::new(log_df.task_ctx());
+    let delayed_kv = Arc::new(kv_df.task_ctx());
+    let first_log = collect_stream(log_source.execute(1, Arc::clone(&delayed_log))?).await?;
+    let first_kv = collect_stream(kv_source.execute(1, Arc::clone(&delayed_kv))?).await?;
+    assert_eq!(
+        metric(
+            &log_source.metrics().unwrap(),
+            "fluss_partitions_discovered"
+        ),
+        2
+    );
+    assert_eq!(
+        metric(&kv_source.metrics().unwrap(), "fluss_partitions_discovered"),
+        2
+    );
+
+    // New partitions do not enter the still-running execution. A new
+    // execution of those same sources sees them, and later sees DDL removal.
     create_ready_partition(&admin, log, "west").await?;
     create_ready_partition(&admin, kv, "west").await?;
     let mut row = GenericRow::new(3);
@@ -687,6 +720,46 @@ async fn check_partitioned_sql(
     kv_writer.upsert(&row)?;
     log_writer.flush().await?;
     kv_writer.flush().await?;
+    let late_log = collect_stream(log_source.execute(0, delayed_log)?).await?;
+    let late_kv = collect_stream(kv_source.execute(0, delayed_kv)?).await?;
+    assert_eq!(
+        first_log
+            .iter()
+            .chain(&late_log)
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        4
+    );
+    assert_eq!(
+        first_kv
+            .iter()
+            .chain(&late_kv)
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        4
+    );
+    for source in [&log_source, &kv_source] {
+        let metrics = source.metrics().unwrap();
+        assert_eq!(metric(&metrics, "fluss_partitions_discovered"), 2);
+        assert_eq!(metric(&metrics, "fluss_partitions_selected"), 2);
+        assert_eq!(metric(&metrics, "fluss_buckets_assigned"), 4);
+    }
+    assert_eq!(
+        collect_plan(Arc::clone(&log_source), Arc::new(log_df.task_ctx()))
+            .await?
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        5
+    );
+    assert_eq!(
+        collect_plan(Arc::clone(&kv_source), Arc::new(kv_df.task_ctx()))
+            .await?
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        5
+    );
     for table in ["plog", "pkv"] {
         assert_eq!(
             count_sql(&ctx, &format!("SELECT COUNT(*) FROM {table}")).await?,
@@ -694,13 +767,108 @@ async fn check_partitioned_sql(
         );
     }
     let south = PartitionSpec::new([("region", "south")].into_iter().collect());
+    let old_log_id = partition_id(&admin, log, "south").await?;
+    let old_kv_id = partition_id(&admin, kv, "south").await?;
+    let log_query = ctx
+        .sql("SELECT id FROM plog WHERE region = 'south'")
+        .await?;
+    let log_old = source_plan(&log_query.create_physical_plan().await?);
+    let kv_query = ctx.sql("SELECT id FROM pkv WHERE region = 'south'").await?;
+    let kv_old = source_plan(&kv_query.create_physical_plan().await?);
+    let log_context = Arc::new(log_query.task_ctx());
+    let kv_context = Arc::new(kv_query.task_ctx());
+    collect_stream(log_old.execute(0, Arc::clone(&log_context))?).await?;
+    collect_stream(kv_old.execute(0, Arc::clone(&kv_context))?).await?;
     admin.drop_partition(log, &south, false).await?;
     admin.drop_partition(kv, &south, false).await?;
+    create_ready_partition(&admin, log, "south").await?;
+    create_ready_partition(&admin, kv, "south").await?;
+    assert_ne!(partition_id(&admin, log, "south").await?, old_log_id);
+    assert_ne!(partition_id(&admin, kv, "south").await?, old_kv_id);
+    let mut replacement = GenericRow::new(3);
+    replacement.set_field(0, 6_i32);
+    replacement.set_field(1, "south");
+    replacement.set_field(2, "replacement");
+    let new_log = connection
+        .get_table(log)
+        .await?
+        .new_append()?
+        .create_writer()?;
+    new_log.append(&replacement)?;
+    new_log.flush().await?;
+    let new_kv = connection
+        .get_table(kv)
+        .await?
+        .new_upsert()?
+        .create_writer()?;
+    new_kv.upsert(&replacement)?;
+    new_kv.flush().await?;
+    assert_no_recreated_rows(&log_old, log_context).await?;
+    assert_no_recreated_rows(&kv_old, kv_context).await?;
+    assert_eq!(
+        count_sql(&ctx, "SELECT COUNT(*) FROM plog WHERE id = 6").await?,
+        1
+    );
+    assert_eq!(
+        count_sql(&ctx, "SELECT COUNT(*) FROM pkv WHERE id = 6").await?,
+        1
+    );
+    admin.drop_partition(log, &south, false).await?;
+    admin.drop_partition(kv, &south, false).await?;
+    assert_eq!(
+        collect_plan(Arc::clone(&log_source), Arc::new(log_df.task_ctx()))
+            .await?
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        3
+    );
+    assert_eq!(
+        collect_plan(Arc::clone(&kv_source), Arc::new(kv_df.task_ctx()))
+            .await?
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        3
+    );
     for table in ["plog", "pkv"] {
         assert_eq!(
             count_sql(&ctx, &format!("SELECT COUNT(*) FROM {table}")).await?,
             3
         );
+    }
+    Ok(())
+}
+
+async fn partition_id(
+    admin: &fluss::client::FlussAdmin,
+    path: &TablePath,
+    name: &str,
+) -> TestResult<i64> {
+    Ok(admin
+        .list_partition_infos(path)
+        .await?
+        .into_iter()
+        .find(|info| info.get_partition_name() == name)
+        .expect("partition must exist")
+        .get_partition_id())
+}
+
+async fn assert_no_recreated_rows(
+    source: &Arc<dyn ExecutionPlan>,
+    ctx: Arc<datafusion::execution::TaskContext>,
+) -> TestResult<()> {
+    // A dropped, not-yet-open old partition may fail; it must never continue
+    // against the new partition ID under the same name.
+    if let Ok(rows) = collect_stream(source.execute(1, ctx)?).await {
+        for batch in rows {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
+            assert!(!(0..ids.len()).any(|index| ids.value(index) == 6));
+        }
     }
     Ok(())
 }

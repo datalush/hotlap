@@ -17,7 +17,10 @@
 
 //! Consume completed fetches as offset-bearing log records.
 
-use super::*;
+use super::{
+    ApiError, CompletedFetch, Error, FetchErrorAction, FetchResult, FlussError, HashMap,
+    LogFetcher, Result, ScanRecord, TableBucket, warn,
+};
 
 impl LogFetcher {
     /// Collect completed fetches from buffer

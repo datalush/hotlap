@@ -17,7 +17,13 @@
 
 //! Log fetcher construction, schema contexts and error classification.
 
-use super::*;
+use super::{
+    Arc, ClientSchemaGetter, Config, FetchErrorAction, FetchErrorContext, FetchErrorLogLevel,
+    FlussError, HashSet, LogFetchBuffer, LogFetcher, LogScannerStatus, Metadata, Mutex,
+    PbPredicate, ReadContext, ReadContextResolver, RemoteLogDownloader, Result, RowType, RpcClient,
+    ScannerMetrics, SchemaRef, SecurityTokenManager, TableBucket, TableInfo, TempDir,
+    to_arrow_schema,
+};
 
 impl LogFetcher {
     #[allow(clippy::too_many_arguments)]
@@ -119,7 +125,7 @@ impl LogFetcher {
         })
     }
 
-    pub(super) fn create_read_context(
+    fn create_read_context(
         full_arrow_schema: SchemaRef,
         row_type: Arc<RowType>,
         projected_fields: Option<Vec<usize>>,
