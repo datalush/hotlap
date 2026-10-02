@@ -9,6 +9,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -31,6 +32,7 @@ pub(crate) struct KvScanSpec {
     pub(crate) buckets: i32,
     pub(crate) partitioned: bool,
     pub(crate) partition_filter: PartitionFilter,
+    pub(crate) max_assigned_buckets: usize,
     pub(crate) partition_captures: Arc<SharedCaptures<PartitionSelection>>,
     pub(crate) timeout: Duration,
     pub(crate) metrics: ExecutionPlanMetricsSet,
@@ -49,6 +51,7 @@ impl KvScanSpec {
                     spec: Arc::clone(self),
                     bucket_ids: ids.clone(),
                     index,
+                    group_count: groups.len(),
                 }) as Arc<dyn PartitionStream>
             })
             .collect()
@@ -60,6 +63,7 @@ struct KvPartition {
     spec: Arc<KvScanSpec>,
     bucket_ids: Vec<i32>,
     index: usize,
+    group_count: usize,
 }
 
 impl fmt::Debug for KvPartition {
@@ -78,6 +82,8 @@ impl PartitionStream for KvPartition {
 
     fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
         let metrics = PartitionMetrics::new(&self.spec.metrics, self.index, &self.bucket_ids);
+        let reservation =
+            MemoryConsumer::new("FlussKvScan").register(&ctx.runtime_env().memory_pool);
         let state = KvReadState {
             partition: self.clone(),
             buckets: None,
@@ -92,6 +98,7 @@ impl PartitionStream for KvPartition {
             _context: ctx,
             _lifetime: ReaderLifetime::new(metrics.active_streams.clone()),
             metrics,
+            reservation,
         };
         let schema = Arc::clone(&self.spec.schema);
         let stream = futures::stream::try_unfold(state, |mut state| async move {
@@ -106,7 +113,7 @@ impl PartitionStream for KvPartition {
 
 struct KvReadState {
     partition: KvPartition,
-    buckets: Option<Vec<TableBucket>>,
+    buckets: Option<Vec<(TableBucket, i32)>>,
     partition_capture: Option<Capture<PartitionSelection>>,
     next_bucket: usize,
     reader: Option<KvBatchScanner>,
@@ -115,10 +122,12 @@ struct KvReadState {
     _context: Arc<TaskContext>,
     _lifetime: ReaderLifetime,
     metrics: PartitionMetrics,
+    reservation: MemoryReservation,
 }
 
 impl KvReadState {
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        self.reservation.free();
         self.ensure_buckets().await?;
         loop {
             if self.reader.is_none() {
@@ -126,9 +135,9 @@ impl KvReadState {
                 if self.next_bucket == buckets.len() {
                     return Ok(None);
                 }
-                let bucket = buckets[self.next_bucket].clone();
+                let (bucket, count) = buckets[self.next_bucket].clone();
                 let remaining = self.remaining()?;
-                let reader = tokio::time::timeout(remaining, self.open_bucket(bucket))
+                let reader = tokio::time::timeout(remaining, self.open_bucket(bucket, count))
                     .await
                     .map_err(|_| expired())??;
                 self.reader = Some(reader);
@@ -155,6 +164,7 @@ impl KvReadState {
             self.first_page = false;
             match batch {
                 Some(batch) => {
+                    self.reservation.try_resize(batch.get_array_memory_size())?;
                     self.metrics.record_decoded_batch(&batch);
                     let output = if self
                         .partition
@@ -180,6 +190,8 @@ impl KvReadState {
             return Ok(());
         }
         let spec = &self.partition.spec;
+        let group_count = self.partition.group_count;
+        let group_index = self.partition.index;
         let partitions = if let Some(capture) = &self.partition_capture {
             let selected = tokio::time::timeout(
                 self.remaining()?,
@@ -187,8 +199,8 @@ impl KvReadState {
                     partitions::discover(
                         &spec.connection,
                         &spec.path,
-                        spec.buckets,
                         &spec.partition_filter,
+                        spec.max_assigned_buckets,
                     )
                     .await
                     .map(Arc::new)
@@ -217,13 +229,21 @@ impl KvReadState {
                     .selected
                     .iter()
                     .flat_map(|partition| {
-                        self.partition.bucket_ids.iter().map(move |&bucket| {
-                            TableBucket::new_with_partition(
-                                spec.table_id,
-                                Some(partition.get_partition_id()),
-                                bucket,
-                            )
-                        })
+                        let count = partition
+                            .get_bucket_count()
+                            .expect("partition layout validated");
+                        (0..count)
+                            .filter(move |&bucket| bucket as usize % group_count == group_index)
+                            .map(move |bucket| {
+                                (
+                                    TableBucket::new_with_partition(
+                                        spec.table_id,
+                                        Some(partition.get_partition_id()),
+                                        bucket,
+                                    ),
+                                    count,
+                                )
+                            })
                     })
                     .collect()
             }
@@ -231,7 +251,7 @@ impl KvReadState {
                 .partition
                 .bucket_ids
                 .iter()
-                .map(|&bucket| TableBucket::new(spec.table_id, bucket))
+                .map(|&bucket| (TableBucket::new(spec.table_id, bucket), spec.buckets))
                 .collect(),
         });
         self.metrics
@@ -240,7 +260,7 @@ impl KvReadState {
         Ok(())
     }
 
-    async fn open_bucket(&self, bucket: TableBucket) -> Result<KvBatchScanner> {
+    async fn open_bucket(&self, bucket: TableBucket, count: i32) -> Result<KvBatchScanner> {
         let spec = &self.partition.spec;
         let table = spec
             .connection
@@ -249,7 +269,7 @@ impl KvReadState {
             .map_err(fluss_error)?;
         let info = table.get_table_info();
         if info.table_id != spec.table_id
-            || info.get_num_buckets() != spec.buckets
+            || (!spec.partitioned && info.get_num_buckets() != spec.buckets)
             || !info.has_primary_key()
             || info.is_partitioned() != spec.partitioned
             || to_arrow_schema(info.get_row_type())
@@ -266,7 +286,8 @@ impl KvReadState {
             Some(indices) if !indices.is_empty() => scan.project(indices).map_err(fluss_error)?,
             _ => scan,
         };
-        scan.create_kv_batch_scanner(bucket).map_err(fluss_error)
+        scan.create_kv_batch_scanner_with_bucket_count(bucket, count)
+            .map_err(fluss_error)
     }
 
     fn remaining(&self) -> Result<Duration> {

@@ -18,8 +18,8 @@ use fluss::metadata::TablePath;
 
 use crate::execution::FlussScanExec;
 use crate::filter;
-use crate::offsets::{OffsetCaptures, SharedCaptures};
-use crate::partitions::PartitionFilter;
+use crate::offsets::{OffsetWindow, SharedCaptures};
+use crate::partitions::{DEFAULT_MAX_ASSIGNED_BUCKETS, PartitionFilter};
 use crate::scan::{PartitionedOffsets, ScanSpec};
 
 /// Append-only log table with bounded, parallel physical scan partitions.
@@ -33,6 +33,7 @@ pub struct FlussLogTable {
     partition_keys: Vec<String>,
     timeout: Duration,
     max_partitions: Option<usize>,
+    max_assigned_buckets: usize,
 }
 
 impl FlussLogTable {
@@ -77,6 +78,7 @@ impl FlussLogTable {
             partition_keys,
             timeout,
             max_partitions: None,
+            max_assigned_buckets: DEFAULT_MAX_ASSIGNED_BUCKETS,
         })
     }
 
@@ -88,6 +90,17 @@ impl FlussLogTable {
             ));
         }
         self.max_partitions = Some(max_partitions);
+        Ok(self)
+    }
+
+    /// Fail rather than planning an unbounded number of partition/bucket pairs.
+    pub fn with_max_assigned_buckets(mut self, limit: usize) -> Result<Self> {
+        if limit == 0 {
+            return Err(DataFusionError::Plan(
+                "Fluss max assigned buckets must be positive".into(),
+            ));
+        }
+        self.max_assigned_buckets = limit;
         Ok(self)
     }
 
@@ -144,6 +157,11 @@ impl TableProvider for FlussLogTable {
         // Fluss prunes whole batches; DataFusion retains exact filters and
         // global limits. Do not push a SQL limit into each bucket.
         let schema = self.projected_schema(projection)?;
+        if !self.partitioned && self.buckets as usize > self.max_assigned_buckets {
+            return Err(DataFusionError::Plan(
+                "Fluss table exceeds max_assigned_buckets".into(),
+            ));
+        }
         let groups = bucket_groups(self.buckets, self.parallelism(state));
         let metrics = ExecutionPlanMetricsSet::new();
         let mut partition_filter = PartitionFilter::default();
@@ -184,9 +202,10 @@ impl TableProvider for FlussLogTable {
             buckets: self.buckets,
             partitioned: self.partitioned,
             partition_filter,
+            max_assigned_buckets: self.max_assigned_buckets,
             partition_captures: Arc::new(SharedCaptures::<PartitionedOffsets>::default()),
             timeout: self.timeout,
-            captures: Arc::new(OffsetCaptures::default()),
+            captures: Arc::new(SharedCaptures::<OffsetWindow>::default()),
             metrics: metrics.clone(),
         });
         let inner =

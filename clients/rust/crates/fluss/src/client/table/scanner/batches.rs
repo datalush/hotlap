@@ -30,26 +30,29 @@ impl LogFetcher {
         let mut batches_remaining = MAX_BATCHES;
         let mut bytes_consumed: usize = 0;
 
-        let collect_result: Result<()> = {
+        {
             while batches_remaining > 0 && bytes_consumed < MAX_BYTES {
                 let next_in_line = self.log_fetch_buffer.next_in_line_fetch();
 
                 match next_in_line {
                     Some(mut next_fetch) if !next_fetch.is_consumed() => {
+                        let raw_bytes = next_fetch.size_in_bytes();
                         let fetch_result =
                             self.fetch_batches_from_fetch(&mut next_fetch, batches_remaining)?;
                         match fetch_result {
                             FetchResult::Data(scan_batches) => {
                                 let batch_count = scan_batches.len();
 
-                                if !scan_batches.is_empty() {
-                                    // Track bytes consumed (soft cap - may exceed by one fetch)
-                                    let batch_bytes: usize = scan_batches
-                                        .iter()
-                                        .map(|sb| sb.batch().get_array_memory_size())
-                                        .sum();
-                                    bytes_consumed += batch_bytes;
+                                // Bound this poll by both raw fetch size and decoded
+                                // Arrow size. The last fetch may exceed the soft cap.
+                                let batch_bytes: usize = scan_batches
+                                    .iter()
+                                    .map(|sb| sb.batch().get_array_memory_size())
+                                    .sum();
+                                bytes_consumed =
+                                    bytes_consumed.saturating_add(raw_bytes.max(batch_bytes));
 
+                                if !scan_batches.is_empty() {
                                     result.extend(scan_batches);
                                     batches_remaining =
                                         batches_remaining.saturating_sub(batch_count);
@@ -79,18 +82,12 @@ impl LogFetcher {
                     _ => {
                         if let Some(completed_fetch) = self.log_fetch_buffer.poll() {
                             if !completed_fetch.is_initialized() {
-                                let size_in_bytes = completed_fetch.size_in_bytes();
                                 match self.initialize_fetch(completed_fetch) {
                                     Ok(initialized) => {
                                         self.log_fetch_buffer.set_next_in_line_fetch(initialized);
                                         continue;
                                     }
-                                    Err(e) => {
-                                        if result.is_empty() && size_in_bytes == 0 {
-                                            continue;
-                                        }
-                                        return Err(e);
-                                    }
+                                    Err(e) => return Err(e),
                                 }
                             } else {
                                 self.log_fetch_buffer
@@ -102,19 +99,8 @@ impl LogFetcher {
                     }
                 }
             }
-            Ok(())
-        };
-
-        match collect_result {
-            Ok(()) => Ok(result),
-            Err(e) => {
-                if result.is_empty() {
-                    Err(e)
-                } else {
-                    Ok(result)
-                }
-            }
         }
+        Ok(result)
     }
 
     fn fetch_batches_from_fetch(

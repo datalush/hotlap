@@ -9,9 +9,10 @@ Python binding. No second Fluss protocol implementation is planned.
 clients/
   java/                    Fluss Maven reactor (build with ./mvnw -pl fluss-client -am)
   rust/                    Fluss Rust workspace and bindings/python
-crates/fluss-datafusion/    Bounded DataFusion source for append-only log tables
+crates/fluss-datafusion/    Bounded DataFusion sources for logs and KV tables
 python/fluss_connectors/   Small DuckDB/Polars/pandas adapters for Arrow results
 docs/reading-semantics.md  Contracts to satisfy before claiming full scans
+docs/production-readiness.md  Verified guarantees, limits, and checks
 ```
 
 The Java and Rust trees are source copies of the `fluss-clients` checkout at
@@ -64,8 +65,8 @@ explicitly. `FlussCatalog::load` discovers database/table names once and
 selects the appropriate provider, allowing SQL such as
 `fluss.lab_spark.demo_log` or a KV table (reload the catalog after DDL).
 
-For **logs**, execution captures each bucket's latest offset once, streams
-Arrow batches from the earliest **retained** offsets until those stopping
+For **logs**, execution captures each bucket's earliest retained and latest
+offsets once, streams Arrow batches from those starting offsets until their stopping
 offsets, and errors on timeout rather than claiming a partial result is
 complete. DataFusion's required non-empty projection is pushed to Fluss;
 `COUNT(*)` still fetches rows because Fluss cannot scan zero columns. Simple
@@ -92,9 +93,12 @@ physical scan partitions. Safe `region = 'north'`-style string equalities on
 partition keys prune partitions. `AND` may contribute a supported conjunct;
 `OR` never prunes. Filters remain exact in DataFusion. New partitions created
 after discovery are visible on the next execution, and removed partitions may
-cause an in-progress scan to fail. A partition whose bucket count differs from
-the table's (per-partition rescale) fails explicitly instead of silently
-omitting buckets.
+cause an in-progress scan to fail. After a partitioned-table bucket rescale,
+old and new partitions are each scanned using their own reported bucket count;
+the table default is not used for old partitions. Missing or invalid
+per-partition counts cause an error instead of an incomplete result. The
+integration test rescales the table default from two to three buckets and
+verifies SQL over both layouts, including rows stored in the new third bucket.
 
 To see actual pruning, enable batch statistics **when creating the log table**
 with `table.statistics.columns: id` (or `*`). Existing batches written without
@@ -116,6 +120,11 @@ KV state after upserts and deletions, pagination, and catalog dispatch):
 ```bash
 uv run --env-file ../lab/.env cargo test -p fluss-datafusion --test live_log_sql -- --ignored
 ```
+
+The native table providers currently use **DataFusion Rust 55.1**. Registering
+them in the upstream `datafusion` Python `SessionContext` requires a matching
+major version through `datafusion-ffi`; the published Python wheel is 54.0,
+so this repository does not advertise an incompatible Python provider.
 
 The sources use `min(buckets, DataFusion target_partitions)`, optionally capped
 with `FlussLogTable::with_max_partitions(n)` or

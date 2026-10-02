@@ -204,6 +204,60 @@ async fn handle_fetch_response_advances_past_a_fully_filtered_range() -> Result<
 }
 
 #[tokio::test]
+async fn batch_scan_fails_when_retention_removed_its_next_offset() -> Result<()> {
+    let table_path = TablePath::new("db", "tbl");
+    let table_info = build_table_info(table_path.clone(), 1, 1);
+    let cluster = build_cluster_arc(&table_path, 1, 1);
+    let metadata = Arc::new(Metadata::new_for_test(cluster));
+    let status = Arc::new(LogScannerStatus::new());
+    status.assign_scan_bucket(TableBucket::new(1, 0), 2);
+    let fetcher = filtering_fetcher(&table_info, &metadata, status, None)?;
+
+    let mut response = filtered_response(None, None);
+    response.tables_resp[0].buckets_resp[0].error_code =
+        Some(FlussError::LogOffsetOutOfRangeException.code());
+    response.tables_resp[0].buckets_resp[0].error_message =
+        Some("requested offset was deleted by retention".into());
+    LogFetcher::handle_fetch_response(response, test_response_context(&fetcher, &metadata)).await;
+    let error = fetcher
+        .collect_batches()
+        .await
+        .expect_err("a lost offset must fail the scan");
+    assert!(error.to_string().contains("out of range"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_scan_does_not_hide_retention_error_after_decoding_other_bucket() -> Result<()> {
+    let table_path = TablePath::new("db", "tbl");
+    let table_info = build_table_info(table_path.clone(), 1, 2);
+    let metadata = Arc::new(Metadata::new_for_test(build_cluster_arc(&table_path, 1, 2)));
+    let status = Arc::new(LogScannerStatus::new());
+    status.assign_scan_bucket(TableBucket::new(1, 0), 0);
+    status.assign_scan_bucket(TableBucket::new(1, 1), 0);
+    let fetcher = filtering_fetcher(&table_info, &metadata, status, None)?;
+
+    let mut data = filtered_response(None, Some(1));
+    data.tables_resp[0].buckets_resp[0].records =
+        Some(build_records(&table_info, Arc::new(table_path))?);
+    LogFetcher::handle_fetch_response(data, test_response_context(&fetcher, &metadata)).await;
+
+    let mut lost = filtered_response(None, None);
+    let response = &mut lost.tables_resp[0].buckets_resp[0];
+    response.bucket_id = 1;
+    response.error_code = Some(FlussError::LogOffsetOutOfRangeException.code());
+    response.error_message = Some("retention passed this bucket".into());
+    LogFetcher::handle_fetch_response(lost, test_response_context(&fetcher, &metadata)).await;
+
+    let error = fetcher
+        .collect_batches()
+        .await
+        .expect_err("decoded rows cannot hide a later missing range");
+    assert!(error.to_string().contains("out of range"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn handle_fetch_response_ignores_a_filtered_range_behind_the_fetch_offset() -> Result<()> {
     let table_path = TablePath::new("db".to_string(), "tbl".to_string());
     let table_info = build_table_info(table_path.clone(), 1, 1);

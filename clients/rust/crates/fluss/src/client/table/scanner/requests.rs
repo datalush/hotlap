@@ -207,7 +207,9 @@ impl LogFetcher {
                             bucket_id: bucket.bucket_id(),
                             fetch_offset: offset,
                             max_fetch_bytes: self.fetch_max_bytes_for_bucket,
-                            routing_bucket_count: None,
+                            routing_bucket_count: bucket.partition_id().and_then(|id| {
+                                self.partition_bucket_counts.read().get(&id).copied()
+                            }),
                         };
 
                         fetch_log_req_for_buckets

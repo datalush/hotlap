@@ -57,6 +57,17 @@ impl PrefixLookupRequest {
             inner_request: request,
         }
     }
+
+    pub fn with_bucket_counts(
+        mut self,
+        counts: &std::collections::HashMap<PartitionId, i32>,
+    ) -> Self {
+        for bucket in &mut self.inner_request.buckets_req {
+            bucket.routing_bucket_count =
+                bucket.partition_id.and_then(|id| counts.get(&id).copied());
+        }
+        self
+    }
 }
 
 impl RequestBody for PrefixLookupRequest {

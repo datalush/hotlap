@@ -21,7 +21,7 @@ use crate::execution::FlussScanExec;
 use crate::kv_scan::KvScanSpec;
 use crate::log_table::bucket_groups;
 use crate::offsets::SharedCaptures;
-use crate::partitions::PartitionFilter;
+use crate::partitions::{DEFAULT_MAX_ASSIGNED_BUCKETS, PartitionFilter};
 
 /// Each execution opens a fresh snapshot per bucket. There is no global
 /// cross-bucket transaction or shared snapshot across repeated SQL queries.
@@ -35,6 +35,7 @@ pub struct FlussKvTable {
     partition_keys: Vec<String>,
     timeout: Duration,
     max_partitions: Option<usize>,
+    max_assigned_buckets: usize,
 }
 
 impl FlussKvTable {
@@ -75,6 +76,7 @@ impl FlussKvTable {
             partition_keys,
             timeout,
             max_partitions: None,
+            max_assigned_buckets: DEFAULT_MAX_ASSIGNED_BUCKETS,
         })
     }
 
@@ -86,6 +88,17 @@ impl FlussKvTable {
             ));
         }
         self.max_partitions = Some(max_partitions);
+        Ok(self)
+    }
+
+    /// Fail rather than planning an unbounded number of partition/bucket pairs.
+    pub fn with_max_assigned_buckets(mut self, limit: usize) -> Result<Self> {
+        if limit == 0 {
+            return Err(DataFusionError::Plan(
+                "Fluss max assigned buckets must be positive".into(),
+            ));
+        }
+        self.max_assigned_buckets = limit;
         Ok(self)
     }
 }
@@ -132,6 +145,11 @@ impl TableProvider for FlussKvTable {
             Some(indices) => Arc::new(self.schema.project(indices)?),
             None => Arc::clone(&self.schema),
         };
+        if !self.partitioned && self.buckets as usize > self.max_assigned_buckets {
+            return Err(DataFusionError::Plan(
+                "Fluss table exceeds max_assigned_buckets".into(),
+            ));
+        }
         let target = state.config_options().execution.target_partitions.max(1);
         let parallelism = self.max_partitions.map_or(target, |max| target.min(max));
         let groups = bucket_groups(self.buckets, parallelism);
@@ -168,6 +186,7 @@ impl TableProvider for FlussKvTable {
             buckets: self.buckets,
             partitioned: self.partitioned,
             partition_filter,
+            max_assigned_buckets: self.max_assigned_buckets,
             partition_captures: Arc::new(SharedCaptures::default()),
             timeout: self.timeout,
             metrics: metrics.clone(),

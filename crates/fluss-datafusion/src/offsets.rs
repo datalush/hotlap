@@ -10,7 +10,39 @@ use tokio::sync::OnceCell;
 
 pub(super) type Offsets = Arc<HashMap<i32, i64>>;
 pub(super) type Capture<T = HashMap<i32, i64>> = Arc<OnceCell<Result<Arc<T>, String>>>;
+#[cfg(test)]
 pub(super) type OffsetCaptures = SharedCaptures<HashMap<i32, i64>>;
+
+pub(super) struct OffsetWindow {
+    pub(super) earliest: Offsets,
+    pub(super) latest: Offsets,
+}
+
+pub(super) fn validate_window(
+    earliest: Offsets,
+    latest: Offsets,
+) -> DataFusionResult<OffsetWindow> {
+    for (&bucket, &start) in earliest.iter() {
+        let stop = latest.get(&bucket).copied().ok_or_else(|| {
+            DataFusionError::Execution(format!("Missing latest offset for Fluss bucket {bucket}"))
+        })?;
+        if start > stop {
+            return Err(DataFusionError::Execution(format!(
+                "Invalid retained range for Fluss bucket {bucket}: earliest {start} exceeds latest {stop}"
+            )));
+        }
+    }
+    Ok(OffsetWindow { earliest, latest })
+}
+
+pub(super) fn ensure_retained(captured: i64, current: i64, bucket: i32) -> DataFusionResult<()> {
+    if current > captured {
+        return Err(DataFusionError::Execution(format!(
+            "Fluss bucket {bucket} lost retained log offsets needed by this scan: captured start {captured}, current earliest {current}"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 pub(super) struct SharedCaptures<T> {
@@ -180,6 +212,20 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn retention_must_not_advance_past_a_captured_start() {
+        assert!(ensure_retained(5, 5, 0).is_ok());
+        assert!(ensure_retained(5, 4, 0).is_ok());
+        assert!(ensure_retained(5, 6, 0).is_err());
+        assert!(
+            validate_window(
+                Arc::new(HashMap::from([(0, 6)])),
+                Arc::new(HashMap::from([(0, 5)])),
+            )
+            .is_err()
         );
     }
 }

@@ -19,9 +19,9 @@
 
 use super::{
     Arc, ClientSchemaGetter, Config, FetchErrorAction, FetchErrorContext, FetchErrorLogLevel,
-    FlussError, HashSet, LogFetchBuffer, LogFetcher, LogScannerStatus, Metadata, Mutex,
+    FlussError, HashMap, HashSet, LogFetchBuffer, LogFetcher, LogScannerStatus, Metadata, Mutex,
     PbPredicate, ReadContext, ReadContextResolver, RemoteLogDownloader, Result, RowType, RpcClient,
-    ScannerMetrics, SchemaRef, SecurityTokenManager, TableBucket, TableInfo, TempDir,
+    RwLock, ScannerMetrics, SchemaRef, SecurityTokenManager, TableBucket, TableInfo, TempDir,
     to_arrow_schema,
 };
 
@@ -117,6 +117,7 @@ impl LogFetcher {
             nodes_with_pending_fetch_requests: Arc::new(Mutex::new(HashSet::new())),
             metrics,
             filter: filter.map(|predicate| (predicate, table_info.get_schema_id())),
+            partition_bucket_counts: RwLock::new(HashMap::new()),
             max_poll_records: config.scanner_log_max_poll_records,
             fetch_max_bytes: config.scanner_log_fetch_max_bytes,
             fetch_min_bytes: config.scanner_log_fetch_min_bytes,

@@ -23,7 +23,8 @@ snapshot** during concurrent writes, nor a snapshot retained across queries.
 Both partitioned and non-partitioned KV tables are supported. No row filter or global SQL limit is
 pushed into `ScanKv`; DataFusion evaluates them exactly. Non-empty projections
 are applied by the Arrow decoder after reading value records, and `COUNT(*)`
-still decodes full rows. A changed schema or bucket layout requires replanning.
+still decodes full rows. Schema changes and non-partitioned topology changes
+require replanning; partitioned layouts are rediscovered on each execution.
 
 The append-only log source relies on the client's bounded offset reader. Its predicate
 pushdown only prunes batches, so filters must still be evaluated exactly
@@ -34,13 +35,18 @@ needs `table.statistics.columns` set before writing for those batches to
 carry useful pruning statistics. Keep projection, limits, and partitions
 honest about these semantics.
 
-The log provider supports append-only logs, including partitioned tables. Both providers
-use the minimum of Fluss buckets,
-DataFusion's target parallelism and an optional positive connector cap;
-each reads a group of buckets. They share one offset capture per execution.
-Each bucket starts at its earliest
-**retained** offset; reusing the physical source plan with a new TaskContext
-captures new offsets. The bounded read
+The log provider supports append-only logs, including partitioned tables. Both
+providers set their physical stream count using the table's bucket count at
+planning time, DataFusion's target parallelism and an optional positive
+connector cap. At execution time, every selected partition's actual buckets
+are assigned across those streams, even when its count differs from the
+table default. Log streams share one offset capture per execution.
+Each bucket starts at its earliest **retained** offset captured alongside its
+latest offset; reusing the physical source plan with a new TaskContext
+captures new offsets. Before subscribing, the source checks that retention has
+not advanced past that start. If it has, the query fails rather than silently
+starting from newer data. A server out-of-range response during an ongoing
+scan also fails the query. The bounded read
 finishes or fails with an explicit error on timeout. Offsets are collected
 per bucket, not as a transactional cross-bucket snapshot. Non-empty SQL
 projections are requested from the Fluss scanner; zero-column `COUNT(*)`
@@ -71,10 +77,12 @@ execution. If a partition is dropped in flight, an already-open session may
 complete, or its pending scan can fail; never assume atomic DDL/read isolation.
 For `Utf8` partition keys, simple equality to a string literal (including
 conjuncts under `AND`) can prune partitions; `OR`, casts, and other conditions
-are evaluated exactly by DataFusion without partition pruning. The table
-bucket count must match each discovered partition's own bucket count: if
-Fluss has rescaled a partition independently, this reader errors rather than
-omitting its extra buckets. Each query has a finite timeout.
+are evaluated exactly by DataFusion without partition pruning. Each selected
+partition supplies its own bucket count to range validation, routing, and
+the physical-stream assignment. Changing the table default does not rewrite
+old partitions; the existing physical plan can rediscover the new layout on
+its next execution. Missing or invalid partition bucket counts fail the scan
+instead of silently omitting buckets. Each query has a finite timeout.
 
 `EXPLAIN ANALYZE` identifies log versus KV scans, table and projected
 columns, optional log batch predicate and partition pruning. Partition
@@ -87,6 +95,14 @@ Arrow output batches. First-page latency includes request and decoding.
 Projection is identified as `server` for logs, `decoder` for KV, or
 `full_rows_for_count` for a zero-column scan. These are not network-byte or
 server-only snapshot-opening measurements.
+
+Each source holds its most recently decoded Arrow batch against the shared
+DataFusion `MemoryPool` until the next pull or stream drop. When the configured
+pool cannot reserve that batch, the query fails rather than returning a partial
+result. This reservation does **not** account for Fluss fetch buffers, remote
+prefetch or batches retained by downstream operators: size the client fetch
+settings and DataFusion target parallelism accordingly. With the default
+unbounded DataFusion pool, it is accounting rather than a memory limit.
 
 The read-only catalog discovers names once; reload it after creating tables.
 It selects the log or KV provider from the table's primary-key metadata.

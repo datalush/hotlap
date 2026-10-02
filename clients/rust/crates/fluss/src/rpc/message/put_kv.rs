@@ -38,6 +38,7 @@ impl PutKvRequest {
         max_request_timeout_ms: i32,
         target_columns: Vec<i32>,
         ready_batches: &mut [ReadyWriteBatch],
+        routing_bucket_counts: &std::collections::HashMap<crate::PartitionId, i32>,
     ) -> crate::error::Result<Self> {
         let mut request = proto::PutKvRequest {
             table_id,
@@ -52,7 +53,10 @@ impl PutKvRequest {
                 bucket_id: ready_batch.table_bucket.bucket_id(),
                 records: ready_batch.write_batch.build()?,
                 original_partition_name: None,
-                routing_bucket_count: None,
+                routing_bucket_count: ready_batch
+                    .table_bucket
+                    .partition_id()
+                    .and_then(|id| routing_bucket_counts.get(&id).copied()),
             })
         }
 

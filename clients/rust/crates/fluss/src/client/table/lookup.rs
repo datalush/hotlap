@@ -412,9 +412,14 @@ impl Lookuper {
             None
         };
 
-        let bucket_id = self
-            .bucketing_function
-            .bucketing(&bk_bytes, self.num_buckets)?;
+        let count = match partition_id {
+            Some(id) => self
+                .metadata
+                .get_cluster()
+                .routing_bucket_count(self.table_info.table_id, id)?,
+            None => self.num_buckets,
+        };
+        let bucket_id = self.bucketing_function.bucketing(&bk_bytes, count)?;
 
         let table_id = self.table_info.get_table_id();
         let table_bucket = TableBucket::new_with_partition(table_id, partition_id, bucket_id);
@@ -649,9 +654,14 @@ impl PrefixKeyLookuper {
             None
         };
 
-        let bucket_id = self
-            .bucketing_function
-            .bucketing(&bk_bytes, self.num_buckets)?;
+        let count = match partition_id {
+            Some(id) => self
+                .metadata
+                .get_cluster()
+                .routing_bucket_count(self.table_info.table_id, id)?,
+            None => self.num_buckets,
+        };
+        let bucket_id = self.bucketing_function.bucketing(&bk_bytes, count)?;
 
         let table_id = self.table_info.get_table_id();
         let table_bucket = TableBucket::new_with_partition(table_id, partition_id, bucket_id);

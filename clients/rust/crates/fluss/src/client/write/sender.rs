@@ -20,6 +20,7 @@ use crate::client::metadata::Metadata;
 use crate::client::write::IdempotenceManager;
 use crate::client::write::batch::WriteBatch;
 use crate::client::{ReadyWriteBatch, RecordAccumulator};
+use crate::cluster::Cluster;
 use crate::error::Error::UnexpectedError;
 use crate::error::{FlussError, Result};
 use crate::metadata::{PhysicalTablePath, TableBucket, TablePath};
@@ -369,11 +370,13 @@ impl Sender {
                 continue;
             }
 
+            let cluster = self.metadata.get_cluster();
             let write_request = match Self::build_write_request(
                 table_id,
                 acks,
                 self.max_request_timeout_ms,
                 &mut request_batches,
+                &cluster,
             ) {
                 Ok(req) => req,
                 Err(e) => {
@@ -421,12 +424,27 @@ impl Sender {
         acks: i16,
         timeout_ms: i32,
         request_batches: &mut [ReadyWriteBatch],
+        cluster: &Cluster,
     ) -> Result<WriteRequest> {
+        let mut routing_counts = HashMap::new();
+        for batch in request_batches.iter() {
+            if let Some(id) = batch.table_bucket.partition_id() {
+                routing_counts
+                    .entry(id)
+                    .or_insert(cluster.routing_bucket_count(table_id, id)?);
+            }
+        }
         let first_batch = &request_batches.first().unwrap().write_batch;
 
         let request = match first_batch {
             WriteBatch::ArrowLog(_) => {
-                let req = ProduceLogRequest::new(table_id, acks, timeout_ms, request_batches)?;
+                let req = ProduceLogRequest::new(
+                    table_id,
+                    acks,
+                    timeout_ms,
+                    request_batches,
+                    &routing_counts,
+                )?;
                 WriteRequest::ProduceLog(req)
             }
             WriteBatch::Kv(kv_write_batch) => {
@@ -457,7 +475,14 @@ impl Sender {
                 let cols = target_columns
                     .map(|arc| arc.iter().map(|&c| c as i32).collect())
                     .unwrap_or_default();
-                let req = PutKvRequest::new(table_id, acks, timeout_ms, cols, request_batches)?;
+                let req = PutKvRequest::new(
+                    table_id,
+                    acks,
+                    timeout_ms,
+                    cols,
+                    request_batches,
+                    &routing_counts,
+                )?;
                 WriteRequest::PutKv(req)
             }
         };

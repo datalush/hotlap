@@ -1167,6 +1167,8 @@ pub struct TableInfo {
     pub bucket_keys: Vec<String>,
     pub partition_keys: Arc<[String]>,
     pub num_buckets: i32,
+    /// Incremented when the table default is rescaled; absent on old servers.
+    pub bucket_count_epoch: i64,
     pub properties: HashMap<String, String>,
     pub table_config: TableConfig,
     pub custom_properties: HashMap<String, String>,
@@ -1181,6 +1183,11 @@ pub struct TableInfo {
 impl TableInfo {
     pub fn row_type(&self) -> &RowType {
         &self.row_type
+    }
+
+    pub fn with_bucket_count_epoch(mut self, epoch: i64) -> Self {
+        self.bucket_count_epoch = epoch;
+        self
     }
 }
 
@@ -1424,6 +1431,7 @@ impl TableInfo {
             bucket_keys,
             partition_keys,
             num_buckets,
+            bucket_count_epoch: 0,
             properties,
             table_config,
             custom_properties,

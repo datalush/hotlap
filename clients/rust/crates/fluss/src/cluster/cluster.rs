@@ -42,6 +42,7 @@ pub struct Cluster {
     table_info_by_path: HashMap<TablePath, TableInfo>,
     partitions_id_by_path: HashMap<Arc<PhysicalTablePath>, PartitionId>,
     partition_name_by_id: HashMap<PartitionId, String>,
+    partition_bucket_counts: HashMap<PartitionId, i32>,
 }
 
 impl Cluster {
@@ -75,7 +76,48 @@ impl Cluster {
             table_info_by_path,
             partitions_id_by_path,
             partition_name_by_id,
+            partition_bucket_counts: HashMap::new(),
         }
+    }
+
+    fn with_partition_bucket_counts(mut self, counts: HashMap<PartitionId, i32>) -> Self {
+        self.partition_bucket_counts = counts;
+        self
+    }
+
+    /// The coordinator's routing count for a physical partition, if present.
+    /// An unavailable count must not be guessed after bucket rescaling.
+    pub fn partition_bucket_count(&self, partition_id: PartitionId) -> Option<i32> {
+        self.partition_bucket_counts.get(&partition_id).copied()
+    }
+
+    /// Resolve the physical layout, falling back to the table default only
+    /// when the table has never been rescaled. Both the assigner and the RPC
+    /// sender must use this same count.
+    pub fn routing_bucket_count(
+        &self,
+        table_id: TableId,
+        partition_id: PartitionId,
+    ) -> Result<i32> {
+        let path = self.get_table_path_by_id(table_id).ok_or_else(|| {
+            Error::invalid_table(format!("Table {table_id} is missing from metadata"))
+        })?;
+        let table = self.get_table(path)?;
+        let count = match self.partition_bucket_count(partition_id) {
+            Some(count) => count,
+            None if table.bucket_count_epoch == 0 => table.get_num_buckets(),
+            None => {
+                return Err(Error::invalid_table(format!(
+                    "Routing count for partition {partition_id} is unavailable after bucket rescale; refresh metadata"
+                )));
+            }
+        };
+        if count <= 0 {
+            return Err(Error::invalid_table(format!(
+                "Invalid routing bucket count {count} for partition {partition_id}"
+            )));
+        }
+        Ok(count)
     }
 
     pub fn invalidate_server(&self, server_id: &i32, table_ids: Vec<TableId>) -> Self {
@@ -103,6 +145,7 @@ impl Cluster {
             self.table_info_by_path.clone(),
             self.partitions_id_by_path.clone(),
         )
+        .with_partition_bucket_counts(self.partition_bucket_counts.clone())
     }
 
     pub fn invalidate_physical_table_meta(
@@ -121,6 +164,7 @@ impl Cluster {
             self.table_info_by_path.clone(),
             self.partitions_id_by_path.clone(),
         )
+        .with_partition_bucket_counts(self.partition_bucket_counts.clone())
     }
 
     /// Returns a copy without `table_path`'s id, info, partitions and bucket
@@ -144,13 +188,20 @@ impl Cluster {
             .map(|(path, table_info)| (path.clone(), table_info.clone()))
             .collect();
 
-        let partitions_id_by_path = self
+        let partitions_id_by_path: HashMap<Arc<PhysicalTablePath>, PartitionId> = self
             .partitions_id_by_path
             .iter()
             .filter(|&(path, _)| path.get_table_path() != table_path)
             .map(|(path, partition_id)| (Arc::clone(path), *partition_id))
             .collect();
 
+        let live_ids: HashSet<_> = partitions_id_by_path.values().copied().collect();
+        let counts = self
+            .partition_bucket_counts
+            .iter()
+            .filter(|(id, _)| live_ids.contains(id))
+            .map(|(&id, &count)| (id, count))
+            .collect();
         Cluster::new(
             self.coordinator_server.clone(),
             self.alive_tablet_servers_by_id.clone(),
@@ -160,6 +211,7 @@ impl Cluster {
             table_info_by_path,
             partitions_id_by_path,
         )
+        .with_partition_bucket_counts(counts)
     }
 
     pub fn update(&mut self, cluster: Cluster) {
@@ -174,6 +226,7 @@ impl Cluster {
             table_info_by_path,
             partitions_id_by_path,
             partition_name_by_id,
+            partition_bucket_counts,
         } = cluster;
         self.coordinator_server = coordinator_server;
         self.alive_tablet_servers_by_id = alive_tablet_servers_by_id;
@@ -185,6 +238,7 @@ impl Cluster {
         self.table_info_by_path = table_info_by_path;
         self.partitions_id_by_path = partitions_id_by_path;
         self.partition_name_by_id = partition_name_by_id;
+        self.partition_bucket_counts = partition_bucket_counts;
     }
 
     fn filter_bucket_locations_by_path(
@@ -257,6 +311,7 @@ impl Cluster {
         let mut table_id_by_path = HashMap::new();
         let mut table_info_by_path = HashMap::new();
         let mut partitions_id_by_path = HashMap::new();
+        let mut partition_bucket_counts = HashMap::new();
         let mut tmp_available_locations_by_path = HashMap::new();
         let mut tmp_available_location_by_bucket = HashMap::new();
 
@@ -264,6 +319,7 @@ impl Cluster {
             table_info_by_path.extend(origin.get_table_info_by_path().clone());
             table_id_by_path.extend(origin.get_table_id_by_path().clone());
             partitions_id_by_path.extend(origin.partitions_id_by_path.clone());
+            partition_bucket_counts.extend(origin.partition_bucket_counts.clone());
             tmp_available_locations_by_path.extend(origin.available_locations_by_path.clone());
             tmp_available_location_by_bucket.extend(origin.available_locations_by_bucket.clone());
         }
@@ -288,7 +344,8 @@ impl Cluster {
                 table_descriptor,
                 table_metadata.created_time,
                 table_metadata.modified_time,
-            );
+            )
+            .with_bucket_count_epoch(table_metadata.bucket_count_epoch.unwrap_or(0));
             table_info_by_path.insert(table_path.clone(), table_info);
             table_id_by_path.insert(table_path.clone(), table_id);
 
@@ -313,6 +370,9 @@ impl Cluster {
                 let partition_name = partition_metadata.partition_name;
                 let table_path = cluster.get_table_path_by_id(table_id).unwrap();
                 let partition_id = partition_metadata.partition_id;
+                if let Some(count) = partition_metadata.bucket_count {
+                    partition_bucket_counts.insert(partition_id, count);
+                }
 
                 let physical_table_path = Arc::new(PhysicalTablePath::of_partitioned(
                     Arc::new(table_path.clone()),
@@ -333,6 +393,9 @@ impl Cluster {
             }
         }
 
+        let live_ids: HashSet<_> = partitions_id_by_path.values().copied().collect();
+        partition_bucket_counts.retain(|id, _| live_ids.contains(id));
+
         for bucket_locations in &mut tmp_available_locations_by_path.values() {
             for location in bucket_locations {
                 if location.leader().is_some() {
@@ -350,7 +413,8 @@ impl Cluster {
             table_id_by_path,
             table_info_by_path,
             partitions_id_by_path,
-        ))
+        )
+        .with_partition_bucket_counts(partition_bucket_counts))
     }
 
     pub fn get_coordinator_server(&self) -> Option<&ServerNode> {
@@ -512,6 +576,26 @@ fn get_bucket_locations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rescaled_tables_route_by_each_partitions_own_count() {
+        let path = TablePath::new("db", "rescaled");
+        let mut cluster = crate::test_utils::build_cluster(&path, 1, 2);
+        let table = cluster.table_info_by_path.get_mut(&path).unwrap();
+        table.num_buckets = 3;
+        table.bucket_count_epoch = 1;
+        cluster.partition_bucket_counts.insert(10, 2);
+        cluster.partition_bucket_counts.insert(11, 3);
+        assert_eq!(cluster.routing_bucket_count(1, 10).unwrap(), 2);
+        assert_eq!(cluster.routing_bucket_count(1, 11).unwrap(), 3);
+        assert!(cluster.routing_bucket_count(1, 12).is_err());
+        cluster
+            .table_info_by_path
+            .get_mut(&path)
+            .unwrap()
+            .bucket_count_epoch = 0;
+        assert_eq!(cluster.routing_bucket_count(1, 12).unwrap(), 3);
+    }
 
     fn make_coordinator() -> ServerNode {
         ServerNode::new(

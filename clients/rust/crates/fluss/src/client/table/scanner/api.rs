@@ -70,6 +70,10 @@ impl LogScanner {
 
 // Implementation for RecordBatchLogScanner (batches mode)
 impl RecordBatchLogScanner {
+    pub(crate) fn set_partition_bucket_counts(&self, counts: HashMap<PartitionId, i32>) {
+        *self.inner.log_fetcher.partition_bucket_counts.write() = counts;
+    }
+
     /// Poll for batches with metadata (bucket and offset information).
     pub async fn poll(&self, timeout: Duration) -> Result<Vec<ScanBatch>> {
         self.inner.poll_batches(timeout).await

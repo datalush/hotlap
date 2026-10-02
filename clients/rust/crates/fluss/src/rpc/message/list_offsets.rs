@@ -77,6 +77,7 @@ impl ListOffsetsRequest {
         partition_id: Option<PartitionId>,
         bucket_ids: Vec<BucketId>,
         offset_spec: OffsetSpec,
+        routing_bucket_count: Option<i32>,
     ) -> Self {
         ListOffsetsRequest {
             inner_request: proto::ListOffsetsRequest {
@@ -86,7 +87,7 @@ impl ListOffsetsRequest {
                 partition_id,
                 bucket_id: bucket_ids,
                 start_timestamp: offset_spec.start_timestamp(),
-                routing_bucket_count: None,
+                routing_bucket_count,
             },
         }
     }

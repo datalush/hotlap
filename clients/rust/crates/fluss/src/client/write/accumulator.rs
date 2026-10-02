@@ -186,6 +186,9 @@ pub struct RecordAccumulator {
     write_batches: DashMap<Arc<PhysicalTablePath>, BucketAndWriteBatches>,
     // batch_id -> (complete callback, memory permit)
     incomplete_batches: RwLock<HashMap<i64, (ResultHandle, MemoryPermit)>>,
+    /// First failed ACK since the last flush. Bounded independently of the
+    /// number of failed writes; individual futures keep per-record errors.
+    first_write_failure: Mutex<Option<Error>>,
     batch_timeout_ms: i64,
     closed: AtomicBool,
     flushes_in_progress: AtomicI32,
@@ -218,6 +221,7 @@ impl RecordAccumulator {
             config,
             write_batches: Default::default(),
             incomplete_batches: Default::default(),
+            first_write_failure: Default::default(),
             batch_timeout_ms,
             closed: Default::default(),
             flushes_in_progress: Default::default(),
@@ -822,7 +826,11 @@ impl RecordAccumulator {
     }
 
     pub fn remove_incomplete_batches(&self, batch_id: i64) {
-        self.incomplete_batches.write().remove(&batch_id);
+        if let Some((handle, _permit)) = self.incomplete_batches.write().remove(&batch_id)
+            && let Some(error) = handle.completed_error()
+        {
+            self.first_write_failure.lock().get_or_insert(error);
+        }
     }
 
     fn record_actual_batch_size(&self, table_path: &Arc<PhysicalTablePath>, actual: usize) {
@@ -990,6 +998,9 @@ impl RecordAccumulator {
         let mut incomplete = self.incomplete_batches.write();
         for (handle, _permit) in incomplete.values() {
             handle.fail(error.clone());
+            if let Some(failure) = handle.completed_error() {
+                self.first_write_failure.lock().get_or_insert(failure);
+            }
         }
         incomplete.clear();
     }
@@ -1039,9 +1050,8 @@ impl RecordAccumulator {
         }
 
         // Drop the completed batches' handles and memory permits.
-        let mut incomplete = self.incomplete_batches.write();
         for batch_id in completed_batch_ids {
-            incomplete.remove(&batch_id);
+            self.remove_incomplete_batches(batch_id);
         }
     }
 
@@ -1075,7 +1085,7 @@ impl RecordAccumulator {
         for batch in stale_batches {
             if batch.complete(Err(error.clone())) {
                 self.release_idempotence_slot(&batch);
-                self.incomplete_batches.write().remove(&batch.batch_id());
+                self.remove_incomplete_batches(batch.batch_id());
             }
         }
     }
@@ -1144,13 +1154,26 @@ impl RecordAccumulator {
         self.flushes_in_progress.load(Ordering::SeqCst) > 0
     }
 
-    pub fn begin_flush(&self) {
-        self.flushes_in_progress.fetch_add(1, Ordering::SeqCst);
+    pub fn begin_flush(&self) -> Result<()> {
+        self.flushes_in_progress
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| Error::IllegalArgument {
+                message: "A writer flush is already in progress".into(),
+            })?;
         self.wakeup_sender();
+        Ok(())
     }
 
-    #[allow(unused_must_use)]
     pub async fn await_flush_completion(&self) -> Result<()> {
+        // The caller has already incremented the counter. Dropping this
+        // future must release it too, not leave future writes in flush mode.
+        struct FlushGuard<'a>(&'a AtomicI32);
+        impl Drop for FlushGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _guard = FlushGuard(&self.flushes_in_progress);
         // Clone handles before awaiting to avoid holding RwLock read guard across await points
         let handles: Vec<_> = self
             .incomplete_batches
@@ -1159,20 +1182,22 @@ impl RecordAccumulator {
             .map(|(h, _)| h.clone())
             .collect();
 
-        // Await on all handles
-        let result = async {
-            for result_handle in handles {
-                result_handle.wait().await?;
+        // Wait for every outstanding batch, even if one failed. A flush only
+        // succeeds when all of those batch acknowledgments succeeded.
+        let mut first_error = None;
+        for result_handle in handles {
+            let result = match result_handle.wait().await {
+                Ok(result) => result_handle.result(result),
+                Err(error) => Err(error),
+            };
+            if first_error.is_none() {
+                first_error = result.err();
             }
-            Ok(())
         }
-        .await;
-
-        // Always decrement flushes_in_progress, even if an error occurred
-        // This mimics the Java finally block behavior
-        self.flushes_in_progress.fetch_sub(1, Ordering::SeqCst);
-
-        result
+        if let Some(error) = self.first_write_failure.lock().take() {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1518,7 +1543,7 @@ mod tests {
         let config = Config::default();
         let accumulator = RecordAccumulator::new(config, disabled_idempotence());
 
-        accumulator.begin_flush();
+        accumulator.begin_flush()?;
         assert_eq!(accumulator.flushes_in_progress.load(Ordering::SeqCst), 1);
 
         // Create a failing batch by dropping the BroadcastOnce without broadcasting
@@ -1542,6 +1567,92 @@ mod tests {
         assert_eq!(accumulator.flushes_in_progress.load(Ordering::SeqCst), 0);
         assert!(!accumulator.flush_in_progress());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flush_reports_batch_ack_failure_even_if_the_receiver_succeeded() -> Result<()> {
+        use crate::client::write::broadcast::{BroadcastOnce, Error as BroadcastError};
+
+        let accumulator = RecordAccumulator::new(Config::default(), disabled_idempotence());
+        let broadcast = BroadcastOnce::default();
+        let handle = ResultHandle::new(broadcast.receiver());
+        let permit = accumulator.memory_limiter.acquire(1024)?;
+        accumulator
+            .incomplete_batches
+            .write()
+            .insert(1, (handle, permit));
+        broadcast.broadcast(Err(BroadcastError::WriteFailed {
+            code: 74,
+            message: "invalid bucket routing".into(),
+        }));
+
+        accumulator.begin_flush()?;
+        let error = accumulator.await_flush_completion().await.unwrap_err();
+        assert!(matches!(&error, Error::FlussAPIError { api_error } if api_error.code == 74));
+        assert!(error.to_string().contains("invalid bucket routing"));
+        assert!(!accumulator.flush_in_progress());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flush_reports_ack_that_failed_before_flush_started() -> Result<()> {
+        use crate::client::write::broadcast::{BroadcastOnce, Error as BroadcastError};
+
+        let accumulator = RecordAccumulator::new(Config::default(), disabled_idempotence());
+        let broadcast = BroadcastOnce::default();
+        let handle = ResultHandle::new(broadcast.receiver());
+        let permit = accumulator.memory_limiter.acquire(1024)?;
+        accumulator
+            .incomplete_batches
+            .write()
+            .insert(1, (handle, permit));
+        broadcast.broadcast(Err(BroadcastError::WriteFailed {
+            code: 74,
+            message: "stale routing count".into(),
+        }));
+        accumulator.remove_incomplete_batches(1);
+        accumulator.begin_flush()?;
+        let error = accumulator.await_flush_completion().await.unwrap_err();
+        assert!(error.to_string().contains("stale routing count"));
+        accumulator.begin_flush()?;
+        accumulator.await_flush_completion().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_flush_releases_flush_mode() -> Result<()> {
+        use crate::client::write::broadcast::BroadcastOnce;
+
+        let accumulator = RecordAccumulator::new(Config::default(), disabled_idempotence());
+        let broadcast = BroadcastOnce::default();
+        let handle = ResultHandle::new(broadcast.receiver());
+        let permit = accumulator.memory_limiter.acquire(1024)?;
+        accumulator
+            .incomplete_batches
+            .write()
+            .insert(1, (handle, permit));
+        accumulator.begin_flush()?;
+        let mut pending = Box::pin(accumulator.await_flush_completion());
+        assert!(matches!(
+            futures::poll!(pending.as_mut()),
+            std::task::Poll::Pending
+        ));
+        drop(pending);
+        assert!(!accumulator.flush_in_progress());
+        drop(broadcast);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_flush_cannot_consume_another_flushes_ack_error() -> Result<()> {
+        let accumulator = RecordAccumulator::new(Config::default(), disabled_idempotence());
+        accumulator.begin_flush()?;
+        let error = accumulator.begin_flush().unwrap_err();
+        assert!(error.to_string().contains("already in progress"));
+        accumulator.await_flush_completion().await?;
+        accumulator.begin_flush()?;
+        accumulator.await_flush_completion().await?;
         Ok(())
     }
 

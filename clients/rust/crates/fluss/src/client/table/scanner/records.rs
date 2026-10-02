@@ -29,7 +29,7 @@ impl LogFetcher {
         let mut result: HashMap<TableBucket, Vec<ScanRecord>> = HashMap::new();
         let mut records_remaining = self.max_poll_records;
 
-        let collect_result: Result<()> = {
+        {
             while records_remaining > 0 {
                 // Get the next in line fetch, or get a new one from buffer
                 let next_in_line = self.log_fetch_buffer.next_in_line_fetch();
@@ -39,23 +39,12 @@ impl LogFetcher {
                     if let Some(completed_fetch) = self.log_fetch_buffer.poll() {
                         // Initialize the fetch if not already initialized
                         if !completed_fetch.is_initialized() {
-                            let size_in_bytes = completed_fetch.size_in_bytes();
                             match self.initialize_fetch(completed_fetch) {
                                 Ok(initialized) => {
                                     self.log_fetch_buffer.set_next_in_line_fetch(initialized);
                                     continue;
                                 }
-                                Err(e) => {
-                                    // Remove a completedFetch upon a parse with exception if
-                                    // (1) it contains no records, and
-                                    // (2) there are no fetched records with actual content preceding this
-                                    // exception.
-                                    if result.is_empty() && size_in_bytes == 0 {
-                                        // todo: do we need to consider it like java ?
-                                        // self.log_fetch_buffer.poll();
-                                    }
-                                    return Err(e);
-                                }
+                                Err(e) => return Err(e),
                             }
                         } else {
                             self.log_fetch_buffer
@@ -121,19 +110,8 @@ impl LogFetcher {
                     }
                 }
             }
-            Ok(())
-        };
-
-        match collect_result {
-            Ok(()) => Ok(result),
-            Err(e) => {
-                if result.is_empty() {
-                    Err(e)
-                } else {
-                    Ok(result)
-                }
-            }
         }
+        Ok(result)
     }
 
     /// Initialize a completed fetch, checking offset match and updating high watermark

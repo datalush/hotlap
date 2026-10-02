@@ -136,6 +136,9 @@ pub struct AlterTableChanges {
     pub drop_columns: Vec<DropColumn>,
     pub rename_columns: Vec<RenameColumn>,
     pub modify_columns: Vec<ModifyColumn>,
+    /// New table default for future partitions; existing partitions keep
+    /// their own bucket count.
+    pub modify_bucket_count: Option<i32>,
 }
 
 /// Modify a column's type/comment/position. Mirrors the `ModifyColumn` variant of

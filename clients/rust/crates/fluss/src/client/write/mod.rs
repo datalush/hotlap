@@ -230,6 +230,20 @@ impl ResultHandle {
             },
         })
     }
+
+    /// An ACK may arrive and be removed from the pending map before `flush`
+    /// starts. Preserve its failure for the next flush even if the individual
+    /// write future was dropped.
+    pub(crate) fn completed_error(&self) -> Option<Error> {
+        match self.receiver.peek() {
+            Some(Ok(result)) => self.result(result).err(),
+            Some(Err(error)) => Some(Error::UnexpectedError {
+                message: format!("Fail to wait write result {error:?}"),
+                source: None,
+            }),
+            None => None,
+        }
+    }
 }
 
 /// A future that represents a pending write operation.

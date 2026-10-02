@@ -179,6 +179,8 @@ struct LogFetcher {
     /// Encoded filter sent on every fetch request, paired with the schema id it
     /// was compiled against so the server can resolve its field ids.
     filter: Option<(PbPredicate, i32)>,
+    /// Routing counts captured alongside the partition IDs for a bounded scan.
+    partition_bucket_counts: RwLock<HashMap<PartitionId, i32>>,
     max_poll_records: usize,
     fetch_max_bytes: i32,
     fetch_min_bytes: i32,

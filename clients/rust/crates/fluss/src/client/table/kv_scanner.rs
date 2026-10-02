@@ -52,6 +52,7 @@ pub struct KvBatchScanner {
     schema_getter: Arc<ClientSchemaGetter>,
     projection: Option<Vec<usize>>,
     bucket: TableBucket,
+    routing_bucket_count: i32,
     connection: Option<ServerConnection>,
     scanner_id: Option<Vec<u8>>,
     sequence: i32,
@@ -69,6 +70,7 @@ impl KvBatchScanner {
         schema_getter: Arc<ClientSchemaGetter>,
         projection: Option<Vec<usize>>,
         bucket: TableBucket,
+        routing_bucket_count: i32,
     ) -> Self {
         Self {
             rpc,
@@ -77,6 +79,7 @@ impl KvBatchScanner {
             schema_getter,
             projection,
             bucket,
+            routing_bucket_count,
             connection: None,
             scanner_id: None,
             sequence: 0,
@@ -150,7 +153,7 @@ impl KvBatchScanner {
                         partition_id: self.bucket.partition_id(),
                         bucket_id: self.bucket.bucket_id(),
                         limit: None,
-                        routing_bucket_count: Some(self.info.get_num_buckets()),
+                        routing_bucket_count: Some(self.routing_bucket_count),
                     }),
                     Some(0),
                     Some(BATCH_SIZE_BYTES),
@@ -239,9 +242,88 @@ mod tests {
     use super::*;
     use crate::client::FlussConnection;
     use crate::config::Config;
+    use crate::metadata::ClusterHealthStatus;
     use crate::metadata::{DataTypes, Schema, TableDescriptor, TablePath};
     use crate::row::GenericRow;
+    use std::process::Command;
     use std::time::Duration;
+
+    type LiveResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    async fn lab_connection() -> LiveResult<FlussConnection> {
+        let connection = FlussConnection::new(Config {
+            bootstrap_servers: std::env::var("FLUSS_BOOTSTRAP")?,
+            security_ssl_enabled: true,
+            security_ssl_ca_file: Some(std::env::var("FLUSS_CA_FILE")?),
+            security_protocol: "sasl".into(),
+            security_sasl_username: std::env::var("FLUSS_USER")?,
+            security_sasl_password: std::env::var("FLUSS_PASSWORD")?,
+            ..Config::default()
+        })
+        .await?;
+        connection
+            .get_admin()?
+            .create_database("datafusion_tests", None, true)
+            .await?;
+        Ok(connection)
+    }
+
+    fn fixture_path(prefix: &str) -> LiveResult<TablePath> {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        Ok(TablePath::new(
+            "datafusion_tests",
+            format!("{prefix}_{suffix}"),
+        ))
+    }
+
+    async fn create_fixture(connection: &FlussConnection, path: &TablePath) -> LiveResult<()> {
+        connection
+            .get_admin()?
+            .create_table(
+                path,
+                &TableDescriptor::builder()
+                    .schema(
+                        Schema::builder()
+                            .column("id", DataTypes::int())
+                            .column("value", DataTypes::string())
+                            .primary_key(vec!["id"])?
+                            .build()?,
+                    )
+                    .distributed_by(Some(1), vec!["id".into()])
+                    .property("table.replication.factor", "2")
+                    .build()?,
+                false,
+            )
+            .await?;
+        let table = connection.get_table(path).await?;
+        let writer = table.new_upsert()?.create_writer()?;
+        let payload = "x".repeat(350_000);
+        for id in 0..8 {
+            let mut row = GenericRow::new(2);
+            row.set_field(0, id);
+            row.set_field(1, format!("{id}-{payload}"));
+            writer.upsert(&row)?;
+        }
+        writer.flush().await?;
+        Ok(())
+    }
+
+    fn kubectl(kubeconfig: &str, args: &[&str]) -> LiveResult<String> {
+        let output = Command::new("kubectl")
+            .env("KUBECONFIG", kubeconfig)
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "kubectl {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    }
 
     #[test]
     fn expired_or_moved_session_fails_instead_of_mixing_snapshots() {
@@ -259,54 +341,14 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires native-sni and FLUSS_* credentials; run with --ignored"]
-    async fn server_closed_session_fails_without_restarting_snapshot()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let connection = FlussConnection::new(Config {
-            bootstrap_servers: std::env::var("FLUSS_BOOTSTRAP")?,
-            security_ssl_enabled: true,
-            security_ssl_ca_file: Some(std::env::var("FLUSS_CA_FILE")?),
-            security_protocol: "sasl".into(),
-            security_sasl_username: std::env::var("FLUSS_USER")?,
-            security_sasl_password: std::env::var("FLUSS_PASSWORD")?,
-            ..Config::default()
-        })
-        .await?;
+    async fn server_closed_session_fails_without_restarting_snapshot() -> LiveResult<()> {
+        let connection = lab_connection().await?;
         let admin = connection.get_admin()?;
-        admin
-            .create_database("datafusion_tests", None, true)
-            .await?;
-        let suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos();
-        let path = TablePath::new("datafusion_tests", format!("kv_loss_{suffix}"));
-        admin
-            .create_table(
-                &path,
-                &TableDescriptor::builder()
-                    .schema(
-                        Schema::builder()
-                            .column("id", DataTypes::int())
-                            .column("value", DataTypes::string())
-                            .primary_key(vec!["id"])?
-                            .build()?,
-                    )
-                    .distributed_by(Some(1), vec!["id".into()])
-                    .build()?,
-                false,
-            )
-            .await?;
+        let path = fixture_path("kv_loss")?;
+        create_fixture(&connection, &path).await?;
 
-        let check: std::result::Result<(), Box<dyn std::error::Error>> = async {
+        let check: LiveResult<()> = async {
             let table = connection.get_table(&path).await?;
-            let writer = table.new_upsert()?.create_writer()?;
-            let payload = "x".repeat(350_000);
-            for id in 0..8 {
-                let mut row = GenericRow::new(2);
-                row.set_field(0, id);
-                row.set_field(1, format!("{id}-{payload}"));
-                writer.upsert(&row)?;
-            }
-            writer.flush().await?;
             let bucket = TableBucket::new(table.get_table_info().table_id, 0);
             let mut scanner = table.new_scan().create_kv_batch_scanner(bucket.clone())?;
             let first = scanner.next_batch().await?.expect("first page");
@@ -331,6 +373,136 @@ mod tests {
         }.await;
         let cleanup = admin.drop_table(&path, true).await;
         check?;
+        cleanup?;
+        connection.close(Duration::from_secs(5)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated k3d-native-sni KUBECONFIG and FLUSS_*; restarts a tabletserver pod"]
+    async fn leader_restart_invalidates_snapshot_without_restarting_reader() -> LiveResult<()> {
+        let kubeconfig = std::env::var("KUBECONFIG")?;
+        if kubectl(&kubeconfig, &["config", "current-context"])?.as_str() != "k3d-native-sni" {
+            return Err("failover test requires the isolated k3d-native-sni context".into());
+        }
+        let connection = lab_connection().await?;
+        let admin = connection.get_admin()?;
+        let path = fixture_path("kv_leader_loss")?;
+        create_fixture(&connection, &path).await?;
+        let result: LiveResult<()> = async {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while admin
+                    .get_cluster_health()
+                    .await
+                    .ok()
+                    .is_none_or(|h| h.status != ClusterHealthStatus::Green)
+                {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+            .await?;
+            let table = connection.get_table(&path).await?;
+            let bucket = TableBucket::new(table.get_table_info().table_id, 0);
+            let leader = table
+                .metadata()
+                .leader_for(&path, &bucket)
+                .await?
+                .ok_or("KV bucket has no leader")?;
+            let pod = format!("native-tabletserver-{}", leader.id());
+            let uid = kubectl(
+                &kubeconfig,
+                &[
+                    "-n",
+                    "native-test",
+                    "get",
+                    "pod",
+                    &pod,
+                    "-o",
+                    "jsonpath={.metadata.uid}",
+                ],
+            )?;
+
+            let mut scanner = table.new_scan().create_kv_batch_scanner(bucket.clone())?;
+            let first = scanner.next_batch().await?.expect("first page");
+            assert!(first.num_rows() < 8);
+            let first_pages = scanner.stats().pages_received;
+            kubectl(
+                &kubeconfig,
+                &["-n", "native-test", "delete", "pod", &pod, "--wait=false"],
+            )?;
+            tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    if let Ok(current) = kubectl(
+                        &kubeconfig,
+                        &[
+                            "-n",
+                            "native-test",
+                            "get",
+                            "pod",
+                            &pod,
+                            "-o",
+                            "jsonpath={.metadata.uid}",
+                        ],
+                    ) && current != uid
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            })
+            .await?;
+            let error = tokio::time::timeout(Duration::from_secs(45), scanner.next_batch())
+                .await?
+                .expect_err("a restarted leader must invalidate its RocksDB snapshot");
+            assert!(
+                matches!(error, Error::FlussAPIError { .. } | Error::RpcError { .. }),
+                "{error:?}"
+            );
+            assert_eq!(scanner.stats().pages_received, first_pages);
+            assert!(
+                scanner.next_batch().await.is_err(),
+                "an invalidated snapshot must not resume"
+            );
+            drop(scanner);
+
+            kubectl(
+                &kubeconfig,
+                &[
+                    "-n",
+                    "native-test",
+                    "wait",
+                    "--for=condition=Ready",
+                    &format!("pod/{pod}"),
+                    "--timeout=120s",
+                ],
+            )?;
+            tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    if admin
+                        .get_cluster_health()
+                        .await
+                        .ok()
+                        .is_some_and(|h| h.status == ClusterHealthStatus::Green)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            })
+            .await?;
+            admin.get_table_info(&path).await?;
+            let fresh_table = connection.get_table(&path).await?;
+            let mut fresh = fresh_table.new_scan().create_kv_batch_scanner(bucket)?;
+            let mut count = 0;
+            while let Some(batch) = fresh.next_batch().await? {
+                count += batch.num_rows();
+            }
+            assert_eq!(count, 8);
+            Ok(())
+        }
+        .await;
+        let cleanup = admin.drop_table(&path, true).await;
+        result?;
         cleanup?;
         connection.close(Duration::from_secs(5)).await?;
         Ok(())

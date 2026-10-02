@@ -170,6 +170,7 @@ impl FlussAdmin {
             table_json,
             created_time,
             modified_time,
+            bucket_count_epoch,
             ..
         } = response;
         let table_descriptor = parse_table_descriptor(&table_json)?;
@@ -180,7 +181,8 @@ impl FlussAdmin {
             table_descriptor,
             created_time,
             modified_time,
-        ))
+        )
+        .with_bucket_count_epoch(bucket_count_epoch.unwrap_or(0)))
     }
 
     /// List all tables in the given database
@@ -384,12 +386,13 @@ impl FlussAdmin {
         &self,
         table_path: &TablePath,
         partition_id: PartitionId,
+        bucket_count: i32,
         buckets_id: &[BucketId],
         offset_spec: OffsetSpec,
     ) -> Result<HashMap<i32, i64>> {
-        if buckets_id.is_empty() {
+        if bucket_count <= 0 || buckets_id.is_empty() {
             return Err(Error::IllegalArgument {
-                message: "Buckets are empty.".to_string(),
+                message: "Partition bucket count and requested buckets must be positive.".into(),
             });
         }
         self.metadata.update_table_metadata(table_path).await?;
@@ -397,8 +400,14 @@ impl FlussAdmin {
             .check_and_update_partition_metadata_by_ids(table_path, &[partition_id])
             .await?;
         let table_id = self.metadata.get_cluster().get_table(table_path)?.table_id;
-        self.query_offsets(table_id, Some(partition_id), buckets_id, offset_spec)
-            .await
+        self.query_offsets(
+            table_id,
+            Some(partition_id),
+            buckets_id,
+            offset_spec,
+            Some(bucket_count),
+        )
+        .await
     }
 
     async fn do_list_offsets(
@@ -446,7 +455,19 @@ impl FlussAdmin {
             None
         };
 
-        self.query_offsets(table_id, partition_id, buckets_id, offset_spec)
+        let count = if let Some(id) = partition_id {
+            self.list_partition_infos(table_path)
+                .await?
+                .into_iter()
+                .find(|info| info.get_partition_id() == id)
+                .ok_or_else(|| {
+                    Error::partition_not_exist(format!("Partition {id} no longer exists"))
+                })?
+                .get_bucket_count()
+        } else {
+            None
+        };
+        self.query_offsets(table_id, partition_id, buckets_id, offset_spec, count)
             .await
     }
 
@@ -456,10 +477,16 @@ impl FlussAdmin {
         partition_id: Option<PartitionId>,
         buckets_id: &[BucketId],
         offset_spec: OffsetSpec,
+        routing_bucket_count: Option<i32>,
     ) -> Result<HashMap<i32, i64>> {
         // Prepare requests
-        let requests_by_server =
-            self.prepare_list_offsets_requests(table_id, partition_id, buckets_id, offset_spec)?;
+        let requests_by_server = self.prepare_list_offsets_requests(
+            table_id,
+            partition_id,
+            buckets_id,
+            offset_spec,
+            routing_bucket_count,
+        )?;
 
         // Send Requests
         let response_futures = self.send_list_offsets_request(requests_by_server).await?;
@@ -482,6 +509,7 @@ impl FlussAdmin {
         partition_id: Option<PartitionId>,
         buckets: &[BucketId],
         offset_spec: OffsetSpec,
+        routing_bucket_count: Option<i32>,
     ) -> Result<HashMap<i32, ListOffsetsRequest>> {
         let cluster = self.metadata.get_cluster();
         let mut node_for_bucket_list: HashMap<i32, Vec<BucketId>> = HashMap::new();
@@ -504,8 +532,13 @@ impl FlussAdmin {
 
         let mut list_offsets_requests = HashMap::new();
         for (leader_id, bucket_ids) in node_for_bucket_list {
-            let request =
-                ListOffsetsRequest::new(table_id, partition_id, bucket_ids, offset_spec.clone());
+            let request = ListOffsetsRequest::new(
+                table_id,
+                partition_id,
+                bucket_ids,
+                offset_spec.clone(),
+                routing_bucket_count,
+            );
             list_offsets_requests.insert(leader_id, request);
         }
         Ok(list_offsets_requests)
@@ -586,11 +619,7 @@ impl FlussAdmin {
             .request(AlterTableRequest::new(
                 table_path,
                 ignore_if_not_exists,
-                changes.config_changes,
-                changes.add_columns,
-                changes.drop_columns,
-                changes.rename_columns,
-                changes.modify_columns,
+                changes,
             ))
             .await?;
         Ok(())

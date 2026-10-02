@@ -58,6 +58,7 @@ trait LookupProtocol {
     fn build_request(
         table_id: TableId,
         keys_by_bucket: Vec<(BucketId, Option<PartitionId>, Vec<Bytes>)>,
+        routing_counts: &HashMap<PartitionId, i32>,
     ) -> Self::Request;
 
     fn decode_buckets(
@@ -76,8 +77,9 @@ impl LookupProtocol for Primary {
     fn build_request(
         table_id: TableId,
         keys_by_bucket: Vec<(BucketId, Option<PartitionId>, Vec<Bytes>)>,
+        routing_counts: &HashMap<PartitionId, i32>,
     ) -> Self::Request {
-        LookupRequest::new_batched(table_id, keys_by_bucket)
+        LookupRequest::new_batched(table_id, keys_by_bucket).with_bucket_counts(routing_counts)
     }
 
     fn decode_buckets(
@@ -104,8 +106,10 @@ impl LookupProtocol for Prefix {
     fn build_request(
         table_id: TableId,
         keys_by_bucket: Vec<(BucketId, Option<PartitionId>, Vec<Bytes>)>,
+        routing_counts: &HashMap<PartitionId, i32>,
     ) -> Self::Request {
         PrefixLookupRequest::new_batched(table_id, keys_by_bucket)
+            .with_bucket_counts(routing_counts)
     }
 
     fn decode_buckets(
@@ -436,8 +440,30 @@ impl LookupSender {
 
         let mut pending = FuturesUnordered::new();
         for (table_id, mut batches) in batches_by_table {
+            let cluster = self.metadata.get_cluster();
+            let mut routing_counts = HashMap::new();
+            let mut routing_error = None;
+            for batch in &batches {
+                if let Some(id) = batch.table_bucket.partition_id() {
+                    match cluster.routing_bucket_count(table_id, id) {
+                        Ok(count) => {
+                            routing_counts.insert(id, count);
+                        }
+                        Err(error) => {
+                            routing_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(error) = routing_error {
+                for batch in &mut batches {
+                    batch.complete_all_with_error(&error.to_string());
+                }
+                continue;
+            }
             let keys_by_bucket: Vec<_> = batches.iter_mut().map(|b| b.keys_tuple()).collect();
-            let request = P::build_request(table_id, keys_by_bucket);
+            let request = P::build_request(table_id, keys_by_bucket, &routing_counts);
             pending.push(self.send_single_table_lookup::<P>(
                 table_id,
                 destination,

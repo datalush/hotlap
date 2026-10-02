@@ -188,6 +188,22 @@ impl<'a> TableScan<'a> {
     /// request runs when the caller asks for its first Arrow batch. No SQL
     /// filter or row limit is pushed into this scan.
     pub fn create_kv_batch_scanner(self, bucket: TableBucket) -> Result<KvBatchScanner> {
+        if self.table_info.is_partitioned() {
+            return Err(Error::IllegalArgument {
+                message: "Partitioned KV scans require the discovered partition's bucket count; use create_kv_batch_scanner_with_bucket_count".into(),
+            });
+        }
+        let count = self.table_info.get_num_buckets();
+        self.create_kv_batch_scanner_with_bucket_count(bucket, count)
+    }
+
+    /// Create a KV scanner using the discovered layout of its partition.
+    /// The count is sent with the initial RPC to validate routing at the server.
+    pub fn create_kv_batch_scanner_with_bucket_count(
+        self,
+        bucket: TableBucket,
+        bucket_count: i32,
+    ) -> Result<KvBatchScanner> {
         self.reject_filter("KvBatchScanner")?;
         self.reject_limit("KvBatchScanner")?;
         if !self.table_info.has_primary_key() {
@@ -195,10 +211,11 @@ impl<'a> TableScan<'a> {
                 message: "KV snapshot scans require a primary-key table".into(),
             });
         }
-        if bucket.table_id() != self.table_info.table_id
+        if bucket_count <= 0
+            || bucket.table_id() != self.table_info.table_id
             || bucket.partition_id().is_some() != self.table_info.is_partitioned()
             || bucket.bucket_id() < 0
-            || bucket.bucket_id() >= self.table_info.get_num_buckets()
+            || bucket.bucket_id() >= bucket_count
         {
             return Err(Error::IllegalArgument {
                 message: format!("Invalid KV scan bucket: {bucket}"),
@@ -220,6 +237,7 @@ impl<'a> TableScan<'a> {
             getter,
             self.projected_fields,
             bucket,
+            bucket_count,
         ))
     }
 

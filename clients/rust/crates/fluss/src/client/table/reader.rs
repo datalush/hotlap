@@ -260,22 +260,51 @@ impl RecordBatchLogReader {
         scanner: RecordBatchLogScanner,
         ranges: Vec<BoundedLogReadRange>,
     ) -> Result<Self> {
+        Self::new_from_ranges_inner(scanner, ranges, None).await
+    }
+
+    /// Like [`new_from_ranges`](Self::new_from_ranges), but validates each
+    /// partition bucket against its own discovered count and sends that count
+    /// with log fetches. Required when historical partitions have a layout
+    /// different from the table's current default.
+    pub async fn new_from_ranges_with_bucket_counts(
+        scanner: RecordBatchLogScanner,
+        ranges: Vec<BoundedLogReadRange>,
+        counts: HashMap<PartitionId, i32>,
+    ) -> Result<Self> {
+        if !scanner.is_partitioned() {
+            return Err(Error::IllegalArgument {
+                message: "Per-partition bucket counts require a partitioned log scanner".into(),
+            });
+        }
+        Self::new_from_ranges_inner(scanner, ranges, Some(counts)).await
+    }
+
+    async fn new_from_ranges_inner(
+        scanner: RecordBatchLogScanner,
+        ranges: Vec<BoundedLogReadRange>,
+        counts: Option<HashMap<PartitionId, i32>>,
+    ) -> Result<Self> {
         // Acquire the guard before inspecting or changing subscriptions. The
         // internal subscribe helpers below require this guard and bypass the
         // public subscription check that intentionally rejects active readers.
         let activation = ReaderActivationGuard::acquire(&scanner)?;
 
-        validate_read_ranges(
+        validate_read_ranges_with_counts(
             scanner.table_id(),
             scanner.is_partitioned(),
             scanner.num_buckets(),
             &ranges,
+            counts.as_ref(),
         )?;
         if !scanner.get_subscribed_buckets().is_empty() {
             return Err(Error::IllegalArgument {
                 message: "new_from_ranges requires a scanner without existing subscriptions."
                     .to_string(),
             });
+        }
+        if let Some(counts) = counts {
+            scanner.set_partition_bucket_counts(counts);
         }
 
         let mut stopping_offsets = HashMap::with_capacity(ranges.len());
@@ -656,6 +685,16 @@ fn validate_read_buckets<'a>(
     num_buckets: i32,
     buckets: impl IntoIterator<Item = &'a TableBucket>,
 ) -> Result<()> {
+    validate_read_buckets_with_counts(table_id, is_partitioned, num_buckets, buckets, None)
+}
+
+fn validate_read_buckets_with_counts<'a>(
+    table_id: TableId,
+    is_partitioned: bool,
+    num_buckets: i32,
+    buckets: impl IntoIterator<Item = &'a TableBucket>,
+    counts: Option<&HashMap<PartitionId, i32>>,
+) -> Result<()> {
     let mut seen = HashSet::new();
     for bucket in buckets {
         if bucket.table_id() != table_id {
@@ -674,10 +713,16 @@ fn validate_read_buckets<'a>(
                 },
             });
         }
-        if bucket.bucket_id() < 0 || bucket.bucket_id() >= num_buckets {
+        let count = match (bucket.partition_id(), counts) {
+            (Some(id), Some(counts)) => *counts.get(&id).ok_or_else(|| Error::IllegalArgument {
+                message: format!("Missing routing bucket count for partition {id}"),
+            })?,
+            _ => num_buckets,
+        };
+        if count <= 0 || bucket.bucket_id() < 0 || bucket.bucket_id() >= count {
             return Err(Error::IllegalArgument {
                 message: format!(
-                    "Bounded read bucket id {} is out of range for a table with {num_buckets} buckets.",
+                    "Bounded read bucket id {} is out of range for a partition with {count} buckets.",
                     bucket.bucket_id()
                 ),
             });
@@ -693,17 +738,29 @@ fn validate_read_buckets<'a>(
 
 /// Validate read ranges against the scanned table before any subscription
 /// happens.
+#[cfg(test)]
 fn validate_read_ranges(
     table_id: TableId,
     is_partitioned: bool,
     num_buckets: i32,
     ranges: &[BoundedLogReadRange],
 ) -> Result<()> {
-    validate_read_buckets(
+    validate_read_ranges_with_counts(table_id, is_partitioned, num_buckets, ranges, None)
+}
+
+fn validate_read_ranges_with_counts(
+    table_id: TableId,
+    is_partitioned: bool,
+    num_buckets: i32,
+    ranges: &[BoundedLogReadRange],
+    counts: Option<&HashMap<PartitionId, i32>>,
+) -> Result<()> {
+    validate_read_buckets_with_counts(
         table_id,
         is_partitioned,
         num_buckets,
         ranges.iter().map(|range| &range.bucket),
+        counts,
     )?;
     for range in ranges {
         if range.starting_offset < 0 && range.starting_offset != crate::client::EARLIEST_OFFSET {
@@ -1116,6 +1173,29 @@ mod tests {
         let result = validate_read_ranges(1, false, 2, &ranges);
 
         assert!(matches!(result, Err(Error::IllegalArgument { .. })));
+    }
+
+    #[test]
+    fn partition_ranges_use_each_partitions_captured_bucket_count() {
+        let old = range(TableBucket::new_with_partition(1, Some(7), 1), 0, 4);
+        let new = range(TableBucket::new_with_partition(1, Some(8), 3), 0, 4);
+        let ranges = [old, new];
+        let counts = HashMap::from([(7, 2), (8, 4)]);
+        validate_read_ranges_with_counts(1, true, 4, &ranges, Some(&counts)).unwrap();
+        assert!(
+            validate_read_ranges_with_counts(1, true, 4, &ranges, Some(&HashMap::from([(7, 2)])))
+                .is_err()
+        );
+        assert!(
+            validate_read_ranges_with_counts(
+                1,
+                true,
+                4,
+                &ranges,
+                Some(&HashMap::from([(7, 1), (8, 4)]))
+            )
+            .is_err()
+        );
     }
 
     #[test]

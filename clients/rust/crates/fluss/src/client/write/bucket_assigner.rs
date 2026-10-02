@@ -37,13 +37,15 @@ pub trait BucketAssigner: Sync + Send {
 #[derive(Debug)]
 pub struct StickyBucketAssigner {
     table_path: Arc<PhysicalTablePath>,
+    num_buckets: i32,
     current_bucket_id: AtomicI32,
 }
 
 impl StickyBucketAssigner {
-    pub fn new(table_path: Arc<PhysicalTablePath>) -> Self {
+    pub fn new(table_path: Arc<PhysicalTablePath>, num_buckets: i32) -> Self {
         Self {
             table_path,
+            num_buckets,
             current_bucket_id: AtomicI32::new(-1),
         }
     }
@@ -57,7 +59,7 @@ impl StickyBucketAssigner {
                 let mut rng = rand::rng();
                 let mut random: i32 = rng.random();
                 random &= i32::MAX;
-                new_bucket = random % cluster.get_bucket_count(self.table_path.get_table_path());
+                new_bucket = random % self.num_buckets;
             } else if available_buckets.len() == 1 {
                 new_bucket = available_buckets[0].table_bucket.bucket_id();
             } else {
@@ -201,9 +203,10 @@ mod tests {
     fn sticky_bucket_assigner_picks_available_bucket() {
         let table_path = TablePath::new("db".to_string(), "tbl".to_string());
         let cluster = build_cluster(&table_path, 1, 2);
-        let assigner = StickyBucketAssigner::new(Arc::new(PhysicalTablePath::of(Arc::new(
-            table_path.clone(),
-        ))));
+        let assigner = StickyBucketAssigner::new(
+            Arc::new(PhysicalTablePath::of(Arc::new(table_path.clone()))),
+            2,
+        );
         let bucket = assigner.assign_bucket(None, &cluster).expect("bucket");
         assert!((0..2).contains(&bucket));
 

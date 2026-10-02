@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::BucketId;
 use crate::bucketing::BucketingFunction;
 use crate::client::metadata::Metadata;
 use crate::client::write::IdempotenceManager;
@@ -31,6 +30,7 @@ use crate::config::NoKeyAssigner;
 use crate::error::{Error, FlussError, Result};
 use crate::metadata::{PhysicalTablePath, TableInfo};
 use crate::metrics::WriterMetrics;
+use crate::{BucketId, PartitionId};
 use bytes::Bytes;
 use dashmap::DashMap;
 use log::warn;
@@ -48,8 +48,14 @@ pub struct WriterClient {
     shutdown_tx: Mutex<Option<mpsc::Sender<()>>>,
     sender_join_handle: Mutex<Option<JoinHandle<()>>>,
     metadata: Arc<Metadata>,
-    bucket_assigners: DashMap<Arc<PhysicalTablePath>, Arc<dyn BucketAssigner>>,
+    bucket_assigners: DashMap<Arc<PhysicalTablePath>, BucketAssignerBinding>,
     idempotence_manager: Arc<IdempotenceManager>,
+}
+
+struct BucketAssignerBinding {
+    partition_id: Option<PartitionId>,
+    bucket_count: i32,
+    assigner: Arc<dyn BucketAssigner>,
 }
 
 impl WriterClient {
@@ -166,14 +172,42 @@ impl WriterClient {
         table_path: &Arc<PhysicalTablePath>,
         cluster: &Arc<Cluster>,
     ) -> Result<(Arc<dyn BucketAssigner>, BucketId)> {
+        let current = cluster.get_table(table_path.get_table_path())?;
+        let partition_id = cluster.get_partition_id(table_path);
+        let count = if current.is_partitioned() {
+            match partition_id {
+                Some(id) => cluster.routing_bucket_count(current.table_id, id)?,
+                None if current.bucket_count_epoch == 0 => current.get_num_buckets(),
+                None => {
+                    return Err(Error::invalid_table(format!(
+                        "Partition metadata for {table_path} is unavailable after bucket rescale"
+                    )));
+                }
+            }
+        } else {
+            current.get_num_buckets()
+        };
         let bucket_assigner = {
-            if let Some(assigner) = self.bucket_assigners.get(table_path) {
-                assigner.clone()
+            if let Some(binding) = self.bucket_assigners.get(table_path)
+                && binding.partition_id == partition_id
+                && binding.bucket_count == count
+            {
+                Arc::clone(&binding.assigner)
             } else {
-                let assigner =
-                    Self::create_bucket_assigner(table_info, Arc::clone(table_path), &self.config)?;
-                self.bucket_assigners
-                    .insert(Arc::clone(table_path), Arc::clone(&assigner));
+                let assigner = Self::create_bucket_assigner(
+                    table_info,
+                    Arc::clone(table_path),
+                    &self.config,
+                    count,
+                )?;
+                self.bucket_assigners.insert(
+                    Arc::clone(table_path),
+                    BucketAssignerBinding {
+                        partition_id,
+                        bucket_count: count,
+                        assigner: Arc::clone(&assigner),
+                    },
+                );
                 assigner
             }
         };
@@ -227,7 +261,7 @@ impl WriterClient {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        self.accumulate.begin_flush();
+        self.accumulate.begin_flush()?;
         self.accumulate.await_flush_completion().await?;
         Ok(())
     }
@@ -244,21 +278,22 @@ impl WriterClient {
         table_info: &Arc<TableInfo>,
         table_path: Arc<PhysicalTablePath>,
         config: &Config,
+        bucket_count: i32,
     ) -> Result<Arc<dyn BucketAssigner>> {
         // Decide from the table's bucket key, not an individual record's key.
         if table_info.has_bucket_key() {
             let datalake_format = table_info.get_table_config().get_datalake_format()?;
             let function = <dyn BucketingFunction>::of(datalake_format.as_ref());
-            Ok(Arc::new(HashBucketAssigner::new(
-                table_info.num_buckets,
-                function,
-            )))
+            Ok(Arc::new(HashBucketAssigner::new(bucket_count, function)))
         } else {
             match config.writer_bucket_no_key_assigner {
-                NoKeyAssigner::Sticky => Ok(Arc::new(StickyBucketAssigner::new(table_path))),
+                NoKeyAssigner::Sticky => Ok(Arc::new(StickyBucketAssigner::new(
+                    table_path,
+                    bucket_count,
+                ))),
                 NoKeyAssigner::RoundRobin => Ok(Arc::new(RoundRobinBucketAssigner::new(
                     table_path,
-                    table_info.num_buckets,
+                    bucket_count,
                 ))),
             }
         }

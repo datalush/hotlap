@@ -7,6 +7,8 @@ use std::time::Duration;
 use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::DataFusionError;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::collect as collect_plan;
 use datafusion::physical_plan::common::collect as collect_stream;
 use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
@@ -21,6 +23,7 @@ use fluss::metadata::{
 use fluss::row::GenericRow;
 use fluss::rpc::message::OffsetSpec;
 use fluss_datafusion::{FlussCatalog, FlussKvTable, FlussLogTable};
+use futures::StreamExt;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 const DATABASE: &str = "datafusion_tests";
@@ -340,6 +343,19 @@ async fn check_kv_sql(
     assert_eq!(limited.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
     assert_eq!(count_sql(ctx, "SELECT COUNT(*) FROM kv").await?, 70);
 
+    check_memory_pool(connection, log_path, kv_path).await?;
+
+    let parallel = ctx.sql("SELECT * FROM kv").await?;
+    let source = source_plan(&parallel.create_physical_plan().await?);
+    let reads = (0..4).map(|_| collect_plan(Arc::clone(&source), Arc::new(parallel.task_ctx())));
+    for result in futures::future::try_join_all(reads).await? {
+        assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 70);
+    }
+    assert_eq!(
+        metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
+        0
+    );
+
     let timed = SessionContext::new();
     timed.register_table(
         "kv",
@@ -359,6 +375,88 @@ async fn check_kv_sql(
             .collect()
             .await
             .is_err()
+    );
+    Ok(())
+}
+
+async fn check_memory_pool(
+    connection: &Arc<FlussConnection>,
+    log: &TablePath,
+    kv: &TablePath,
+) -> TestResult<()> {
+    let tiny_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
+    let tiny = SessionContext::new_with_config_rt(
+        SessionConfig::new(),
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&tiny_pool))
+                .build()?,
+        ),
+    );
+    tiny.register_table(
+        "log",
+        Arc::new(FlussLogTable::open(Arc::clone(connection), log.clone(), SCAN_TIMEOUT).await?),
+    )?;
+    tiny.register_table(
+        "kv",
+        Arc::new(FlussKvTable::open(Arc::clone(connection), kv.clone(), SCAN_TIMEOUT).await?),
+    )?;
+    for table in ["log", "kv"] {
+        let query = tiny.sql(&format!("SELECT * FROM {table}")).await?;
+        let plan = query.create_physical_plan().await?;
+        let source = source_plan(&plan);
+        let error = collect_plan(plan, Arc::new(query.task_ctx()))
+            .await
+            .expect_err("the scan must respect the query's shared memory pool");
+        assert!(
+            error.to_string().to_lowercase().contains("memory"),
+            "{error}"
+        );
+        assert_eq!(tiny_pool.reserved(), 0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while metric(&source.metrics().unwrap(), "fluss_active_partition_streams") != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
+            0
+        );
+    }
+
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+    let slow = SessionContext::new_with_config_rt(
+        SessionConfig::new().with_target_partitions(1),
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build()?,
+        ),
+    );
+    slow.register_table(
+        "kv",
+        Arc::new(FlussKvTable::open(Arc::clone(connection), kv.clone(), SCAN_TIMEOUT).await?),
+    )?;
+    let query = slow.sql("SELECT * FROM kv").await?;
+    let plan = query.create_physical_plan().await?;
+    let source = source_plan(&plan);
+    let mut stream = source.execute(0, Arc::new(query.task_ctx()))?;
+    let first = stream.next().await.expect("first KV page")?;
+    assert!(first.num_rows() > 0);
+    let held = pool.reserved();
+    assert!(held > 0 && held <= 8 * 1024 * 1024);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        pool.reserved(),
+        held,
+        "a stalled consumer must not pull more pages"
+    );
+    drop(stream);
+    assert_eq!(pool.reserved(), 0);
+    assert_eq!(
+        metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
+        0
     );
     Ok(())
 }
@@ -611,6 +709,41 @@ async fn check_partitioned_sql(
     }
     log_writer.flush().await?;
     kv_writer.flush().await?;
+    let capped = SessionContext::new();
+    capped.register_table(
+        "plog",
+        Arc::new(
+            FlussLogTable::open(Arc::clone(connection), log.clone(), SCAN_TIMEOUT)
+                .await?
+                .with_max_assigned_buckets(3)?,
+        ),
+    )?;
+    capped.register_table(
+        "pkv",
+        Arc::new(
+            FlussKvTable::open(Arc::clone(connection), kv.clone(), SCAN_TIMEOUT)
+                .await?
+                .with_max_assigned_buckets(3)?,
+        ),
+    )?;
+    for table in ["plog", "pkv"] {
+        assert!(
+            capped
+                .sql(&format!("SELECT COUNT(*) FROM {table}"))
+                .await?
+                .collect()
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            count_sql(
+                &capped,
+                &format!("SELECT COUNT(*) FROM {table} WHERE region = 'north'")
+            )
+            .await?,
+            2
+        );
+    }
     for table in ["plog", "pkv"] {
         assert_eq!(
             count_sql(&ctx, &format!("SELECT COUNT(*) FROM {table}")).await?,
@@ -708,16 +841,55 @@ async fn check_partitioned_sql(
         2
     );
 
-    // New partitions do not enter the still-running execution. A new
-    // execution of those same sources sees them, and later sees DDL removal.
+    // Old partitions retain two buckets after table defaults change; a new
+    // partition receives three. The already-started execution still uses its
+    // captured topology, while the same plan sees all buckets on the next run.
+    for path in [log, kv] {
+        admin
+            .alter_table(
+                path,
+                false,
+                AlterTableChanges {
+                    modify_bucket_count: Some(3),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        for name in ["north", "south"] {
+            assert_eq!(partition_bucket_count(&admin, path, name).await?, 2);
+        }
+    }
     create_ready_partition(&admin, log, "west").await?;
     create_ready_partition(&admin, kv, "west").await?;
-    let mut row = GenericRow::new(3);
-    row.set_field(0, 5_i32);
-    row.set_field(1, "west");
-    row.set_field(2, "value-5");
-    log_writer.append(&row)?;
-    kv_writer.upsert(&row)?;
+    assert_eq!(partition_bucket_count(&admin, log, "west").await?, 3);
+    assert_eq!(partition_bucket_count(&admin, kv, "west").await?, 3);
+    let mut west_rows = 0_usize;
+    let mut third_bucket_written = false;
+    let mut west_ids = Vec::new();
+    for id in [5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] {
+        let mut row = GenericRow::new(3);
+        row.set_field(0, id);
+        row.set_field(1, "west");
+        row.set_field(2, format!("value-{id}"));
+        log_writer.append(&row)?.await?;
+        kv_writer.upsert(&row)?.await?;
+        west_rows += 1;
+        west_ids.push(id);
+        let log_offsets = admin
+            .list_partition_offsets(log, "west", &[0, 1, 2], OffsetSpec::Latest)
+            .await?;
+        let kv_offsets = admin
+            .list_partition_offsets(kv, "west", &[0, 1, 2], OffsetSpec::Latest)
+            .await?;
+        if log_offsets[&2] > 0 && kv_offsets[&2] > 0 {
+            third_bucket_written = true;
+            break;
+        }
+    }
+    assert!(
+        third_bucket_written,
+        "both sources must exercise bucket 2 of the rescaled partition"
+    );
     log_writer.flush().await?;
     kv_writer.flush().await?;
     let late_log = collect_stream(log_source.execute(0, delayed_log)?).await?;
@@ -744,13 +916,43 @@ async fn check_partitioned_sql(
         assert_eq!(metric(&metrics, "fluss_partitions_selected"), 2);
         assert_eq!(metric(&metrics, "fluss_buckets_assigned"), 4);
     }
+    // The same writers were created before ALTER. They must now use the old
+    // partition's two buckets and the new partition's three buckets.
+    let mut old_row = GenericRow::new(3);
+    old_row.set_field(0, 1000_i32);
+    old_row.set_field(1, "north");
+    old_row.set_field(2, "after-rescale");
+    log_writer.append(&old_row)?.await?;
+    kv_writer.upsert(&old_row)?.await?;
+    assert_eq!(
+        count_sql(&ctx, "SELECT COUNT(*) FROM plog WHERE id = 1000").await?,
+        1
+    );
+    assert_eq!(
+        count_sql(&ctx, "SELECT COUNT(*) FROM pkv WHERE id = 1000").await?,
+        1
+    );
+    let lookup_table = connection.get_table(kv).await?;
+    let mut lookuper = lookup_table.new_lookup()?.create_lookuper()?;
+    for (region, id) in [("north", 1_i32), ("north", 1000), ("south", 3)]
+        .into_iter()
+        .chain(west_ids.into_iter().map(|id| ("west", id)))
+    {
+        let mut key = GenericRow::new(2);
+        key.set_field(0, region);
+        key.set_field(1, id);
+        assert!(
+            lookuper.lookup(&key).await?.get_single_row()?.is_some(),
+            "lookup must find {region}/{id} in its partition's own bucket layout"
+        );
+    }
     assert_eq!(
         collect_plan(Arc::clone(&log_source), Arc::new(log_df.task_ctx()))
             .await?
             .iter()
             .map(RecordBatch::num_rows)
             .sum::<usize>(),
-        5
+        5 + west_rows
     );
     assert_eq!(
         collect_plan(Arc::clone(&kv_source), Arc::new(kv_df.task_ctx()))
@@ -758,12 +960,24 @@ async fn check_partitioned_sql(
             .iter()
             .map(RecordBatch::num_rows)
             .sum::<usize>(),
-        5
+        5 + west_rows
     );
     for table in ["plog", "pkv"] {
         assert_eq!(
             count_sql(&ctx, &format!("SELECT COUNT(*) FROM {table}")).await?,
-            5
+            (5 + west_rows) as i64
+        );
+        let query = ctx.sql(&format!("SELECT * FROM {table}")).await?;
+        let plan = query.create_physical_plan().await?;
+        let source = source_plan(&plan);
+        let rows = collect_plan(plan, Arc::new(query.task_ctx())).await?;
+        assert_eq!(
+            rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            5 + west_rows
+        );
+        assert_eq!(
+            metric(&source.metrics().unwrap(), "fluss_buckets_assigned"),
+            7
         );
     }
     let south = PartitionSpec::new([("region", "south")].into_iter().collect());
@@ -789,20 +1003,8 @@ async fn check_partitioned_sql(
     replacement.set_field(0, 6_i32);
     replacement.set_field(1, "south");
     replacement.set_field(2, "replacement");
-    let new_log = connection
-        .get_table(log)
-        .await?
-        .new_append()?
-        .create_writer()?;
-    new_log.append(&replacement)?;
-    new_log.flush().await?;
-    let new_kv = connection
-        .get_table(kv)
-        .await?
-        .new_upsert()?
-        .create_writer()?;
-    new_kv.upsert(&replacement)?;
-    new_kv.flush().await?;
+    log_writer.append(&replacement)?.await?;
+    kv_writer.upsert(&replacement)?.await?;
     assert_no_recreated_rows(&log_old, log_context).await?;
     assert_no_recreated_rows(&kv_old, kv_context).await?;
     assert_eq!(
@@ -821,7 +1023,7 @@ async fn check_partitioned_sql(
             .iter()
             .map(RecordBatch::num_rows)
             .sum::<usize>(),
-        3
+        3 + west_rows
     );
     assert_eq!(
         collect_plan(Arc::clone(&kv_source), Arc::new(kv_df.task_ctx()))
@@ -829,12 +1031,12 @@ async fn check_partitioned_sql(
             .iter()
             .map(RecordBatch::num_rows)
             .sum::<usize>(),
-        3
+        3 + west_rows
     );
     for table in ["plog", "pkv"] {
         assert_eq!(
             count_sql(&ctx, &format!("SELECT COUNT(*) FROM {table}")).await?,
-            3
+            (3 + west_rows) as i64
         );
     }
     Ok(())
@@ -852,6 +1054,21 @@ async fn partition_id(
         .find(|info| info.get_partition_name() == name)
         .expect("partition must exist")
         .get_partition_id())
+}
+
+async fn partition_bucket_count(
+    admin: &fluss::client::FlussAdmin,
+    path: &TablePath,
+    name: &str,
+) -> TestResult<i32> {
+    Ok(admin
+        .list_partition_infos(path)
+        .await?
+        .into_iter()
+        .find(|info| info.get_partition_name() == name)
+        .expect("partition must exist")
+        .get_bucket_count()
+        .expect("server must report partition bucket count"))
 }
 
 async fn assert_no_recreated_rows(
@@ -880,10 +1097,11 @@ async fn create_ready_partition(
 ) -> TestResult<()> {
     let spec = PartitionSpec::new([("region", name)].into_iter().collect());
     admin.create_partition(path, &spec, false).await?;
-    tokio::time::timeout(Duration::from_secs(20), async {
+    let buckets: Vec<_> = (0..partition_bucket_count(admin, path, name).await?).collect();
+    let ready = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if admin
-                .list_partition_offsets(path, name, &[0, 1], OffsetSpec::Latest)
+                .list_partition_offsets(path, name, &buckets, OffsetSpec::Latest)
                 .await
                 .is_ok()
             {
@@ -892,7 +1110,16 @@ async fn create_ready_partition(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await?;
+    .await;
+    if ready.is_err() {
+        return Err(format!(
+            "Partition {path}/{name} buckets {buckets:?} never became readable: {:?}",
+            admin
+                .list_partition_offsets(path, name, &buckets, OffsetSpec::Latest)
+                .await
+        )
+        .into());
+    }
     Ok(())
 }
 
