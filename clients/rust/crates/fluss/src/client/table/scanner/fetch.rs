@@ -24,6 +24,7 @@ use super::{
     RwLock, ScannerMetrics, SchemaRef, SecurityTokenManager, TableBucket, TableInfo, TempDir,
     to_arrow_schema,
 };
+use crate::client::table::remote_log::RemoteDownloadLimits;
 
 impl LogFetcher {
     #[allow(clippy::too_many_arguments)]
@@ -94,10 +95,7 @@ impl LogFetcher {
 
         let remote_log_downloader = Arc::new(RemoteLogDownloader::new(
             tmp_dir,
-            config.scanner_remote_log_prefetch_num,
-            config.scanner_remote_log_max_pending_segments,
-            config.remote_file_download_thread_num,
-            config.scanner_remote_log_read_concurrency,
+            RemoteDownloadLimits::from_config(config),
             credentials_rx,
             Arc::clone(&metrics),
         )?);

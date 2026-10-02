@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 
 use crate::client::table::read_context_resolver::ReadContextResolver;
 use crate::client::table::remote_log::{
-    PrefetchPermit, RemoteLogDownloadFuture, RemoteLogFile, RemoteLogSegment,
+    PrefetchBytesPermit, PrefetchPermit, RemoteLogDownloadFuture, RemoteLogFile, RemoteLogSegment,
 };
 use crate::error::{ApiError, Error, Result};
 use crate::metadata::TableBucket;
@@ -202,15 +202,17 @@ impl LogFetchBuffer {
     /// Add a pending fetch to the buffer
     pub fn pend(&self, pending_fetch: Box<dyn PendingFetch>) {
         let table_bucket = pending_fetch.table_bucket().clone();
-        let completed = pending_fetch.is_completed();
-        self.pending_fetches
-            .lock()
-            .entry(table_bucket.clone())
-            .or_default()
-            .push_back(pending_fetch);
-        // The download may finish before the callback sees this insertion.
-        // Either the callback or this check must move it to the ready queue.
-        if completed {
+        let ready = {
+            let mut pending = self.pending_fetches.lock();
+            let queue = pending.entry(table_bucket.clone()).or_default();
+            queue.push_back(pending_fetch);
+            // Hold the queue lock through the check: a callback that completes
+            // after this point cannot pass try_complete until insertion ends.
+            queue.front().is_some_and(|front| front.is_completed())
+        };
+        // A callback that ran before insertion saw no pending fetch. This
+        // post-insertion check completes it without depending on another RPC.
+        if ready {
             self.try_complete(&table_bucket);
         }
     }
@@ -850,14 +852,20 @@ impl CompletedFetch for DefaultCompletedFetch {
 /// Holds RAII permit until consumed (data is in inner)
 pub struct RemoteCompletedFetch {
     inner: DefaultCompletedFetch,
-    permit: Option<PrefetchPermit>,
+    _permit: PrefetchPermit,
+    _bytes_permit: PrefetchBytesPermit,
 }
 
 impl RemoteCompletedFetch {
-    pub fn new(inner: DefaultCompletedFetch, permit: PrefetchPermit) -> Self {
+    pub fn new(
+        inner: DefaultCompletedFetch,
+        permit: PrefetchPermit,
+        bytes_permit: PrefetchBytesPermit,
+    ) -> Self {
         Self {
             inner,
-            permit: Some(permit),
+            _permit: permit,
+            _bytes_permit: bytes_permit,
         }
     }
 }
@@ -900,9 +908,8 @@ impl CompletedFetch for RemoteCompletedFetch {
 
     fn drain(&mut self) {
         self.inner.drain();
-        // Release permit immediately (don't wait for struct drop)
-        // Critical: allows prefetch to continue even if Box<dyn CompletedFetch> kept around
-        self.permit.take(); // drops permit here, triggers recycle notification
+        // The file source remains owned by `inner` until this fetch drops;
+        // retain both permits until then so bytes and slots reflect live files.
     }
 
     fn size_in_bytes(&self) -> usize {
@@ -973,6 +980,7 @@ impl PendingFetch for RemotePendingFetch {
             file_path,
             file_size: _,
             permit,
+            bytes_permit,
         } = remote_log_file;
 
         // Open file for streaming (no memory allocation for entire file)
@@ -1013,7 +1021,11 @@ impl PendingFetch for RemotePendingFetch {
         // Wrap it with RemoteCompletedFetch to hold the permit
         // Permit manages the prefetch slot (releases semaphore and notifies coordinator) when dropped;
         // file deletion is handled by FileCleanupGuard in the file-backed source created via from_file
-        Ok(Box::new(RemoteCompletedFetch::new(inner_fetch, permit)))
+        Ok(Box::new(RemoteCompletedFetch::new(
+            inner_fetch,
+            permit,
+            bytes_permit,
+        )))
     }
 }
 
@@ -1180,10 +1192,10 @@ mod tests {
     async fn await_not_empty_returns_pending_error() {
         let buffer = LogFetchBuffer::new(test_resolver().unwrap());
         let table_bucket = TableBucket::new(1, 0);
+        buffer.try_complete(&table_bucket); // completion raced ahead of insertion
         buffer.pend(Box::new(ErrorPendingFetch {
             table_bucket: table_bucket.clone(),
         }));
-        buffer.try_complete(&table_bucket);
 
         let result = buffer.await_not_empty(Duration::from_millis(10)).await;
         assert!(matches!(result, Ok(true)));

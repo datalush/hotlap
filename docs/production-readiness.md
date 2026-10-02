@@ -31,16 +31,29 @@ bucket**, not an atomic cross-bucket snapshot.
 
 ## Verified in a separate Docker server profile
 
-The ignored `remote_retention` test uses the Fluss 1.0 server image, a local
-filesystem shared with its tabletserver, 120-byte log segments and one-second
-tiering/retention checks. It verifies the **actual remote-download byte
+The ignored `remote_retention` tests use the Fluss 1.0 server image, either a
+local filesystem shared with its tabletserver or the existing RustFS S3
+endpoint, 120-byte log segments and one-second tiering/retention checks. The
+S3 test isolates objects under a unique prefix in `fluss-lab` and removes
+that prefix afterward. Both tests verify the **actual remote-download byte
 counter** while DataFusion returns exactly the projected and filtered rows.
 With a stalled remote consumer it checks the four-file prefetch bound, stable
 DataFusion reservation and cleanup of temporary files after cancellation.
-With `table.log.ttl` changed from disabled to two seconds mid-read, the
-original execution fails instead of returning an incomplete result; a new
-query returns exactly the rows still retained. A one-segment pending-request
-budget also fails a large remote scan rather than silently truncating it.
+With `table.log.ttl` changed from disabled to two seconds mid-read, a scanner
+limited to one prefetched remote segment and one row per pull keeps unread
+segments out of its cache. After retention advances, that in-progress scan
+fails with an out-of-range or missing-segment error instead of returning an
+incomplete result; a new query returns exactly the rows still retained. A
+one-segment pending-request budget and a one-byte remote
+prefetch budget both fail a large remote scan rather than silently truncating
+it. Remote request slots are released on cancellation, and temporary S3
+credentials received as either `security_token` or `session_token` are passed
+to OpenDAL as its S3 `session_token` property. If both names are present with
+different values, the client rejects them without logging either token.
+The remote downloader reports a missing segment as an incomplete scan (the
+object may have expired or been removed); it preserves the storage error as
+the cause without assuming that TTL was the reason. Permanent storage errors
+are not retried.
 
 ## Runtime limits to configure
 
@@ -53,8 +66,18 @@ operators. Set the Rust client's `scanner_log_fetch_max_bytes`,
 `scanner_log_fetch_max_bytes_for_bucket`,
 `scanner_remote_log_prefetch_num` (downloaded file slots) and
 `scanner_remote_log_max_pending_segments` (outstanding request cap, default
-8192) for the deployment's budget. A single oversized server record can
+8192), and `scanner_remote_log_max_prefetch_bytes` (downloaded remote bytes
+per scanner, default 64 MiB). An oversized remote segment fails the scan
+rather than bypassing the limit. A single oversized server record can
 exceed a fetch size hint before the pool rejects its decoded Arrow batch.
+`scanner_remote_log_max_retries` controls retries *after* the first attempt
+(default 10; `0` means one attempt). `scanner_remote_log_retry_backoff_base_ms`
+and `scanner_remote_log_retry_backoff_max_ms` configure exponential backoff
+with jitter (defaults 100ms and 5000ms); base must be positive and max at
+least base, up to 3600000ms. These settings apply only to retriable remote
+download failures.
+Cancelling a scan interrupts a queued retry instead of waiting for its
+backoff. The DataFusion scan timeout still bounds the complete source read.
 
 The source uses the Rust client copied in this repository. The Rust integration
 pins DataFusion 55.1 and Arrow 59 in `Cargo.lock`. The currently published
@@ -88,14 +111,13 @@ Run the independent Docker storage profile separately from the native-sni
 tests (both may bind port 9123):
 
 ```bash
-FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 cargo test -p fluss-datafusion --test remote_retention -- --ignored
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 cargo test -p fluss-datafusion --test remote_retention datafusion_reads_remote_and_rejects_lost_retention -- --ignored
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_reads_and_expires_rustfs_s3 -- --ignored
 ```
 
 ## Remaining verification before a general production claim
 
-The Docker test uses a local filesystem for remote segments; it does not yet
-verify the same transition against the intended S3 backend. Long-duration
-load tests should measure compressed fetch-buffer memory (which the DataFusion
-reservation does not cover), temporary disk usage, simultaneous queries and
-coordinator failover. Reproduce them against the exact server, client and
-storage profile intended for deployment.
+Long-duration load tests should measure compressed fetch-buffer memory (which
+the DataFusion reservation does not cover), temporary disk usage, simultaneous
+queries and coordinator failover. Reproduce them against the exact server,
+client and storage profile intended for deployment.

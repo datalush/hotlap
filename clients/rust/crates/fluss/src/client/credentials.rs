@@ -45,10 +45,38 @@ const DEFAULT_NON_EXPIRING_REFRESH_INTERVAL: Duration = Duration::from_secs(7 * 
 pub type CredentialsReceiver = watch::Receiver<Option<HashMap<String, String>>>;
 
 #[derive(Debug, Deserialize)]
+#[serde(try_from = "WireCredentials")]
 struct Credentials {
     access_key_id: String,
     access_key_secret: String,
     security_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireCredentials {
+    access_key_id: String,
+    access_key_secret: String,
+    security_token: Option<String>,
+    session_token: Option<String>,
+}
+
+impl TryFrom<WireCredentials> for Credentials {
+    type Error = &'static str;
+
+    fn try_from(wire: WireCredentials) -> std::result::Result<Self, Self::Error> {
+        let security_token = match (wire.security_token, wire.session_token) {
+            (Some(security), Some(session)) if security != session => {
+                return Err("conflicting security_token and session_token");
+            }
+            (Some(token), _) | (_, Some(token)) => Some(token),
+            (None, None) => None,
+        };
+        Ok(Self {
+            access_key_id: wire.access_key_id,
+            access_key_secret: wire.access_key_secret,
+            security_token,
+        })
+    }
 }
 
 /// Returns (opendal_key, needs_inversion)
@@ -57,7 +85,7 @@ fn convert_hadoop_key_to_opendal(hadoop_key: &str) -> Option<(String, bool)> {
     match hadoop_key {
         // S3 specific configurations
         "fs.s3a.endpoint" => Some(("endpoint".to_string(), false)),
-        "fs.s3a.endpoint.region" => Some(("region".to_string(), false)),
+        "fs.s3a.region" | "fs.s3a.endpoint.region" => Some(("region".to_string(), false)),
         "fs.s3a.path.style.access" => Some(("enable_virtual_host_style".to_string(), true)),
         "fs.s3a.connection.ssl.enabled" => None,
         // OSS specific configurations
@@ -93,6 +121,8 @@ fn build_remote_fs_props(
     );
 
     if let Some(token) = &credentials.security_token {
+        // OpenDAL S3 uses session_token; OSS uses security_token.
+        props.insert("session_token".to_string(), token.clone());
         props.insert("security_token".to_string(), token.clone());
     }
 
@@ -354,6 +384,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn credentials_accept_either_token_name_or_both_when_equal() {
+        for fields in [
+            r#""security_token":"same""#,
+            r#""session_token":"same""#,
+            r#""security_token":"same","session_token":"same""#,
+        ] {
+            let json = format!(r#"{{"access_key_id":"ak","access_key_secret":"sk",{fields}}}"#);
+            let credentials: Credentials = serde_json::from_str(&json).unwrap();
+            assert_eq!(credentials.security_token.as_deref(), Some("same"));
+            let props = build_remote_fs_props(&credentials, &HashMap::new());
+            assert_eq!(props.get("session_token").map(String::as_str), Some("same"));
+            assert_eq!(
+                props.get("security_token").map(String::as_str),
+                Some("same")
+            );
+        }
+
+        let credentials: Credentials =
+            serde_json::from_str(r#"{"access_key_id":"ak","access_key_secret":"sk"}"#).unwrap();
+        assert!(credentials.security_token.is_none());
+        let props = build_remote_fs_props(&credentials, &HashMap::new());
+        assert!(!props.contains_key("session_token"));
+        assert!(!props.contains_key("security_token"));
+    }
+
+    #[test]
+    fn credentials_reject_conflicting_tokens_without_exposing_them() {
+        let error = serde_json::from_str::<Credentials>(
+            r#"{"access_key_id":"ak","access_key_secret":"sk","security_token":"first-secret","session_token":"second-secret"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("conflicting security_token and session_token"));
+        assert!(!error.contains("first-secret"));
+        assert!(!error.contains("second-secret"));
+    }
+
+    #[test]
     fn convert_hadoop_key_to_opendal_maps_known_keys() {
         // S3 keys
         let (key, invert) = convert_hadoop_key_to_opendal("fs.s3a.endpoint").expect("key");
@@ -421,17 +489,23 @@ mod tests {
             access_key_secret: "sk".to_string(),
             security_token: Some("token".to_string()),
         };
-        let addition_infos =
-            HashMap::from([("fs.s3a.path.style.access".to_string(), "true".to_string())]);
+        let addition_infos = HashMap::from([
+            ("fs.s3a.path.style.access".to_string(), "true".to_string()),
+            ("fs.s3a.region".to_string(), "us-east-1".to_string()),
+            ("fs.s3a.endpoint".to_string(), "http://s3:9000".to_string()),
+        ]);
 
         let props = build_remote_fs_props(&credentials, &addition_infos);
         assert_eq!(props.get("access_key_id"), Some(&"ak".to_string()));
         assert_eq!(props.get("access_key_secret"), Some(&"sk".to_string()));
         assert_eq!(props.get("access_key_secret"), Some(&"sk".to_string()));
         assert_eq!(props.get("security_token"), Some(&"token".to_string()));
+        assert_eq!(props.get("session_token"), Some(&"token".to_string()));
         assert_eq!(
             props.get("enable_virtual_host_style"),
             Some(&"false".to_string())
         );
+        assert_eq!(props.get("region"), Some(&"us-east-1".to_string()));
+        assert_eq!(props.get("endpoint"), Some(&"http://s3:9000".to_string()));
     }
 }

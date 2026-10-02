@@ -28,6 +28,10 @@ const DEFAULT_WRITER_DYNAMIC_BATCH_SIZE_ENABLED: bool = true;
 const DEFAULT_RETRIES: i32 = i32::MAX;
 const DEFAULT_PREFETCH_NUM: usize = 4;
 const DEFAULT_REMOTE_MAX_PENDING_SEGMENTS: usize = 8_192;
+const DEFAULT_REMOTE_MAX_PREFETCH_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_REMOTE_LOG_MAX_RETRIES: u32 = 10;
+const DEFAULT_REMOTE_LOG_RETRY_BACKOFF_BASE_MS: u64 = 100;
+const DEFAULT_REMOTE_LOG_RETRY_BACKOFF_MAX_MS: u64 = 5_000;
 const DEFAULT_DOWNLOAD_THREADS: usize = 3;
 const DEFAULT_SCANNER_REMOTE_LOG_READ_CONCURRENCY: usize = 4;
 const DEFAULT_MAX_POLL_RECORDS: usize = 500;
@@ -105,6 +109,26 @@ pub struct Config {
     /// remote download requests. Default: 8192.
     #[arg(long, default_value_t = DEFAULT_REMOTE_MAX_PENDING_SEGMENTS)]
     pub scanner_remote_log_max_pending_segments: usize,
+
+    /// Maximum bytes held in downloaded remote segments by one scanner.
+    /// A segment exceeding this value fails the scan. Default: 64 MiB.
+    #[arg(long, default_value_t = DEFAULT_REMOTE_MAX_PREFETCH_BYTES)]
+    pub scanner_remote_log_max_prefetch_bytes: usize,
+
+    /// Retries after the initial remote segment download attempt. 0 disables
+    /// retries. Permanent storage errors are never retried. Default: 10.
+    #[arg(long, default_value_t = DEFAULT_REMOTE_LOG_MAX_RETRIES)]
+    pub scanner_remote_log_max_retries: u32,
+
+    /// Initial backoff between remote download attempts (milliseconds).
+    /// Default: 100ms.
+    #[arg(long, default_value_t = DEFAULT_REMOTE_LOG_RETRY_BACKOFF_BASE_MS)]
+    pub scanner_remote_log_retry_backoff_base_ms: u64,
+
+    /// Maximum backoff between remote download attempts (milliseconds).
+    /// Default: 5000ms.
+    #[arg(long, default_value_t = DEFAULT_REMOTE_LOG_RETRY_BACKOFF_MAX_MS)]
+    pub scanner_remote_log_retry_backoff_max_ms: u64,
 
     /// Maximum concurrent remote log downloads
     /// Default: 3 (matching Java REMOTE_FILE_DOWNLOAD_THREAD_NUM)
@@ -263,6 +287,22 @@ impl std::fmt::Debug for Config {
                 &self.scanner_remote_log_max_pending_segments,
             )
             .field(
+                "scanner_remote_log_max_prefetch_bytes",
+                &self.scanner_remote_log_max_prefetch_bytes,
+            )
+            .field(
+                "scanner_remote_log_max_retries",
+                &self.scanner_remote_log_max_retries,
+            )
+            .field(
+                "scanner_remote_log_retry_backoff_base_ms",
+                &self.scanner_remote_log_retry_backoff_base_ms,
+            )
+            .field(
+                "scanner_remote_log_retry_backoff_max_ms",
+                &self.scanner_remote_log_retry_backoff_max_ms,
+            )
+            .field(
                 "remote_file_download_thread_num",
                 &self.remote_file_download_thread_num,
             )
@@ -337,6 +377,10 @@ impl Default for Config {
             writer_bucket_no_key_assigner: NoKeyAssigner::Sticky,
             scanner_remote_log_prefetch_num: DEFAULT_PREFETCH_NUM,
             scanner_remote_log_max_pending_segments: DEFAULT_REMOTE_MAX_PENDING_SEGMENTS,
+            scanner_remote_log_max_prefetch_bytes: DEFAULT_REMOTE_MAX_PREFETCH_BYTES,
+            scanner_remote_log_max_retries: DEFAULT_REMOTE_LOG_MAX_RETRIES,
+            scanner_remote_log_retry_backoff_base_ms: DEFAULT_REMOTE_LOG_RETRY_BACKOFF_BASE_MS,
+            scanner_remote_log_retry_backoff_max_ms: DEFAULT_REMOTE_LOG_RETRY_BACKOFF_MAX_MS,
             remote_file_download_thread_num: DEFAULT_DOWNLOAD_THREADS,
             scanner_remote_log_read_concurrency: DEFAULT_SCANNER_REMOTE_LOG_READ_CONCURRENCY,
             scanner_log_max_poll_records: DEFAULT_MAX_POLL_RECORDS,
@@ -417,6 +461,18 @@ impl Config {
         }
         if self.scanner_remote_log_max_pending_segments == 0 {
             return Err("scanner_remote_log_max_pending_segments must be > 0".into());
+        }
+        if self.scanner_remote_log_max_prefetch_bytes == 0 {
+            return Err("scanner_remote_log_max_prefetch_bytes must be > 0".into());
+        }
+        if self.scanner_remote_log_retry_backoff_base_ms == 0
+            || self.scanner_remote_log_retry_backoff_max_ms
+                < self.scanner_remote_log_retry_backoff_base_ms
+            || self.scanner_remote_log_retry_backoff_max_ms > 3_600_000
+        {
+            return Err(
+                "remote log retry backoff must have base > 0 and base <= max <= 3600000ms".into(),
+            );
         }
         if self.scanner_remote_log_read_concurrency == 0 {
             return Err("scanner_remote_log_read_concurrency must be > 0".to_string());
@@ -631,6 +687,64 @@ mod tests {
             ..Config::default()
         };
         assert!(config.validate_scanner().is_err());
+    }
+
+    #[test]
+    fn test_scanner_remote_log_max_prefetch_bytes_zero() {
+        let config = Config {
+            scanner_remote_log_max_prefetch_bytes: 0,
+            ..Config::default()
+        };
+        assert!(config.validate_scanner().is_err());
+    }
+
+    #[test]
+    fn remote_log_retry_policy_accepts_zero_retries_and_rejects_invalid_backoff() {
+        let parsed = Config::try_parse_from([
+            "fluss",
+            "--scanner-remote-log-max-retries",
+            "0",
+            "--scanner-remote-log-retry-backoff-base-ms",
+            "50",
+            "--scanner-remote-log-retry-backoff-max-ms",
+            "500",
+        ])
+        .expect("remote retry policy must be configurable without recompiling");
+        assert_eq!(parsed.scanner_remote_log_max_retries, 0);
+        assert_eq!(parsed.scanner_remote_log_retry_backoff_base_ms, 50);
+        assert_eq!(parsed.scanner_remote_log_retry_backoff_max_ms, 500);
+        assert!(parsed.validate_scanner().is_ok());
+
+        let config = Config {
+            scanner_remote_log_max_retries: 0,
+            ..Config::default()
+        };
+        assert!(config.validate_scanner().is_ok());
+        assert!(
+            Config {
+                scanner_remote_log_retry_backoff_base_ms: 0,
+                ..config.clone()
+            }
+            .validate_scanner()
+            .is_err()
+        );
+        assert!(
+            Config {
+                scanner_remote_log_retry_backoff_base_ms: 20,
+                scanner_remote_log_retry_backoff_max_ms: 10,
+                ..config.clone()
+            }
+            .validate_scanner()
+            .is_err()
+        );
+        assert!(
+            Config {
+                scanner_remote_log_retry_backoff_max_ms: u64::MAX,
+                ..config
+            }
+            .validate_scanner()
+            .is_err()
+        );
     }
 
     #[test]

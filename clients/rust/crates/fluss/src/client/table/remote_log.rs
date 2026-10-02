@@ -15,6 +15,7 @@
 // limitations under the License.
 
 use crate::client::credentials::CredentialsReceiver;
+use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::io::{FileIO, Storage};
 use crate::metadata::TableBucket;
@@ -49,34 +50,87 @@ pub const DEFAULT_SCANNER_REMOTE_LOG_PREFETCH_NUM: usize = 4;
 /// Matches Java's REMOTE_FILE_DOWNLOAD_THREAD_NUM (default: 3)
 pub const DEFAULT_REMOTE_FILE_DOWNLOAD_THREAD_NUM: usize = 3;
 
-/// Initial retry backoff delay (milliseconds)
-/// Prevents hot-spin retry loops on persistent failures
-const RETRY_BACKOFF_BASE_MS: u64 = 100;
+#[derive(Clone, Copy, Debug)]
+struct RemoteRetryPolicy {
+    max_retries: u32,
+    backoff_base_ms: u64,
+    backoff_max_ms: u64,
+}
 
-/// Maximum retry backoff delay (milliseconds)
-/// Caps exponential backoff to avoid excessive delays
-const RETRY_BACKOFF_MAX_MS: u64 = 5_000;
+#[derive(Clone, Copy)]
+struct DownloadOptions {
+    max_prefetch_bytes: usize,
+    retry_policy: RemoteRetryPolicy,
+}
 
-/// Maximum number of retries before giving up
-/// After this many retries, the download will fail permanently
-const MAX_RETRY_COUNT: u32 = 10;
+impl From<&Config> for RemoteRetryPolicy {
+    fn from(config: &Config) -> Self {
+        Self {
+            max_retries: config.scanner_remote_log_max_retries,
+            backoff_base_ms: config.scanner_remote_log_retry_backoff_base_ms,
+            backoff_max_ms: config.scanner_remote_log_retry_backoff_max_ms,
+        }
+    }
+}
 
 /// Calculate exponential backoff delay with jitter for retries
-fn calculate_backoff_delay(retry_count: u32) -> tokio::time::Duration {
+fn calculate_backoff_delay(retry_count: u32, policy: RemoteRetryPolicy) -> Duration {
     use rand::Rng;
 
-    // Exponential backoff: base * 2^retry_count
-    let exponential_ms = RETRY_BACKOFF_BASE_MS.saturating_mul(1 << retry_count.min(10)); // Cap exponent to prevent overflow
+    // First retry uses the configured base; later retries grow exponentially.
+    let exponential_ms = policy
+        .backoff_base_ms
+        .saturating_mul(1_u64 << retry_count.saturating_sub(1).min(63));
 
     // Cap at maximum
-    let capped_ms = exponential_ms.min(RETRY_BACKOFF_MAX_MS);
+    let capped_ms = exponential_ms.min(policy.backoff_max_ms);
 
     // Add jitter (±25% randomness) to avoid thundering herd
     let mut rng = rand::rng();
     let jitter = rng.random_range(0.75..=1.25);
-    let final_ms = ((capped_ms as f64) * jitter) as u64;
+    let final_ms = (((capped_ms as f64) * jitter) as u64)
+        .max(1)
+        .min(policy.backoff_max_ms);
 
-    tokio::time::Duration::from_millis(final_ms)
+    Duration::from_millis(final_ms)
+}
+
+fn remote_failure_can_retry(error: &Error) -> bool {
+    match error {
+        Error::RemoteStorageUnexpectedError { source, .. } => source.is_temporary(),
+        Error::IoUnexpectedError { source, .. } => matches!(
+            source.kind(),
+            io::ErrorKind::TimedOut
+                | io::ErrorKind::Interrupted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::WouldBlock
+        ),
+        // UnexpectedError may wrap a transient error from a custom fetcher.
+        Error::UnexpectedError { .. } => true,
+        _ => false,
+    }
+}
+
+fn remote_failure_for_scan(error: Error, segment_id: &str, attempts: u32) -> Error {
+    let missing = matches!(
+        &error,
+        Error::RemoteStorageUnexpectedError { source, .. }
+            if source.kind() == opendal::ErrorKind::NotFound
+    ) || matches!(&error, Error::IoUnexpectedError { source, .. } if source.kind() == io::ErrorKind::NotFound);
+    let message = if missing {
+        format!(
+            "Required remote log segment {segment_id} is missing; this scan cannot complete (the object may have expired or been removed). Replan to read the currently retained offsets. Download attempts: {attempts}"
+        )
+    } else {
+        format!("Failed to download remote log segment after {attempts} attempt(s): {error}")
+    };
+    Error::UnexpectedError {
+        message,
+        source: Some(Box::new(error)),
+    }
 }
 
 /// Result of a fetch operation containing file path and size
@@ -185,6 +239,45 @@ impl Drop for PrefetchPermit {
     }
 }
 
+/// Reserves remote-file disk bytes while a download or prefetched file is
+/// alive. A cancelled scanner releases the reservation via ordinary Drop.
+#[derive(Debug)]
+pub(crate) struct PrefetchBytesPermit {
+    reserved: Arc<AtomicUsize>,
+    bytes: usize,
+    recycle_notify: Arc<Notify>,
+}
+
+impl PrefetchBytesPermit {
+    fn adjust_to(&mut self, actual: usize, limit: usize) -> bool {
+        if actual > self.bytes {
+            let extra = actual - self.bytes;
+            if self
+                .reserved
+                .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |used| {
+                    used.checked_add(extra).filter(|&next| next <= limit)
+                })
+                .is_err()
+            {
+                return false;
+            }
+        } else if actual < self.bytes {
+            self.reserved
+                .fetch_sub(self.bytes - actual, AtomicOrdering::AcqRel);
+            self.recycle_notify.notify_one();
+        }
+        self.bytes = actual;
+        true
+    }
+}
+
+impl Drop for PrefetchBytesPermit {
+    fn drop(&mut self) {
+        self.reserved.fetch_sub(self.bytes, AtomicOrdering::AcqRel);
+        self.recycle_notify.notify_one();
+    }
+}
+
 /// Downloaded remote log file with prefetch permit
 /// File remains on disk for memory efficiency; file deletion is handled by FileCleanupGuard in FileSource
 #[derive(Debug)]
@@ -197,6 +290,7 @@ pub struct RemoteLogFile {
     pub file_size: usize,
     /// RAII permit that releases prefetch semaphore slot and notifies coordinator when dropped
     pub permit: PrefetchPermit,
+    pub(crate) bytes_permit: PrefetchBytesPermit,
 }
 
 /// Represents a request to download a remote log segment with priority ordering
@@ -207,6 +301,18 @@ pub struct RemoteLogDownloadRequest {
     result_sender: oneshot::Sender<Result<RemoteLogFile>>,
     retry_count: u32,
     next_retry_at: Option<tokio::time::Instant>,
+    /// Keep the queue slot until the coordinator has discarded or finished
+    /// this request, even if the caller dropped its future earlier.
+    _pending_slot: Option<PendingSlot>,
+}
+
+#[derive(Debug)]
+struct PendingSlot(Arc<AtomicUsize>);
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
 }
 
 impl RemoteLogDownloadRequest {
@@ -386,7 +492,10 @@ struct DownloadCoordinator {
     active_downloads: JoinSet<DownloadResult>,
     in_flight: usize,
     prefetch_semaphore: Arc<Semaphore>,
+    prefetch_bytes: Arc<AtomicUsize>,
+    max_prefetch_bytes: usize,
     max_concurrent_downloads: usize,
+    retry_policy: RemoteRetryPolicy,
     recycle_notify: Arc<Notify>,
     fetcher: Arc<dyn RemoteLogFetcher>,
     /// Per-table scanner metric handles cloned by every spawned download
@@ -399,9 +508,21 @@ impl DownloadCoordinator {
     /// Check if we should wait for recycle notification
     /// Only wait if we're blocked on permits AND have pending work
     fn should_wait_for_recycle(&self) -> bool {
-        !self.download_queue.is_empty()
-            && self.in_flight < self.max_concurrent_downloads
-            && self.prefetch_semaphore.available_permits() == 0
+        !self.download_queue.is_empty() && self.in_flight < self.max_concurrent_downloads
+    }
+
+    fn reserve_bytes(&self, size: usize) -> Option<PrefetchBytesPermit> {
+        self.prefetch_bytes
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |used| {
+                used.checked_add(size)
+                    .filter(|&next| next <= self.max_prefetch_bytes)
+            })
+            .ok()?;
+        Some(PrefetchBytesPermit {
+            reserved: Arc::clone(&self.prefetch_bytes),
+            bytes: size,
+            recycle_notify: Arc::clone(&self.recycle_notify),
+        })
     }
 
     /// Find the earliest retry deadline among pending requests
@@ -441,6 +562,13 @@ impl DownloadCoordinator {
 
             scanned += 1;
 
+            // A closed receiver must be discarded even during a long retry
+            // backoff, otherwise cancellation keeps its queue slot reserved.
+            if request.result_sender.is_closed() {
+                drop(permit);
+                continue;
+            }
+
             // Retry backoff check: defer if retry time hasn't arrived yet
             if let Some(next_retry_at) = request.next_retry_at {
                 let now = tokio::time::Instant::now();
@@ -452,20 +580,44 @@ impl DownloadCoordinator {
                 }
             }
 
-            // Cancellation check: skip if sender closed
-            if request.result_sender.is_closed() {
+            let bytes = request.segment.size_in_bytes.max(1) as usize;
+            if bytes > self.max_prefetch_bytes {
                 drop(permit);
-                continue; // Try next request
+                let _ = request.result_sender.send(Err(Error::BufferExhausted {
+                    message: format!(
+                        "Remote segment requires {bytes} bytes, above the {}-byte prefetch limit",
+                        self.max_prefetch_bytes
+                    ),
+                }));
+                continue;
             }
+            let Some(bytes_permit) = self.reserve_bytes(bytes) else {
+                drop(permit);
+                deferred.push(request);
+                continue;
+            };
 
             // Clone data for the spawned task
             let fetcher = self.fetcher.clone();
             let recycle_notify = self.recycle_notify.clone();
             let metrics = Arc::clone(&self.metrics);
+            let options = DownloadOptions {
+                max_prefetch_bytes: self.max_prefetch_bytes,
+                retry_policy: self.retry_policy,
+            };
 
             // Spawn download task
             self.active_downloads.spawn(async move {
-                spawn_download_task(request, permit, fetcher, recycle_notify, metrics).await
+                spawn_download_task(
+                    request,
+                    permit,
+                    bytes_permit,
+                    options,
+                    fetcher,
+                    recycle_notify,
+                    metrics,
+                )
+                .await
             });
             self.in_flight += 1;
         }
@@ -487,8 +639,10 @@ impl DownloadCoordinator {
 /// - Other segments can make progress while one is failing
 /// - Natural retry through coordinator re-picking from queue
 async fn spawn_download_task(
-    request: RemoteLogDownloadRequest,
+    mut request: RemoteLogDownloadRequest,
     permit: tokio::sync::OwnedSemaphorePermit,
+    mut bytes_permit: PrefetchBytesPermit,
+    options: DownloadOptions,
     fetcher: Arc<dyn RemoteLogFetcher>,
     recycle_notify: Arc<Notify>,
     metrics: Arc<ScannerMetrics>,
@@ -505,10 +659,31 @@ async fn spawn_download_task(
     metrics.record_remote_fetch_request();
 
     // Try download ONCE
-    let download_result = fetcher.fetch(&request).await;
+    // Cancellation closes the one-shot receiver. Drop the underlying download
+    // future immediately instead of waiting for a blocked object store to
+    // respond while it still owns a prefetch slot and the scanner's temp dir.
+    let download_result = tokio::select! {
+        result = fetcher.fetch(&request) => result,
+        _ = request.result_sender.closed() => {
+            drop(permit);
+            return DownloadResult::Cancelled;
+        }
+    };
 
     match download_result {
         Ok(fetch_result) => {
+            if !bytes_permit.adjust_to(fetch_result.file_size, options.max_prefetch_bytes) {
+                let _ = tokio::fs::remove_file(&fetch_result.file_path).await;
+                return DownloadResult::FailedPermanently {
+                    error: Error::BufferExhausted {
+                        message: format!(
+                            "Downloaded remote segment requires {} bytes, above the prefetch budget",
+                            fetch_result.file_size
+                        ),
+                    },
+                    result_sender: request.result_sender,
+                };
+            }
             // Success - permit will be released on drop (FileSource handles file deletion)
             metrics.record_remote_fetch_bytes(fetch_result.file_size as u64);
             DownloadResult::Success {
@@ -516,6 +691,7 @@ async fn spawn_download_task(
                     file_path: fetch_result.file_path,
                     file_size: fetch_result.file_size,
                     permit: PrefetchPermit::new(permit, recycle_notify.clone()),
+                    bytes_permit,
                 },
                 result_sender: request.result_sender,
             }
@@ -529,30 +705,27 @@ async fn spawn_download_task(
             // Download failed - check if we should retry or give up
             // Counted per attempt, so retries each contribute one error.
             metrics.record_remote_fetch_error();
-            let retry_count = request.retry_count + 1;
+            let attempts = request.retry_count.saturating_add(1);
 
-            if retry_count > MAX_RETRY_COUNT {
-                // Too many retries - give up and fail the future
+            if request.retry_count >= options.retry_policy.max_retries
+                || !remote_failure_can_retry(&e)
+            {
                 log::error!(
-                    "Failed to download remote log segment {} after {} retries: {}. Giving up.",
+                    "Failed to download remote log segment {} after {} attempt(s): {}. Giving up.",
                     request.segment.segment_id,
-                    retry_count,
+                    attempts,
                     e
                 );
                 drop(permit); // Release immediately
 
                 DownloadResult::FailedPermanently {
-                    error: Error::UnexpectedError {
-                        message: format!(
-                            "Failed to download remote log segment after {retry_count} retries: {e}"
-                        ),
-                        source: Some(Box::new(e)),
-                    },
+                    error: remote_failure_for_scan(e, &request.segment.segment_id, attempts),
                     result_sender: request.result_sender,
                 }
             } else {
                 // Retry with exponential backoff
-                let backoff_delay = calculate_backoff_delay(retry_count);
+                let retry_count = attempts;
+                let backoff_delay = calculate_backoff_delay(retry_count, options.retry_policy);
                 let next_retry_at = tokio::time::Instant::now() + backoff_delay;
 
                 log::warn!(
@@ -560,7 +733,7 @@ async fn spawn_download_task(
                     request.segment.segment_id,
                     e,
                     retry_count,
-                    MAX_RETRY_COUNT,
+                    options.retry_policy.max_retries,
                     backoff_delay
                 );
                 drop(permit); // Release immediately - critical!
@@ -671,7 +844,7 @@ pub struct RemoteLogDownloadFuture {
     result: Arc<Mutex<Option<Result<RemoteLogFile>>>>,
     completion_callbacks: Arc<Mutex<Vec<CompletionCallback>>>,
     worker: tokio::task::AbortHandle,
-    pending_slots: Option<Arc<AtomicUsize>>,
+    recycle_notify: Option<Arc<Notify>>,
 }
 
 impl RemoteLogDownloadFuture {
@@ -714,12 +887,12 @@ impl RemoteLogDownloadFuture {
             result,
             completion_callbacks,
             worker: worker.abort_handle(),
-            pending_slots: None,
+            recycle_notify: None,
         }
     }
 
-    fn with_pending_slot(mut self, slots: Arc<AtomicUsize>) -> Self {
-        self.pending_slots = Some(slots);
+    fn with_recycle_notify(mut self, recycle_notify: Arc<Notify>) -> Self {
+        self.recycle_notify = Some(recycle_notify);
         self
     }
 
@@ -763,13 +936,7 @@ impl RemoteLogDownloadFuture {
         let mut guard = self.result.lock();
         match guard.take() {
             Some(Ok(remote_log_file)) => Ok(remote_log_file),
-            Some(Err(e)) => {
-                let error_msg = format!("{e}");
-                Err(Error::IoUnexpectedError {
-                    message: format!("Fail to get remote log file: {error_msg}"),
-                    source: io::Error::other(error_msg),
-                })
-            }
+            Some(Err(e)) => Err(e),
             None => Err(Error::IoUnexpectedError {
                 message: "Remote log file already taken or not ready".to_string(),
                 source: io::Error::other("Remote log file already taken or not ready"),
@@ -783,8 +950,10 @@ impl Drop for RemoteLogDownloadFuture {
         // A cancelled scanner must close the one-shot receiver. The download
         // coordinator can then skip queued segments and release permits/files.
         self.worker.abort();
-        if let Some(slots) = &self.pending_slots {
-            slots.fetch_sub(1, AtomicOrdering::AcqRel);
+        // A cancelled request may be parked in backoff for several seconds.
+        // Wake the coordinator to discard it and release its pending slot now.
+        if let Some(notify) = &self.recycle_notify {
+            notify.notify_one();
         }
     }
 }
@@ -798,31 +967,55 @@ impl Drop for RemoteLogDownloadFuture {
 /// won't wait for completion. Pending futures will fail.
 pub struct RemoteLogDownloader {
     request_sender: Option<mpsc::UnboundedSender<RemoteLogDownloadRequest>>,
+    recycle_notify: Arc<Notify>,
     pending_slots: Arc<AtomicUsize>,
     max_pending_segments: usize,
+    #[cfg(test)]
+    prefetch_bytes: Arc<AtomicUsize>,
+}
+
+pub(crate) struct RemoteDownloadLimits {
+    prefetch_segments: usize,
+    pending_segments: usize,
+    prefetch_bytes: usize,
+    concurrent_downloads: usize,
+    read_concurrency: usize,
+    retry_policy: RemoteRetryPolicy,
+}
+
+impl RemoteDownloadLimits {
+    pub(crate) fn from_config(config: &Config) -> Self {
+        Self {
+            prefetch_segments: config.scanner_remote_log_prefetch_num,
+            pending_segments: config.scanner_remote_log_max_pending_segments,
+            prefetch_bytes: config.scanner_remote_log_max_prefetch_bytes,
+            concurrent_downloads: config.remote_file_download_thread_num,
+            read_concurrency: config.scanner_remote_log_read_concurrency,
+            retry_policy: RemoteRetryPolicy::from(config),
+        }
+    }
 }
 
 impl RemoteLogDownloader {
     pub(crate) fn new(
         local_log_dir: TempDir,
-        max_prefetch_segments: usize,
-        max_pending_segments: usize,
-        max_concurrent_downloads: usize,
-        remote_log_read_concurrency: usize,
+        limits: RemoteDownloadLimits,
         credentials_rx: CredentialsReceiver,
         metrics: Arc<ScannerMetrics>,
     ) -> Result<Self> {
         let fetcher = Arc::new(ProductionFetcher {
             credentials_rx,
             local_log_dir: Arc::new(local_log_dir),
-            remote_log_read_concurrency,
+            remote_log_read_concurrency: limits.read_concurrency,
         });
 
-        Self::new_with_fetcher_and_limit(
+        Self::new_with_fetcher_and_retry(
             fetcher,
-            max_prefetch_segments,
-            max_pending_segments,
-            max_concurrent_downloads,
+            limits.prefetch_segments,
+            limits.pending_segments,
+            limits.prefetch_bytes,
+            limits.concurrent_downloads,
+            limits.retry_policy,
             metrics,
         )
     }
@@ -839,27 +1032,55 @@ impl RemoteLogDownloader {
             fetcher,
             max_prefetch_segments,
             8_192,
+            64 * 1024 * 1024,
             max_concurrent_downloads,
             metrics,
         )
     }
 
+    #[cfg(test)]
     fn new_with_fetcher_and_limit(
         fetcher: Arc<dyn RemoteLogFetcher>,
         max_prefetch_segments: usize,
         max_pending_segments: usize,
+        max_prefetch_bytes: usize,
         max_concurrent_downloads: usize,
+        metrics: Arc<ScannerMetrics>,
+    ) -> Result<Self> {
+        Self::new_with_fetcher_and_retry(
+            fetcher,
+            max_prefetch_segments,
+            max_pending_segments,
+            max_prefetch_bytes,
+            max_concurrent_downloads,
+            RemoteRetryPolicy::from(&Config::default()),
+            metrics,
+        )
+    }
+
+    fn new_with_fetcher_and_retry(
+        fetcher: Arc<dyn RemoteLogFetcher>,
+        max_prefetch_segments: usize,
+        max_pending_segments: usize,
+        max_prefetch_bytes: usize,
+        max_concurrent_downloads: usize,
+        retry_policy: RemoteRetryPolicy,
         metrics: Arc<ScannerMetrics>,
     ) -> Result<Self> {
         let (request_sender, request_receiver) = mpsc::unbounded_channel();
 
+        let prefetch_bytes = Arc::new(AtomicUsize::new(0));
+        let recycle_notify = Arc::new(Notify::new());
         let coordinator = DownloadCoordinator {
             download_queue: BinaryHeap::new(),
             active_downloads: JoinSet::new(),
             in_flight: 0,
             prefetch_semaphore: Arc::new(Semaphore::new(max_prefetch_segments)),
+            prefetch_bytes: Arc::clone(&prefetch_bytes),
+            max_prefetch_bytes,
             max_concurrent_downloads,
-            recycle_notify: Arc::new(Notify::new()),
+            retry_policy,
+            recycle_notify: Arc::clone(&recycle_notify),
             fetcher,
             metrics,
         };
@@ -869,8 +1090,11 @@ impl RemoteLogDownloader {
 
         Ok(Self {
             request_sender: Some(request_sender),
+            recycle_notify,
             pending_slots: Arc::new(AtomicUsize::new(0)),
             max_pending_segments,
+            #[cfg(test)]
+            prefetch_bytes,
         })
     }
 
@@ -904,12 +1128,13 @@ impl RemoteLogDownloader {
             result_sender,
             retry_count: 0,
             next_retry_at: None,
+            _pending_slot: Some(PendingSlot(Arc::clone(&self.pending_slots))),
         };
 
         // Send to coordinator (non-blocking)
         if let Some(ref sender) = self.request_sender {
             if sender.send(request).is_err() {
-                self.pending_slots.fetch_sub(1, AtomicOrdering::AcqRel);
+                // The failed send returns and drops the request and its slot.
                 // Coordinator is gone - immediately fail the future
                 let (error_sender, error_receiver) = oneshot::channel();
                 let _ = error_sender.send(Err(Error::UnexpectedError {
@@ -921,7 +1146,7 @@ impl RemoteLogDownloader {
         }
 
         RemoteLogDownloadFuture::new(result_receiver)
-            .with_pending_slot(Arc::clone(&self.pending_slots))
+            .with_recycle_notify(Arc::clone(&self.recycle_notify))
     }
 }
 
@@ -1072,6 +1297,14 @@ mod tests {
         auto_complete: bool,
     }
 
+    struct InFlightGuard(Arc<AtomicUsize>);
+
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     impl FakeFetcher {
         fn new(fail_count: usize, auto_complete: bool) -> Self {
             Self {
@@ -1117,6 +1350,7 @@ mod tests {
             Box::pin(async move {
                 // Track in-flight
                 let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                let _in_flight = InFlightGuard(Arc::clone(&in_flight));
                 max_seen.fetch_max(current, Ordering::SeqCst);
 
                 // Wait for gate (or auto-complete)
@@ -1136,8 +1370,6 @@ mod tests {
                         false
                     }
                 };
-
-                in_flight.fetch_sub(1, Ordering::SeqCst);
 
                 if should_fail {
                     Err(Error::UnexpectedError {
@@ -1162,6 +1394,166 @@ mod tests {
                 }
             })
         }
+    }
+
+    struct StorageFailureFetcher {
+        kind: opendal::ErrorKind,
+        temporary: bool,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl RemoteLogFetcher for StorageFailureFetcher {
+        fn fetch(
+            &self,
+            _request: &RemoteLogDownloadRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<FetchResult>> + Send>> {
+            let kind = self.kind;
+            let temporary = self.temporary;
+            let attempts = Arc::clone(&self.attempts);
+            Box::pin(async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(opendal::Error::new(kind, "remote stat failed")
+                    .with_temporary(temporary)
+                    .into())
+            })
+        }
+    }
+
+    async fn check_storage_retry_policy(
+        kind: opendal::ErrorKind,
+        temporary: bool,
+        policy: RemoteRetryPolicy,
+        expected_attempts: usize,
+    ) -> Error {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let fetcher = Arc::new(StorageFailureFetcher {
+            kind,
+            temporary,
+            attempts: Arc::clone(&attempts),
+        });
+        let downloader = RemoteLogDownloader::new_with_fetcher_and_retry(
+            fetcher,
+            1,
+            2,
+            64 * 1024,
+            1,
+            policy,
+            metrics(),
+        )
+        .unwrap();
+        let segment = create_segment("lost", 0, 0, create_table_bucket(1, 0));
+        let future = downloader.request_remote_log("dir", &segment);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !future.is_done() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let error = future.take_remote_log_file().unwrap_err();
+        assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
+        error
+    }
+
+    #[tokio::test]
+    async fn remote_retries_are_configurable_and_count_attempts_correctly() {
+        let config = Config {
+            scanner_remote_log_max_retries: 2,
+            scanner_remote_log_retry_backoff_base_ms: 1,
+            scanner_remote_log_retry_backoff_max_ms: 1,
+            ..Config::default()
+        };
+        let error = check_storage_retry_policy(
+            opendal::ErrorKind::Unexpected,
+            true,
+            RemoteRetryPolicy::from(&config),
+            3,
+        )
+        .await;
+        assert!(error.to_string().contains("after 3 attempt(s)"));
+
+        let no_retries = Config {
+            scanner_remote_log_max_retries: 0,
+            ..config
+        };
+        let error = check_storage_retry_policy(
+            opendal::ErrorKind::Unexpected,
+            true,
+            RemoteRetryPolicy::from(&no_retries),
+            1,
+        )
+        .await;
+        assert!(error.to_string().contains("after 1 attempt(s)"));
+    }
+
+    #[tokio::test]
+    async fn permanent_remote_errors_do_not_retry_and_missing_segment_retains_cause() {
+        let policy = RemoteRetryPolicy::from(&Config::default());
+        let error =
+            check_storage_retry_policy(opendal::ErrorKind::NotFound, false, policy, 1).await;
+        match error {
+            Error::UnexpectedError { message, source } => {
+                assert!(message.contains("scan cannot complete"));
+                assert!(message.contains("may have expired or been removed"));
+                assert!(source.is_some());
+            }
+            other => panic!("expected missing segment error, got {other}"),
+        }
+        let error =
+            check_storage_retry_policy(opendal::ErrorKind::PermissionDenied, false, policy, 1)
+                .await;
+        assert!(error.to_string().contains("after 1 attempt(s)"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_long_retry_backoff_releases_pending_slot_promptly() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let downloader = RemoteLogDownloader::new_with_fetcher_and_retry(
+            Arc::new(StorageFailureFetcher {
+                kind: opendal::ErrorKind::Unexpected,
+                temporary: true,
+                attempts: Arc::clone(&attempts),
+            }),
+            1,
+            1,
+            64 * 1024,
+            1,
+            RemoteRetryPolicy {
+                max_retries: 2,
+                backoff_base_ms: 10_000,
+                backoff_max_ms: 10_000,
+            },
+            metrics(),
+        )
+        .unwrap();
+        let segment = create_segment("retry", 0, 0, create_table_bucket(1, 0));
+        let future = downloader.request_remote_log("dir", &segment);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), async {
+                while !future.is_done() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "the retry should be waiting in backoff"
+        );
+        drop(future);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while downloader.pending_slots.load(AtomicOrdering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled backoff should not hold a slot for ten seconds");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     /// Helper function to create a RemoteLogSegment for testing
@@ -1190,6 +1582,7 @@ mod tests {
             result_sender,
             retry_count: 0,
             next_retry_at: None,
+            _pending_slot: None,
         }
     }
 
@@ -1363,6 +1756,7 @@ mod tests {
             fake_fetcher.clone(),
             1,
             1,
+            64 * 1024 * 1024,
             1,
             metrics(),
         )
@@ -1371,6 +1765,17 @@ mod tests {
         let first_seg = create_segment("first", 0, 1000, bucket.clone());
         let second_seg = create_segment("second", 100, 1000, bucket.clone());
         let first = downloader.request_remote_log("dir", &first_seg);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fake_fetcher.in_flight() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(first);
+        // Cancelling the future must not allow new work to bypass the still
+        // blocked in-flight download's admission slot.
+        assert_eq!(downloader.pending_slots.load(AtomicOrdering::SeqCst), 1);
         let second = downloader.request_remote_log("dir", &second_seg);
         tokio::time::timeout(Duration::from_secs(1), async {
             while !second.is_done() {
@@ -1386,14 +1791,104 @@ mod tests {
                 .to_string()
                 .contains("pending segments")
         );
-        assert_eq!(downloader.pending_slots.load(AtomicOrdering::SeqCst), 1);
-        drop(first);
-        assert_eq!(downloader.pending_slots.load(AtomicOrdering::SeqCst), 0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while downloader.pending_slots.load(AtomicOrdering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            fake_fetcher.in_flight(),
+            0,
+            "cancellation must abort the blocked download"
+        );
         let third = downloader.request_remote_log("dir", &second_seg);
         assert_eq!(downloader.pending_slots.load(AtomicOrdering::SeqCst), 1);
         drop(third);
-        assert_eq!(downloader.pending_slots.load(AtomicOrdering::SeqCst), 0);
-        fake_fetcher.release_all();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while downloader.pending_slots.load(AtomicOrdering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_prefetch_byte_budget_cancels_blocked_downloads() {
+        let fetcher = Arc::new(FakeFetcher::new(100, false));
+        let downloader = RemoteLogDownloader::new_with_fetcher_and_limit(
+            fetcher.clone(),
+            2,
+            4,
+            1_536,
+            2,
+            metrics(),
+        )
+        .unwrap();
+        let bucket = create_table_bucket(1, 0);
+        let first =
+            downloader.request_remote_log("dir", &create_segment("one", 0, 0, bucket.clone()));
+        let second =
+            downloader.request_remote_log("dir", &create_segment("two", 1, 0, bucket.clone()));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fetcher.in_flight() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            downloader.prefetch_bytes.load(AtomicOrdering::SeqCst),
+            1_024
+        );
+        assert!(
+            !second.is_done(),
+            "second download must wait for the byte budget"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fetcher.in_flight() != 1
+                || downloader.pending_slots.load(AtomicOrdering::SeqCst) != 1
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            downloader.prefetch_bytes.load(AtomicOrdering::SeqCst),
+            1_024
+        );
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while downloader.prefetch_bytes.load(AtomicOrdering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fetcher.in_flight(), 0);
+
+        let mut oversized = create_segment("too-big", 2, 0, bucket);
+        oversized.size_in_bytes = 2_048;
+        let rejected = downloader.request_remote_log("dir", &oversized);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !rejected.is_done() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            rejected
+                .take_remote_log_file()
+                .unwrap_err()
+                .to_string()
+                .contains("prefetch limit")
+        );
+        assert_eq!(downloader.prefetch_bytes.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[tokio::test]
