@@ -27,7 +27,7 @@ use crate::client::metadata::Metadata;
 use crate::client::table::batch_scanner::decode_kv_batch;
 use crate::error::{ApiError, Error, FlussError, Result};
 use crate::metadata::{TableBucket, TableInfo};
-use crate::proto::{ErrorResponse, PbScanReqForBucket};
+use crate::proto::{ErrorResponse, PbScanReqForBucket, ScanKvResponse};
 use crate::rpc::message::ScanKvRequest;
 use crate::rpc::{RpcClient, ServerConnection};
 
@@ -47,6 +47,8 @@ pub struct KvBatchScanner {
     scanner_id: Option<Vec<u8>>,
     sequence: i32,
     finished: bool,
+    in_flight: bool,
+    failed: bool,
 }
 
 impl KvBatchScanner {
@@ -69,18 +71,30 @@ impl KvBatchScanner {
             scanner_id: None,
             sequence: 0,
             finished: false,
+            in_flight: false,
+            failed: false,
         }
     }
 
     /// Fetches one nonempty batch or the end of this bucket's snapshot. An
     /// error invalidates the session; do not resume this scanner after failure.
     pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        // Dropping a future while an RPC or its schema decode is in flight
+        // leaves it unclear whether the server advanced the cursor. Resuming
+        // could silently omit a page, even if the next RPC itself succeeds.
+        if self.in_flight || self.failed {
+            self.failed = true;
+            return Err(Error::UnexpectedError {
+                message: "KV snapshot scan was interrupted; open a new scanner".into(),
+                source: None,
+            });
+        }
         if self.finished {
             return Ok(None);
         }
         let result = self.read_next().await;
         if result.is_err() {
-            self.finished = true;
+            self.failed = true;
         }
         result
     }
@@ -127,17 +141,9 @@ impl KvBatchScanner {
                     None,
                 ),
             };
+            self.in_flight = true;
             let response = connection.request(request).await?;
-            if let Some(code) = response.error_code
-                && code != FlussError::None.code()
-            {
-                let error: ApiError = ErrorResponse {
-                    error_code: code,
-                    error_message: response.error_message,
-                }
-                .into();
-                return Err(Error::FlussAPIError { api_error: error });
-            }
+            check_response(&response)?;
             let more = response.has_more_results.unwrap_or(false);
             if more {
                 self.scanner_id =
@@ -167,14 +173,30 @@ impl KvBatchScanner {
                 )
                 .await?;
                 if batch.num_rows() > 0 {
+                    self.in_flight = false;
                     return Ok(Some(batch));
                 }
             }
             if self.finished {
+                self.in_flight = false;
                 return Ok(None);
             }
         }
     }
+}
+
+fn check_response(response: &ScanKvResponse) -> Result<()> {
+    if let Some(code) = response.error_code
+        && code != FlussError::None.code()
+    {
+        let error: ApiError = ErrorResponse {
+            error_code: code,
+            error_message: response.error_message.clone(),
+        }
+        .into();
+        return Err(Error::FlussAPIError { api_error: error });
+    }
+    Ok(())
 }
 
 impl Drop for KvBatchScanner {
@@ -188,6 +210,25 @@ impl Drop for KvBatchScanner {
                     .request(ScanKvRequest::new(Some(id), None, None, None, Some(true)))
                     .await;
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_or_moved_session_fails_instead_of_mixing_snapshots() {
+        for code in [FlussError::ScannerExpired, FlussError::NotLeaderOrFollower] {
+            let response = ScanKvResponse {
+                error_code: Some(code.code()),
+                error_message: Some("session is no longer valid".into()),
+                ..Default::default()
+            };
+            let error = check_response(&response).expect_err("failed session must fail the scan");
+            assert!(matches!(error, Error::FlussAPIError { .. }));
+            assert!(error.to_string().contains("session is no longer valid"));
         }
     }
 }

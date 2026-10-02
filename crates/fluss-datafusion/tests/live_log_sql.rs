@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::DataFusionError;
 use datafusion::physical_plan::collect as collect_plan;
@@ -14,7 +14,10 @@ use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use fluss::client::FlussConnection;
 use fluss::config::Config;
-use fluss::metadata::{DataTypes, Schema, TableDescriptor, TablePath};
+use fluss::metadata::{
+    AddColumn, AlterTableChanges, ColumnPositionType, DataTypes, JsonSerde, PartitionSpec, Schema,
+    TableBucket, TableDescriptor, TablePath,
+};
 use fluss::row::GenericRow;
 use fluss::rpc::message::OffsetSpec;
 use fluss_datafusion::{FlussCatalog, FlussKvTable, FlussLogTable};
@@ -169,7 +172,7 @@ async fn create_known_tables(
         .build()?;
     if let Err(error) = admin.create_table(&kv, &kv_descriptor, false).await {
         admin.drop_table(&log, true).await?;
-        return Err(Box::new(error));
+        return Err(error.into());
     }
     let write_result: TestResult<()> = async {
         let table = connection.get_table(&log).await?;
@@ -357,6 +360,371 @@ async fn check_kv_sql(
             .await
             .is_err()
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires native-sni and FLUSS_* credentials; run with --ignored"]
+async fn kv_snapshot_isolation_and_schema_evolution() -> TestResult<()> {
+    let connection = connect().await?;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = TablePath::new(DATABASE, format!("kv_snapshot_{suffix}"));
+    let admin = connection.get_admin()?;
+    admin
+        .create_table(
+            &path,
+            &TableDescriptor::builder()
+                .schema(
+                    Schema::builder()
+                        .column("id", DataTypes::int())
+                        .column("value", DataTypes::string())
+                        .primary_key(vec!["id"])?
+                        .build()?,
+                )
+                .distributed_by(Some(1), vec!["id".to_string()])
+                .build()?,
+            false,
+        )
+        .await?;
+    let result = check_kv_snapshot(&connection, &path).await;
+    let cleanup = admin.drop_table(&path, true).await;
+    result?;
+    cleanup?;
+    connection.close(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
+async fn check_kv_snapshot(connection: &Arc<FlussConnection>, path: &TablePath) -> TestResult<()> {
+    let table = connection.get_table(path).await?;
+    let table_id = table.get_table_info().table_id;
+    let writer = table.new_upsert()?.create_writer()?;
+    let payload = "x".repeat(250_000);
+    for id in 0..12 {
+        let mut row = GenericRow::new(2);
+        row.set_field(0, id);
+        row.set_field(1, format!("old-{id}-{payload}"));
+        writer.upsert(&row)?;
+    }
+    writer.flush().await?;
+
+    let mut reader = table
+        .new_scan()
+        .create_kv_batch_scanner(TableBucket::new(table_id, 0))?;
+    let first = reader.next_batch().await?.expect("first snapshot page");
+    assert!(first.num_rows() > 0 && first.num_rows() < 12);
+
+    let mut updated = GenericRow::new(2);
+    updated.set_field(0, 11_i32);
+    updated.set_field(1, "new-11");
+    writer.upsert(&updated)?;
+    let mut deleted = GenericRow::new(2);
+    deleted.set_field(0, 10_i32);
+    writer.delete(&deleted)?;
+    let mut inserted = GenericRow::new(2);
+    inserted.set_field(0, 13_i32);
+    inserted.set_field(1, "new-13");
+    writer.upsert(&inserted)?;
+    writer.flush().await?;
+
+    let mut pages = vec![first];
+    while let Some(batch) = reader.next_batch().await? {
+        pages.push(batch);
+    }
+    assert!(pages.len() > 1);
+    let mut ids = Vec::new();
+    for page in pages {
+        let keys = page
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = page
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row in 0..page.num_rows() {
+            let id = keys.value(row);
+            assert!(values.value(row).starts_with(&format!("old-{id}-")));
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, (0..12).collect::<Vec<_>>());
+
+    let mut interrupted = table
+        .new_scan()
+        .create_kv_batch_scanner(TableBucket::new(table_id, 0))?;
+    let first = interrupted.next_batch().await?.expect("first page");
+    assert!(first.num_rows() < 12);
+    let mut pending = Box::pin(interrupted.next_batch());
+    assert!(matches!(
+        futures::poll!(pending.as_mut()),
+        std::task::Poll::Pending
+    ));
+    drop(pending);
+    assert!(
+        interrupted.next_batch().await.is_err(),
+        "a cancelled continuation must not skip or duplicate a page"
+    );
+    drop(interrupted);
+    let mut fresh = table
+        .new_scan()
+        .create_kv_batch_scanner(TableBucket::new(table_id, 0))?;
+    let mut count = 0;
+    while let Some(batch) = fresh.next_batch().await? {
+        count += batch.num_rows();
+    }
+    assert_eq!(count, 12, "a fresh session must still read the whole state");
+
+    // Old value records remain readable after an additive schema change;
+    // only the newly written row has the added nullable column populated.
+    connection
+        .get_admin()?
+        .alter_table(
+            path,
+            false,
+            AlterTableChanges {
+                add_columns: vec![AddColumn {
+                    column_name: "note".into(),
+                    data_type_json: DataTypes::string()
+                        .serialize_json()?
+                        .to_string()
+                        .into_bytes(),
+                    comment: None,
+                    position: ColumnPositionType::Last,
+                }],
+                ..Default::default()
+            },
+        )
+        .await?;
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "kv",
+        Arc::new(FlussKvTable::open(Arc::clone(connection), path.clone(), SCAN_TIMEOUT).await?),
+    )?;
+    assert_eq!(
+        count_sql(&ctx, "SELECT COUNT(*) FROM kv WHERE note IS NULL").await?,
+        12
+    );
+    let mut new = GenericRow::new(3);
+    new.set_field(0, 14_i32);
+    new.set_field(1, "new-14");
+    new.set_field(2, "present");
+    connection
+        .get_table(path)
+        .await?
+        .new_upsert()?
+        .create_writer()?
+        .upsert(&new)?
+        .await?;
+    assert_eq!(
+        count_sql(&ctx, "SELECT COUNT(*) FROM kv WHERE note = 'present'").await?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires native-sni and FLUSS_* credentials; run with --ignored"]
+async fn partitioned_logs_and_kv_discover_each_execution() -> TestResult<()> {
+    let connection = connect().await?;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let log = TablePath::new(DATABASE, format!("partition_log_{suffix}"));
+    let kv = TablePath::new(DATABASE, format!("partition_kv_{suffix}"));
+    let admin = connection.get_admin()?;
+    let schema = || {
+        Schema::builder()
+            .column("id", DataTypes::int())
+            .column("region", DataTypes::string())
+            .column("value", DataTypes::string())
+    };
+    admin
+        .create_table(
+            &log,
+            &TableDescriptor::builder()
+                .schema(schema().build()?)
+                .partitioned_by(vec!["region"])
+                .distributed_by(Some(2), vec!["id".to_string()])
+                .build()?,
+            false,
+        )
+        .await?;
+    let kv_descriptor = TableDescriptor::builder()
+        .schema(schema().primary_key(vec!["region", "id"])?.build()?)
+        .partitioned_by(vec!["region"])
+        .distributed_by(Some(2), vec!["id".to_string()])
+        .build()?;
+    if let Err(error) = admin.create_table(&kv, &kv_descriptor, false).await {
+        admin.drop_table(&log, true).await?;
+        return Err(error.into());
+    }
+    let result = check_partitioned_sql(&connection, &log, &kv).await;
+    let log_cleanup = admin.drop_table(&log, true).await;
+    let kv_cleanup = admin.drop_table(&kv, true).await;
+    result?;
+    log_cleanup?;
+    kv_cleanup?;
+    connection.close(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
+async fn check_partitioned_sql(
+    connection: &Arc<FlussConnection>,
+    log: &TablePath,
+    kv: &TablePath,
+) -> TestResult<()> {
+    let admin = connection.get_admin()?;
+    for name in ["north", "south"] {
+        create_ready_partition(&admin, log, name).await?;
+        create_ready_partition(&admin, kv, name).await?;
+    }
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "plog",
+        Arc::new(FlussLogTable::open(Arc::clone(connection), log.clone(), SCAN_TIMEOUT).await?),
+    )?;
+    ctx.register_table(
+        "pkv",
+        Arc::new(FlussKvTable::open(Arc::clone(connection), kv.clone(), SCAN_TIMEOUT).await?),
+    )?;
+    assert_eq!(count_sql(&ctx, "SELECT COUNT(*) FROM plog").await?, 0);
+    assert_eq!(count_sql(&ctx, "SELECT COUNT(*) FROM pkv").await?, 0);
+
+    let log_table = connection.get_table(log).await?;
+    let log_writer = log_table.new_append()?.create_writer()?;
+    let kv_table = connection.get_table(kv).await?;
+    let kv_writer = kv_table.new_upsert()?.create_writer()?;
+    for (id, region) in [(1, "north"), (2, "north"), (3, "south"), (4, "south")] {
+        let mut row = GenericRow::new(3);
+        row.set_field(0, id);
+        row.set_field(1, region);
+        row.set_field(2, format!("value-{id}"));
+        log_writer.append(&row)?;
+        kv_writer.upsert(&row)?;
+    }
+    log_writer.flush().await?;
+    kv_writer.flush().await?;
+    for table in ["plog", "pkv"] {
+        assert_eq!(
+            count_sql(&ctx, &format!("SELECT COUNT(*) FROM {table}")).await?,
+            4
+        );
+        assert_eq!(
+            count_sql(
+                &ctx,
+                &format!("SELECT COUNT(*) FROM {table} WHERE region = 'north'")
+            )
+            .await?,
+            2
+        );
+        assert_eq!(
+            count_sql(
+                &ctx,
+                &format!("SELECT COUNT(*) FROM {table} WHERE 'south' = region")
+            )
+            .await?,
+            2
+        );
+        assert_eq!(
+            count_sql(
+                &ctx,
+                &format!("SELECT COUNT(*) FROM {table} WHERE region = 'missing'")
+            )
+            .await?,
+            0
+        );
+        assert_eq!(
+            count_sql(
+                &ctx,
+                &format!("SELECT COUNT(*) FROM {table} WHERE region = 'north' OR id = 4")
+            )
+            .await?,
+            3
+        );
+    }
+    for (table, kind) in [("plog", "kind=log"), ("pkv", "kind=kv_snapshot")] {
+        let query = ctx
+            .sql(&format!("SELECT id FROM {table} WHERE region = 'north'"))
+            .await?;
+        let plan = query.create_physical_plan().await?;
+        let source = source_plan(&plan);
+        let rows = collect_plan(plan, Arc::new(query.task_ctx())).await?;
+        assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        let metrics = source.metrics().unwrap();
+        assert_eq!(metric(&metrics, "fluss_partitions_discovered"), 2);
+        assert_eq!(metric(&metrics, "fluss_partitions_selected"), 1);
+        if table == "pkv" {
+            assert!(metric(&metrics, "kv_sessions_opened") > 0);
+            assert!(metric(&metrics, "kv_pages_received") > 0);
+        }
+        let explain = explain_text(
+            &ctx,
+            &format!("EXPLAIN ANALYZE SELECT id FROM {table} WHERE region = 'north'"),
+        )
+        .await?;
+        assert!(explain.contains(kind), "missing scan kind in {explain}");
+        assert!(explain.contains("projected_columns"));
+        assert!(explain.contains("fluss_partitions_selected"));
+        if table == "pkv" {
+            assert!(explain.contains("kv_first_page_time"));
+        }
+    }
+
+    // The physical plans are already registered, but new executions discover
+    // newly created partitions. Dropped partitions disappear on the next run.
+    create_ready_partition(&admin, log, "west").await?;
+    create_ready_partition(&admin, kv, "west").await?;
+    let mut row = GenericRow::new(3);
+    row.set_field(0, 5_i32);
+    row.set_field(1, "west");
+    row.set_field(2, "value-5");
+    log_writer.append(&row)?;
+    kv_writer.upsert(&row)?;
+    log_writer.flush().await?;
+    kv_writer.flush().await?;
+    for table in ["plog", "pkv"] {
+        assert_eq!(
+            count_sql(&ctx, &format!("SELECT COUNT(*) FROM {table}")).await?,
+            5
+        );
+    }
+    let south = PartitionSpec::new([("region", "south")].into_iter().collect());
+    admin.drop_partition(log, &south, false).await?;
+    admin.drop_partition(kv, &south, false).await?;
+    for table in ["plog", "pkv"] {
+        assert_eq!(
+            count_sql(&ctx, &format!("SELECT COUNT(*) FROM {table}")).await?,
+            3
+        );
+    }
+    Ok(())
+}
+
+async fn create_ready_partition(
+    admin: &fluss::client::FlussAdmin,
+    path: &TablePath,
+    name: &str,
+) -> TestResult<()> {
+    let spec = PartitionSpec::new([("region", name)].into_iter().collect());
+    admin.create_partition(path, &spec, false).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if admin
+                .list_partition_offsets(path, name, &[0, 1], OffsetSpec::Latest)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await?;
     Ok(())
 }
 

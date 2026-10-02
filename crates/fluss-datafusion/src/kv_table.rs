@@ -9,7 +9,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result};
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::streaming::StreamingTableExec;
@@ -20,6 +20,8 @@ use fluss::record::to_arrow_schema;
 use crate::execution::FlussScanExec;
 use crate::kv_scan::KvScanSpec;
 use crate::log_table::bucket_groups;
+use crate::offsets::SharedCaptures;
+use crate::partitions::PartitionFilter;
 
 /// Each execution opens a fresh snapshot per bucket. There is no global
 /// cross-bucket transaction or shared snapshot across repeated SQL queries.
@@ -29,6 +31,8 @@ pub struct FlussKvTable {
     schema: SchemaRef,
     table_id: i64,
     buckets: i32,
+    partitioned: bool,
+    partition_keys: Vec<String>,
     timeout: Duration,
     max_partitions: Option<usize>,
 }
@@ -47,15 +51,16 @@ impl FlussKvTable {
         }
         let table = connection.get_table(&path).await.map_err(fluss_error)?;
         let info = table.get_table_info();
-        if !info.has_primary_key() || info.is_partitioned() {
+        if !info.has_primary_key() {
             return Err(DataFusionError::Plan(
-                "Only non-partitioned Fluss primary-key tables are supported by the KV provider"
-                    .into(),
+                "Only Fluss primary-key tables are supported by the KV provider".into(),
             ));
         }
         let schema = to_arrow_schema(info.get_row_type()).map_err(fluss_error)?;
         let table_id = info.table_id;
         let buckets = info.get_num_buckets();
+        let partitioned = info.is_partitioned();
+        let partition_keys = info.get_partition_keys().iter().cloned().collect();
         if buckets < 1 {
             return Err(DataFusionError::Plan("Fluss table has no buckets".into()));
         }
@@ -66,6 +71,8 @@ impl FlussKvTable {
             schema,
             table_id,
             buckets,
+            partitioned,
+            partition_keys,
             timeout,
             max_partitions: None,
         })
@@ -93,11 +100,30 @@ impl TableProvider for FlussKvTable {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|expr| {
+                if self.partitioned
+                    && !PartitionFilter::from_expr(expr, &self.schema, &self.partition_keys)
+                        .is_empty()
+                {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // The snapshot RPC offers no filter pushdown. DataFusion applies exact
@@ -109,6 +135,23 @@ impl TableProvider for FlussKvTable {
         let target = state.config_options().execution.target_partitions.max(1);
         let parallelism = self.max_partitions.map_or(target, |max| target.min(max));
         let groups = bucket_groups(self.buckets, parallelism);
+        let mut partition_filter = PartitionFilter::default();
+        for expr in filters {
+            partition_filter.extend(PartitionFilter::from_expr(
+                expr,
+                &self.schema,
+                &self.partition_keys,
+            ));
+        }
+        let description = format!(
+            "kind=kv_snapshot, table={}, projected_columns={:?}, partition_pruning={partition_filter:?}",
+            self.path,
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.name())
+                .collect::<Vec<_>>()
+        );
         let metrics = ExecutionPlanMetricsSet::new();
         let spec = Arc::new(KvScanSpec {
             connection: Arc::clone(&self.connection),
@@ -118,12 +161,20 @@ impl TableProvider for FlussKvTable {
             projection: projection.cloned(),
             table_id: self.table_id,
             buckets: self.buckets,
+            partitioned: self.partitioned,
+            partition_filter,
+            partition_captures: Arc::new(SharedCaptures::default()),
             timeout: self.timeout,
             metrics: metrics.clone(),
         });
         let inner =
             StreamingTableExec::try_new(schema, spec.partitions(&groups), None, [], false, None)?;
-        Ok(Arc::new(FlussScanExec::new(inner, metrics, groups)))
+        Ok(Arc::new(FlussScanExec::new(
+            inner,
+            metrics,
+            groups,
+            description,
+        )))
     }
 }
 

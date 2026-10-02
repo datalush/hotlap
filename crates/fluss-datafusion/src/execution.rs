@@ -21,6 +21,7 @@ pub(crate) struct FlussScanExec {
     inner: Arc<StreamingTableExec>,
     metrics: ExecutionPlanMetricsSet,
     groups: Vec<Vec<i32>>,
+    source: String,
 }
 
 impl FlussScanExec {
@@ -28,18 +29,24 @@ impl FlussScanExec {
         inner: StreamingTableExec,
         metrics: ExecutionPlanMetricsSet,
         groups: Vec<Vec<i32>>,
+        source: String,
     ) -> Self {
         Self {
             inner: Arc::new(inner),
             metrics,
             groups,
+            source,
         }
     }
 }
 
 impl DisplayAs for FlussScanExec {
     fn fmt_as(&self, _format: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FlussScanExec: bucket_groups={:?}", self.groups)
+        write!(
+            f,
+            "FlussScanExec: {}, bucket_groups={:?}",
+            self.source, self.groups
+        )
     }
 }
 

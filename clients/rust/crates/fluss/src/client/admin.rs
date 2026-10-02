@@ -377,6 +377,30 @@ impl FlussAdmin {
             .await
     }
 
+    /// Capture offsets for an already-discovered partition ID. Unlike the
+    /// name-based API this cannot silently switch to a newly created
+    /// partition with the same name after a drop-and-recreate race.
+    pub async fn list_partition_offsets_by_id(
+        &self,
+        table_path: &TablePath,
+        partition_id: PartitionId,
+        buckets_id: &[BucketId],
+        offset_spec: OffsetSpec,
+    ) -> Result<HashMap<i32, i64>> {
+        if buckets_id.is_empty() {
+            return Err(Error::IllegalArgument {
+                message: "Buckets are empty.".to_string(),
+            });
+        }
+        self.metadata.update_table_metadata(table_path).await?;
+        self.metadata
+            .check_and_update_partition_metadata_by_ids(table_path, &[partition_id])
+            .await?;
+        let table_id = self.metadata.get_cluster().get_table(table_path)?.table_id;
+        self.query_offsets(table_id, Some(partition_id), buckets_id, offset_spec)
+            .await
+    }
+
     async fn do_list_offsets(
         &self,
         table_path: &TablePath,
@@ -422,6 +446,17 @@ impl FlussAdmin {
             None
         };
 
+        self.query_offsets(table_id, partition_id, buckets_id, offset_spec)
+            .await
+    }
+
+    async fn query_offsets(
+        &self,
+        table_id: TableId,
+        partition_id: Option<PartitionId>,
+        buckets_id: &[BucketId],
+        offset_spec: OffsetSpec,
+    ) -> Result<HashMap<i32, i64>> {
         // Prepare requests
         let requests_by_server =
             self.prepare_list_offsets_requests(table_id, partition_id, buckets_id, offset_spec)?;

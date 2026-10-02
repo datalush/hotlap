@@ -9,25 +9,34 @@ use datafusion::execution::TaskContext;
 use tokio::sync::OnceCell;
 
 pub(super) type Offsets = Arc<HashMap<i32, i64>>;
-pub(super) type Capture = Arc<OnceCell<Result<Offsets, String>>>;
+pub(super) type Capture<T = HashMap<i32, i64>> = Arc<OnceCell<Result<Arc<T>, String>>>;
+pub(super) type OffsetCaptures = SharedCaptures<HashMap<i32, i64>>;
 
-#[derive(Default, Debug)]
-pub(super) struct OffsetCaptures {
-    entries: Mutex<HashMap<usize, Entry>>,
+#[derive(Debug)]
+pub(super) struct SharedCaptures<T> {
+    entries: Mutex<HashMap<usize, Entry<T>>>,
 }
 
 #[derive(Debug)]
-struct Entry {
+struct Entry<T> {
     context: Weak<TaskContext>,
     seen: HashSet<usize>,
-    capture: Capture,
+    capture: Capture<T>,
 }
 
-impl OffsetCaptures {
+impl<T> Default for SharedCaptures<T> {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<T> SharedCaptures<T> {
     /// DataFusion shares an Arc<TaskContext> between all partitions of one
     /// query. Repeated execution of the same physical plan with the *same*
     /// context starts another generation when a partition is seen again.
-    pub(super) fn for_partition(&self, context: &Arc<TaskContext>, partition: usize) -> Capture {
+    pub(super) fn for_partition(&self, context: &Arc<TaskContext>, partition: usize) -> Capture<T> {
         let key = Arc::as_ptr(context) as usize;
         let mut entries = self.entries.lock().expect("offset registry mutex poisoned");
         entries.retain(|_, entry| entry.context.upgrade().is_some());

@@ -268,6 +268,7 @@ impl Display for ResolvedPartitionSpec {
 pub struct PartitionInfo {
     partition_id: PartitionId,
     partition_spec: ResolvedPartitionSpec,
+    bucket_count: Option<i32>,
 }
 
 impl PartitionInfo {
@@ -275,6 +276,7 @@ impl PartitionInfo {
         Self {
             partition_id,
             partition_spec,
+            bucket_count: None,
         }
     }
 
@@ -296,12 +298,18 @@ impl PartitionInfo {
         self.partition_spec.to_partition_spec()
     }
 
+    /// Effective bucket count when supplied by the coordinator. Older
+    /// coordinators omit it; callers can then use the table's bucket count.
+    pub fn get_bucket_count(&self) -> Option<i32> {
+        self.bucket_count
+    }
+
     pub fn to_pb(&self) -> PbPartitionInfo {
         PbPartitionInfo {
             partition_id: self.partition_id,
             partition_spec: self.partition_spec.to_pb(),
             remote_data_dir: None,
-            bucket_count: None,
+            bucket_count: self.bucket_count,
         }
     }
 
@@ -309,6 +317,7 @@ impl PartitionInfo {
         Self {
             partition_id: pb.partition_id,
             partition_spec: ResolvedPartitionSpec::from_pb(&pb.partition_spec),
+            bucket_count: pb.bucket_count,
         }
     }
 }
@@ -456,6 +465,12 @@ mod tests {
 
         assert_eq!(info.get_partition_id(), restored.get_partition_id());
         assert_eq!(info.get_partition_name(), restored.get_partition_name());
+        assert_eq!(restored.get_bucket_count(), None);
+        let mut pb = pb;
+        pb.bucket_count = Some(3);
+        let rescaled = PartitionInfo::from_pb(&pb);
+        assert_eq!(rescaled.get_bucket_count(), Some(3));
+        assert_eq!(rescaled.to_pb().bucket_count, Some(3));
     }
 
     #[test]

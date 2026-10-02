@@ -15,6 +15,11 @@ pub(crate) struct PartitionMetrics {
     pub(crate) output_batches: Count,
     pub(crate) capture_time: Time,
     pub(crate) read_time: Time,
+    pub(crate) kv_first_page_time: Time,
+    pub(crate) kv_sessions_opened: Count,
+    pub(crate) kv_pages_received: Count,
+    pub(crate) partitions_discovered: Count,
+    pub(crate) partitions_selected: Count,
     pub(crate) peak_batch_bytes: Gauge,
     pub(crate) active_streams: Gauge,
 }
@@ -50,6 +55,11 @@ impl PartitionMetrics {
             output_batches: builder().output_batches(partition),
             capture_time: builder().subset_time("fluss_offset_capture_time", partition),
             read_time: builder().subset_time("fluss_read_time", partition),
+            kv_first_page_time: builder().subset_time("kv_first_page_time", partition),
+            kv_sessions_opened: builder().counter("kv_sessions_opened", partition),
+            kv_pages_received: builder().counter("kv_pages_received", partition),
+            partitions_discovered: builder().counter("fluss_partitions_discovered", partition),
+            partitions_selected: builder().counter("fluss_partitions_selected", partition),
             peak_batch_bytes: builder()
                 .peak_memory_usage("fluss_peak_decoded_arrow_batch_bytes", partition),
             active_streams: builder()

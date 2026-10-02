@@ -23,9 +23,15 @@ use fluss::record::ScanBatch;
 use fluss::rpc::message::OffsetSpec;
 
 use crate::metrics::{PartitionMetrics, ReaderLifetime};
-use crate::offsets::{Capture, OffsetCaptures, Offsets, validate_offsets};
+use crate::offsets::{Capture, OffsetCaptures, Offsets, SharedCaptures, validate_offsets};
+use crate::partitions::{self, PartitionFilter};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+pub(crate) struct PartitionedOffsets {
+    discovered: usize,
+    partitions: Vec<(i64, Offsets)>,
+}
 
 /// Immutable inputs shared by the physical partitions of one planned scan.
 pub(crate) struct ScanSpec {
@@ -37,6 +43,9 @@ pub(crate) struct ScanSpec {
     pub(crate) filter: Option<Predicate>,
     pub(crate) table_id: i64,
     pub(crate) buckets: i32,
+    pub(crate) partitioned: bool,
+    pub(crate) partition_filter: PartitionFilter,
+    pub(crate) partition_captures: Arc<SharedCaptures<PartitionedOffsets>>,
     pub(crate) timeout: Duration,
     pub(crate) captures: Arc<OffsetCaptures>,
     pub(crate) metrics: ExecutionPlanMetricsSet,
@@ -92,6 +101,7 @@ struct ReadState {
     reader: Option<RecordBatchLogReader>,
     deadline: Instant,
     capture: Capture,
+    partition_capture: Option<Capture<PartitionedOffsets>>,
     // Keep the execution identity alive for late partitions of this query.
     _context: Arc<TaskContext>,
     _lifetime: ReaderLifetime,
@@ -103,12 +113,19 @@ impl ReadState {
         let metrics = PartitionMetrics::new(&source.spec.metrics, source.index, &source.bucket_ids);
         let lifetime = ReaderLifetime::new(metrics.active_streams.clone());
         let capture = source.spec.captures.for_partition(&ctx, source.index);
+        let partition_capture = source.spec.partitioned.then(|| {
+            source
+                .spec
+                .partition_captures
+                .for_partition(&ctx, source.index)
+        });
         let deadline = Instant::now() + source.spec.timeout;
         Self {
             source,
             reader: None,
             deadline,
             capture,
+            partition_capture,
             _context: ctx,
             _lifetime: lifetime,
             metrics,
@@ -188,10 +205,10 @@ impl ReadState {
     }
 
     async fn start_reader(&self) -> Result<RecordBatchLogReader> {
-        let offsets = self.shared_offsets().await?;
+        let ranges = self.ranges().await?;
         let table = self.current_table().await?;
         let scanner = self.projected_scanner(&table)?;
-        RecordBatchLogReader::new_from_ranges(scanner, self.ranges(&offsets))
+        RecordBatchLogReader::new_from_ranges(scanner, ranges)
             .await
             .map_err(fluss_error)
     }
@@ -216,6 +233,7 @@ impl ReadState {
         let info = table.get_table_info();
         if info.table_id != self.source.spec.table_id
             || info.get_num_buckets() != self.source.spec.buckets
+            || info.is_partitioned() != self.source.spec.partitioned
         {
             return Err(DataFusionError::Execution(
                 "Fluss table topology changed; plan again".into(),
@@ -256,16 +274,99 @@ impl ReadState {
         Ok(scanner)
     }
 
-    fn ranges(&self, offsets: &Offsets) -> Vec<BoundedLogReadRange> {
-        self.source
-            .bucket_ids
-            .iter()
-            .map(|&bucket| BoundedLogReadRange {
-                bucket: TableBucket::new(self.source.spec.table_id, bucket),
-                starting_offset: EARLIEST_OFFSET,
-                stopping_offset: offsets[&bucket],
-            })
-            .collect()
+    async fn ranges(&self) -> Result<Vec<BoundedLogReadRange>> {
+        let partitions = if let Some(capture) = &self.partition_capture {
+            Some(
+                capture
+                    .get_or_init(|| async {
+                        self.capture_partitioned_offsets()
+                            .await
+                            .map(Arc::new)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .as_ref()
+                    .map(Arc::clone)
+                    .map_err(|error| DataFusionError::Execution(error.clone()))?,
+            )
+        } else {
+            None
+        };
+        Ok(match partitions {
+            Some(snapshot) => {
+                if self.source.index == 0 {
+                    self.metrics.partitions_discovered.add(snapshot.discovered);
+                    self.metrics
+                        .partitions_selected
+                        .add(snapshot.partitions.len());
+                }
+                snapshot
+                    .partitions
+                    .iter()
+                    .flat_map(|(partition_id, offsets)| {
+                        self.source
+                            .bucket_ids
+                            .iter()
+                            .map(move |&bucket| BoundedLogReadRange {
+                                bucket: TableBucket::new_with_partition(
+                                    self.source.spec.table_id,
+                                    Some(*partition_id),
+                                    bucket,
+                                ),
+                                starting_offset: EARLIEST_OFFSET,
+                                stopping_offset: offsets[&bucket],
+                            })
+                    })
+                    .collect()
+            }
+            None => {
+                let offsets = self.shared_offsets().await?;
+                self.source
+                    .bucket_ids
+                    .iter()
+                    .map(|&bucket| BoundedLogReadRange {
+                        bucket: TableBucket::new(self.source.spec.table_id, bucket),
+                        starting_offset: EARLIEST_OFFSET,
+                        stopping_offset: offsets[&bucket],
+                    })
+                    .collect()
+            }
+        })
+    }
+
+    async fn capture_partitioned_offsets(&self) -> Result<PartitionedOffsets> {
+        let _timer = self.metrics.capture_time.timer();
+        let spec = &self.source.spec;
+        let selection = partitions::discover(
+            &spec.connection,
+            &spec.path,
+            spec.buckets,
+            &spec.partition_filter,
+        )
+        .await?;
+        let discovered = selection.discovered;
+        let admin = spec.connection.get_admin().map_err(fluss_error)?;
+        let buckets: Vec<_> = (0..spec.buckets).collect();
+        let mut captured = Vec::with_capacity(selection.selected.len());
+        for partition in selection.selected {
+            let offsets = admin
+                .list_partition_offsets_by_id(
+                    &spec.path,
+                    partition.get_partition_id(),
+                    &buckets,
+                    OffsetSpec::Latest,
+                )
+                .await
+                .map_err(fluss_error)?;
+            captured.push((
+                partition.get_partition_id(),
+                validate_offsets(offsets, spec.buckets)?,
+            ));
+        }
+        Ok(PartitionedOffsets {
+            discovered,
+            partitions: captured,
+        })
     }
 
     async fn capture_offsets(&self) -> Result<Offsets> {

@@ -59,7 +59,7 @@ no credentials are stored in this repository.
 
 ## DataFusion (logs and primary-key tables)
 
-`FlussLogTable::open` and `FlussKvTable::open` register non-partitioned tables
+`FlussLogTable::open` and `FlussKvTable::open` register tables
 explicitly. `FlussCatalog::load` discovers database/table names once and
 selects the appropriate provider, allowing SQL such as
 `fluss.lab_spark.demo_log` or a KV table (reload the catalog after DDL).
@@ -83,7 +83,18 @@ projections are pushed into the Arrow decoder. There is no single
 transactional snapshot shared between buckets: sessions start when each
 bucket is first read, so concurrent writes may be visible in some buckets
 but not others. A failure, expired session or timeout fails the query rather
-than returning an incomplete table. Partitioned tables remain unsupported.
+than returning an incomplete table. If an in-flight KV continuation is
+cancelled, the scanner cannot resume it: open a fresh query instead.
+
+Partitioned **logs and KV** discover their partition list once at execution
+start; the selected partition/bucket pairs are distributed over DataFusion's
+physical scan partitions. Safe `region = 'north'`-style string equalities on
+partition keys prune partitions. `AND` may contribute a supported conjunct;
+`OR` never prunes. Filters remain exact in DataFusion. New partitions created
+after discovery are visible on the next execution, and removed partitions may
+cause an in-progress scan to fail. A partition whose bucket count differs from
+the table's (per-partition rescale) fails explicitly instead of silently
+omitting buckets.
 
 To see actual pruning, enable batch statistics **when creating the log table**
 with `table.statistics.columns: id` (or `*`). Existing batches written without

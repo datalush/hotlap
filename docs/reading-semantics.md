@@ -20,7 +20,7 @@ best-effort, with server TTL for an interrupted initial open. A query timeout
 fails rather than claiming partial results. Each bucket opens its snapshot
 when it is first read; there is **no transactionally consistent cross-bucket
 snapshot** during concurrent writes, nor a snapshot retained across queries.
-Only non-partitioned KV tables are supported. No filter or global SQL limit is
+Both partitioned and non-partitioned KV tables are supported. No row filter or global SQL limit is
 pushed into `ScanKv`; DataFusion evaluates them exactly. Non-empty projections
 are applied by the Arrow decoder after reading value records, and `COUNT(*)`
 still decodes full rows. A changed schema or bucket layout requires replanning.
@@ -34,7 +34,7 @@ needs `table.statistics.columns` set before writing for those batches to
 carry useful pruning statistics. Keep projection, limits, and partitions
 honest about these semantics.
 
-The log provider supports **non-partitioned append-only logs**. Both providers
+The log provider supports append-only logs, including partitioned tables. Both providers
 use the minimum of Fluss buckets,
 DataFusion's target parallelism and an optional positive connector cap;
 each reads a group of buckets. They share one offset capture per execution.
@@ -63,6 +63,26 @@ and waiting for read batches; they are not an end-to-end latency budget.
 failed and cancelled reads, and is zero after each source query completes.
 The peak-batch gauge does not include buffers held by DataFusion operators
 upstream of the scan.
+For partitioned tables, the execution discovers partition names/IDs once and
+shares that list between physical streams. Log queries also capture the
+selected partitions' bucket stopping offsets once per execution; KV sessions
+still open lazily per bucket. New partitions created later belong to the next
+execution. If a partition is dropped in flight, an already-open session may
+complete, or its pending scan can fail; never assume atomic DDL/read isolation.
+For `Utf8` partition keys, simple equality to a string literal (including
+conjuncts under `AND`) can prune partitions; `OR`, casts, and other conditions
+are evaluated exactly by DataFusion without partition pruning. The table
+bucket count must match each discovered partition's own bucket count: if
+Fluss has rescaled a partition independently, this reader errors rather than
+omitting its extra buckets. Each query has a finite timeout.
+
+`EXPLAIN ANALYZE` identifies log versus KV scans, table and projected
+columns, optional log batch predicate and partition pruning. Partition
+counts describe discovered and selected partitions (recorded once, not once
+per physical stream). KV reports opened nonempty sessions, received Arrow
+pages, and first-page latency (which includes request and decoding). These
+are not network-byte or server-only snapshot-opening measurements.
+
 The read-only catalog discovers names once; reload it after creating tables.
 It selects the log or KV provider from the table's primary-key metadata.
 

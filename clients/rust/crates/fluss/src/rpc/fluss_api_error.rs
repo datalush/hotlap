@@ -171,6 +171,14 @@ pub enum FlussError {
     InvalidAlterTableException = 56,
     /// Deletion operations are disabled on this table.
     DeletionDisabledException = 57,
+    /// A server-side KV scan session expired; continuing would change snapshots.
+    ScannerExpired = 66,
+    /// The server no longer recognizes this KV scan session.
+    UnknownScannerId = 67,
+    /// Invalid or out-of-order KV scan request.
+    InvalidScanRequest = 68,
+    /// Too many active server-side KV scanners.
+    TooManyScanners = 69,
     /// The KV storage engine rejected a write due to backpressure.
     StorageBackpressureException = 72,
 }
@@ -301,6 +309,10 @@ impl FlussError {
             FlussError::DeletionDisabledException => {
                 "Deletion operations are disabled on this table."
             }
+            FlussError::ScannerExpired => "The KV scanner session expired.",
+            FlussError::UnknownScannerId => "The KV scanner ID is unknown.",
+            FlussError::InvalidScanRequest => "The KV scan request is invalid.",
+            FlussError::TooManyScanners => "Too many active KV scanner sessions.",
             FlussError::StorageBackpressureException => {
                 "The tablet server has rejected the write because the KV storage engine has reached its write-pressure threshold."
             }
@@ -378,6 +390,10 @@ impl FlussError {
             55 => FlussError::IneligibleReplicaException,
             56 => FlussError::InvalidAlterTableException,
             57 => FlussError::DeletionDisabledException,
+            66 => FlussError::ScannerExpired,
+            67 => FlussError::UnknownScannerId,
+            68 => FlussError::InvalidScanRequest,
+            69 => FlussError::TooManyScanners,
             72 => FlussError::StorageBackpressureException,
             _ => FlussError::UnknownServerError,
         }
