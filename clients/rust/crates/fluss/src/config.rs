@@ -34,6 +34,8 @@ const DEFAULT_REMOTE_LOG_RETRY_BACKOFF_BASE_MS: u64 = 100;
 const DEFAULT_REMOTE_LOG_RETRY_BACKOFF_MAX_MS: u64 = 5_000;
 const DEFAULT_DOWNLOAD_THREADS: usize = 3;
 const DEFAULT_SCANNER_REMOTE_LOG_READ_CONCURRENCY: usize = 4;
+const DEFAULT_SCANNER_REMOTE_LOG_READ_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_SCANNER_REMOTE_LOG_OPERATION_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_POLL_RECORDS: usize = 500;
 const DEFAULT_SCANNER_LOG_FETCH_MAX_BYTES: i32 = 16 * 1024 * 1024;
 const DEFAULT_SCANNER_LOG_FETCH_MIN_BYTES: i32 = 1;
@@ -139,6 +141,17 @@ pub struct Config {
     /// Download path always uses streaming reader.
     #[arg(long, default_value_t = DEFAULT_SCANNER_REMOTE_LOG_READ_CONCURRENCY)]
     pub scanner_remote_log_read_concurrency: usize,
+
+    /// Maximum chunk requested from remote storage by each concurrent reader.
+    /// These read buffers are not charged to DataFusion's memory pool.
+    /// Default: 8388608 bytes (8 MiB).
+    #[arg(long, default_value_t = DEFAULT_SCANNER_REMOTE_LOG_READ_CHUNK_BYTES)]
+    pub scanner_remote_log_read_chunk_bytes: usize,
+
+    /// Timeout for each remote reader/open/read operation in milliseconds,
+    /// not an overall query deadline. Default: 30000ms.
+    #[arg(long, default_value_t = DEFAULT_SCANNER_REMOTE_LOG_OPERATION_TIMEOUT_MS)]
+    pub scanner_remote_log_operation_timeout_ms: u64,
 
     /// Maximum number of records returned in a single call to poll() for LogScanner.
     /// Default: 500 (matching Java CLIENT_SCANNER_LOG_MAX_POLL_RECORDS)
@@ -307,6 +320,18 @@ impl std::fmt::Debug for Config {
                 &self.remote_file_download_thread_num,
             )
             .field(
+                "scanner_remote_log_read_concurrency",
+                &self.scanner_remote_log_read_concurrency,
+            )
+            .field(
+                "scanner_remote_log_read_chunk_bytes",
+                &self.scanner_remote_log_read_chunk_bytes,
+            )
+            .field(
+                "scanner_remote_log_operation_timeout_ms",
+                &self.scanner_remote_log_operation_timeout_ms,
+            )
+            .field(
                 "scanner_log_max_poll_records",
                 &self.scanner_log_max_poll_records,
             )
@@ -383,6 +408,9 @@ impl Default for Config {
             scanner_remote_log_retry_backoff_max_ms: DEFAULT_REMOTE_LOG_RETRY_BACKOFF_MAX_MS,
             remote_file_download_thread_num: DEFAULT_DOWNLOAD_THREADS,
             scanner_remote_log_read_concurrency: DEFAULT_SCANNER_REMOTE_LOG_READ_CONCURRENCY,
+            scanner_remote_log_read_chunk_bytes: DEFAULT_SCANNER_REMOTE_LOG_READ_CHUNK_BYTES,
+            scanner_remote_log_operation_timeout_ms:
+                DEFAULT_SCANNER_REMOTE_LOG_OPERATION_TIMEOUT_MS,
             scanner_log_max_poll_records: DEFAULT_MAX_POLL_RECORDS,
             scanner_log_fetch_max_bytes: DEFAULT_SCANNER_LOG_FETCH_MAX_BYTES,
             scanner_log_fetch_min_bytes: DEFAULT_SCANNER_LOG_FETCH_MIN_BYTES,
@@ -476,6 +504,16 @@ impl Config {
         }
         if self.scanner_remote_log_read_concurrency == 0 {
             return Err("scanner_remote_log_read_concurrency must be > 0".to_string());
+        }
+        if self.scanner_remote_log_read_chunk_bytes == 0
+            || self.scanner_remote_log_read_chunk_bytes > 64 * 1024 * 1024
+        {
+            return Err("scanner_remote_log_read_chunk_bytes must be in 1..=67108864".into());
+        }
+        if self.scanner_remote_log_operation_timeout_ms == 0
+            || self.scanner_remote_log_operation_timeout_ms > 3_600_000
+        {
+            return Err("scanner_remote_log_operation_timeout_ms must be in 1..=3600000".into());
         }
         if self.remote_file_download_thread_num == 0 {
             return Err("remote_file_download_thread_num must be > 0".to_string());
@@ -754,6 +792,41 @@ mod tests {
             ..Config::default()
         };
         assert!(config.validate_scanner().is_err());
+    }
+
+    #[test]
+    fn remote_streaming_buffer_and_timeout_are_configurable_and_bounded() {
+        let parsed = Config::try_parse_from([
+            "fluss",
+            "--scanner-remote-log-read-chunk-bytes",
+            "65536",
+            "--scanner-remote-log-operation-timeout-ms",
+            "15000",
+        ])
+        .expect("streaming limits must be configurable without recompiling");
+        assert_eq!(parsed.scanner_remote_log_read_chunk_bytes, 65_536);
+        assert_eq!(parsed.scanner_remote_log_operation_timeout_ms, 15_000);
+        assert!(parsed.validate_scanner().is_ok());
+        for config in [
+            Config {
+                scanner_remote_log_read_chunk_bytes: 0,
+                ..parsed.clone()
+            },
+            Config {
+                scanner_remote_log_read_chunk_bytes: usize::MAX,
+                ..parsed.clone()
+            },
+            Config {
+                scanner_remote_log_operation_timeout_ms: 0,
+                ..parsed.clone()
+            },
+            Config {
+                scanner_remote_log_operation_timeout_ms: u64::MAX,
+                ..parsed.clone()
+            },
+        ] {
+            assert!(config.validate_scanner().is_err());
+        }
     }
 
     #[test]

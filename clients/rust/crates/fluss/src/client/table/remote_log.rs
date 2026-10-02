@@ -418,7 +418,7 @@ enum DownloadResult {
 struct ProductionFetcher {
     credentials_rx: CredentialsReceiver,
     local_log_dir: Arc<TempDir>,
-    remote_log_read_concurrency: usize,
+    streaming_options: StreamingReadOptions,
 }
 
 impl ProductionFetcher {
@@ -429,7 +429,7 @@ impl ProductionFetcher {
     ) -> Pin<Box<dyn Future<Output = Result<FetchResult>> + Send + 'a>> {
         let mut credentials_rx = self.credentials_rx.clone();
         let local_log_dir = self.local_log_dir.clone();
-        let remote_log_read_concurrency = self.remote_log_read_concurrency;
+        let streaming_options = self.streaming_options;
 
         // Clone data needed for async operation to avoid lifetime issues
         let segment = request.segment.clone();
@@ -483,13 +483,13 @@ impl ProductionFetcher {
                 }
             };
 
-            // Download file to disk (streaming, no memory spike)
+            // Stream to disk without materializing the whole remote file.
             let file_path = RemoteLogDownloader::download_file(
                 &remote_log_tablet_dir,
                 &remote_path,
                 &local_file_path,
                 &remote_fs_props,
-                remote_log_read_concurrency,
+                streaming_options,
                 budget,
             )
             .await?;
@@ -1041,7 +1041,7 @@ pub(crate) struct RemoteDownloadLimits {
     pending_segments: usize,
     prefetch_bytes: usize,
     concurrent_downloads: usize,
-    read_concurrency: usize,
+    streaming_options: StreamingReadOptions,
     retry_policy: RemoteRetryPolicy,
 }
 
@@ -1052,7 +1052,11 @@ impl RemoteDownloadLimits {
             pending_segments: config.scanner_remote_log_max_pending_segments,
             prefetch_bytes: config.scanner_remote_log_max_prefetch_bytes,
             concurrent_downloads: config.remote_file_download_thread_num,
-            read_concurrency: config.scanner_remote_log_read_concurrency,
+            streaming_options: StreamingReadOptions {
+                chunk_size: config.scanner_remote_log_read_chunk_bytes,
+                concurrency: config.scanner_remote_log_read_concurrency,
+                timeout: Duration::from_millis(config.scanner_remote_log_operation_timeout_ms),
+            },
             retry_policy: RemoteRetryPolicy::from(config),
         }
     }
@@ -1068,7 +1072,7 @@ impl RemoteLogDownloader {
         let fetcher = Arc::new(ProductionFetcher {
             credentials_rx,
             local_log_dir: Arc::new(local_log_dir),
-            remote_log_read_concurrency: limits.read_concurrency,
+            streaming_options: limits.streaming_options,
         });
 
         Self::new_with_fetcher_and_retry(
@@ -1247,7 +1251,7 @@ impl RemoteLogDownloader {
         remote_path: &str,
         local_path: &Path,
         remote_fs_props: &HashMap<String, String>,
-        remote_log_read_concurrency: usize,
+        options: StreamingReadOptions,
         budget: Option<&mut (dyn FnMut(usize) -> Result<()> + Send)>,
     ) -> Result<PathBuf> {
         // Handle both URL (e.g., "s3://bucket/path") and local file paths
@@ -1279,23 +1283,8 @@ impl RemoteLogDownloader {
         let storage = Storage::build(file_io_builder)?;
         let (op, relative_path) = storage.create(remote_path)?;
 
-        // Timeout for remote storage operations (30 seconds)
-        const REMOTE_OP_TIMEOUT: Duration = Duration::from_secs(30);
-        const CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8MiB
-
-        Self::download_file_streaming(
-            &op,
-            relative_path,
-            remote_path,
-            local_path,
-            StreamingReadOptions {
-                chunk_size: CHUNK_SIZE,
-                concurrency: remote_log_read_concurrency,
-                timeout: REMOTE_OP_TIMEOUT,
-            },
-            budget,
-        )
-        .await?;
+        Self::download_file_streaming(&op, relative_path, remote_path, local_path, options, budget)
+            .await?;
 
         Ok(local_path.to_path_buf())
     }
@@ -1385,6 +1374,20 @@ mod tests {
     /// surface.
     fn metrics() -> Arc<ScannerMetrics> {
         test_scanner_metrics(&TablePath::new("db", "tbl"))
+    }
+
+    #[test]
+    fn scanner_config_reaches_remote_streaming_options() {
+        let config = Config {
+            scanner_remote_log_read_chunk_bytes: 256,
+            scanner_remote_log_read_concurrency: 2,
+            scanner_remote_log_operation_timeout_ms: 15_000,
+            ..Config::default()
+        };
+        let limits = RemoteDownloadLimits::from_config(&config);
+        assert_eq!(limits.streaming_options.chunk_size, 256);
+        assert_eq!(limits.streaming_options.concurrency, 2);
+        assert_eq!(limits.streaming_options.timeout, Duration::from_secs(15));
     }
 
     /// Simplified fake fetcher for testing

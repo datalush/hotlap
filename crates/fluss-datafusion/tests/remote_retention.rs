@@ -3,11 +3,14 @@
 //! Run alone with FLUSS_IMAGE and FLUSS_VERSION set to a matching Fluss server.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use fluss::client::FlussConnection;
 use fluss::config::Config;
 use fluss::metadata::{
@@ -63,10 +66,7 @@ fn tiering_conf() -> HashMap<String, String> {
 fn datafusion_reads_and_expires_rustfs_s3() -> TestResult<()> {
     std::env::var("FLUSS_IMAGE")?;
     std::env::var("FLUSS_VERSION")?;
-    let endpoint = std::env::var("RUSTFS_ENDPOINT")?;
-    let bucket = std::env::var("RUSTFS_BUCKET")?;
-    let access = std::env::var("RUSTFS_ACCESS_KEY")?;
-    let secret = std::env::var("RUSTFS_SECRET_KEY")?;
+    let (conf, mut test_objects) = rustfs_profile()?;
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     metrics::with_local_recorder(&recorder, || {
@@ -74,48 +74,6 @@ fn datafusion_reads_and_expires_rustfs_s3() -> TestResult<()> {
             .enable_all()
             .build()?
             .block_on(async {
-                let check = s3_command(
-                    &endpoint,
-                    &access,
-                    &secret,
-                    &["s3api", "head-bucket", "--bucket", &bucket],
-                )?;
-                if !check.status.success() {
-                    return Err(format!(
-                        "RustFS bucket unavailable: {}",
-                        String::from_utf8_lossy(&check.stderr)
-                    )
-                    .into());
-                }
-                // Test-scoped prefix only. Never touch other objects in the
-                // existing RustFS bucket shared with the laboratory.
-                let suffix = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_nanos();
-                let prefix = format!("datafusion-remote-tests/{}-{suffix}", std::process::id());
-                let mut test_objects = S3TestPrefix {
-                    endpoint: endpoint.clone(),
-                    access: access.clone(),
-                    secret: secret.clone(),
-                    bucket: bucket.clone(),
-                    prefix: prefix.clone(),
-                    cleaned: false,
-                };
-
-                let mut conf = tiering_conf();
-                conf.extend([
-                    ("remote.data.dir".into(), format!("s3://{bucket}/{prefix}")),
-                    ("s3.region".into(), "us-east-1".into()),
-                    ("s3.endpoint".into(), endpoint.clone()),
-                    ("s3.path-style-access".into(), "true".into()),
-                    ("s3.access-key".into(), access.clone()),
-                    ("s3.secret-key".into(), secret.clone()),
-                    (
-                        "s3.assumed.role.arn".into(),
-                        "arn:aws:iam::rustfs:role/fluss-read".into(),
-                    ),
-                    ("s3.assumed.role.sts.endpoint".into(), endpoint.clone()),
-                ]);
                 let mut builder =
                     FlussTestingClusterBuilder::new_with_cluster_conf("datafusion-s3", &conf)
                         .with_port(9323);
@@ -127,6 +85,585 @@ fn datafusion_reads_and_expires_rustfs_s3() -> TestResult<()> {
                 cleanup
             })
     })
+}
+
+fn rustfs_profile() -> TestResult<(HashMap<String, String>, S3TestPrefix)> {
+    let endpoint = std::env::var("RUSTFS_ENDPOINT")?;
+    let bucket = std::env::var("RUSTFS_BUCKET")?;
+    let access = std::env::var("RUSTFS_ACCESS_KEY")?;
+    let secret = std::env::var("RUSTFS_SECRET_KEY")?;
+    let check = s3_command(
+        &endpoint,
+        &access,
+        &secret,
+        &["s3api", "head-bucket", "--bucket", &bucket],
+    )?;
+    if !check.status.success() {
+        return Err(format!(
+            "RustFS bucket unavailable: {}",
+            String::from_utf8_lossy(&check.stderr)
+        )
+        .into());
+    }
+    // Test-scoped prefix only. Never touch other objects in the shared bucket.
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let prefix = format!("datafusion-remote-tests/{}-{suffix}", std::process::id());
+    let test_objects = S3TestPrefix {
+        endpoint: endpoint.clone(),
+        access: access.clone(),
+        secret: secret.clone(),
+        bucket: bucket.clone(),
+        prefix: prefix.clone(),
+        cleaned: false,
+    };
+    let mut conf = tiering_conf();
+    conf.extend([
+        ("remote.data.dir".into(), format!("s3://{bucket}/{prefix}")),
+        ("s3.region".into(), "us-east-1".into()),
+        ("s3.endpoint".into(), endpoint.clone()),
+        ("s3.path-style-access".into(), "true".into()),
+        ("s3.access-key".into(), access),
+        ("s3.secret-key".into(), secret),
+        (
+            "s3.assumed.role.arn".into(),
+            "arn:aws:iam::rustfs:role/fluss-read".into(),
+        ),
+        ("s3.assumed.role.sts.endpoint".into(), endpoint),
+    ]);
+    Ok((conf, test_objects))
+}
+
+#[test]
+#[ignore = "35-minute Docker/RustFS load profile; requires AWS CLI, RUSTFS_*, FLUSS_IMAGE and FLUSS_VERSION"]
+fn datafusion_resource_pressure_rustfs() -> TestResult<()> {
+    std::env::var("FLUSS_IMAGE")?;
+    std::env::var("FLUSS_VERSION")?;
+    let profile = PressureProfile::from_env()?;
+    let (mut conf, mut test_objects) = rustfs_profile()?;
+    // Large enough to offload a compressible dataset without creating a
+    // separate object for every record.
+    conf.insert("log.segment.file-size".into(), "64kb".into());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let mut builder =
+                    FlussTestingClusterBuilder::new_with_cluster_conf("datafusion-pressure", &conf)
+                        .with_port(9523);
+                let cluster = builder.build().await;
+                let result = check_resource_pressure(&cluster, profile, &snapshotter).await;
+                drop(cluster);
+                let cleanup = test_objects.cleanup();
+                result?;
+                cleanup
+            })
+    })
+}
+
+const PRESSURE_VALUE_BYTES: usize = 128 * 1024;
+const PRESSURE_POOL_BYTES: usize = 512 * 1024 * 1024;
+const PRESSURE_RSS_LIMIT: usize = 1536 * 1024 * 1024;
+const PRESSURE_TEMP_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+
+fn pressure_value(id: i32) -> String {
+    // 4 KiB of distinct but deterministic data repeated to 128 KiB: Arrow
+    // must decode a large row, while the remote object is ~32x smaller.
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    let mut block = format!("row-{id:08}-");
+    let mut seed = (id as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    while block.len() < 4 * 1024 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        block.push(ALPHABET[(seed & 63) as usize] as char);
+    }
+    block.repeat(PRESSURE_VALUE_BYTES / block.len())
+}
+
+#[derive(Clone, Copy)]
+struct PressureProfile {
+    rows: usize,
+    warmup: Duration,
+    measure: Duration,
+    full: bool,
+}
+
+impl PressureProfile {
+    fn from_env() -> TestResult<Self> {
+        let value = |key: &str, default| -> TestResult<usize> {
+            Ok(std::env::var(key).map_or(Ok(default), |v| v.parse::<usize>())?)
+        };
+        let rows = value("FLUSS_PRESSURE_ROWS", 4_800)?;
+        let warmup = value("FLUSS_PRESSURE_WARMUP_SECS", 300)?;
+        let measure = value("FLUSS_PRESSURE_MEASURE_SECS", 1_800)?;
+        if rows == 0 || rows > 4_800 || measure == 0 || measure > 1_800 || warmup > 300 {
+            return Err("invalid pressure profile size/duration".into());
+        }
+        let full = rows == 4_800 && warmup == 300 && measure == 1_800;
+        assert!(!full || rows * PRESSURE_VALUE_BYTES > PRESSURE_POOL_BYTES);
+        Ok(Self {
+            rows,
+            warmup: Duration::from_secs(warmup as u64),
+            measure: Duration::from_secs(measure as u64),
+            full,
+        })
+    }
+}
+
+#[derive(Default)]
+struct PressureSamples {
+    peak_rss: usize,
+    peak_pool: usize,
+    peak_temp: u64,
+    last_rss: usize,
+    failure: Option<String>,
+}
+
+fn process_memory_bytes(field: &str) -> TestResult<usize> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let line = status
+        .lines()
+        .find(|line| line.starts_with(field))
+        .ok_or(format!("/proc/self/status contains no {field}"))?;
+    let kb: usize = line
+        .split_whitespace()
+        .nth(1)
+        .ok_or(format!("missing {field}"))?
+        .parse()?;
+    Ok(kb * 1024)
+}
+
+fn rss_bytes() -> TestResult<usize> {
+    process_memory_bytes("VmRSS:")
+}
+
+fn remote_temp_bytes() -> std::io::Result<u64> {
+    let mut total = 0_u64;
+    for directory in std::fs::read_dir(std::env::temp_dir())? {
+        let directory = directory?;
+        if directory
+            .file_name()
+            .to_string_lossy()
+            .starts_with("fluss-remote-logs")
+        {
+            for file in std::fs::read_dir(directory.path())? {
+                total += file?.metadata()?.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
+async fn observe_pressure(
+    pool: Arc<dyn MemoryPool>,
+    samples: Arc<Mutex<PressureSamples>>,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        let failed = {
+            let observed = (|| -> TestResult<(usize, usize, u64)> {
+                Ok((rss_bytes()?, pool.reserved(), remote_temp_bytes()?))
+            })();
+            let mut state = samples.lock().unwrap();
+            match observed {
+                Ok((rss, reserved, temporary)) => {
+                    state.last_rss = rss;
+                    state.peak_rss = state.peak_rss.max(rss);
+                    state.peak_pool = state.peak_pool.max(reserved);
+                    state.peak_temp = state.peak_temp.max(temporary);
+                    if rss > PRESSURE_RSS_LIMIT
+                        || temporary > PRESSURE_TEMP_LIMIT
+                        || reserved > PRESSURE_POOL_BYTES
+                    {
+                        state.failure = Some(format!(
+                            "resource budget exceeded: rss={rss}, pool={reserved}, temporary={temporary}"
+                        ));
+                    }
+                }
+                Err(error) => state.failure = Some(error.to_string()),
+            }
+            state.failure.is_some()
+        };
+        if failed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn check_resource_pressure(
+    cluster: &fluss_test_cluster::FlussTestingCluster,
+    profile: PressureProfile,
+    snapshotter: &Snapshotter,
+) -> TestResult<()> {
+    let config = Config {
+        bootstrap_servers: cluster.plaintext_bootstrap_servers().to_string(),
+        scanner_log_max_poll_records: 128,
+        scanner_remote_log_read_chunk_bytes: 1024 * 1024,
+        scanner_remote_log_read_concurrency: 2,
+        remote_file_download_thread_num: 2,
+        scanner_remote_log_prefetch_num: 2,
+        scanner_remote_log_max_prefetch_bytes: 64 * 1024 * 1024,
+        ..Config::default()
+    };
+    let connection = Arc::new(
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match FlussConnection::new(config.clone()).await {
+                    Ok(connection) => break connection,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+                }
+            }
+        })
+        .await
+        .map_err(|_| "pressure coordinator did not accept a connection within 60s")?,
+    );
+    let admin = connection.get_admin()?;
+    let metadata = connection.get_metadata();
+    wait_for(Duration::from_secs(60), || async {
+        let updated = metadata
+            .update_tables_metadata(
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+                vec![],
+            )
+            .await
+            .is_ok();
+        Ok::<bool, std::convert::Infallible>(
+            updated && metadata.get_cluster().get_tablet_server(0).is_some(),
+        )
+    })
+    .await?;
+    let suffix = std::process::id();
+    let log = TablePath::new("fluss", format!("pressure_log_{suffix}"));
+    let kv = TablePath::new("fluss", format!("pressure_kv_{suffix}"));
+    let schema = || {
+        Schema::builder()
+            .column("id", DataTypes::int())
+            .column("value", DataTypes::string())
+    };
+    admin
+        .create_table(
+            &log,
+            &TableDescriptor::builder()
+                .schema(schema().build()?)
+                .distributed_by(Some(2), vec!["id".into()])
+                .property("table.log.ttl", "0ms")
+                .property("table.log.tiered.local-segments", "1")
+                .build()?,
+            false,
+        )
+        .await
+        .map_err(|error| format!("create pressure log: {error}"))?;
+    let result: TestResult<()> = async {
+        admin
+            .create_table(
+                &kv,
+                &TableDescriptor::builder()
+                    .schema(schema().primary_key(vec!["id"])?.build()?)
+                    .distributed_by(Some(2), vec!["id".into()])
+                    .build()?,
+                false,
+            )
+            .await
+            .map_err(|error| format!("create pressure KV: {error}"))?;
+        run_pressure_profile(&connection, &log, &kv, profile, snapshotter)
+            .await
+            .map_err(|error| format!("run pressure profile: {error}").into())
+    }
+    .await;
+    let log_cleanup = admin.drop_table(&log, true).await;
+    let kv_cleanup = admin.drop_table(&kv, true).await;
+    result?;
+    log_cleanup?;
+    kv_cleanup?;
+    connection.close(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
+async fn run_pressure_profile(
+    connection: &Arc<FlussConnection>,
+    log: &TablePath,
+    kv: &TablePath,
+    profile: PressureProfile,
+    snapshotter: &Snapshotter,
+) -> TestResult<()> {
+    let log_writer = connection
+        .get_table(log)
+        .await?
+        .new_append()?
+        .create_writer()?;
+    for id in 0..profile.rows {
+        let mut row = GenericRow::new(2);
+        row.set_field(0, id as i32);
+        row.set_field(1, pressure_value(id as i32));
+        log_writer
+            .append(&row)
+            .map_err(|error| format!("append log row {id}: {error}"))?;
+        if id % 64 == 63 {
+            log_writer
+                .flush()
+                .await
+                .map_err(|error| format!("flush log after row {id}: {error}"))?;
+        }
+    }
+    log_writer
+        .flush()
+        .await
+        .map_err(|error| format!("final log flush: {error}"))?;
+    drop(log_writer);
+    let kv_writer = connection
+        .get_table(kv)
+        .await?
+        .new_upsert()?
+        .create_writer()?;
+    for id in 0..64_i32 {
+        let mut row = GenericRow::new(2);
+        row.set_field(0, id);
+        row.set_field(1, pressure_value(id));
+        kv_writer
+            .upsert(&row)
+            .map_err(|error| format!("upsert KV row {id}: {error}"))?;
+        if id % 32 == 31 {
+            kv_writer
+                .flush()
+                .await
+                .map_err(|error| format!("flush KV after row {id}: {error}"))?;
+        }
+    }
+    kv_writer
+        .flush()
+        .await
+        .map_err(|error| format!("final KV flush: {error}"))?;
+    drop(kv_writer);
+    let admin = connection.get_admin()?;
+    let table_id = connection.get_table(log).await?.get_table_info().table_id;
+    if profile.full {
+        wait_for(Duration::from_secs(90), || async {
+            admin
+                .list_remote_log_manifests(table_id, None)
+                .await
+                .map(|entries| entries.iter().any(|entry| entry.remote_log_end_offset > 0))
+        })
+        .await?;
+    }
+
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(PRESSURE_POOL_BYTES));
+    let ctx = SessionContext::new_with_config_rt(
+        SessionConfig::new().with_target_partitions(2),
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build()?,
+        ),
+    );
+    ctx.register_table(
+        "pressure_log",
+        Arc::new(
+            FlussLogTable::open(
+                Arc::clone(connection),
+                log.clone(),
+                Duration::from_secs(180),
+            )
+            .await?,
+        ),
+    )?;
+    ctx.register_table(
+        "pressure_kv",
+        Arc::new(
+            fluss_datafusion::FlussKvTable::open(
+                Arc::clone(connection),
+                kv.clone(),
+                Duration::from_secs(180),
+            )
+            .await?,
+        ),
+    )?;
+
+    // Deliberately provoke a pool rejection, then verify the normal context
+    // can continue. The result is an error, not a truncated successful query.
+    let tiny_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
+    let tiny = SessionContext::new_with_config_rt(
+        SessionConfig::new().with_target_partitions(2),
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&tiny_pool))
+                .build()?,
+        ),
+    );
+    tiny.register_table(
+        "log",
+        Arc::new(
+            FlussLogTable::open(
+                Arc::clone(connection),
+                log.clone(),
+                Duration::from_secs(180),
+            )
+            .await?,
+        ),
+    )?;
+    let error = tiny
+        .sql("SELECT * FROM log")
+        .await?
+        .collect()
+        .await
+        .expect_err("memory pressure must reject the scan");
+    assert!(
+        error.to_string().to_lowercase().contains("memory"),
+        "{error}"
+    );
+    assert_eq!(tiny_pool.reserved(), 0);
+    drop(tiny);
+
+    let samples = Arc::new(Mutex::new(PressureSamples::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = tokio::spawn(observe_pressure(
+        Arc::clone(&pool),
+        Arc::clone(&samples),
+        Arc::clone(&stop),
+    ));
+    let result = async {
+        let warmup_runs = run_pressure_stage(&ctx, &pool, &samples, profile.rows, profile.warmup).await?;
+        if profile.full && remote_bytes(snapshotter) == 0 {
+            return Err("no remote log bytes fetched during pressure warmup".into());
+        }
+        let warm_rss = rss_bytes()?;
+        let start = Instant::now();
+        let measured_runs = run_pressure_stage(&ctx, &pool, &samples, profile.rows, profile.measure).await?;
+        let elapsed = start.elapsed();
+        wait_for(Duration::from_secs(10), || async { remote_temp_bytes().map(|bytes| bytes == 0) }).await?;
+        assert_eq!(pool.reserved(), 0);
+        let state = samples.lock().unwrap();
+        if let Some(error) = &state.failure {
+            return Err(error.clone().into());
+        }
+        let final_rss = rss_bytes()?;
+        let high_water_rss = process_memory_bytes("VmHWM:")?;
+        let downloaded = remote_bytes(snapshotter);
+        eprintln!(
+            "DataFusion pressure profile full={} rows={} warmup_scans={} measured_scans={} measured_seconds={:.1} warmup_rss_mib={} sampled_peak_rss_mib={} process_hwm_rss_mib={} final_rss_mib={} peak_pool_mib={} sampled_peak_remote_temp_bytes={} remote_download_bytes={}",
+            profile.full, profile.rows, warmup_runs, measured_runs, elapsed.as_secs_f64(),
+            warm_rss / (1024 * 1024), state.peak_rss / (1024 * 1024), high_water_rss / (1024 * 1024),
+            final_rss / (1024 * 1024), state.peak_pool / (1024 * 1024), state.peak_temp, downloaded
+        );
+        if high_water_rss > PRESSURE_RSS_LIMIT {
+            return Err(format!("process RSS high-water mark exceeded budget: {high_water_rss}").into());
+        }
+        if profile.full && final_rss > warm_rss + 256 * 1024 * 1024 {
+            return Err(format!("RSS did not stabilize after warmup: {warm_rss} -> {final_rss}").into());
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }.await;
+    stop.store(true, Ordering::Relaxed);
+    sampler.await?;
+    result
+}
+
+async fn run_pressure_stage(
+    ctx: &SessionContext,
+    pool: &Arc<dyn MemoryPool>,
+    samples: &Arc<Mutex<PressureSamples>>,
+    log_rows: usize,
+    duration: Duration,
+) -> TestResult<usize> {
+    let until = Instant::now() + duration;
+    let mut scans = 0;
+    loop {
+        let reads = (0..4).map(|index| {
+            let (table, expected) = if index % 2 == 0 {
+                ("pressure_log", log_rows)
+            } else {
+                ("pressure_kv", 64)
+            };
+            pressure_read(ctx, table, expected, samples)
+        });
+        futures::future::try_join_all(reads).await?;
+        scans += 4;
+        wait_for(Duration::from_secs(5), || async {
+            Ok::<bool, std::convert::Infallible>(pool.reserved() == 0)
+        })
+        .await?;
+        // Exercise early termination after each complete wave. Temporary
+        // downloads and pool reservations must disappear before the next wave.
+        for table in ["pressure_log", "pressure_kv"] {
+            let query = ctx.sql(&format!("SELECT id, value FROM {table}")).await?;
+            let source = source_plan(&query.create_physical_plan().await?);
+            let mut stream = source.execute(0, Arc::new(query.task_ctx()))?;
+            let first = stream.next().await.expect("first pressure batch")?;
+            let held = pool.reserved();
+            assert!(first.num_rows() > 0 && held > 0);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(pool.reserved(), held, "paused source pulled more data");
+            drop(first);
+            drop(stream);
+            wait_for(Duration::from_secs(5), || async {
+                Ok::<bool, std::convert::Infallible>(pool.reserved() == 0)
+            })
+            .await?;
+        }
+        wait_for(Duration::from_secs(5), || async {
+            remote_temp_bytes().map(|bytes| bytes == 0)
+        })
+        .await?;
+        if let Some(error) = samples.lock().unwrap().failure.clone() {
+            return Err(error.into());
+        }
+        if Instant::now() >= until {
+            break;
+        }
+    }
+    Ok(scans)
+}
+
+async fn pressure_read(
+    ctx: &SessionContext,
+    table: &str,
+    expected: usize,
+    samples: &Arc<Mutex<PressureSamples>>,
+) -> TestResult<()> {
+    let mut seen = vec![false; expected];
+    let mut stream = ctx
+        .sql(&format!("SELECT id, value FROM {table}"))
+        .await?
+        .execute_stream()
+        .await?;
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .ok_or("invalid id column")?;
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .ok_or("invalid value column")?;
+        for index in 0..batch.num_rows() {
+            let id = usize::try_from(ids.value(index))?;
+            if id >= expected
+                || seen[id]
+                || values.value(index).len() != PRESSURE_VALUE_BYTES
+                || !values.value(index).starts_with(&format!("row-{id:08}-"))
+            {
+                return Err(format!("invalid or repeated {table} row {id}").into());
+            }
+            seen[id] = true;
+        }
+        if let Some(error) = samples.lock().unwrap().failure.clone() {
+            return Err(error.into());
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    if seen.iter().any(|present| !present) {
+        return Err(format!("{table}: scan omitted rows").into());
+    }
+    Ok(())
 }
 
 fn s3_command(
@@ -528,6 +1065,8 @@ async fn read_during_retention(
     let mut scan_config = connection.config().clone();
     scan_config.scanner_remote_log_prefetch_num = 1;
     scan_config.scanner_log_max_poll_records = 1;
+    scan_config.scanner_remote_log_read_chunk_bytes = 256;
+    scan_config.scanner_remote_log_operation_timeout_ms = 15_000;
     let scan_connection = Arc::new(FlussConnection::new(scan_config).await?);
     let ctx = SessionContext::new();
     ctx.register_table(

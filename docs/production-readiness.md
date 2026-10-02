@@ -81,6 +81,15 @@ This limits the scanner's remote temporary files, not other users of the same
 disk or temporary memory used by OpenDAL's read chunks. A single oversized
 server record can exceed a fetch size hint before the pool rejects its decoded
 Arrow batch.
+`scanner_remote_log_read_chunk_bytes` (default 8 MiB, maximum 64 MiB) sets
+the per-reader chunk size; combine it with `scanner_remote_log_read_concurrency`
+and `remote_file_download_thread_num` (defaults 4 and 3) when budgeting memory
+outside the DataFusion pool. At the defaults their product is 96 MiB of
+potential in-flight chunk data **per scanner**. This is a sizing input, not
+a strict process-memory bound: decompression, fetch responses and OpenDAL's
+internal allocations are additional. Set
+`scanner_remote_log_operation_timeout_ms` (default 30000ms) for individual
+remote reader/open/read operations; this is not a query-wide timeout.
 `scanner_remote_log_max_retries` controls retries *after* the first attempt
 (default 10; `0` means one attempt). `scanner_remote_log_retry_backoff_base_ms`
 and `scanner_remote_log_retry_backoff_max_ms` configure exponential backoff
@@ -126,9 +135,51 @@ FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUIL
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_reads_and_expires_rustfs_s3 -- --ignored
 ```
 
+## Reference resource-pressure profile
+
+The ignored `datafusion_resource_pressure_rustfs` test creates its **own**
+Docker Fluss cluster and a unique, removable prefix in the existing RustFS
+bucket. It runs against the Rust DataFusion provider, not the Python wheel.
+Its default profile writes 4,800 log rows of 128 KiB (600 MiB decoded, larger
+than the 512 MiB pool) and 64 KV rows (8 MiB). Four queries run concurrently
+(two logs, two KV), with two physical partitions per query. It uses a shared
+512 MiB DataFusion pool, 1 MiB remote chunks, two read operations and two
+downloads per scanner, and two prefetched segments/64 MiB per scanner. After
+five minutes of warmup it measures for 30 minutes; a scan wave completes
+before another starts. Every scan checks row IDs, values and duplicates;
+each wave exercises early cancellation and checks that Arrow reservations and
+remote temporary files are released. The test also forces an explicit memory
+pool rejection using a separate tiny pool.
+
+On the reference machine with the test process pinned to four permitted CPUs
+(`taskset -c 0-3`), two full runs passed. The latest run measured 112 scans in
+1,854 seconds, 832,049,024 remote bytes fetched, sampled RSS peak 170 MiB,
+kernel-reported RSS high-water mark about 169 MiB, sampled pool peak 19 MiB,
+and sampled remote temporary-file peak 636,819 bytes. RSS after warmup was
+120 MiB and after measurement 122 MiB. The test rejects RSS above 1.5 GiB,
+remote temporary-file bytes above 2 GiB, nonzero reservations or temporary
+bytes after each wave, or an RSS increase above 256 MiB after warmup. The 2 GiB memory
+budget was **checked by RSS/high-water mark**, not imposed as a cgroup limit;
+the temporary-file limit covers the client scanner, not all process disk use.
+The two RSS measurements are separate kernel observations and are rounded to
+MiB; do not treat a one-MiB difference as an exact ordering of peaks.
+
+Run the long profile alone, with four CPU IDs allowed by the host affinity:
+
+```bash
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env taskset -c 0-3 cargo test -p fluss-datafusion --test remote_retention datafusion_resource_pressure_rustfs -- --ignored --nocapture
+```
+
+For a functional smoke run before committing to 35 minutes, set
+`FLUSS_PRESSURE_ROWS=64 FLUSS_PRESSURE_WARMUP_SECS=2 FLUSS_PRESSURE_MEASURE_SECS=5`.
+Its output is marked `full=false` and **does not** meet the resource-profile
+acceptance criterion.
+
 ## Remaining verification before a general production claim
 
-Long-duration load tests should measure compressed fetch-buffer memory (which
-the DataFusion reservation does not cover), temporary disk usage, simultaneous
-queries and coordinator failover. Reproduce them against the exact server,
-client and storage profile intended for deployment.
+The measured profile is evidence for this **Rust, Docker Fluss, RustFS**
+configuration, not a strict bound on every transient allocation or another
+deployment. Compressed fetch buffers and OpenDAL remain outside the DataFusion
+pool; an Arrow batch is decoded before the pool can reserve it. Coordinator
+failover, other resource profiles and the eventual Python-FFI path (if needed)
+still require separate acceptance evidence.
