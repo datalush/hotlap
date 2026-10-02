@@ -28,6 +28,7 @@ pub struct FlussLogTable {
     path: TablePath,
     schema: SchemaRef,
     table_id: i64,
+    initial_schema: bool,
     buckets: i32,
     partitioned: bool,
     partition_keys: Vec<String>,
@@ -61,6 +62,11 @@ impl FlussLogTable {
             .map_err(fluss_error)?
             .schema();
         let table_id = info.table_id;
+        // Older log batches may predate newly added columns. The server
+        // rejects projection/filtering of those columns against old batches.
+        // Version 1 is the initial schema in Fluss; later versions must
+        // project locally after decoding a full row under the pinned schema.
+        let initial_schema = info.get_schema_id() == 1;
         let buckets = info.get_num_buckets();
         let partitioned = info.is_partitioned();
         let partition_keys = info.get_partition_keys().iter().cloned().collect();
@@ -73,6 +79,7 @@ impl FlussLogTable {
             path,
             schema,
             table_id,
+            initial_schema,
             buckets,
             partitioned,
             partition_keys,
@@ -134,7 +141,7 @@ impl TableProvider for FlussLogTable {
         Ok(filters
             .iter()
             .map(|filter| {
-                if filter::translate(filter, &self.schema).is_some()
+                if (self.initial_schema && filter::translate(filter, &self.schema).is_some())
                     || (self.partitioned
                         && !PartitionFilter::from_expr(filter, &self.schema, &self.partition_keys)
                             .is_empty())
@@ -172,18 +179,25 @@ impl TableProvider for FlussLogTable {
                 &self.partition_keys,
             ));
         }
-        let predicate = fluss::predicate::Predicate::and_all(
-            filters
-                .iter()
-                .filter_map(|expr| filter::translate(expr, &self.schema)),
-        );
+        let predicate = self
+            .initial_schema
+            .then(|| {
+                fluss::predicate::Predicate::and_all(
+                    filters
+                        .iter()
+                        .filter_map(|expr| filter::translate(expr, &self.schema)),
+                )
+            })
+            .flatten();
         let description = format!(
             "kind=log, table={}, projection={}, projected_columns={:?}, batch_pruning={predicate:?}, partition_pruning={partition_filter:?}",
             self.path,
             if projection.is_some_and(Vec::is_empty) {
                 "full_rows_for_count"
-            } else {
+            } else if self.initial_schema {
                 "server"
+            } else {
+                "client_evolved_schema"
             },
             schema
                 .fields()
@@ -199,6 +213,7 @@ impl TableProvider for FlussLogTable {
             projection: projection.cloned(),
             filter: predicate,
             table_id: self.table_id,
+            project_at_source: self.initial_schema,
             buckets: self.buckets,
             partitioned: self.partitioned,
             partition_filter,

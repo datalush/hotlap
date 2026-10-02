@@ -4,9 +4,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
-use datafusion::common::DataFusionError;
+use datafusion::common::{DataFusionError, ScalarValue};
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::collect as collect_plan;
@@ -1295,6 +1295,8 @@ async fn empty_log_and_new_offsets_on_each_query() -> TestResult<()> {
         check_late_partition(&connection, &path, &admin, &df, &source).await?;
         check_batch_metrics(&source.metrics().unwrap());
         check_filter_pushdown(&ctx).await?;
+        check_reference_queries(&ctx).await?;
+        check_concurrent_reexecution(&df, &source).await?;
         assert_eq!(
             count_sql(&ctx, "SELECT COUNT(*) FROM log WHERE id = 8").await?,
             1
@@ -1457,6 +1459,309 @@ async fn check_filter_pushdown(ctx: &SessionContext) -> TestResult<()> {
         metric(&outside_source.metrics().unwrap(), "arrow_decoded_bytes"),
         full_bytes
     );
+    Ok(())
+}
+
+async fn check_reference_queries(ctx: &SessionContext) -> TestResult<()> {
+    let ids: ArrayRef = Arc::new(Int32Array::from_iter_values(0..512));
+    let optional: ArrayRef = Arc::new(Int32Array::from(
+        (0..512)
+            .map(|id| (id % 2 == 0).then_some(id))
+            .collect::<Vec<_>>(),
+    ));
+    ctx.register_batch(
+        "reference",
+        RecordBatch::try_from_iter([("id", ids), ("optional", optional)])?,
+    )?;
+    // Both queries run in DataFusion. Only the Fluss source and its optional
+    // pruning/projection differ from the Arrow reference table.
+    for query in [
+        "SELECT optional, id FROM {table} WHERE id >= 100 AND id < 200 AND optional IS NULL ORDER BY id",
+        "SELECT id FROM {table} WHERE id > 2147483648 OR optional IS NULL ORDER BY id",
+        "SELECT id, optional FROM {table} WHERE id > 100 AND optional < 120 ORDER BY id",
+    ] {
+        let actual = sql_rows(ctx, &query.replace("{table}", "log")).await?;
+        let expected = sql_rows(ctx, &query.replace("{table}", "reference")).await?;
+        assert_eq!(
+            actual, expected,
+            "Fluss changed DataFusion's result for {query}"
+        );
+    }
+    Ok(())
+}
+
+async fn sql_rows(ctx: &SessionContext, sql: &str) -> TestResult<Vec<Vec<ScalarValue>>> {
+    let mut rows = Vec::new();
+    for batch in ctx.sql(sql).await?.collect().await? {
+        for row in 0..batch.num_rows() {
+            rows.push(
+                (0..batch.num_columns())
+                    .map(|column| ScalarValue::try_from_array(batch.column(column), row))
+                    .collect::<datafusion::common::Result<Vec<_>>>()?,
+            );
+        }
+    }
+    Ok(rows)
+}
+
+async fn check_concurrent_reexecution(
+    df: &datafusion::dataframe::DataFrame,
+    source: &Arc<dyn ExecutionPlan>,
+) -> TestResult<()> {
+    // Reuse one physical plan with distinct DataFusion query contexts. Each
+    // execution must capture its own offsets and read every bucket once.
+    let reads = (0..3).map(|_| collect_plan(Arc::clone(source), Arc::new(df.task_ctx())));
+    for batches in futures::future::try_join_all(reads).await? {
+        let mut ids = Vec::new();
+        for batch in batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend((0..column.len()).map(|row| column.value(row)));
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (0..512).collect::<Vec<_>>());
+    }
+    assert_eq!(
+        metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires native-sni and FLUSS_* credentials; run with --ignored"]
+async fn old_log_and_kv_plans_reject_changed_or_recreated_tables() -> TestResult<()> {
+    let connection = connect().await?;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let log = TablePath::new(DATABASE, format!("log_lifecycle_{suffix}"));
+    let kv = TablePath::new(DATABASE, format!("kv_lifecycle_{suffix}"));
+    let admin = connection.get_admin()?;
+    let schema = || {
+        Schema::builder()
+            .column("id", DataTypes::int())
+            .column("value", DataTypes::string())
+    };
+    let log_descriptor = TableDescriptor::builder()
+        .schema(schema().build()?)
+        .distributed_by(Some(1), vec!["id".into()])
+        .build()?;
+    let kv_descriptor = TableDescriptor::builder()
+        .schema(schema().primary_key(vec!["id"])?.build()?)
+        .distributed_by(Some(1), vec!["id".into()])
+        .build()?;
+    admin.create_table(&log, &log_descriptor, false).await?;
+    if let Err(error) = admin.create_table(&kv, &kv_descriptor, false).await {
+        admin.drop_table(&log, true).await?;
+        return Err(error.into());
+    }
+    let result = check_old_plans(&connection, &log, &kv).await;
+    let log_cleanup = admin.drop_table(&log, true).await;
+    let kv_cleanup = admin.drop_table(&kv, true).await;
+    result?;
+    log_cleanup?;
+    kv_cleanup?;
+    connection.close(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
+async fn check_old_plans(
+    connection: &Arc<FlussConnection>,
+    log: &TablePath,
+    kv: &TablePath,
+) -> TestResult<()> {
+    write_lifecycle_row(connection, log, kv, 1).await?;
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "old_log",
+        Arc::new(FlussLogTable::open(Arc::clone(connection), log.clone(), SCAN_TIMEOUT).await?),
+    )?;
+    ctx.register_table(
+        "old_kv",
+        Arc::new(FlussKvTable::open(Arc::clone(connection), kv.clone(), SCAN_TIMEOUT).await?),
+    )?;
+    let mut old_plans = Vec::new();
+    for name in ["old_log", "old_kv"] {
+        let query = ctx.sql(&format!("SELECT * FROM {name}")).await?;
+        old_plans.push((
+            query.create_physical_plan().await?,
+            Arc::new(query.task_ctx()),
+        ));
+    }
+    let admin = connection.get_admin()?;
+    for path in [log, kv] {
+        admin
+            .alter_table(
+                path,
+                false,
+                AlterTableChanges {
+                    add_columns: vec![AddColumn {
+                        column_name: "note".into(),
+                        data_type_json: DataTypes::string()
+                            .serialize_json()?
+                            .to_string()
+                            .into_bytes(),
+                        comment: None,
+                        position: ColumnPositionType::Last,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await?;
+    }
+    for (plan, task_ctx) in &old_plans {
+        match collect_plan(Arc::clone(plan), Arc::clone(task_ctx)).await {
+            Ok(batches) => {
+                // An additive change may leave the old projected schema valid.
+                // Its plan must still return the original columns and row.
+                assert_eq!(plan.schema().fields().len(), 2);
+                assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                for batch in batches {
+                    assert_eq!(batch.schema(), plan.schema());
+                    assert_eq!(
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .value(0),
+                        1
+                    );
+                }
+            }
+            Err(error) => assert!(
+                error.to_string().contains("schema changed")
+                    || error.to_string().contains("schema or topology changed"),
+                "{error}"
+            ),
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let updated = SessionContext::new();
+        updated.register_table(
+            "updated_log",
+            Arc::new(FlussLogTable::open(Arc::clone(connection), log.clone(), SCAN_TIMEOUT).await?),
+        )?;
+        updated.register_table(
+            "updated_kv",
+            Arc::new(FlussKvTable::open(Arc::clone(connection), kv.clone(), SCAN_TIMEOUT).await?),
+        )?;
+        match async {
+            for name in ["updated_log", "updated_kv"] {
+                let count = count_sql(
+                    &updated,
+                    &format!("SELECT COUNT(*) FROM {name} WHERE note IS NULL"),
+                )
+                .await?;
+                if count != 1 {
+                    return Err(format!("{name}: expected one retained row, got {count}").into());
+                }
+            }
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await
+        {
+            Ok(()) => break,
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                return Err(
+                    format!("fresh providers did not read added nullable column: {error}").into(),
+                );
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Recreate under exactly the same names and schema as the original
+    // plans. Table identity, not the SQL name or field names, must win.
+    for path in [log, kv] {
+        admin.drop_table(path, true).await?;
+    }
+    let schema = || {
+        Schema::builder()
+            .column("id", DataTypes::int())
+            .column("value", DataTypes::string())
+    };
+    admin
+        .create_table(
+            log,
+            &TableDescriptor::builder()
+                .schema(schema().build()?)
+                .distributed_by(Some(1), vec!["id".into()])
+                .build()?,
+            false,
+        )
+        .await?;
+    admin
+        .create_table(
+            kv,
+            &TableDescriptor::builder()
+                .schema(schema().primary_key(vec!["id"])?.build()?)
+                .distributed_by(Some(1), vec!["id".into()])
+                .build()?,
+            false,
+        )
+        .await?;
+    write_lifecycle_row(connection, log, kv, 7).await?;
+    for (plan, task_ctx) in old_plans {
+        let error = collect_plan(plan, task_ctx)
+            .await
+            .expect_err("an old plan must not read a replacement table");
+        assert!(
+            error.to_string().contains("topology changed")
+                || error.to_string().contains("schema or topology changed"),
+            "{error}"
+        );
+    }
+    for (name, table) in [
+        (
+            "new_log",
+            Arc::new(FlussLogTable::open(Arc::clone(connection), log.clone(), SCAN_TIMEOUT).await?)
+                as Arc<dyn datafusion::catalog::TableProvider>,
+        ),
+        (
+            "new_kv",
+            Arc::new(FlussKvTable::open(Arc::clone(connection), kv.clone(), SCAN_TIMEOUT).await?)
+                as Arc<dyn datafusion::catalog::TableProvider>,
+        ),
+    ] {
+        ctx.register_table(name, table)?;
+        assert_eq!(
+            sql_rows(&ctx, &format!("SELECT id FROM {name}")).await?,
+            vec![vec![ScalarValue::Int32(Some(7))]]
+        );
+    }
+    Ok(())
+}
+
+async fn write_lifecycle_row(
+    connection: &Arc<FlussConnection>,
+    log: &TablePath,
+    kv: &TablePath,
+    id: i32,
+) -> TestResult<()> {
+    let mut row = GenericRow::new(2);
+    row.set_field(0, id);
+    row.set_field(1, format!("value-{id}"));
+    let log_writer = connection
+        .get_table(log)
+        .await?
+        .new_append()?
+        .create_writer()?;
+    log_writer.append(&row)?.await?;
+    log_writer.flush().await?;
+    let kv_writer = connection
+        .get_table(kv)
+        .await?
+        .new_upsert()?
+        .create_writer()?;
+    kv_writer.upsert(&row)?.await?;
+    kv_writer.flush().await?;
     Ok(())
 }
 

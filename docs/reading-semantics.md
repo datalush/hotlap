@@ -28,8 +28,9 @@ require replanning; partitioned layouts are rediscovered on each execution.
 
 The append-only log source relies on the client's bounded offset reader. Its predicate
 pushdown only prunes batches, so filters must still be evaluated exactly
-in the engine. Only representable `Int32`/`Int64` comparisons are translated;
-conjuncts may be pushed independently because DataFusion retains the whole
+in the engine. Only representable `Int32`/`Int64` comparisons are translated
+for tables still on their initial schema. Conjuncts may be pushed independently
+because DataFusion retains the whole
 expression. `OR` and lossy numeric conversions are not pushed. A log table
 needs `table.statistics.columns` set before writing for those batches to
 carry useful pruning statistics. Keep projection, limits, and partitions
@@ -49,9 +50,12 @@ starting from newer data. A server out-of-range response during an ongoing
 scan also fails the query. The bounded read
 finishes or fails with an explicit error on timeout. Offsets are collected
 per bucket, not as a transactional cross-bucket snapshot. Non-empty SQL
-projections are requested from the Fluss scanner; zero-column `COUNT(*)`
-still fetches full rows before stripping columns locally. Exact filtering
-and global SQL limits remain DataFusion operations.
+projections are requested from the Fluss scanner on initial-schema tables.
+After a schema change, the source reads full rows and projects Arrow columns
+locally: older log batches may not contain fields added later, and the server
+can reject a projection or predicate referring to those fields. A zero-column
+`COUNT(*)` also fetches full rows before stripping columns locally. Exact
+filtering and global SQL limits remain DataFusion operations.
 When every trailing batch is pruned, the scanner's consumed offset advances
 even though it yields no Arrow batches. The bounded reader checks that
 progress and completes once each captured stopping offset is reached;
@@ -92,7 +96,8 @@ per physical stream, regardless of which stream starts first).
 to executed streams, including empty ranges. KV counts server-confirmed
 sessions and successful `ScanKv` RPC responses (including empty pages), not
 Arrow output batches. First-page latency includes request and decoding.
-Projection is identified as `server` for logs, `decoder` for KV, or
+Projection is identified as `server` for initial-schema logs,
+`client_evolved_schema` for evolved logs, `decoder` for KV, or
 `full_rows_for_count` for a zero-column scan. These are not network-byte or
 server-only snapshot-opening measurements.
 

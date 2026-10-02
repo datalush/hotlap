@@ -25,6 +25,12 @@ bucket**, not an atomic cross-bucket snapshot.
   captured start before subscription, the read fails. A unit test injects an
   out-of-range response *after* another bucket produced data and checks that
   the Arrow batch reader fails instead of swallowing the error.
+- Evolved log schemas read historical rows without pushing newly added fields
+  into the server projection. A fresh DataFusion provider returns those
+  fields as null for older rows; an old plan keeps its original schema or
+  fails. After dropping and recreating a table with the same name, old log
+  and KV plans reject the new table identity. Concurrent executions of one
+  physical log source with distinct TaskContexts return complete results.
 - An execution-time budget (default 16,384 selected partition/bucket pairs)
   rejects larger scans instead of silently omitting buckets. Use
   `with_max_assigned_buckets` to choose a deliberate larger budget.

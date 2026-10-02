@@ -47,6 +47,7 @@ pub(crate) struct ScanSpec {
     pub(crate) projection: Option<Vec<usize>>,
     pub(crate) filter: Option<Predicate>,
     pub(crate) table_id: i64,
+    pub(crate) project_at_source: bool,
     pub(crate) buckets: i32,
     pub(crate) partitioned: bool,
     pub(crate) partition_filter: PartitionFilter,
@@ -207,16 +208,11 @@ impl ReadState {
         self.reservation
             .try_resize(decoded.get_array_memory_size())?;
         self.metrics.record_decoded_batch(&decoded);
-        let output = if self
-            .source
-            .spec
-            .projection
-            .as_ref()
-            .is_some_and(Vec::is_empty)
-        {
-            decoded.project(&[])?
-        } else {
-            decoded
+        let output = match &self.source.spec.projection {
+            Some(indices) if indices.is_empty() || !self.source.spec.project_at_source => {
+                decoded.project(indices)?
+            }
+            _ => decoded,
         };
         self.metrics.record_output_batch(&output);
         Ok(output)
@@ -354,7 +350,9 @@ impl ReadState {
     fn projected_scanner(&self, table: &FlussTable<'_>) -> Result<RecordBatchLogScanner> {
         let scan = table.new_scan();
         let scan = match self.source.spec.projection.as_deref() {
-            Some(indices) if !indices.is_empty() => scan.project(indices).map_err(fluss_error)?,
+            Some(indices) if !indices.is_empty() && self.source.spec.project_at_source => {
+                scan.project(indices).map_err(fluss_error)?
+            }
             _ => scan,
         };
         let scan = match &self.source.spec.filter {
@@ -364,12 +362,13 @@ impl ReadState {
         let scanner = scan
             .create_record_batch_log_scanner()
             .map_err(fluss_error)?;
-        let expected_schema = if self
-            .source
-            .spec
-            .projection
-            .as_ref()
-            .is_some_and(Vec::is_empty)
+        let expected_schema = if !self.source.spec.project_at_source
+            || self
+                .source
+                .spec
+                .projection
+                .as_ref()
+                .is_some_and(Vec::is_empty)
         {
             &self.source.spec.full_schema
         } else {
