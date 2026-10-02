@@ -104,7 +104,10 @@ server-only snapshot-opening measurements.
 Each source holds its most recently decoded Arrow batch against the shared
 DataFusion `MemoryPool` until the next pull or stream drop. When the configured
 pool cannot reserve that batch, the query fails rather than returning a partial
-result. This reservation does **not** account for Fluss fetch buffers, remote
+result. The batch is decoded before its size is known and reserved; the pool
+does not prevent that transient allocation. An evolved log scan charges the
+full decoded batch before locally projecting the requested columns. This
+reservation does **not** account for Fluss fetch buffers, remote
 prefetch or batches retained by downstream operators: size the client fetch
 settings and DataFusion target parallelism accordingly. With the default
 unbounded DataFusion pool, it is accounting rather than a memory limit.

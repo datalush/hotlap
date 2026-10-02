@@ -63,6 +63,13 @@ struct DownloadOptions {
     retry_policy: RemoteRetryPolicy,
 }
 
+#[derive(Clone, Copy)]
+struct StreamingReadOptions {
+    chunk_size: usize,
+    concurrency: usize,
+    timeout: Duration,
+}
+
 impl From<&Config> for RemoteRetryPolicy {
     fn from(config: &Config) -> Self {
         Self {
@@ -146,6 +153,17 @@ pub trait RemoteLogFetcher: Send + Sync {
         &self,
         request: &RemoteLogDownloadRequest,
     ) -> Pin<Box<dyn Future<Output = Result<FetchResult>> + Send>>;
+
+    /// Production fetchers reserve real bytes before writing each chunk.
+    /// Test fetchers that only return a completed file may use the default;
+    /// the coordinator still checks their final size before delivering it.
+    fn fetch_bounded<'a>(
+        &'a self,
+        request: &'a RemoteLogDownloadRequest,
+        _reserve: &'a mut (dyn FnMut(usize) -> Result<()> + Send),
+    ) -> Pin<Box<dyn Future<Output = Result<FetchResult>> + Send + 'a>> {
+        self.fetch(request)
+    }
 }
 
 /// Represents a remote log segment that needs to be downloaded
@@ -301,6 +319,7 @@ pub struct RemoteLogDownloadRequest {
     result_sender: oneshot::Sender<Result<RemoteLogFile>>,
     retry_count: u32,
     next_retry_at: Option<tokio::time::Instant>,
+    cancel_notify: Arc<Notify>,
     /// Keep the queue slot until the coordinator has discarded or finished
     /// this request, even if the caller dropped its future earlier.
     _pending_slot: Option<PendingSlot>,
@@ -402,11 +421,12 @@ struct ProductionFetcher {
     remote_log_read_concurrency: usize,
 }
 
-impl RemoteLogFetcher for ProductionFetcher {
-    fn fetch(
+impl ProductionFetcher {
+    fn fetch_impl<'a>(
         &self,
         request: &RemoteLogDownloadRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<FetchResult>> + Send>> {
+        budget: Option<&'a mut (dyn FnMut(usize) -> Result<()> + Send)>,
+    ) -> Pin<Box<dyn Future<Output = Result<FetchResult>> + Send + 'a>> {
         let mut credentials_rx = self.credentials_rx.clone();
         let local_log_dir = self.local_log_dir.clone();
         let remote_log_read_concurrency = self.remote_log_read_concurrency;
@@ -470,6 +490,7 @@ impl RemoteLogFetcher for ProductionFetcher {
                 &local_file_path,
                 &remote_fs_props,
                 remote_log_read_concurrency,
+                budget,
             )
             .await?;
 
@@ -483,6 +504,23 @@ impl RemoteLogFetcher for ProductionFetcher {
                 file_size,
             })
         })
+    }
+}
+
+impl RemoteLogFetcher for ProductionFetcher {
+    fn fetch(
+        &self,
+        request: &RemoteLogDownloadRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<FetchResult>> + Send>> {
+        self.fetch_impl(request, None)
+    }
+
+    fn fetch_bounded<'a>(
+        &'a self,
+        request: &'a RemoteLogDownloadRequest,
+        budget: &'a mut (dyn FnMut(usize) -> Result<()> + Send),
+    ) -> Pin<Box<dyn Future<Output = Result<FetchResult>> + Send + 'a>> {
+        self.fetch_impl(request, Some(budget))
     }
 }
 
@@ -639,7 +677,7 @@ impl DownloadCoordinator {
 /// - Other segments can make progress while one is failing
 /// - Natural retry through coordinator re-picking from queue
 async fn spawn_download_task(
-    mut request: RemoteLogDownloadRequest,
+    request: RemoteLogDownloadRequest,
     permit: tokio::sync::OwnedSemaphorePermit,
     mut bytes_permit: PrefetchBytesPermit,
     options: DownloadOptions,
@@ -662,11 +700,25 @@ async fn spawn_download_task(
     // Cancellation closes the one-shot receiver. Drop the underlying download
     // future immediately instead of waiting for a blocked object store to
     // respond while it still owns a prefetch slot and the scanner's temp dir.
-    let download_result = tokio::select! {
-        result = fetcher.fetch(&request) => result,
-        _ = request.result_sender.closed() => {
-            drop(permit);
-            return DownloadResult::Cancelled;
+    let download_result = {
+        let mut reserve_written_bytes = |actual| {
+            if bytes_permit.adjust_to(actual, options.max_prefetch_bytes) {
+                Ok(())
+            } else {
+                Err(Error::BufferExhausted {
+                    message: format!(
+                        "Remote segment needs {actual} bytes while downloading, above the {}-byte prefetch budget",
+                        options.max_prefetch_bytes
+                    ),
+                })
+            }
+        };
+        tokio::select! {
+            result = fetcher.fetch_bounded(&request, &mut reserve_written_bytes) => result,
+            _ = request.cancel_notify.notified() => {
+                drop(permit);
+                return DownloadResult::Cancelled;
+            }
         }
     };
 
@@ -845,6 +897,7 @@ pub struct RemoteLogDownloadFuture {
     completion_callbacks: Arc<Mutex<Vec<CompletionCallback>>>,
     worker: tokio::task::AbortHandle,
     recycle_notify: Option<Arc<Notify>>,
+    cancel_notify: Option<Arc<Notify>>,
 }
 
 impl RemoteLogDownloadFuture {
@@ -888,11 +941,17 @@ impl RemoteLogDownloadFuture {
             completion_callbacks,
             worker: worker.abort_handle(),
             recycle_notify: None,
+            cancel_notify: None,
         }
     }
 
     fn with_recycle_notify(mut self, recycle_notify: Arc<Notify>) -> Self {
         self.recycle_notify = Some(recycle_notify);
+        self
+    }
+
+    fn with_cancel_notify(mut self, cancel_notify: Arc<Notify>) -> Self {
+        self.cancel_notify = Some(cancel_notify);
         self
     }
 
@@ -950,6 +1009,9 @@ impl Drop for RemoteLogDownloadFuture {
         // A cancelled scanner must close the one-shot receiver. The download
         // coordinator can then skip queued segments and release permits/files.
         self.worker.abort();
+        if let Some(notify) = &self.cancel_notify {
+            notify.notify_one();
+        }
         // A cancelled request may be parked in backoff for several seconds.
         // Wake the coordinator to discard it and release its pending slot now.
         if let Some(notify) = &self.recycle_notify {
@@ -1122,12 +1184,14 @@ impl RemoteLogDownloader {
             return RemoteLogDownloadFuture::new(result_receiver);
         }
 
+        let cancel_notify = Arc::new(Notify::new());
         let request = RemoteLogDownloadRequest {
             segment: segment.clone(),
             remote_log_tablet_dir: remote_log_tablet_dir.to_string(),
             result_sender,
             retry_count: 0,
             next_retry_at: None,
+            cancel_notify: Arc::clone(&cancel_notify),
             _pending_slot: Some(PendingSlot(Arc::clone(&self.pending_slots))),
         };
 
@@ -1147,6 +1211,7 @@ impl RemoteLogDownloader {
 
         RemoteLogDownloadFuture::new(result_receiver)
             .with_recycle_notify(Arc::clone(&self.recycle_notify))
+            .with_cancel_notify(cancel_notify)
     }
 }
 
@@ -1160,6 +1225,21 @@ impl Drop for RemoteLogDownloader {
     }
 }
 
+/// A partial download must not remain on disk after a failed or cancelled
+/// attempt. On success the file passes to FileSource, which owns its cleanup.
+struct IncompleteDownload {
+    path: PathBuf,
+    finished: bool,
+}
+
+impl Drop for IncompleteDownload {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 impl RemoteLogDownloader {
     /// Download a file from remote storage to local using streaming read/write.
     async fn download_file(
@@ -1168,6 +1248,7 @@ impl RemoteLogDownloader {
         local_path: &Path,
         remote_fs_props: &HashMap<String, String>,
         remote_log_read_concurrency: usize,
+        budget: Option<&mut (dyn FnMut(usize) -> Result<()> + Send)>,
     ) -> Result<PathBuf> {
         // Handle both URL (e.g., "s3://bucket/path") and local file paths
         // If the path doesn't contain "://", treat it as a local file path
@@ -1207,9 +1288,12 @@ impl RemoteLogDownloader {
             relative_path,
             remote_path,
             local_path,
-            CHUNK_SIZE,
-            remote_log_read_concurrency,
-            REMOTE_OP_TIMEOUT,
+            StreamingReadOptions {
+                chunk_size: CHUNK_SIZE,
+                concurrency: remote_log_read_concurrency,
+                timeout: REMOTE_OP_TIMEOUT,
+            },
+            budget,
         )
         .await?;
 
@@ -1221,24 +1305,27 @@ impl RemoteLogDownloader {
         relative_path: &str,
         remote_path: &str,
         local_path: &Path,
-        chunk_size: usize,
-        streaming_read_concurrency: usize,
-        remote_op_timeout: Duration,
+        options: StreamingReadOptions,
+        mut budget: Option<&mut (dyn FnMut(usize) -> Result<()> + Send)>,
     ) -> Result<()> {
+        let mut cleanup = IncompleteDownload {
+            path: local_path.to_path_buf(),
+            finished: false,
+        };
         let mut local_file = tokio::fs::File::create(local_path).await?;
 
         let reader_future = op
             .reader_with(relative_path)
-            .chunk(chunk_size)
-            .concurrent(streaming_read_concurrency);
-        let reader = tokio::time::timeout(remote_op_timeout, reader_future)
+            .chunk(options.chunk_size)
+            .concurrent(options.concurrency);
+        let reader = tokio::time::timeout(options.timeout, reader_future)
             .await
             .map_err(|e| Error::IoUnexpectedError {
                 message: format!("Timeout creating streaming reader for {remote_path}: {e}."),
                 source: io::ErrorKind::TimedOut.into(),
             })??;
 
-        let mut stream = tokio::time::timeout(remote_op_timeout, reader.into_bytes_stream(..))
+        let mut stream = tokio::time::timeout(options.timeout, reader.into_bytes_stream(..))
             .await
             .map_err(|e| Error::IoUnexpectedError {
                 message: format!("Timeout creating streaming bytes stream for {remote_path}: {e}."),
@@ -1246,7 +1333,8 @@ impl RemoteLogDownloader {
             })??;
 
         let mut chunk_count = 0u64;
-        while let Some(chunk) = tokio::time::timeout(remote_op_timeout, stream.try_next())
+        let mut written = 0usize;
+        while let Some(chunk) = tokio::time::timeout(options.timeout, stream.try_next())
             .await
             .map_err(|e| Error::IoUnexpectedError {
                 message: format!(
@@ -1259,10 +1347,22 @@ impl RemoteLogDownloader {
             if chunk_count <= 3 || chunk_count % 10 == 0 {
                 log::debug!("Remote log streaming download: chunk #{chunk_count} ({remote_path})");
             }
+            let next = written
+                .checked_add(chunk.len())
+                .ok_or(Error::BufferExhausted {
+                    message: "Remote segment byte count overflowed during download".into(),
+                })?;
+            // Charge this chunk before touching disk. The metadata size is
+            // only a hint, and concurrent downloads share the same budget.
+            if let Some(reserve) = budget.as_deref_mut() {
+                reserve(next)?;
+            }
             local_file.write_all(&chunk).await?;
+            written = next;
         }
 
         local_file.sync_all().await?;
+        cleanup.finished = true;
         Ok(())
     }
 }
@@ -1582,6 +1682,7 @@ mod tests {
             result_sender,
             retry_count: 0,
             next_retry_at: None,
+            cancel_notify: Arc::new(Notify::new()),
             _pending_slot: None,
         }
     }
@@ -1889,6 +1990,145 @@ mod tests {
                 .contains("prefetch limit")
         );
         assert_eq!(downloader.prefetch_bytes.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_download_rejects_underreported_bytes_before_writing_them() -> Result<()> {
+        let remote = TempDir::new()?;
+        let output = TempDir::new()?;
+        let remote_path = remote.path().join("segment.log");
+        let output_path = output.path().join("segment.log");
+        tokio::fs::write(&remote_path, vec![17_u8; 20]).await?;
+        let op = opendal::Operator::new(
+            opendal::services::Fs::default().root(remote.path().to_str().unwrap()),
+        )?
+        .finish();
+        let reserved = Arc::new(AtomicUsize::new(1));
+        let mut permit = PrefetchBytesPermit {
+            reserved: Arc::clone(&reserved),
+            bytes: 1,
+            recycle_notify: Arc::new(Notify::new()),
+        };
+        let error = {
+            let mut check = |actual| {
+                if permit.adjust_to(actual, 12) {
+                    Ok(())
+                } else {
+                    Err(Error::BufferExhausted {
+                        message: "stream exceeded configured disk budget".into(),
+                    })
+                }
+            };
+            RemoteLogDownloader::download_file_streaming(
+                &op,
+                "segment.log",
+                "segment.log",
+                &output_path,
+                StreamingReadOptions {
+                    chunk_size: 8,
+                    concurrency: 1,
+                    timeout: Duration::from_secs(3),
+                },
+                Some(&mut check),
+            )
+            .await
+            .expect_err("the last chunk must exceed the budget before being written")
+        };
+        assert!(matches!(error, Error::BufferExhausted { .. }));
+        assert!(!output_path.exists(), "partial download must be removed");
+        assert!(reserved.load(Ordering::SeqCst) <= 12);
+        drop(permit);
+        assert_eq!(reserved.load(Ordering::SeqCst), 0);
+
+        let mut check = |_actual| Ok(());
+        RemoteLogDownloader::download_file_streaming(
+            &op,
+            "segment.log",
+            "segment.log",
+            &output_path,
+            StreamingReadOptions {
+                chunk_size: 8,
+                concurrency: 1,
+                timeout: Duration::from_secs(3),
+            },
+            Some(&mut check),
+        )
+        .await?;
+        assert_eq!(tokio::fs::read(&output_path).await?, vec![17_u8; 20]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_partial_stream_removes_file_and_byte_reservation() -> Result<()> {
+        let remote = TempDir::new()?;
+        let output = TempDir::new()?;
+        tokio::fs::write(
+            remote.path().join("segment.log"),
+            vec![17_u8; 16 * 1024 * 1024],
+        )
+        .await?;
+        let output_path = output.path().join("segment.log");
+        let op = opendal::Operator::new(
+            opendal::services::Fs::default().root(remote.path().to_str().unwrap()),
+        )?
+        .finish();
+        let reserved = Arc::new(AtomicUsize::new(1));
+        let tracked = Arc::clone(&reserved);
+        let task_path = output_path.clone();
+        let task = tokio::spawn(async move {
+            let mut permit = PrefetchBytesPermit {
+                reserved: tracked,
+                bytes: 1,
+                recycle_notify: Arc::new(Notify::new()),
+            };
+            let mut check = |actual| {
+                if permit.adjust_to(actual, 32 * 1024 * 1024) {
+                    Ok(())
+                } else {
+                    Err(Error::BufferExhausted {
+                        message: "unexpected test budget exhaustion".into(),
+                    })
+                }
+            };
+            RemoteLogDownloader::download_file_streaming(
+                &op,
+                "segment.log",
+                "segment.log",
+                &task_path,
+                StreamingReadOptions {
+                    chunk_size: 1_024,
+                    concurrency: 1,
+                    timeout: Duration::from_secs(5),
+                },
+                Some(&mut check),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::fs::metadata(&output_path)
+                    .await
+                    .is_ok_and(|meta| meta.len() > 0)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the partial file must be written before cancellation");
+        assert!(
+            !task.is_finished(),
+            "the stream must be aborted mid-download"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            !output_path.exists(),
+            "cancelled download left a partial file"
+        );
+        assert_eq!(reserved.load(Ordering::SeqCst), 0);
+        Ok(())
     }
 
     #[tokio::test]

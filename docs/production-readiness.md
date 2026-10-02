@@ -74,8 +74,13 @@ operators. Set the Rust client's `scanner_log_fetch_max_bytes`,
 `scanner_remote_log_max_pending_segments` (outstanding request cap, default
 8192), and `scanner_remote_log_max_prefetch_bytes` (downloaded remote bytes
 per scanner, default 64 MiB). An oversized remote segment fails the scan
-rather than bypassing the limit. A single oversized server record can
-exceed a fetch size hint before the pool rejects its decoded Arrow batch.
+rather than bypassing the limit: the scanner initially reserves its advertised
+size, then reserves any extra bytes **before writing each downloaded chunk**.
+Failure or cancellation removes partial files and releases the reservation.
+This limits the scanner's remote temporary files, not other users of the same
+disk or temporary memory used by OpenDAL's read chunks. A single oversized
+server record can exceed a fetch size hint before the pool rejects its decoded
+Arrow batch.
 `scanner_remote_log_max_retries` controls retries *after* the first attempt
 (default 10; `0` means one attempt). `scanner_remote_log_retry_backoff_base_ms`
 and `scanner_remote_log_retry_backoff_max_ms` configure exponential backoff

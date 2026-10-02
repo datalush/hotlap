@@ -458,6 +458,64 @@ async fn check_memory_pool(
         metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
         0
     );
+
+    // Distinct queries against the same provider share DataFusion's pool.
+    // Pausing both consumers retains two decoded-batch reservations, while
+    // dropping either stream releases only its own reservation.
+    let shared_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+    let shared = SessionContext::new_with_config_rt(
+        SessionConfig::new().with_target_partitions(1),
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&shared_pool))
+                .build()?,
+        ),
+    );
+    shared.register_table(
+        "kv",
+        Arc::new(FlussKvTable::open(Arc::clone(connection), kv.clone(), SCAN_TIMEOUT).await?),
+    )?;
+    let query = shared.sql("SELECT * FROM kv").await?;
+    let source = source_plan(&query.create_physical_plan().await?);
+    let mut first = source.execute(0, Arc::new(query.task_ctx()))?;
+    let mut second = source.execute(0, Arc::new(query.task_ctx()))?;
+    let first_batch = first.next().await.expect("first query page")?;
+    assert!(first_batch.num_rows() > 0);
+    let first_reserved = shared_pool.reserved();
+    assert!(first_reserved > 0);
+    let second_batch = second.next().await.expect("second query page")?;
+    assert!(second_batch.num_rows() > 0);
+    let both_reserved = shared_pool.reserved();
+    assert!(both_reserved > first_reserved);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(shared_pool.reserved(), both_reserved);
+    drop(first_batch);
+    drop(second_batch);
+    drop(first);
+    assert!(shared_pool.reserved() > 0 && shared_pool.reserved() < both_reserved);
+    drop(second);
+    assert_eq!(shared_pool.reserved(), 0);
+    for _ in 0..10 {
+        let mut stream = source.execute(0, Arc::new(query.task_ctx()))?;
+        assert!(
+            stream
+                .next()
+                .await
+                .expect("restarted query page")?
+                .num_rows()
+                > 0
+        );
+        drop(stream);
+        assert_eq!(
+            shared_pool.reserved(),
+            0,
+            "cancelled query retained a reservation"
+        );
+        assert_eq!(
+            metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
+            0
+        );
+    }
     Ok(())
 }
 
@@ -1676,6 +1734,34 @@ async fn check_old_plans(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+
+    // Evolved logs now decode full rows before projecting. A restrictive
+    // DataFusion pool must reject that decoded batch and release its charge.
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
+    let tiny = SessionContext::new_with_config_rt(
+        SessionConfig::new(),
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build()?,
+        ),
+    );
+    tiny.register_table(
+        "evolved_log",
+        Arc::new(FlussLogTable::open(Arc::clone(connection), log.clone(), SCAN_TIMEOUT).await?),
+    )?;
+    let query = tiny.sql("SELECT id FROM evolved_log").await?;
+    let error = collect_plan(
+        query.create_physical_plan().await?,
+        Arc::new(query.task_ctx()),
+    )
+    .await
+    .expect_err("projecting an evolved log must still charge its decoded batch");
+    assert!(
+        error.to_string().to_lowercase().contains("memory"),
+        "{error}"
+    );
+    assert_eq!(pool.reserved(), 0);
 
     // Recreate under exactly the same names and schema as the original
     // plans. Table identity, not the SQL name or field names, must win.
