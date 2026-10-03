@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fluss-datafusion"]
+members = ["crates/fluss-datafusion", "crates/fluss-datafusion-python"]
 exclude = ["clients/rust"]
 
 [workspace.package]

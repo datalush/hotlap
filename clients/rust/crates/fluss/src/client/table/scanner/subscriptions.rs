@@ -92,7 +92,7 @@ impl LogScannerInner {
             let table_bucket = TableBucket::new(self.table_id, *bucket_id);
             scan_bucket_offsets.insert(table_bucket, *offset);
         }
-        self.do_subscribe_buckets(scan_bucket_offsets, reader_is_active)
+        self.do_subscribe_buckets(scan_bucket_offsets, reader_is_active, None)
             .await
     }
 
@@ -126,7 +126,16 @@ impl LogScannerInner {
         &self,
         partition_bucket_offsets: &HashMap<(PartitionId, i32), i64>,
     ) -> Result<()> {
-        self.subscribe_partition_buckets_internal(partition_bucket_offsets, false)
+        self.subscribe_partition_buckets_internal(partition_bucket_offsets, false, None)
+            .await
+    }
+
+    pub(super) async fn subscribe_partition_buckets_with_counts(
+        &self,
+        offsets: &HashMap<(PartitionId, i32), i64>,
+        counts: HashMap<PartitionId, i32>,
+    ) -> Result<()> {
+        self.subscribe_partition_buckets_internal(offsets, false, Some(counts))
             .await
     }
 
@@ -134,7 +143,7 @@ impl LogScannerInner {
         &self,
         partition_bucket_offsets: &HashMap<(PartitionId, i32), i64>,
     ) -> Result<()> {
-        self.subscribe_partition_buckets_internal(partition_bucket_offsets, true)
+        self.subscribe_partition_buckets_internal(partition_bucket_offsets, true, None)
             .await
     }
 
@@ -145,6 +154,7 @@ impl LogScannerInner {
         &self,
         partition_bucket_offsets: &HashMap<(PartitionId, i32), i64>,
         reader_is_active: bool,
+        counts: Option<HashMap<PartitionId, i32>>,
     ) -> Result<()> {
         if !reader_is_active {
             self.check_no_active_reader()?;
@@ -163,7 +173,7 @@ impl LogScannerInner {
                 TableBucket::new_with_partition(self.table_id, Some(partition_id), bucket_id);
             scan_bucket_offsets.insert(table_bucket, offset);
         }
-        self.do_subscribe_buckets(scan_bucket_offsets, reader_is_active)
+        self.do_subscribe_buckets(scan_bucket_offsets, reader_is_active, counts)
             .await
     }
 
@@ -171,6 +181,7 @@ impl LogScannerInner {
         &self,
         bucket_offsets: HashMap<TableBucket, i64>,
         reader_is_active: bool,
+        counts: Option<HashMap<PartitionId, i32>>,
     ) -> Result<()> {
         if bucket_offsets.is_empty() {
             return Err(Error::UnexpectedError {
@@ -202,6 +213,9 @@ impl LogScannerInner {
             );
         } else {
             self.check_no_active_reader()?;
+        }
+        if let Some(counts) = counts {
+            *self.log_fetcher.partition_bucket_counts.write() = counts;
         }
         self.log_scanner_status.assign_scan_buckets(bucket_offsets);
         Ok(())

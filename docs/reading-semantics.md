@@ -26,8 +26,10 @@ are applied by the Arrow decoder after reading value records, and `COUNT(*)`
 still decodes full rows. Schema changes and non-partitioned topology changes
 require replanning; partitioned layouts are rediscovered on each execution.
 
-The append-only log source relies on the client's bounded offset reader. Its predicate
-pushdown only prunes batches, so filters must still be evaluated exactly
+The batch append-only log source relies on the client's bounded offset reader;
+the continuous source subscribes to the client's unbounded batch scanner. Both
+share the same projection/pruning path. Predicate pushdown only prunes
+batches, so filters must still be evaluated exactly
 in the engine. Only representable `Int32`/`Int64` comparisons are translated
 for tables still on their initial schema. Conjuncts may be pushed independently
 because DataFusion retains the whole
@@ -42,8 +44,11 @@ planning time, DataFusion's target parallelism and an optional positive
 connector cap. At execution time, every selected partition's actual buckets
 are assigned across those streams, even when its count differs from the
 table default. Log streams share one offset capture per execution.
-Each bucket starts at its earliest **retained** offset captured alongside its
-latest offset; reusing the physical source plan with a new TaskContext
+By default each bucket starts at its earliest **retained** offset captured
+alongside its latest offset; an explicit start can use captured latest offsets
+or a complete mapping of table/partition/bucket IDs to inclusive offsets.
+Incomplete/stale mappings and out-of-range starts fail explicitly. Reusing
+the physical source plan with a new TaskContext
 captures new offsets. Before subscribing, the source checks that retention has
 not advanced past that start. If it has, the query fails rather than silently
 starting from newer data. A server out-of-range response during an ongoing
@@ -86,7 +91,21 @@ partition supplies its own bucket count to range validation, routing, and
 the physical-stream assignment. Changing the table default does not rewrite
 old partitions; the existing physical plan can rediscover the new layout on
 its next execution. Missing or invalid partition bucket counts fail the scan
-instead of silently omitting buckets. Each query has a finite timeout.
+instead of silently omitting buckets. Each **batch** query has a finite timeout.
+
+`FlussLogTable::open` remains batch for existing callers, while
+`open_with_options(LogReadOptions::default())` uses streaming. A streaming scan
+has no query-completion deadline: when idle, it waits for records and does not
+report EOF. Scanner operation/network deadlines remain configurable. DataFusion
+sees `Boundedness::Unbounded`, incremental emission and no global order; final
+global sorts/aggregates cannot be assumed to finish. During polling the source
+checks table ID/schema and partition IDs/counts periodically; changes fail
+explicitly rather than incorporating unknown buckets without start positions.
+New partitions require a new execution. `subscribe_deliveries()` observes
+source-side batches with table/partition/bucket, first and exclusive next
+offset, and execution ID. Server-side pruning may leave gaps and downstream
+SQL may filter entire batches. These are neither prefetched offsets nor
+processed/committed sink checkpoints. Treat a lagged observer as an error.
 
 `EXPLAIN ANALYZE` identifies log versus KV scans, table and projected
 columns, optional log batch predicate and partition pruning. Partition
@@ -115,8 +134,15 @@ unbounded DataFusion pool, it is accounting rather than a memory limit.
 The read-only catalog discovers names once; reload it after creating tables.
 It selects the log or KV provider from the table's primary-key metadata.
 
-The Python adapters take **already bounded** PyArrow tables/readers from the
-existing binding: DuckDB registers them for local SQL; Polars and pandas
-materialize local DataFrames. They are not Fluss table providers. Reopen
-one-shot readers for a second query, and bound data before materializing a
-DataFrame.
+The DuckDB/Polars/pandas Python adapters take **already bounded** PyArrow
+results from the existing binding; they are not live Fluss table providers.
+The separate `fluss_datafusion_native` FFI wheel exposes Rust log and KV
+providers to DataFusion Python 55. Its new log API defaults to streaming:
+request `mode="batch"` before a finite `COUNT(*)` or `.collect()`. Consume
+continuous sources with `execute_stream()` / `execute_stream_partitioned()`;
+`LIMIT` can end a compatible streaming plan. DataFusion's `FilterExec`
+coalesces small filtered batches up to the configured session `batch_size`:
+with the default a sparse, nonterminating stream may wait for thousands of
+matching rows before yielding a result. Choose a smaller DataFusion batch
+size (e.g. 1 for single-event latency) explicitly if needed, trading batching
+efficiency for latency; the source must not add a second SQL filter.

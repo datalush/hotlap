@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Validate an append-only table and plan its parallel bounded scan.
+//! Validate an append-only table and plan a bounded or continuous scan.
 
 use std::fmt;
 use std::sync::Arc;
@@ -18,33 +18,49 @@ use fluss::metadata::TablePath;
 
 use crate::execution::FlussScanExec;
 use crate::filter;
+use crate::log_options::{LogReadMode, LogReadOptions};
+use crate::log_progress::LogDelivery;
 use crate::offsets::{OffsetWindow, SharedCaptures};
 use crate::partitions::{DEFAULT_MAX_ASSIGNED_BUCKETS, PartitionFilter};
 use crate::scan::{PartitionedOffsets, ScanSpec};
 
-/// Append-only log table with bounded, parallel physical scan partitions.
+/// Append-only log table with parallel batch or continuous physical partitions.
 pub struct FlussLogTable {
     connection: Arc<FlussConnection>,
     path: TablePath,
     schema: SchemaRef,
     table_id: i64,
+    schema_id: i32,
     initial_schema: bool,
     buckets: i32,
     partitioned: bool,
     partition_keys: Vec<String>,
-    timeout: Duration,
+    options: LogReadOptions,
     max_partitions: Option<usize>,
     max_assigned_buckets: usize,
+    deliveries: tokio::sync::broadcast::Sender<LogDelivery>,
 }
 
 impl FlussLogTable {
-    /// Validate the table and capture its schema. No rows are fetched yet.
+    /// Legacy bounded source. Use `open_with_options` to select streaming or
+    /// an explicit start position; this constructor stays batch for existing
+    /// consumers that expect `collect()` to finish.
     pub async fn open(
         connection: Arc<FlussConnection>,
         path: TablePath,
         timeout: Duration,
     ) -> Result<Self> {
-        if timeout.is_zero() {
+        Self::open_with_options(connection, path, LogReadOptions::batch(timeout)).await
+    }
+
+    /// Validate the table and capture its schema. No rows are fetched yet.
+    /// `LogReadOptions::default()` follows new log records indefinitely.
+    pub async fn open_with_options(
+        connection: Arc<FlussConnection>,
+        path: TablePath,
+        options: LogReadOptions,
+    ) -> Result<Self> {
+        if options.mode == LogReadMode::Batch && options.batch_timeout.is_zero() {
             return Err(DataFusionError::Plan(
                 "Fluss scan timeout must be positive".into(),
             ));
@@ -62,6 +78,7 @@ impl FlussLogTable {
             .map_err(fluss_error)?
             .schema();
         let table_id = info.table_id;
+        let schema_id = info.get_schema_id();
         // Older log batches may predate newly added columns. The server
         // rejects projection/filtering of those columns against old batches.
         // Version 1 is the initial schema in Fluss; later versions must
@@ -79,14 +96,23 @@ impl FlussLogTable {
             path,
             schema,
             table_id,
+            schema_id,
             initial_schema,
             buckets,
             partitioned,
             partition_keys,
-            timeout,
+            options,
             max_partitions: None,
             max_assigned_buckets: DEFAULT_MAX_ASSIGNED_BUCKETS,
+            deliveries: tokio::sync::broadcast::channel(1024).0,
         })
+    }
+
+    /// Subscribe before executing to observe source-side batches. A lagged
+    /// receiver is an error for checkpoint consumers: do not skip events.
+    /// Multiple concurrent queries share the provider but have distinct IDs.
+    pub fn subscribe_deliveries(&self) -> tokio::sync::broadcast::Receiver<LogDelivery> {
+        self.deliveries.subscribe()
     }
 
     /// Cap physical partitions; the default uses DataFusion's target partitions.
@@ -190,7 +216,8 @@ impl TableProvider for FlussLogTable {
             })
             .flatten();
         let description = format!(
-            "kind=log, table={}, projection={}, projected_columns={:?}, batch_pruning={predicate:?}, partition_pruning={partition_filter:?}",
+            "kind=log, mode={:?}, table={}, projection={}, projected_columns={:?}, batch_pruning={predicate:?}, partition_pruning={partition_filter:?}",
+            self.options.mode,
             self.path,
             if projection.is_some_and(Vec::is_empty) {
                 "full_rows_for_count"
@@ -213,18 +240,27 @@ impl TableProvider for FlussLogTable {
             projection: projection.cloned(),
             filter: predicate,
             table_id: self.table_id,
+            schema_id: self.schema_id,
             project_at_source: self.initial_schema,
             buckets: self.buckets,
             partitioned: self.partitioned,
             partition_filter,
             max_assigned_buckets: self.max_assigned_buckets,
             partition_captures: Arc::new(SharedCaptures::<PartitionedOffsets>::default()),
-            timeout: self.timeout,
+            options: self.options.clone(),
             captures: Arc::new(SharedCaptures::<OffsetWindow>::default()),
             metrics: metrics.clone(),
+            deliveries: self.deliveries.clone(),
+            execution_ids: Arc::new(SharedCaptures::<u64>::default()),
         });
-        let inner =
-            StreamingTableExec::try_new(schema, spec.partitions(&groups), None, [], false, None)?;
+        let inner = StreamingTableExec::try_new(
+            schema,
+            spec.partitions(&groups),
+            None,
+            [],
+            self.options.mode == LogReadMode::Streaming,
+            None,
+        )?;
         Ok(Arc::new(FlussScanExec::new(
             inner,
             metrics,

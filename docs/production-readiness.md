@@ -21,10 +21,25 @@ bucket**, not an atomic cross-bucket snapshot.
   batch. With a restrictive pool, scans fail instead of returning partial
   results. A stalled consumer does not pull another KV page; cancelling it
   releases the reservation.
-- Logs capture earliest retained and latest offsets. If retention passes a
+- Batch logs capture earliest retained and latest offsets. If retention passes a
   captured start before subscription, the read fails. A unit test injects an
   out-of-range response *after* another bucket produced data and checks that
   the Arrow batch reader fails instead of swallowing the error.
+- The streaming source declares itself unbounded and waits through idle polls;
+  an isolated log created in native-sni delivered rows appended after the
+  query started, without EOF between writes. Source-side delivery events
+  carried the correct next offsets and execution ID. Pausing its consumer left
+  the shared 8 MiB DataFusion pool reservation stable, and dropping the stream
+  released it. An explicit batch scan resumed from offset 1 without replaying
+  row 0, while an invalid offset failed; a fresh partition added during an
+  open partitioned streaming scan caused an explicit topology error instead
+  of disappearing silently. The Python 55 FFI stream independently received
+  two late appends on another isolated log through an SQL filter, observed
+  progress and cancelled. The filtered stream used DataFusion session
+  `batch_size=1`; its default `FilterExec` coalescing can delay small
+  nonterminating results until more rows arrive (see reading semantics).
+  This is not an engine checkpoint, continuous KV changelog, or a sustained
+  streaming resource profile.
 - Evolved log schemas read historical rows without pushing newly added fields
   into the server projection. A fresh DataFusion provider returns those
   fields as null for older rows; an old plan keeps its original schema or
@@ -55,9 +70,13 @@ limited to one prefetched remote segment and one row per pull keeps unread
 segments out of its cache. After retention advances, that in-progress scan
 fails with an out-of-range or missing-segment error instead of returning an
 incomplete result; a new query returns exactly the rows still retained. A
-one-segment pending-request budget and a one-byte remote
-prefetch budget both fail a large remote scan rather than silently truncating
-it. Remote request slots are released on cancellation, and temporary S3
+continuous log scan paused on its first remote row also fails explicitly
+after that retention advance, instead of silently skipping lost records.
+This was verified in the RustFS profile with the published `.6` image and
+the prefix-scoped read-only STS policy. A one-segment pending-request budget
+and a one-byte remote prefetch budget both fail a large remote scan rather
+than silently truncating it. Remote request slots are released on
+cancellation, and temporary S3
 credentials received as either `security_token` or `session_token` are passed
 to OpenDAL as its S3 `session_token` property. If both names are present with
 different values, the client rejects them without logging either token.
@@ -77,7 +96,9 @@ the **existing** RustFS. It injects two 503 responses followed by recovery,
 persistent 503 until the retry budget is exhausted, and a held response for
 timeout/cancellation; a new DataFusion query succeeds afterward. STS calls
 still go directly to RustFS, and only STS-signed reads under the test prefix
-receive injected failures. This test ran in about 36 seconds with 32 rows
+receive injected failures. The same profile also made an **unbounded** log
+scan fail explicitly after exhausting three real HTTP 503 attempts, without
+returning a partial batch. This test ran in about 36 seconds with 32 rows
 against the published `.6` image.
 
 The separate ignored real-expiry profile pauses an active log scan after its
@@ -259,6 +280,17 @@ profile's single coordinator. The short HTTP profile verifies real transport
 expiry and successful renewal on one paused scan; failed credential renewal
 and the deadline after expiry are covered by deterministic client tests.
 A `.6` deployment must explicitly configure
-`s3.assumed.role.policy` to restrict root-signed STS sessions. Other resource
-profiles and the eventual Python-FFI path (if needed) require separate
-acceptance evidence.
+`s3.assumed.role.policy` to restrict root-signed STS sessions. A local Python
+3.12 installation of DataFusion Python 55.0.0 (upstream revision
+`5ef2856f5b02cddcd3d7d3559669d95ef181ccf4`, Rust engine 55.1), the
+separate Fluss FFI wheel, and this package executed real `COUNT(*)`, filtered
+and limited SQL queries on populated native-sni log and KV tables (9 and 3
+rows at the time of the check), plus eight limited queries across four Python
+workers. It used a 256 MiB DataFusion pool and two target partitions.
+Python 55 is not published to PyPI yet; installation from that pinned source
+and both built wheels into a fresh Python 3.12 environment passed all six
+Python tests and `uv pip check`. Installation is documented in the README.
+This live functional check is
+not a Python sustained-resource profile: only the Rust/Docker/RustFS workload
+has the 35-minute pressure evidence above. Other deployment profiles still
+require their own acceptance evidence.

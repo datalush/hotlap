@@ -9,8 +9,9 @@ Python binding. No second Fluss protocol implementation is planned.
 clients/
   java/                    Fluss Maven reactor (build with ./mvnw -pl fluss-client -am)
   rust/                    Fluss Rust workspace and bindings/python
-crates/fluss-datafusion/    Bounded DataFusion sources for logs and KV tables
-python/fluss_connectors/   Small DuckDB/Polars/pandas adapters for Arrow results
+crates/fluss-datafusion/    Batch/streaming log and snapshot KV providers
+crates/fluss-datafusion-python/   DataFusion Python FFI bridge for those providers
+python/fluss_connectors/   DataFusion, DuckDB, Polars and pandas integration
 docs/reading-semantics.md  Contracts to satisfy before claiming full scans
 docs/production-readiness.md  Verified guarantees, limits, and checks
 ```
@@ -60,21 +61,35 @@ no credentials are stored in this repository.
 
 ## DataFusion (logs and primary-key tables)
 
-`FlussLogTable::open` and `FlussKvTable::open` register tables
+`FlussLogTable::open` preserves the existing finite/batch API;
+`FlussLogTable::open_with_options(..., LogReadOptions::default())` follows new
+log events. `FlussKvTable::open` reads a finite KV snapshot. Register tables
 explicitly. `FlussCatalog::load` discovers database/table names once and
 selects the appropriate provider, allowing SQL such as
 `fluss.lab_spark.demo_log` or a KV table (reload the catalog after DDL).
 
-For **logs**, execution captures each bucket's earliest retained and latest
-offsets once, streams Arrow batches from those starting offsets until their stopping
-offsets, and errors on timeout rather than claiming a partial result is
-complete. DataFusion's required non-empty projection is pushed to Fluss;
+For **batch logs**, execution captures each bucket's earliest retained and latest
+offsets once, streams Arrow batches until their stopping offsets, and errors
+on timeout rather than claiming a partial result is complete. For **streaming
+logs**, the same scanner subscribes from earliest, latest or complete explicit
+offsets and stays open across idle periods. DataFusion declares this source
+unbounded with incremental emission and no global order. The scanner's network
+timeout remains a connection setting; the batch-wide timeout does not terminate
+an idle stream. After the source detects a changed table/schema or partition
+topology, it fails explicitly rather than silently skipping new data. An
+execution can subscribe to source-side `LogDelivery` events: `(execution_id,
+bucket, base_offset, next_offset, rows)`. These describe batches offered by
+the source, not bytes prefetched, rows surviving SQL filters or data committed
+by an engine/sink; a lagged observer must not be used for resumption.
+DataFusion's required non-empty projection is pushed to Fluss;
 `COUNT(*)` still fetches rows because Fluss cannot scan zero columns. Simple
 `Int32`/`Int64` comparisons and safe `AND` clauses can prune Fluss record
 batches; pushdown is **Inexact** and DataFusion always evaluates the full
 filter again. `OR`, unsupported expressions and out-of-range literals stay
-in DataFusion. Global limits are not pushed per bucket. Each query opens a
-new finite read.
+in DataFusion. Global limits are not pushed per bucket. Each batch query opens
+a new finite read; a streaming query continues until cancelled or a compatible
+`LIMIT` completes it. `COUNT(*)`/global `ORDER BY` over an unbounded source
+do not produce a finite final answer: select batch explicitly for those.
 
 For **KV**, the server opens an isolated RocksDB snapshot for each bucket's
 `ScanKv` session. The Rust reader paginates and decodes every live row,
@@ -121,10 +136,99 @@ KV state after upserts and deletions, pagination, and catalog dispatch):
 uv run --env-file ../lab/.env cargo test -p fluss-datafusion --test live_log_sql -- --ignored
 ```
 
-The native table providers currently use **DataFusion Rust 55.1**. Registering
-them in the upstream `datafusion` Python `SessionContext` requires a matching
-major version through `datafusion-ffi`; the published Python wheel is 54.0,
-so this repository does not advertise an incompatible Python provider.
+The native providers use **DataFusion Rust 55.1 / Arrow 59**. The optional
+`crates/fluss-datafusion-python` wheel exports those very providers to the
+upstream Python `SessionContext` through `datafusion-ffi`. It requires
+**DataFusion Python 55.0.0** (whose Rust engine is 55.1); the latest published
+wheel is still 54.0.0, so build the matching Python host from the pinned
+upstream revision. Do not use the 54.0.0 wheel with these providers.
+
+For a reproducible Python 3.12 development installation, starting from this
+checkout (use a fresh virtualenv and a separate directory for upstream):
+
+```bash
+git clone https://github.com/apache/datafusion-python.git /tmp/datafusion-python-55
+git -C /tmp/datafusion-python-55 checkout 5ef2856f5b02cddcd3d7d3559669d95ef181ccf4
+uv venv /tmp/fluss-datafusion-env --python 3.12
+uv pip install --python /tmp/fluss-datafusion-env/bin/python 'maturin>=1.9,<2' 'pyarrow==25.0.1' cloudpickle typing-extensions
+# In /tmp/datafusion-python-55:
+VIRTUAL_ENV=/tmp/fluss-datafusion-env CARGO_BUILD_JOBS=2 /tmp/fluss-datafusion-env/bin/maturin develop --uv
+# In crates/fluss-datafusion-python of this checkout:
+VIRTUAL_ENV=/tmp/fluss-datafusion-env CARGO_BUILD_JOBS=2 /tmp/fluss-datafusion-env/bin/maturin develop --uv
+# Back in this checkout's root:
+uv pip install --python /tmp/fluss-datafusion-env/bin/python --no-deps -e .
+```
+
+For the **wheel-install check**, build three wheels (`maturin build --profile
+dev --out /tmp/fluss-wheels` from upstream and the FFI crate, and `uv build
+--wheel --out-dir /tmp/fluss-wheels` from this repository root). Install those
+wheels into a *different*, fresh Python 3.12 virtualenv with `uv pip install
+--no-deps`, then install `pyarrow==25.0.1`, `cloudpickle`, the local
+`clients/rust/bindings/python` package, and check the complete environment
+with `uv pip check`. This wheel-install check passed, including all six Python
+tests. It uses unoptimized dev wheels to check the installation/FFI contract;
+it is not a release-build performance measurement.
+
+Pass a dictionary of Rust `fluss::config::Config` field names and typed values
+to `fluss_connectors.datafusion.Connection`. Configure DataFusion's own memory
+pool and partition target on its `SessionContext`. `register_log` and
+`register_kv` also accept `timeout_ms`, `max_partitions`, and
+`max_assigned_buckets`. Log mode defaults to streaming in this new API;
+`mode="batch"` keeps finite SQL queries finite. Register both explicitly:
+
+```python
+import datafusion
+from fluss_connectors.datafusion import Connection, register_kv, register_log
+
+connection = Connection({"bootstrap_servers": "localhost:9123"})
+ctx = datafusion.SessionContext(
+    datafusion.SessionConfig().with_target_partitions(2),
+    datafusion.RuntimeEnvBuilder().with_greedy_memory_pool(256 * 1024 * 1024),
+)
+register_log(ctx, connection, "events", "my_database", "events", mode="batch")
+register_kv(ctx, connection, "current", "my_database", "current")
+rows = ctx.sql("SELECT COUNT(*) FROM events").collect()
+# Keep the context alive while queries run; close the connection when finished.
+connection.close()
+```
+
+For a continuous log read, use a dedicated registration and iterate the
+DataFusion stream rather than calling `.collect()` without a `LIMIT`:
+
+```python
+# DataFusion's FilterExec batches filtered rows. Use a small batch_size when
+# individual events must be visible promptly; larger values favor throughput.
+live_ctx = datafusion.SessionContext(
+    datafusion.SessionConfig().with_target_partitions(1).with_batch_size(1),
+)
+live = register_log(live_ctx, connection, "live_events", "my_database", "events",
+                    start="latest")  # mode="streaming" by default
+observed = live.subscribe_deliveries()  # subscribe before executing
+for batch in live_ctx.sql("SELECT id FROM live_events WHERE id >= 1").execute_stream():
+    print(batch.to_pyarrow())
+    print(observed.drain())  # source-side progress, NOT a checkpoint
+    break  # dropping the iterator cancels the source
+live_ctx.deregister_table("live_events")
+```
+
+To resume from explicit positions, pass `start="offsets"` and a complete
+`start_offsets={(table_id, partition_id_or_None, bucket_id): next_offset}` map.
+Wrong table IDs, missing buckets, offsets outside retention and schema or
+topology changes fail rather than silently completing. `LogReadOptions` in
+Rust and Python keeps these read settings separate from connection settings.
+
+The opt-in live FFI check queries populated log and KV tables on the isolated
+lab using `../lab/.env` and these installed wheels:
+
+```bash
+FLUSS_PYTHON_LIVE=1 uv run --no-project --env-file ../lab/.env /tmp/fluss-datafusion-env/bin/python -m unittest discover -s tests/python -p test_datafusion_live.py -v
+```
+
+Use `FLUSS_PY_DATABASE`, `FLUSS_PY_LOG`, and `FLUSS_PY_KV` to override the
+default existing fixtures `lab_spark.demo_log` and `lab_spark.demo`. The
+live test also creates/deletes one isolated log to check that the Python FFI
+stream receives writes made after the query starts. The binding does not
+expose an alternate protocol, SQL executor or retry loop.
 
 The sources use `min(buckets, DataFusion target_partitions)`, optionally capped
 with `FlussLogTable::with_max_partitions(n)` or

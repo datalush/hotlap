@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Lazy per-partition read state: capture offsets, open reader, yield Arrow batches.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow::datatypes::SchemaRef;
@@ -24,6 +25,8 @@ use fluss::predicate::Predicate;
 use fluss::record::ScanBatch;
 use fluss::rpc::message::OffsetSpec;
 
+use crate::log_options::{LogReadMode, LogReadOptions, LogStart};
+use crate::log_progress::LogDelivery;
 use crate::metrics::{PartitionMetrics, ReaderLifetime, ReportOnce};
 use crate::offsets::{
     Capture, OffsetWindow, SharedCaptures, ensure_retained, validate_offsets, validate_window,
@@ -31,6 +34,7 @@ use crate::offsets::{
 use crate::partitions::{self, PartitionFilter};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+static NEXT_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct PartitionedOffsets {
     discovered: usize,
@@ -47,15 +51,18 @@ pub(crate) struct ScanSpec {
     pub(crate) projection: Option<Vec<usize>>,
     pub(crate) filter: Option<Predicate>,
     pub(crate) table_id: i64,
+    pub(crate) schema_id: i32,
     pub(crate) project_at_source: bool,
     pub(crate) buckets: i32,
     pub(crate) partitioned: bool,
     pub(crate) partition_filter: PartitionFilter,
     pub(crate) max_assigned_buckets: usize,
     pub(crate) partition_captures: Arc<SharedCaptures<PartitionedOffsets>>,
-    pub(crate) timeout: Duration,
+    pub(crate) options: LogReadOptions,
     pub(crate) captures: Arc<SharedCaptures<OffsetWindow>>,
     pub(crate) metrics: ExecutionPlanMetricsSet,
+    pub(crate) deliveries: tokio::sync::broadcast::Sender<LogDelivery>,
+    pub(crate) execution_ids: Arc<SharedCaptures<u64>>,
 }
 
 impl ScanSpec {
@@ -107,15 +114,48 @@ impl PartitionStream for FlussPartition {
 
 struct ReadState {
     source: FlussPartition,
-    reader: Option<RecordBatchLogReader>,
-    deadline: Instant,
+    reader: Option<ActiveReader>,
+    deadline: Option<Instant>,
+    last_topology_check: Instant,
     capture: Capture<OffsetWindow>,
+    execution_capture: Capture<u64>,
     partition_capture: Option<Capture<PartitionedOffsets>>,
     // Keep the execution identity alive for late partitions of this query.
     _context: Arc<TaskContext>,
     _lifetime: ReaderLifetime,
     metrics: PartitionMetrics,
     reservation: MemoryReservation,
+}
+
+enum ActiveReader {
+    Bounded(RecordBatchLogReader),
+    Streaming(RecordBatchLogScanner, VecDeque<ScanBatch>),
+    EmptyStreaming,
+}
+
+impl ActiveReader {
+    async fn poll(&mut self, wait: Duration) -> Result<RecordBatchReadOutcome> {
+        match self {
+            Self::Bounded(reader) => reader
+                .next_batch_with_timeout(wait)
+                .await
+                .map_err(fluss_error),
+            Self::Streaming(scanner, buffer) => {
+                if let Some(batch) = buffer.pop_front() {
+                    return Ok(RecordBatchReadOutcome::Batch(batch));
+                }
+                buffer.extend(scanner.poll(wait).await.map_err(fluss_error)?);
+                Ok(buffer.pop_front().map_or(
+                    RecordBatchReadOutcome::TimedOut,
+                    RecordBatchReadOutcome::Batch,
+                ))
+            }
+            Self::EmptyStreaming => {
+                tokio::time::sleep(wait).await;
+                Ok(RecordBatchReadOutcome::TimedOut)
+            }
+        }
+    }
 }
 
 impl ReadState {
@@ -125,18 +165,22 @@ impl ReadState {
         let reservation =
             MemoryConsumer::new("FlussLogScan").register(&ctx.runtime_env().memory_pool);
         let capture = source.spec.captures.for_partition(&ctx, source.index);
+        let execution_capture = source.spec.execution_ids.for_partition(&ctx, source.index);
         let partition_capture = source.spec.partitioned.then(|| {
             source
                 .spec
                 .partition_captures
                 .for_partition(&ctx, source.index)
         });
-        let deadline = Instant::now() + source.spec.timeout;
+        let deadline = (source.spec.options.mode == LogReadMode::Batch)
+            .then(|| Instant::now() + source.spec.options.batch_timeout);
         Self {
             source,
             reader: None,
             deadline,
+            last_topology_check: Instant::now(),
             capture,
+            execution_capture,
             partition_capture,
             _context: ctx,
             _lifetime: lifetime,
@@ -165,7 +209,7 @@ impl ReadState {
         loop {
             match self.poll_reader().await? {
                 RecordBatchReadOutcome::Batch(batch) => {
-                    return self.prepare_output_batch(batch).map(Some);
+                    return self.prepare_output_batch(batch).await.map(Some);
                 }
                 RecordBatchReadOutcome::Finished => return Ok(None),
                 RecordBatchReadOutcome::TimedOut => {}
@@ -175,9 +219,26 @@ impl ReadState {
 
     async fn ensure_reader_started(&mut self) -> Result<()> {
         if self.reader.is_none() {
-            let reader = tokio::time::timeout(self.remaining()?, self.start_reader())
+            let timeout = self.remaining()?.unwrap_or_else(|| {
+                Duration::from_millis(
+                    self.source
+                        .spec
+                        .connection
+                        .config()
+                        .scanner_remote_log_operation_timeout_ms,
+                )
+            });
+            let reader = tokio::time::timeout(timeout, self.start_reader())
                 .await
-                .map_err(|_| expired())??;
+                .map_err(|_| {
+                    if self.deadline.is_some() {
+                        expired()
+                    } else {
+                        DataFusionError::Execution(
+                            "Fluss streaming log source initialization timed out".into(),
+                        )
+                    }
+                })??;
             self.reader = Some(reader);
         }
         Ok(())
@@ -185,25 +246,35 @@ impl ReadState {
 
     async fn poll_reader(&mut self) -> Result<RecordBatchReadOutcome> {
         let remaining = self.remaining()?;
+        if self.source.spec.options.mode == LogReadMode::Streaming
+            && self.last_topology_check.elapsed() >= Duration::from_secs(5)
+        {
+            self.check_streaming_topology().await?;
+            self.last_topology_check = Instant::now();
+        }
         // Inspect scanner progress regularly even when every fetched batch
         // was pruned. The total query deadline still bounds this loop.
-        let poll_wait = remaining.min(POLL_INTERVAL);
-        let result = {
-            let _timer = self.metrics.read_time.timer();
-            tokio::time::timeout(
-                remaining,
-                self.reader
-                    .as_mut()
-                    .expect("reader initialized")
-                    .next_batch_with_timeout(poll_wait),
-            )
-            .await
-            .map_err(|_| expired())?
-        };
-        result.map_err(fluss_error)
+        let poll_wait = remaining.map_or(POLL_INTERVAL, |remaining| remaining.min(POLL_INTERVAL));
+        let _timer = self.metrics.read_time.timer();
+        let poll = self
+            .reader
+            .as_mut()
+            .expect("reader initialized")
+            .poll(poll_wait);
+        if let Some(remaining) = remaining {
+            tokio::time::timeout(remaining, poll)
+                .await
+                .map_err(|_| expired())?
+        } else {
+            poll.await
+        }
     }
 
-    fn prepare_output_batch(&self, batch: ScanBatch) -> Result<RecordBatch> {
+    async fn prepare_output_batch(&self, batch: ScanBatch) -> Result<RecordBatch> {
+        let bucket = batch.bucket().clone();
+        let base_offset = batch.base_offset();
+        let next_offset = batch.last_offset() + 1;
+        let rows = batch.num_records();
         let decoded = batch.into_batch();
         self.reservation
             .try_resize(decoded.get_array_memory_size())?;
@@ -215,14 +286,74 @@ impl ReadState {
             _ => decoded,
         };
         self.metrics.record_output_batch(&output);
+        let execution_id = self
+            .execution_capture
+            .get_or_init(|| async {
+                Ok(Arc::new(NEXT_EXECUTION_ID.fetch_add(1, Ordering::Relaxed)))
+            })
+            .await
+            .as_ref()
+            .map_err(|error: &String| DataFusionError::Execution(error.clone()))?;
+        // The source has handed the batch to DataFusion; the engine must still
+        // acknowledge its own processing and output before checkpointing it.
+        let _ = self.source.spec.deliveries.send(LogDelivery {
+            execution_id: **execution_id,
+            bucket,
+            base_offset,
+            next_offset,
+            rows,
+        });
         Ok(output)
     }
 
-    async fn start_reader(&self) -> Result<RecordBatchLogReader> {
+    async fn start_reader(&self) -> Result<ActiveReader> {
         let ranges = self.ranges().await?;
         let table = self.current_table().await?;
         self.ensure_retention_before_start(&ranges).await?;
         let scanner = self.projected_scanner(&table)?;
+        if self.source.spec.options.mode == LogReadMode::Streaming {
+            if ranges.is_empty() {
+                return Ok(ActiveReader::EmptyStreaming);
+            }
+            if let Some(capture) = &self.partition_capture {
+                let snapshot = capture
+                    .get()
+                    .expect("partition offsets captured")
+                    .as_ref()
+                    .map_err(|error| DataFusionError::Execution(error.clone()))?;
+                let counts = snapshot
+                    .partitions
+                    .iter()
+                    .map(|(id, count, _)| (*id, *count))
+                    .collect();
+                let offsets = ranges
+                    .iter()
+                    .map(|range| {
+                        (
+                            (
+                                range.bucket.partition_id().expect("partitioned"),
+                                range.bucket.bucket_id(),
+                            ),
+                            range.starting_offset,
+                        )
+                    })
+                    .collect();
+                scanner
+                    .subscribe_partition_buckets_with_counts(&offsets, counts)
+                    .await
+                    .map_err(fluss_error)?;
+            } else {
+                let offsets = ranges
+                    .iter()
+                    .map(|range| (range.bucket.bucket_id(), range.starting_offset))
+                    .collect();
+                scanner
+                    .subscribe_buckets(&offsets)
+                    .await
+                    .map_err(fluss_error)?;
+            }
+            return Ok(ActiveReader::Streaming(scanner, VecDeque::new()));
+        }
         if let Some(capture) = &self.partition_capture {
             let snapshot = capture
                 .get()
@@ -236,10 +367,12 @@ impl ReadState {
                 .collect();
             RecordBatchLogReader::new_from_ranges_with_bucket_counts(scanner, ranges, counts)
                 .await
+                .map(ActiveReader::Bounded)
                 .map_err(fluss_error)
         } else {
             RecordBatchLogReader::new_from_ranges(scanner, ranges)
                 .await
+                .map(ActiveReader::Bounded)
                 .map_err(fluss_error)
         }
     }
@@ -247,7 +380,10 @@ impl ReadState {
     async fn ensure_retention_before_start(&self, ranges: &[BoundedLogReadRange]) -> Result<()> {
         let active: Vec<_> = ranges
             .iter()
-            .filter(|range| range.starting_offset < range.stopping_offset)
+            .filter(|range| {
+                self.source.spec.options.mode == LogReadMode::Streaming
+                    || range.starting_offset < range.stopping_offset
+            })
             .collect();
         if active.is_empty() {
             return Ok(());
@@ -339,12 +475,47 @@ impl ReadState {
         if info.table_id != self.source.spec.table_id
             || (!self.source.spec.partitioned && info.get_num_buckets() != self.source.spec.buckets)
             || info.is_partitioned() != self.source.spec.partitioned
+            || (self.source.spec.options.mode == LogReadMode::Streaming
+                && info.get_schema_id() != self.source.spec.schema_id)
         {
             return Err(DataFusionError::Execution(
                 "Fluss table topology changed; plan again".into(),
             ));
         }
         Ok(table)
+    }
+
+    async fn check_streaming_topology(&self) -> Result<()> {
+        let _table = self.current_table().await?;
+        if let Some(capture) = &self.partition_capture {
+            let snapshot = capture
+                .get()
+                .expect("partition offsets captured")
+                .as_ref()
+                .map_err(|error| DataFusionError::Execution(error.clone()))?;
+            let current = partitions::discover(
+                &self.source.spec.connection,
+                &self.source.spec.path,
+                &self.source.spec.partition_filter,
+                self.source.spec.max_assigned_buckets,
+            )
+            .await?;
+            if current.discovered != snapshot.discovered
+                || current.selected.len() != snapshot.partitions.len()
+                || current
+                    .selected
+                    .iter()
+                    .zip(&snapshot.partitions)
+                    .any(|(now, old)| {
+                        now.get_partition_id() != old.0 || now.get_bucket_count() != Some(old.1)
+                    })
+            {
+                return Err(DataFusionError::Execution(
+                    "Fluss partition topology changed during streaming; start a new scan explicitly".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn projected_scanner(&self, table: &FlussTable<'_>) -> Result<RecordBatchLogScanner> {
@@ -400,7 +571,34 @@ impl ReadState {
         } else {
             None
         };
-        let ranges: Vec<BoundedLogReadRange> = match partitions {
+        if let LogStart::Offsets(offsets) = &self.source.spec.options.start {
+            let expected: Vec<TableBucket> = match &partitions {
+                Some(snapshot) => snapshot
+                    .partitions
+                    .iter()
+                    .flat_map(|(id, count, _)| {
+                        (0..*count).map(|bucket| {
+                            TableBucket::new_with_partition(
+                                self.source.spec.table_id,
+                                Some(*id),
+                                bucket,
+                            )
+                        })
+                    })
+                    .collect(),
+                None => (0..self.source.spec.buckets)
+                    .map(|bucket| TableBucket::new(self.source.spec.table_id, bucket))
+                    .collect(),
+            };
+            if offsets.len() != expected.len()
+                || expected.iter().any(|bucket| !offsets.contains_key(bucket))
+            {
+                return Err(DataFusionError::Execution(
+                    "Explicit Fluss offsets must cover exactly the selected buckets".into(),
+                ));
+            }
+        }
+        let mut ranges: Vec<BoundedLogReadRange> = match partitions {
             Some(snapshot) => {
                 self.metrics.record_discovery(
                     &snapshot.reported,
@@ -440,6 +638,28 @@ impl ReadState {
                     .collect()
             }
         };
+        let start = &self.source.spec.options.start;
+        for range in &mut ranges {
+            let earliest = range.starting_offset;
+            let latest = range.stopping_offset;
+            let requested = match start {
+                LogStart::Earliest => earliest,
+                LogStart::Latest => latest,
+                LogStart::Offsets(offsets) => *offsets.get(&range.bucket).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Missing explicit Fluss offset for bucket {:?}",
+                        range.bucket
+                    ))
+                })?,
+            };
+            if requested < earliest || requested > latest {
+                return Err(DataFusionError::Execution(format!(
+                    "Fluss start offset {requested} is outside retained range [{earliest}, {latest}] for bucket {:?}",
+                    range.bucket
+                )));
+            }
+            range.starting_offset = requested;
+        }
         self.metrics.buckets_assigned.add(ranges.len());
         Ok(ranges)
     }
@@ -518,11 +738,15 @@ impl ReadState {
         )?))
     }
 
-    fn remaining(&self) -> Result<Duration> {
+    fn remaining(&self) -> Result<Option<Duration>> {
         self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|time| !time.is_zero())
-            .ok_or_else(expired)
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|time| !time.is_zero())
+                    .ok_or_else(expired)
+            })
+            .transpose()
     }
 }
 

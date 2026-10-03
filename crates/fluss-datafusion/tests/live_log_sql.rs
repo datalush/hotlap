@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Optional isolated-lab integration: run with FLUSS_* from ../lab/.env.
 
+use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,12 +24,381 @@ use fluss::metadata::{
 };
 use fluss::row::GenericRow;
 use fluss::rpc::message::OffsetSpec;
-use fluss_datafusion::{FlussCatalog, FlussKvTable, FlussLogTable};
+use fluss_datafusion::{FlussCatalog, FlussKvTable, FlussLogTable, LogReadOptions, LogStart};
 use futures::StreamExt;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 const DATABASE: &str = "datafusion_tests";
 const SCAN_TIMEOUT: Duration = Duration::from_secs(45);
+
+#[tokio::test]
+#[ignore = "requires native-sni and FLUSS_* credentials; creates one isolated log"]
+async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<()> {
+    let connection = connect().await?;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = TablePath::new(DATABASE, format!("stream_{suffix}"));
+    let admin = connection.get_admin()?;
+    admin
+        .create_table(
+            &path,
+            &TableDescriptor::builder()
+                .schema(Schema::builder().column("id", DataTypes::int()).build()?)
+                .distributed_by(Some(1), vec!["id".into()])
+                .build()?,
+            false,
+        )
+        .await?;
+    let result: TestResult<()> = async {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_batch_size(1),
+            Arc::new(
+                RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::clone(&pool))
+                    .build()?,
+            ),
+        );
+        let source = FlussLogTable::open_with_options(
+            Arc::clone(&connection),
+            path.clone(),
+            LogReadOptions::default(),
+        )
+        .await?;
+        let mut delivered = source.subscribe_deliveries();
+        ctx.register_table("live", Arc::new(source))?;
+        let query = ctx.sql("SELECT id FROM live").await?;
+        let plan = query.create_physical_plan().await?;
+        let source = source_plan(&plan);
+        assert!(source.boundedness().is_unbounded());
+        let mut stream = source.execute(0, Arc::new(query.task_ctx()))?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(900), stream.next())
+                .await
+                .is_err(),
+            "no new records must not end the stream"
+        );
+        let table = connection.get_table(&path).await?;
+        let writer = table.new_append()?.create_writer()?;
+        let mut execution_id = None;
+        for id in [11_i32, 12_i32] {
+            if id == 12 {
+                let held = pool.reserved();
+                assert!(held > 0);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert_eq!(
+                    pool.reserved(),
+                    held,
+                    "slow consumers must not grow Arrow reservations"
+                );
+            }
+            let mut row = GenericRow::new(1);
+            row.set_field(0, id);
+            writer.append(&row)?;
+            writer.flush().await?;
+            let batch = tokio::time::timeout(Duration::from_secs(12), stream.next())
+                .await?
+                .ok_or("stream ended after a late append")??;
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(values.len(), 1);
+            assert_eq!(values.value(0), id);
+            let progress = delivered.try_recv()?;
+            assert_eq!(
+                progress.bucket,
+                TableBucket::new(table.get_table_info().table_id, 0)
+            );
+            assert_eq!(progress.base_offset, (id - 11) as i64);
+            assert_eq!(progress.next_offset, (id - 10) as i64);
+            assert_eq!(progress.rows, 1);
+            if let Some(previous) = execution_id {
+                assert_eq!(progress.execution_id, previous);
+            }
+            execution_id = Some(progress.execution_id);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(900), stream.next())
+                .await
+                .is_err()
+        );
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(
+            metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
+            0
+        );
+
+        let table_id = table.get_table_info().table_id;
+        let resumed = FlussLogTable::open_with_options(
+            Arc::clone(&connection),
+            path.clone(),
+            LogReadOptions {
+                start: LogStart::Offsets(HashMap::from([(TableBucket::new(table_id, 0), 1)])),
+                ..LogReadOptions::batch(SCAN_TIMEOUT)
+            },
+        )
+        .await?;
+        ctx.register_table("resumed", Arc::new(resumed))?;
+        let rows = ctx.sql("SELECT id FROM resumed").await?.collect().await?;
+        assert_eq!(rows.len(), 1);
+        let ids = rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[12]);
+
+        let latest = FlussLogTable::open_with_options(
+            Arc::clone(&connection),
+            path.clone(),
+            LogReadOptions {
+                start: LogStart::Latest,
+                ..LogReadOptions::batch(SCAN_TIMEOUT)
+            },
+        )
+        .await?;
+        ctx.register_table("latest", Arc::new(latest))?;
+        assert!(
+            ctx.sql("SELECT id FROM latest")
+                .await?
+                .collect()
+                .await?
+                .is_empty()
+        );
+
+        let invalid = FlussLogTable::open_with_options(
+            Arc::clone(&connection),
+            path.clone(),
+            LogReadOptions {
+                start: LogStart::Offsets(HashMap::from([(TableBucket::new(table_id, 0), -1)])),
+                ..LogReadOptions::batch(SCAN_TIMEOUT)
+            },
+        )
+        .await?;
+        ctx.register_table("invalid", Arc::new(invalid))?;
+        let error = ctx
+            .sql("SELECT id FROM invalid")
+            .await?
+            .collect()
+            .await
+            .expect_err("expired/invalid offsets cannot become successful scans");
+        assert!(
+            error.to_string().contains("outside retained range"),
+            "{error}"
+        );
+
+        let stale = FlussLogTable::open_with_options(
+            Arc::clone(&connection),
+            path.clone(),
+            LogReadOptions {
+                start: LogStart::Offsets(HashMap::from([(TableBucket::new(table_id + 1, 0), 1)])),
+                ..LogReadOptions::batch(SCAN_TIMEOUT)
+            },
+        )
+        .await?;
+        ctx.register_table("stale", Arc::new(stale))?;
+        let error = ctx
+            .sql("SELECT id FROM stale")
+            .await?
+            .collect()
+            .await
+            .expect_err("a checkpoint from another table identity must not resume here");
+        assert!(error.to_string().contains("cover exactly"), "{error}");
+
+        let continuous_resume = FlussLogTable::open_with_options(
+            Arc::clone(&connection),
+            path.clone(),
+            LogReadOptions {
+                start: LogStart::Offsets(HashMap::from([(TableBucket::new(table_id, 0), 2)])),
+                ..LogReadOptions::default()
+            },
+        )
+        .await?;
+        ctx.register_table("continuous_resume", Arc::new(continuous_resume))?;
+        let next = ctx.sql("SELECT id FROM continuous_resume").await?;
+        let mut resumed_stream = source_plan(&next.create_physical_plan().await?)
+            .execute(0, Arc::new(next.task_ctx()))?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(800), resumed_stream.next())
+                .await
+                .is_err()
+        );
+        let mut row = GenericRow::new(1);
+        row.set_field(0, 13_i32);
+        writer.append(&row)?;
+        writer.flush().await?;
+        let batch = tokio::time::timeout(Duration::from_secs(12), resumed_stream.next())
+            .await?
+            .expect("continuous resume must see later data")?;
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            13
+        );
+        drop(resumed_stream);
+
+        ctx.register_table(
+            "filtered_live",
+            Arc::new(
+                FlussLogTable::open_with_options(
+                    Arc::clone(&connection),
+                    path.clone(),
+                    LogReadOptions {
+                        start: LogStart::Latest,
+                        ..LogReadOptions::default()
+                    },
+                )
+                .await?,
+            ),
+        )?;
+        let filtered = ctx
+            .sql("SELECT id FROM filtered_live WHERE id >= 14")
+            .await?;
+        let plan = filtered.create_physical_plan().await?;
+        let mut filtered_stream = plan.execute(0, Arc::new(filtered.task_ctx()))?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(850), filtered_stream.next())
+                .await
+                .is_err()
+        );
+        row.set_field(0, 14_i32);
+        writer.append(&row)?;
+        writer.flush().await?;
+        let batch = tokio::time::timeout(Duration::from_secs(10), filtered_stream.next())
+            .await?
+            .expect("filtered streaming query unexpectedly ended")?;
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            14
+        );
+        drop(filtered_stream);
+        Ok(())
+    }
+    .await;
+    let cleanup = admin.drop_table(&path, true).await;
+    result?;
+    cleanup?;
+    connection.close(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires native-sni and FLUSS_* credentials; creates isolated partitions"]
+async fn streaming_partition_topology_change_fails_explicitly() -> TestResult<()> {
+    let connection = connect().await?;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = TablePath::new(DATABASE, format!("stream_part_{suffix}"));
+    let admin = connection.get_admin()?;
+    admin
+        .create_table(
+            &path,
+            &TableDescriptor::builder()
+                .schema(
+                    Schema::builder()
+                        .column("id", DataTypes::int())
+                        .column("region", DataTypes::string())
+                        .build()?,
+                )
+                .partitioned_by(vec!["region"])
+                .distributed_by(Some(2), vec!["id".to_string()])
+                .build()?,
+            false,
+        )
+        .await?;
+    let result: TestResult<()> = async {
+        create_ready_partition(&admin, &path, "north").await?;
+        admin
+            .alter_table(
+                &path,
+                false,
+                AlterTableChanges {
+                    modify_bucket_count: Some(3),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        create_ready_partition(&admin, &path, "south").await?;
+        assert_eq!(partition_bucket_count(&admin, &path, "north").await?, 2);
+        assert_eq!(partition_bucket_count(&admin, &path, "south").await?, 3);
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        ctx.register_table(
+            "live",
+            Arc::new(
+                FlussLogTable::open_with_options(
+                    Arc::clone(&connection),
+                    path.clone(),
+                    LogReadOptions::default(),
+                )
+                .await?,
+            ),
+        )?;
+        let query = ctx.sql("SELECT id FROM live").await?;
+        let plan = query.create_physical_plan().await?;
+        let mut stream = source_plan(&plan).execute(0, Arc::new(query.task_ctx()))?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(900), stream.next())
+                .await
+                .is_err()
+        );
+        let table = connection.get_table(&path).await?;
+        let writer = table.new_append()?.create_writer()?;
+        for (id, region) in [(1_i32, "north"), (2_i32, "south")] {
+            let mut row = GenericRow::new(2);
+            row.set_field(0, id);
+            row.set_field(1, region);
+            writer.append(&row)?;
+            writer.flush().await?;
+            let batch = tokio::time::timeout(Duration::from_secs(12), stream.next())
+                .await?
+                .ok_or("partitioned stream unexpectedly completed")??;
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                id,
+            );
+        }
+        create_ready_partition(&admin, &path, "west").await?;
+        let error = tokio::time::timeout(Duration::from_secs(12), stream.next())
+            .await?
+            .expect("stream must explicitly fail when a new partition appears")
+            .expect_err("stream must not skip a new partition");
+        assert!(
+            error.to_string().contains("partition topology changed"),
+            "{error}"
+        );
+        drop(stream);
+        Ok(())
+    }
+    .await;
+    let cleanup = admin.drop_table(&path, true).await;
+    result?;
+    cleanup?;
+    connection.close(Duration::from_secs(5)).await?;
+    Ok(())
+}
 
 async fn connect() -> TestResult<Arc<FlussConnection>> {
     let connection = Arc::new(

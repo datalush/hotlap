@@ -117,6 +117,31 @@ impl RecordBatchLogScanner {
             .await
     }
 
+    /// Subscribe with the discovered count of each partition. This is required
+    /// after a rescale: old partitions may not have the table's current count.
+    pub async fn subscribe_partition_buckets_with_counts(
+        &self,
+        offsets: &HashMap<(PartitionId, i32), i64>,
+        counts: HashMap<PartitionId, i32>,
+    ) -> Result<()> {
+        if !self.is_partitioned() {
+            return Err(Error::IllegalArgument {
+                message: "Per-partition counts require a partitioned log scanner".into(),
+            });
+        }
+        if offsets.iter().any(|(&(partition, bucket), &offset)| {
+            !matches!(counts.get(&partition), Some(count) if *count > 0 && bucket >= 0 && bucket < *count)
+                || offset < 0
+        }) {
+            return Err(Error::IllegalArgument {
+                message: "Missing/invalid partition bucket count or starting offset".into(),
+            });
+        }
+        self.inner
+            .subscribe_partition_buckets_with_counts(offsets, counts)
+            .await
+    }
+
     pub async fn unsubscribe(&self, bucket: i32) -> Result<()> {
         self.inner.unsubscribe(bucket).await
     }
