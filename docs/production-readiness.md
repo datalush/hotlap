@@ -72,18 +72,37 @@ timeout still bounds the full read, including credential waits and retries.
 Unit tests inject temporary OpenDAL failures, confirm recovery within the
 configured retry budget and a subsequent successful read, then separately
 exercise the exhausted budget and a blocked credential refresh.
+An ignored fault profile routes S3 HTTP through a short-lived test proxy to
+the **existing** RustFS. It injects two 503 responses followed by recovery,
+persistent 503 until the retry budget is exhausted, and a held response for
+timeout/cancellation; a new DataFusion query succeeds afterward. STS calls
+still go directly to RustFS, and only STS-signed reads under the test prefix
+receive injected failures. This test ran in about 36 seconds with 32 rows
+against the published `.6` image.
+
+The separate ignored real-expiry profile pauses an active log scan after its
+first STS-signed remote row. Fluss's default AssumeRole request lasts one hour;
+for this profile a test-only STS endpoint requests genuine **900-second**
+sessions from the same RustFS, preserving the inline read-only policy. The
+initial server-issued token listed the test prefix before expiry and was
+rejected by live RustFS afterward (`InvalidRequest`); Fluss fetched a second
+session, and the *same paused scan* returned all 32 rows. The S3 proxy observed
+different session-token fingerprints before and after expiry. This completed
+against the published `.6` image in approximately 938 seconds.
+
 The RustFS lab also has a bucket-scoped `fluss-read` IAM **user** and policy:
 its direct and assumed credentials read but cannot write (403). This user is
 not the Fluss server's uploader. RustFS accepts `RoleArn` for compatibility,
 but sessions signed with server root keys still inherit root permissions
-unless the `AssumeRole` call also carries an inline `Policy`. The fork's
-`develop` server now accepts optional `s3.assumed.role.policy`; without it,
-behavior is unchanged. An **unpublished local image** overlaid with the
-patched S3 plugin successfully uploaded log segments and issued tokens that
+unless the `AssumeRole` call also carries an inline `Policy`. The published
+`ghcr.io/midnattsol/fluss:1.0.0-midnattsol.6` image contains the optional
+`s3.assumed.role.policy` fix (revision `ff40eadf0`). With a policy restricted
+to the isolated test prefix, it uploaded log segments and issued tokens that
 read a real RustFS object but were denied PutObject and DeleteObject; the
-DataFusion S3/TTL scan passed. The existing published `.5` image still issues
-unrestricted root-derived sessions. Configure the policy on a released
-server image before claiming least privilege in production.
+DataFusion S3/TTL scan passed. The same published `.6` image also passed the
+S3/TTL scan with no policy, preserving the default behavior. The `.5` image
+still issues unrestricted root-derived sessions; `.6` requires explicit
+policy configuration before claiming least privilege in production.
 The remote downloader reports a missing segment as an incomplete scan (the
 object may have expired or been removed); it preserves the storage error as
 the cause without assuming that TTL was the reason. Permanent storage errors
@@ -164,14 +183,29 @@ tests (both may bind port 9123):
 ```bash
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 cargo test -p fluss-datafusion --test remote_retention datafusion_reads_remote_and_rejects_lost_retention -- --ignored
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_reads_and_expires_rustfs_s3 -- --ignored
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_STS_READONLY_POLICY=1 CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_reads_and_expires_rustfs_s3 -- --ignored
 ```
 
-With a locally built server image containing the optional STS policy support,
-run `FLUSS_IMAGE=fluss-sts-policy FLUSS_VERSION=develop FLUSS_STS_READONLY_POLICY=1`
-before the second command. This enables a policy limited to the test's unique
-prefix and verifies **the token returned by Fluss**, including a successful
-GetObject and denied PutObject/DeleteObject. Running the same local image
-without the flag exercises the backward-compatible default.
+The third command enables a policy limited to the test's unique prefix and
+verifies **the token returned by Fluss**, including a successful GetObject and
+denied PutObject/DeleteObject. The published `.6` also passed this test without
+`FLUSS_STS_READONLY_POLICY`, exercising the backward-compatible default.
+
+Run the short real-HTTP fault profile separately, using a host IP reachable
+from Docker for `FLUSS_FAULT_PROXY_HOST` (the reference host used
+`192.168.68.55`):
+
+```bash
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_FAULT_PROXY_HOST=<host-IP> CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_handles_real_rustfs_http_failures -- --ignored
+```
+
+Run the separate, approximately 16-minute real STS-expiry profile only when
+that long verification is needed. Add `FLUSS_STS_PREFLIGHT=1` for a short setup
+check that stops before expiry:
+
+```bash
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_FAULT_PROXY_HOST=<host-IP> CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_renews_real_rustfs_sts_after_expiry -- --ignored --nocapture
+```
 
 ## Reference resource-pressure profile
 
@@ -220,10 +254,11 @@ configuration, not a strict bound on every transient allocation or another
 deployment. Compressed fetch buffers and OpenDAL remain outside the DataFusion
 pool; an Arrow batch is decoded before the pool can reserve it. The native-sni
 coordinator failover test covers a live two-coordinator lab, not the Docker
-profile's single coordinator. Simulated temporary OpenDAL errors and synthetic
-credential refreshes verify the client policies; real S3 fault injection and
-STS renewal across an actual expiry are still unverified. The current Fluss
-server's root-signed STS sessions must be restricted before claiming least
-privilege. Other
-resource profiles and the eventual Python-FFI path (if needed) also require
-separate acceptance evidence.
+profile's single coordinator. The short HTTP profile verifies real transport
+503/timeout/cancellation. The separate 900-second STS profile verifies actual
+expiry and successful renewal on one paused scan; failed credential renewal
+and the deadline after expiry are covered by deterministic client tests.
+A `.6` deployment must explicitly configure
+`s3.assumed.role.policy` to restrict root-signed STS sessions. Other resource
+profiles and the eventual Python-FFI path (if needed) require separate
+acceptance evidence.

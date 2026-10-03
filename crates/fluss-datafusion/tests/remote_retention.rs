@@ -2,10 +2,15 @@
 //! Isolated Docker profiles: tiny segments, filesystem or RustFS S3 tiering, short TTL.
 //! Run alone with FLUSS_IMAGE and FLUSS_VERSION set to a matching Fluss server.
 
+#[path = "support/s3_fault_proxy.rs"]
+mod s3_fault_proxy;
+
 use std::collections::HashMap;
+use std::io::BufRead;
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -24,6 +29,7 @@ use fluss_datafusion::FlussLogTable;
 use fluss_test_cluster::FlussTestingClusterBuilder;
 use futures::StreamExt;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+use s3_fault_proxy::S3FaultProxy;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -72,16 +78,7 @@ fn datafusion_reads_and_expires_rustfs_s3() -> TestResult<()> {
     if verify_readonly {
         conf.insert(
             "s3.assumed.role.policy".into(),
-            serde_json::json!({
-                "Version": "2012-10-17",
-                "Statement": [
-                    {"Effect": "Allow", "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
-                     "Resource": [format!("arn:aws:s3:::{}", test_objects.bucket)]},
-                    {"Effect": "Allow", "Action": ["s3:GetObject"],
-                     "Resource": [format!("arn:aws:s3:::{}/{}/*", test_objects.bucket, test_objects.prefix)]}
-                ]
-            })
-            .to_string(),
+            rustfs_read_policy(&test_objects),
         );
     }
     let recorder = DebuggingRecorder::new();
@@ -107,6 +104,577 @@ fn datafusion_reads_and_expires_rustfs_s3() -> TestResult<()> {
                 cleanup
             })
     })
+}
+
+fn rustfs_read_policy(profile: &S3TestPrefix) -> String {
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+             "Resource": [format!("arn:aws:s3:::{}", profile.bucket)]},
+            {"Effect": "Allow", "Action": ["s3:GetObject"],
+             "Resource": [format!("arn:aws:s3:::{}/{}/*", profile.bucket, profile.prefix)]}
+        ]
+    })
+    .to_string()
+}
+
+struct ShortStsProxy(Child);
+
+impl ShortStsProxy {
+    fn start(host: &str, prefix: &str) -> TestResult<(Self, String)> {
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/short_sts_proxy.py"
+        );
+        let mut child = std::process::Command::new("python3")
+            .args([script, host, prefix])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line)?;
+        let port: u16 = line.trim().parse()?;
+        Ok((Self(child), format!("http://{host}:{port}")))
+    }
+}
+
+impl Drop for ShortStsProxy {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+#[ignore = "real 900-second RustFS STS expiry; Docker, RustFS env and FLUSS_FAULT_PROXY_HOST"]
+fn datafusion_renews_real_rustfs_sts_after_expiry() -> TestResult<()> {
+    std::env::var("FLUSS_IMAGE")?;
+    std::env::var("FLUSS_VERSION")?;
+    let host = std::env::var("FLUSS_FAULT_PROXY_HOST")?;
+    let (mut conf, mut test_objects) = rustfs_profile()?;
+    conf.insert(
+        "s3.assumed.role.policy".into(),
+        rustfs_read_policy(&test_objects),
+    );
+    let (_sts, endpoint) = ShortStsProxy::start(&host, &test_objects.prefix)?;
+    conf.insert("s3.assumed.role.sts.endpoint".into(), endpoint);
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let proxy = S3FaultProxy::start(
+                    &host,
+                    &test_objects.endpoint,
+                    &test_objects.bucket,
+                    &test_objects.prefix,
+                )
+                .await?;
+                conf.insert("s3.endpoint".into(), proxy.endpoint.clone());
+                let mut builder = FlussTestingClusterBuilder::new_with_cluster_conf(
+                    "datafusion-sts-expiry",
+                    &conf,
+                )
+                .with_port(9623);
+                let cluster = builder.build().await;
+                eprintln!("STS cluster started");
+                let result =
+                    check_real_sts_expiry(&cluster, &proxy, &test_objects, &snapshotter).await;
+                drop(cluster);
+                drop(proxy);
+                let cleanup = test_objects.cleanup();
+                result?;
+                cleanup
+            })
+    })
+}
+
+async fn check_real_sts_expiry(
+    cluster: &fluss_test_cluster::FlussTestingCluster,
+    proxy: &S3FaultProxy,
+    profile: &S3TestPrefix,
+    snapshotter: &Snapshotter,
+) -> TestResult<()> {
+    const ROWS: i32 = 32;
+    let config = Config {
+        bootstrap_servers: cluster.plaintext_bootstrap_servers().to_string(),
+        scanner_remote_log_prefetch_num: 1,
+        scanner_log_max_poll_records: 1,
+        scanner_remote_log_operation_timeout_ms: 15_000,
+        ..Config::default()
+    };
+    let connection = Arc::new(
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match FlussConnection::new(config.clone()).await {
+                    Ok(connection) => break connection,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+                }
+            }
+        })
+        .await
+        .map_err(|_| "STS profile Fluss connection did not start within 60s")?,
+    );
+    let admin = connection.get_admin()?;
+    let metadata = connection.get_metadata();
+    wait_for(Duration::from_secs(60), || async {
+        let updated = metadata
+            .update_tables_metadata(
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+                vec![],
+            )
+            .await
+            .is_ok();
+        Ok::<bool, std::convert::Infallible>(
+            updated && metadata.get_cluster().get_tablet_server(0).is_some(),
+        )
+    })
+    .await?;
+    let path = TablePath::new("fluss", format!("df_sts_expiry_{}", std::process::id()));
+    admin
+        .create_table(
+            &path,
+            &TableDescriptor::builder()
+                .schema(
+                    Schema::builder()
+                        .column("id", DataTypes::int())
+                        .column("value", DataTypes::string())
+                        .build()?,
+                )
+                .distributed_by(Some(1), vec!["id".into()])
+                .property("table.log.ttl", "0ms")
+                .property("table.log.tiered.local-segments", "1")
+                .build()?,
+            false,
+        )
+        .await?;
+    let result: TestResult<()> = async {
+        let table = connection.get_table(&path).await?;
+        let writer = table.new_append()?.create_writer()?;
+        for id in 0..ROWS {
+            let mut row = GenericRow::new(2);
+            row.set_field(0, id);
+            row.set_field(1, format!("row-{id}"));
+            writer.append(&row)?.await?;
+        }
+        writer.flush().await?;
+        eprintln!("STS fixture written");
+        let table_id = table.get_table_info().table_id;
+        wait_for(Duration::from_secs(60), || async {
+            admin
+                .list_remote_log_manifests(table_id, None)
+                .await
+                .map(|entries| entries.iter().any(|entry| entry.remote_log_end_offset > 0))
+        })
+        .await?;
+        eprintln!("STS remote manifest ready");
+
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "logs",
+            Arc::new(
+                FlussLogTable::open(
+                    Arc::clone(&connection),
+                    path.clone(),
+                    Duration::from_secs(1_100),
+                )
+                .await?,
+            ),
+        )?;
+        let query = ctx.sql("SELECT id FROM logs").await?;
+        let source = source_plan(&query.create_physical_plan().await?);
+        let mut stream = source.execute(0, Arc::new(query.task_ctx()))?;
+        eprintln!("STS first scan started");
+        let first = tokio::time::timeout(Duration::from_secs(30), stream.next())
+            .await?
+            .ok_or("the scan returned no first batch")??;
+        assert_eq!(first.num_rows(), 1);
+        assert!(remote_bytes(snapshotter) > 0);
+        let initial_session = proxy
+            .last_session_fingerprint()
+            .ok_or("first row did not read a real STS-signed RustFS object")?;
+        let (original, expires_at) = connection.remote_storage_token_for_test().await?;
+        let expires_at = expires_at.ok_or("RustFS did not return STS expiration")?;
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+        let lifetime = expires_at - now_ms;
+        assert!(
+            (880_000..=910_000).contains(&lifetime),
+            "expected a real 900s RustFS session; observed {lifetime} ms remaining"
+        );
+        let get = |key: &str| -> TestResult<&str> {
+            original
+                .get(key)
+                .map(String::as_str)
+                .ok_or_else(|| format!("STS token missing {key}").into())
+        };
+        let check_original = || -> TestResult<std::process::Output> {
+            Ok(std::process::Command::new("aws")
+                .env("AWS_ACCESS_KEY_ID", get("access_key_id")?)
+                .env("AWS_SECRET_ACCESS_KEY", get("secret_access_key")?)
+                .env("AWS_SESSION_TOKEN", get("session_token")?)
+                .env("AWS_DEFAULT_REGION", "us-east-1")
+                .env("AWS_EC2_METADATA_DISABLED", "true")
+                .args([
+                    "--endpoint-url",
+                    &profile.endpoint,
+                    "s3api",
+                    "list-objects-v2",
+                    "--bucket",
+                    &profile.bucket,
+                    "--prefix",
+                    &profile.prefix,
+                    "--max-keys",
+                    "1",
+                ])
+                .output()?)
+        };
+        assert!(
+            check_original()?.status.success(),
+            "fresh STS token cannot list the isolated test prefix"
+        );
+        if std::env::var("FLUSS_STS_PREFLIGHT").as_deref() == Ok("1") {
+            drop(stream);
+            connection.close(Duration::from_secs(5)).await?;
+            return Ok(());
+        }
+        eprintln!(
+            "Real STS token expires in {}s; holding the live scan until expiry",
+            lifetime / 1000
+        );
+        tokio::time::sleep(Duration::from_millis((lifetime + 3_000) as u64)).await;
+
+        let old = check_original()?;
+        if old.status.success() {
+            return Err("old real STS token still works after expiration".into());
+        }
+        // RustFS may report several different S3 error codes for an expired
+        // session. Confirm the server is still reachable, so this is not a
+        // false positive caused by a lost network connection.
+        let healthy = s3_command(
+            &profile.endpoint,
+            &profile.access,
+            &profile.secret,
+            &["s3api", "head-bucket", "--bucket", &profile.bucket],
+        )?;
+        if !healthy.status.success() {
+            return Err(
+                "RustFS is unavailable; cannot attribute the old token rejection to expiry".into(),
+            );
+        }
+        let failure = String::from_utf8_lossy(&old.stderr);
+        let code = failure
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(code, _)| code)
+            .filter(|code| code.chars().all(|c| c.is_ascii_alphanumeric()))
+            .unwrap_or("unknown");
+        eprintln!("Expired original STS token rejected by live RustFS ({code})");
+
+        let mut ids = vec![
+            first
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap()
+                .value(0),
+        ];
+        while let Some(batch) = tokio::time::timeout(Duration::from_secs(45), stream.next()).await?
+        {
+            let batch = batch?;
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
+            ids.extend((0..column.len()).map(|i| column.value(i)));
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (0..ROWS).collect::<Vec<_>>());
+        let new_session = proxy
+            .last_session_fingerprint()
+            .ok_or("scan made no remote HTTP requests after expiry")?;
+        assert_ne!(
+            initial_session, new_session,
+            "scan reused the first STS session after its real expiry"
+        );
+        connection.close(Duration::from_secs(5)).await?;
+        Ok(())
+    }
+    .await;
+    let cleanup = admin.drop_table(&path, true).await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "Docker, RustFS env, four-CPU test host with FLUSS_FAULT_PROXY_HOST"]
+fn datafusion_handles_real_rustfs_http_failures() -> TestResult<()> {
+    std::env::var("FLUSS_IMAGE")?;
+    std::env::var("FLUSS_VERSION")?;
+    let host = std::env::var("FLUSS_FAULT_PROXY_HOST")?;
+    let (mut conf, mut test_objects) = rustfs_profile()?;
+    conf.insert(
+        "s3.assumed.role.policy".into(),
+        rustfs_read_policy(&test_objects),
+    );
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let proxy = S3FaultProxy::start(
+                    &host,
+                    &test_objects.endpoint,
+                    &test_objects.bucket,
+                    &test_objects.prefix,
+                )
+                .await?;
+                conf.insert("s3.endpoint".into(), proxy.endpoint.clone());
+                // STS still calls the real RustFS directly. Only S3 data
+                // operations traverse the controlled test-only proxy.
+                let mut builder = FlussTestingClusterBuilder::new_with_cluster_conf(
+                    "datafusion-s3-faults",
+                    &conf,
+                )
+                .with_port(9423);
+                let cluster = builder.build().await;
+                let result = check_real_s3_failures(&cluster, &proxy, &snapshotter).await;
+                drop(cluster);
+                drop(proxy);
+                let cleanup = test_objects.cleanup();
+                result?;
+                cleanup
+            })
+    })
+}
+
+async fn check_real_s3_failures(
+    cluster: &fluss_test_cluster::FlussTestingCluster,
+    proxy: &S3FaultProxy,
+    snapshotter: &Snapshotter,
+) -> TestResult<()> {
+    const ROWS: i32 = 32;
+    let config = Config {
+        bootstrap_servers: cluster.plaintext_bootstrap_servers().to_string(),
+        scanner_remote_log_prefetch_num: 1,
+        scanner_remote_log_max_retries: 2,
+        scanner_remote_log_retry_backoff_base_ms: 20,
+        scanner_remote_log_retry_backoff_max_ms: 50,
+        scanner_remote_log_operation_timeout_ms: 350,
+        ..Config::default()
+    };
+    let connection = Arc::new(
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match FlussConnection::new(config.clone()).await {
+                    Ok(connection) => break connection,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+                }
+            }
+        })
+        .await
+        .map_err(|_| "fault profile Fluss connection did not start within 60s")?,
+    );
+    let admin = connection.get_admin()?;
+    let metadata = connection.get_metadata();
+    wait_for(Duration::from_secs(60), || async {
+        let updated = metadata
+            .update_tables_metadata(
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+                vec![],
+            )
+            .await
+            .is_ok();
+        Ok::<bool, std::convert::Infallible>(
+            updated && metadata.get_cluster().get_tablet_server(0).is_some(),
+        )
+    })
+    .await?;
+    let path = TablePath::new("fluss", format!("df_s3_faults_{}", std::process::id()));
+    admin
+        .create_table(
+            &path,
+            &TableDescriptor::builder()
+                .schema(
+                    Schema::builder()
+                        .column("id", DataTypes::int())
+                        .column("value", DataTypes::string())
+                        .build()?,
+                )
+                .distributed_by(Some(1), vec!["id".into()])
+                .property("table.log.ttl", "0ms")
+                .property("table.log.tiered.local-segments", "1")
+                .build()?,
+            false,
+        )
+        .await?;
+    let result: TestResult<()> = async {
+        let table = connection.get_table(&path).await?;
+        let writer = table.new_append()?.create_writer()?;
+        for id in 0..ROWS {
+            let mut row = GenericRow::new(2);
+            row.set_field(0, id);
+            row.set_field(1, format!("row-{id}"));
+            writer.append(&row)?.await?;
+        }
+        writer.flush().await?;
+        let table_id = table.get_table_info().table_id;
+        wait_for(Duration::from_secs(60), || async {
+            admin
+                .list_remote_log_manifests(table_id, None)
+                .await
+                .map(|items| items.iter().any(|item| item.remote_log_end_offset > 0))
+        })
+        .await?;
+
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "logs",
+            Arc::new(
+                FlussLogTable::open(
+                    Arc::clone(&connection),
+                    path.clone(),
+                    Duration::from_secs(90),
+                )
+                .await?,
+            ),
+        )?;
+        let query_ids = async || -> TestResult<Vec<i32>> {
+            let result = ctx
+                .sql("SELECT id FROM logs ORDER BY id")
+                .await?
+                .collect()
+                .await?;
+            let ids = result
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int32Array>()
+                        .unwrap();
+                    (0..column.len())
+                        .map(|i| column.value(i))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            Ok(ids)
+        };
+        assert_eq!(query_ids().await?, (0..ROWS).collect::<Vec<_>>());
+        assert!(remote_bytes(snapshotter) > 0);
+
+        let start = proxy.matched();
+        proxy.fail_next(2);
+        assert_eq!(query_ids().await?, (0..ROWS).collect::<Vec<_>>());
+        assert!(
+            proxy.matched() >= start + 2,
+            "STS-backed OpenDAL reads must see both real HTTP 503 responses"
+        );
+
+        let start = proxy.matched();
+        proxy.fail_always();
+        let error = ctx
+            .sql("SELECT id FROM logs ORDER BY id")
+            .await?
+            .collect()
+            .await
+            .expect_err("persistently failing HTTP 503 must fail the query");
+        assert!(
+            error.to_string().contains("download") || error.to_string().contains("503"),
+            "{error}"
+        );
+        assert!(
+            proxy.matched() >= start + 3,
+            "the configured retries must reach the real HTTP proxy"
+        );
+
+        proxy.clear();
+        assert_eq!(
+            query_ids().await?,
+            (0..ROWS).collect::<Vec<_>>(),
+            "a fresh query must recover after 503"
+        );
+
+        let block_connection = Arc::new(FlussConnection::new(config).await?);
+        let blocked = SessionContext::new();
+        blocked.register_table(
+            "logs",
+            Arc::new(
+                FlussLogTable::open(
+                    Arc::clone(&block_connection),
+                    path.clone(),
+                    Duration::from_secs(5),
+                )
+                .await?,
+            ),
+        )?;
+        let start = proxy.matched();
+        proxy.block();
+        let blocked_error = tokio::time::timeout(
+            Duration::from_secs(6),
+            blocked.sql("SELECT id FROM logs").await?.collect(),
+        )
+        .await?
+        .expect_err("blocked remote HTTP request must time out");
+        assert!(!blocked_error.to_string().is_empty());
+        assert!(
+            proxy.matched() > start,
+            "the blocked scan must reach the test proxy"
+        );
+        let mut cancel_config = block_connection.config().clone();
+        cancel_config.scanner_remote_log_operation_timeout_ms = 5_000;
+        let cancel_connection = Arc::new(FlussConnection::new(cancel_config).await?);
+        let cancel_ctx = SessionContext::new();
+        cancel_ctx.register_table(
+            "logs",
+            Arc::new(
+                FlussLogTable::open(
+                    Arc::clone(&cancel_connection),
+                    path.clone(),
+                    Duration::from_secs(10),
+                )
+                .await?,
+            ),
+        )?;
+        let query = cancel_ctx.sql("SELECT id FROM logs").await?;
+        let source = source_plan(&query.create_physical_plan().await?);
+        let mut stream = source.execute(0, Arc::new(query.task_ctx()))?;
+        let cancelled = tokio::spawn(async move { stream.next().await });
+        let reached = wait_for(Duration::from_secs(3), || async {
+            Ok::<bool, std::convert::Infallible>(proxy.blocked() > 0)
+        })
+        .await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        reached?;
+        proxy.clear();
+        wait_for(Duration::from_secs(3), || async {
+            Ok::<bool, std::convert::Infallible>(proxy.blocked() == 0)
+        })
+        .await?;
+        wait_for(Duration::from_secs(5), || async {
+            remote_temp_files().map(|files| files == 0)
+        })
+        .await?;
+        cancel_connection.close(Duration::from_secs(5)).await?;
+        block_connection.close(Duration::from_secs(5)).await?;
+        assert_eq!(query_ids().await?, (0..ROWS).collect::<Vec<_>>());
+        connection.close(Duration::from_secs(5)).await?;
+        Ok(())
+    }
+    .await;
+    let cleanup = admin.drop_table(&path, true).await;
+    result?;
+    cleanup?;
+    Ok(())
 }
 
 fn rustfs_profile() -> TestResult<(HashMap<String, String>, S3TestPrefix)> {

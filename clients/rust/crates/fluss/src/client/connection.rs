@@ -169,12 +169,20 @@ impl FlussConnection {
     /// S3 permissions. Never enabled by the production connector build.
     #[cfg(feature = "integration_tests")]
     pub async fn remote_storage_credentials_for_test(&self) -> Result<HashMap<String, String>> {
-        let (props, _) = crate::client::credentials::SecurityTokenManager::fetch_token(
+        Ok(self.remote_storage_token_for_test().await?.0)
+    }
+
+    /// Fetch the actual expiration alongside a server-issued token for an
+    /// isolated test that waits for its real STS session to expire.
+    #[cfg(feature = "integration_tests")]
+    pub async fn remote_storage_token_for_test(
+        &self,
+    ) -> Result<(HashMap<String, String>, Option<i64>)> {
+        crate::client::credentials::SecurityTokenManager::fetch_token(
             &self.network_connects,
             &self.metadata,
         )
-        .await?;
-        Ok(props)
+        .await
     }
 
     /// Gets or creates a lookup client for batched lookup operations.
