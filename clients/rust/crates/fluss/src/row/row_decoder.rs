@@ -50,6 +50,15 @@ pub struct CompactedRowDecoder {
 }
 
 impl CompactedRowDecoder {
+    fn new_projected(row_type: RowType, fields: &[usize]) -> Result<Self> {
+        Ok(Self {
+            field_count: row_type.fields().len(),
+            deserializer: Arc::new(
+                CompactedRowDeserializer::new_from_owned(row_type).with_projection(fields)?,
+            ),
+        })
+    }
+
     /// Create a new CompactedRowDecoder with the given row type.
     pub fn new(row_type: RowType) -> Self {
         let field_count = row_type.fields().len();
@@ -75,6 +84,21 @@ impl RowDecoder for CompactedRowDecoder {
 pub struct RowDecoderFactory;
 
 impl RowDecoderFactory {
+    pub(crate) fn create_projected(
+        kv_format: KvFormat,
+        row_type: RowType,
+        fields: &[usize],
+    ) -> Result<Arc<dyn RowDecoder>> {
+        match kv_format {
+            KvFormat::COMPACTED => Ok(Arc::new(CompactedRowDecoder::new_projected(
+                row_type, fields,
+            )?)),
+            KvFormat::INDEXED => Err(Error::UnsupportedOperation {
+                message: "INDEXED format is not yet supported".into(),
+            }),
+        }
+    }
+
     /// Create a RowDecoder for the given format and row type.
     pub fn create(kv_format: KvFormat, row_type: RowType) -> Result<Arc<dyn RowDecoder>> {
         match kv_format {

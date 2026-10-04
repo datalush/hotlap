@@ -31,6 +31,43 @@ pub(crate) struct FixedSchemaDecoder {
 }
 
 impl FixedSchemaDecoder {
+    /// Select current-schema fields while decoding the original wire schema.
+    /// Missing fields still map to NULL; skipped fields retain checked physical
+    /// boundaries but do not validate/convert their logical values.
+    pub(crate) fn new_projected(
+        kv_format: KvFormat,
+        source_schema: &Schema,
+        target_schema: &Schema,
+        fields: &[usize],
+    ) -> Result<Self> {
+        let mapping = index_mapping(source_schema, target_schema)?;
+        let selected = fields
+            .iter()
+            .map(|&field| {
+                mapping
+                    .get(field)
+                    .copied()
+                    .ok_or_else(|| Error::IllegalArgument {
+                        message: format!("Projected target field {field} is out of range"),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let source_fields: Vec<_> = selected
+            .into_iter()
+            .filter(|&index| index >= 0)
+            .map(|index| index as usize)
+            .collect();
+        let row_decoder = RowDecoderFactory::create_projected(
+            kv_format,
+            source_schema.row_type().clone(),
+            &source_fields,
+        )?;
+        Ok(Self {
+            row_decoder,
+            index_mapping: Some(Arc::from(mapping.into_boxed_slice())),
+        })
+    }
+
     pub fn new_no_projection(kv_format: KvFormat, schema: &Schema) -> Result<Self> {
         let row_decoder = RowDecoderFactory::create(kv_format, schema.row_type().clone())?;
         Ok(Self {

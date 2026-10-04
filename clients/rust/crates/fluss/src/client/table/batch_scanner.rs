@@ -34,11 +34,12 @@ use crate::record::{
     LogRecordsBatches, ReadContext as ArrowReadContext, RowAppendRecordBatchBuilder, ScanBatch,
     to_arrow_schema,
 };
-use crate::row::FixedSchemaDecoder;
+use crate::row::{FixedSchemaDecoder, ProjectedRow};
 use crate::rpc::RpcClient;
 use crate::rpc::message::LimitScanRequest;
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
+use arrow::record_batch::RecordBatchOptions;
 use arrow_schema::SchemaRef;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
@@ -324,6 +325,7 @@ pub(super) async fn decode_kv_batch(
         target_schema_id,
         kv_format,
         &schema_ids,
+        projected_fields,
     )
     .await?;
 
@@ -337,15 +339,15 @@ pub(super) async fn decode_kv_batch(
     )
 }
 
-/// Build one [`FixedSchemaDecoder`] per distinct schema id. The current schema
-/// decodes without projection; older schemas are fetched and projected onto the
-/// current schema.
+/// Build one decoder per write-time schema id, aligned to current field IDs.
+/// Requested columns select physical source fields; absent fields remain NULL.
 async fn build_kv_decoders(
     schema_getter: &ClientSchemaGetter,
     target_schema: &Schema,
     target_schema_id: i16,
     kv_format: KvFormat,
     schema_ids: &[i16],
+    projected_fields: Option<&[usize]>,
 ) -> Result<HashMap<i16, FixedSchemaDecoder>> {
     let mut decoders = HashMap::with_capacity(schema_ids.len());
     for &id in schema_ids {
@@ -353,18 +355,35 @@ async fn build_kv_decoders(
             continue;
         }
         let decoder = if id == target_schema_id {
-            FixedSchemaDecoder::new_no_projection(kv_format, target_schema)?
+            match projected_fields {
+                Some(fields) => FixedSchemaDecoder::new_projected(
+                    kv_format,
+                    target_schema,
+                    target_schema,
+                    fields,
+                )?,
+                None => FixedSchemaDecoder::new_no_projection(kv_format, target_schema)?,
+            }
         } else {
             let source = schema_getter.get_schema(id as i32).await?;
-            FixedSchemaDecoder::new(kv_format, source.as_ref(), target_schema)?
+            match projected_fields {
+                Some(fields) => FixedSchemaDecoder::new_projected(
+                    kv_format,
+                    source.as_ref(),
+                    target_schema,
+                    fields,
+                )?,
+                None => FixedSchemaDecoder::new(kv_format, source.as_ref(), target_schema)?,
+            }
         };
         decoders.insert(id, decoder);
     }
     Ok(decoders)
 }
 
-/// Decode every value record into a row shaped by `target_row_type`, build a
-/// single Arrow batch, keep the last `limit` rows, then apply column projection.
+/// Materialize only requested columns of the last `limit` value records.
+/// Schema alignment stays in FixedSchemaDecoder; ProjectedRow is a lazy view
+/// over the aligned row, so unselected values never enter Arrow builders.
 fn value_records_to_record_batch(
     batch: &ValueRecordBatch,
     ranges: &[Range<usize>],
@@ -373,8 +392,42 @@ fn value_records_to_record_batch(
     projected_fields: Option<&[usize]>,
     limit: usize,
 ) -> Result<RecordBatch> {
-    let mut builder = RowAppendRecordBatchBuilder::new(target_row_type)?;
-    for range in ranges {
+    let projection = projected_fields.map(|fields| {
+        let mut unique = Vec::new();
+        let mut positions = HashMap::new();
+        let output: Vec<usize> = fields
+            .iter()
+            .map(|&index| {
+                *positions.entry(index).or_insert_with(|| {
+                    let position = unique.len();
+                    unique.push(index);
+                    position
+                })
+            })
+            .collect();
+        (unique, output)
+    });
+    let projected_type = projection
+        .as_ref()
+        .map(|(fields, _)| target_row_type.project(fields))
+        .transpose()?;
+    let builder_type = projected_type.as_ref().unwrap_or(target_row_type);
+    let mapping = projection
+        .as_ref()
+        .map(|(fields, _)| {
+            fields
+                .iter()
+                .map(|&index| {
+                    i32::try_from(index).map_err(|_| Error::IllegalArgument {
+                        message: "Column projection exceeds the row mapping range".into(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Arc::<[i32]>::from)
+        })
+        .transpose()?;
+    let mut builder = RowAppendRecordBatchBuilder::new(builder_type)?;
+    for range in &ranges[ranges.len().saturating_sub(limit)..] {
         let payload = &batch.data()[range.clone()];
         let schema_id = read_schema_id(payload)?;
         let decoder = decoders
@@ -384,12 +437,21 @@ fn value_records_to_record_batch(
                 source: None,
             })?;
         let row = decoder.decode(payload)?;
-        builder.append(&row)?;
+        match &mapping {
+            Some(mapping) => {
+                builder.append(&ProjectedRow::new(row, Arc::clone(mapping)))?;
+            }
+            None => {
+                builder.append(&row)?;
+            }
+        }
     }
 
-    let full = Arc::unwrap_or_clone(builder.build_arrow_record_batch()?);
-    let (full, _) = take_last_rows(full, 0, limit);
-    project_batch(full, target_row_type, projected_fields)
+    let decoded = Arc::unwrap_or_clone(builder.build_arrow_record_batch()?);
+    match projection {
+        Some((unique, output)) if unique.len() != output.len() => Ok(decoded.project(&output)?),
+        _ => Ok(decoded),
+    }
 }
 
 /// Read the leading little-endian schema id from a `[schema_id | row]` payload.
@@ -450,7 +512,11 @@ fn project_batch(
                 .iter()
                 .map(|&idx| batch.column(idx).clone())
                 .collect();
-            Ok(RecordBatch::try_new(projected_schema, columns)?)
+            Ok(RecordBatch::try_new_with_options(
+                projected_schema,
+                columns,
+                &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+            )?)
         }
     }
 }
@@ -1040,6 +1106,155 @@ mod tests {
     }
 
     #[test]
+    fn projected_kv_does_not_convert_unselected_variable_values() {
+        let schema = id_name_schema();
+        let decoders = HashMap::from([(
+            0,
+            FixedSchemaDecoder::new_no_projection(KvFormat::COMPACTED, &schema).unwrap(),
+        )]);
+        let mut row = compacted(2, |writer| {
+            writer.write_int(7);
+            writer.write_string("poison");
+        });
+        // Unselected strings must never be converted/validated by a column
+        // writer. Corrupt only that field, leaving record boundaries/id valid.
+        let start = row.windows(6).position(|bytes| bytes == b"poison").unwrap();
+        row[start] = 0xff;
+        let batch = value_batch(&[(0, row)]);
+        let ranges = batch.value_ranges().unwrap();
+        assert!(
+            value_records_to_record_batch(
+                &batch,
+                &ranges,
+                &decoders,
+                schema.row_type(),
+                None,
+                usize::MAX
+            )
+            .is_err()
+        );
+        let decoders = HashMap::from([(
+            0,
+            FixedSchemaDecoder::new_projected(KvFormat::COMPACTED, &schema, &schema, &[0]).unwrap(),
+        )]);
+        let projected = value_records_to_record_batch(
+            &batch,
+            &ranges,
+            &decoders,
+            schema.row_type(),
+            Some(&[0]),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            projected
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
+        let mut truncated = compacted(2, |writer| {
+            writer.write_int(7);
+            writer.write_string("poison");
+        });
+        truncated.pop();
+        let truncated = value_batch(&[(0, truncated)]);
+        assert!(
+            value_records_to_record_batch(
+                &truncated,
+                &truncated.value_ranges().unwrap(),
+                &decoders,
+                schema.row_type(),
+                Some(&[0]),
+                usize::MAX,
+            )
+            .is_err(),
+            "skipping a value must still validate its physical bounds"
+        );
+    }
+
+    #[test]
+    fn projected_kv_reorders_and_shares_duplicate_columns() {
+        let schema = id_name_schema();
+        let decoders = HashMap::from([(
+            0,
+            FixedSchemaDecoder::new_no_projection(KvFormat::COMPACTED, &schema).unwrap(),
+        )]);
+        let row = compacted(2, |writer| {
+            writer.write_int(9);
+            writer.write_string("nine");
+        });
+        let batch = value_batch(&[(0, row)]);
+        let ranges = batch.value_ranges().unwrap();
+        let projected = value_records_to_record_batch(
+            &batch,
+            &ranges,
+            &decoders,
+            schema.row_type(),
+            Some(&[1, 0, 1]),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            projected
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["name", "id", "name"]
+        );
+        assert!(Arc::ptr_eq(projected.column(0), projected.column(2)));
+        assert!(
+            value_records_to_record_batch(
+                &batch,
+                &ranges,
+                &decoders,
+                schema.row_type(),
+                Some(&[2]),
+                usize::MAX
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn zero_column_kv_preserves_row_counts_without_value_materialization() {
+        let schema = id_name_schema();
+        let decoders = HashMap::from([(
+            0,
+            FixedSchemaDecoder::new_projected(KvFormat::COMPACTED, &schema, &schema, &[]).unwrap(),
+        )]);
+        let rows = (1..=3)
+            .map(|id| {
+                (
+                    0,
+                    compacted(2, |writer| {
+                        writer.write_int(id);
+                        writer.write_string("unselected");
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch = value_batch(&rows);
+        let ranges = batch.value_ranges().unwrap();
+        let count = value_records_to_record_batch(
+            &batch,
+            &ranges,
+            &decoders,
+            schema.row_type(),
+            Some(&[]),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(count.num_rows(), 3);
+        assert_eq!(count.num_columns(), 0);
+        assert_eq!(count.get_array_memory_size(), 0);
+    }
+
+    #[test]
     fn value_records_decode_across_schema_evolution() {
         // Source schema (older): [id, name]. Target (current): added `age`.
         let source = id_name_schema();
@@ -1089,5 +1304,44 @@ mod tests {
         // Old record has no `age` column -> null; new record carries 30.
         assert!(age.is_null(0), "old-schema record must read age as null");
         assert_eq!(age.value(1), 30);
+
+        let projected_decoders = HashMap::from([
+            (
+                0,
+                FixedSchemaDecoder::new_projected(KvFormat::COMPACTED, &source, &target, &[2, 0])
+                    .unwrap(),
+            ),
+            (
+                1,
+                FixedSchemaDecoder::new_projected(KvFormat::COMPACTED, &target, &target, &[2, 0])
+                    .unwrap(),
+            ),
+        ]);
+        let projected = value_records_to_record_batch(
+            &batch,
+            &ranges,
+            &projected_decoders,
+            target.row_type(),
+            Some(&[2, 0]),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(projected.schema().field(0).name(), "age");
+        let age = projected
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(age.is_null(0));
+        assert_eq!(age.value(1), 30);
+        assert_eq!(
+            projected
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[1, 2]
+        );
     }
 }

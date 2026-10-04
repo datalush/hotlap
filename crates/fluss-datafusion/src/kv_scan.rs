@@ -180,19 +180,8 @@ impl KvReadState {
                 Some(batch) => {
                     self.metrics.record_decoded_batch(&batch);
                     let batch = crate::resources::reserve_batch(batch, &self.reservation)?;
-                    let output = if self
-                        .partition
-                        .spec
-                        .projection
-                        .as_ref()
-                        .is_some_and(Vec::is_empty)
-                    {
-                        batch.project(&[])?
-                    } else {
-                        batch
-                    };
-                    self.metrics.record_output_batch(&output);
-                    return Ok(Some(output));
+                    self.metrics.record_output_batch(&batch);
+                    return Ok(Some(batch));
                 }
                 None => self.reader = None,
             }
@@ -297,7 +286,7 @@ impl KvReadState {
         }
         let scan = table.new_scan();
         let scan = match spec.projection.as_deref() {
-            Some(indices) if !indices.is_empty() => scan.project(indices).map_err(fluss_error)?,
+            Some(indices) => scan.project(indices).map_err(fluss_error)?,
             _ => scan,
         };
         scan.create_kv_batch_scanner_with_bucket_count(bucket, count)

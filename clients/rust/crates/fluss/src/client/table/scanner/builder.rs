@@ -247,7 +247,8 @@ impl<'a> TableScan<'a> {
     /// * `column_indices` - Zero-based indices of columns to include in the scan
     ///
     /// # Errors
-    /// Returns an error if `column_indices` is empty or if any column index is out of range.
+    /// Empty projection is supported for KV batch row counts only. Log-table
+    /// projections must be nonempty; out-of-range indices are always rejected.
     ///
     /// # Example
     /// ```
@@ -296,7 +297,7 @@ impl<'a> TableScan<'a> {
     /// # }
     /// ```
     pub fn project(mut self, column_indices: &[usize]) -> Result<Self> {
-        if column_indices.is_empty() {
+        if column_indices.is_empty() && !self.table_info.has_primary_key() {
             return Err(Error::IllegalArgument {
                 message: "Column indices cannot be empty".to_string(),
             });
@@ -400,6 +401,12 @@ impl<'a> TableScan<'a> {
     /// (update-before), `+U` (update-after) or `-D` (delete). A log table yields
     /// `+A` (append-only) for every record. Requires the ARROW log format.
     pub fn create_log_scanner(self) -> Result<LogScanner> {
+        if self.projected_fields.as_ref().is_some_and(Vec::is_empty) {
+            return Err(Error::IllegalArgument {
+                message: "Empty projections require a KV batch scanner, not a changelog scanner"
+                    .into(),
+            });
+        }
         self.reject_limit("LogScanner")?;
         validate_scan_support_inner(&self.table_info.table_path, &self.table_info, true)?;
         let admin = self.conn.get_admin()?;

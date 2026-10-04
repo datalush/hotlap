@@ -197,7 +197,7 @@ impl TableProvider for FlussKvTable {
             "kind=kv_snapshot, table={}, projection={}, projected_columns={:?}, partition_pruning={partition_filter:?}",
             self.path,
             if projection.is_some_and(Vec::is_empty) {
-                "full_rows_for_count"
+                "row_count_only"
             } else {
                 "decoder"
             },

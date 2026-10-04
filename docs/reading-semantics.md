@@ -26,8 +26,10 @@ when it is first read; there is **no transactionally consistent cross-bucket
 snapshot** during concurrent writes, nor a snapshot retained across queries.
 Both partitioned and non-partitioned KV tables are supported. No row filter or global SQL limit is
 pushed into `ScanKv`; DataFusion evaluates them exactly. Non-empty projections
-are applied by the Arrow decoder after reading value records, and `COUNT(*)`
-still decodes full rows. Schema changes and non-partitioned topology changes
+are materialized by a selective compacted decoder and Arrow builder after reading
+value records. `COUNT(*)` requests zero columns and preserves row counts without
+building Arrow value columns; raw pages and schema/record framing still arrive.
+Unrequested logical values are not converted/validated. Schema changes and non-partitioned topology changes
 require replanning; partitioned layouts are rediscovered on each execution.
 
 The batch append-only log source relies on the client's bounded offset reader;
@@ -120,8 +122,8 @@ to executed streams, including empty ranges. KV counts server-confirmed
 sessions and successful `ScanKv` RPC responses (including empty pages), not
 Arrow output batches. First-page latency includes request and decoding.
 Projection is identified as `server` for initial-schema logs,
-`client_evolved_schema` for evolved logs, `decoder` for KV, or
-`full_rows_for_count` for a zero-column scan. These are not network-byte or
+`client_evolved_schema` for evolved logs, `decoder` for projected KV,
+`row_count_only` for KV COUNT, or `full_rows_for_count` for zero-column log scans. These are not network-byte or
 server-only snapshot-opening measurements.
 
 Each source reserves decoded Arrow backing buffers in the shared DataFusion pool.

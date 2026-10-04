@@ -33,6 +33,7 @@ pub struct CompactedRowDeserializer<'a> {
     row_type: Cow<'a, RowType>,
     // Index-parallel to row_type.fields(); Some(_) only for ROW-typed fields.
     nested: Vec<Option<Arc<CompactedRowDeserializer<'a>>>>,
+    selected: Option<Vec<bool>>,
 }
 
 fn build_nested_deserializers<'a>(
@@ -60,6 +61,7 @@ impl<'a> CompactedRowDeserializer<'a> {
         Self {
             row_type: Cow::Borrowed(row_type),
             nested,
+            selected: None,
         }
     }
 
@@ -68,11 +70,68 @@ impl<'a> CompactedRowDeserializer<'a> {
         Self {
             row_type: Cow::Owned(row_type),
             nested,
+            selected: None,
         }
     }
 
     pub fn get_row_type(&self) -> &RowType {
         self.row_type.as_ref()
+    }
+
+    pub(crate) fn with_projection(mut self, fields: &[usize]) -> Result<Self> {
+        let mut selected = vec![false; self.row_type.fields().len()];
+        for &field in fields {
+            *selected.get_mut(field).ok_or_else(|| IllegalArgument {
+                message: format!("Projected compacted field {field} is out of range"),
+            })? = true;
+        }
+        self.selected = Some(selected);
+        Ok(self)
+    }
+
+    /// Traverse physical field boundaries without materializing/converting a
+    /// value. Variable-length fields share the format's checked byte reader.
+    fn skip_field(
+        &self,
+        reader: &CompactedRowReader<'a>,
+        dtype: &DataType,
+        cursor: usize,
+    ) -> Result<usize> {
+        Ok(match dtype {
+            DataType::Boolean(_) | DataType::TinyInt(_) => reader.read_byte(cursor)?.1,
+            DataType::SmallInt(_) => reader.read_short(cursor)?.1,
+            DataType::Int(_) | DataType::Date(_) | DataType::Time(_) => reader.read_int(cursor)?.1,
+            DataType::BigInt(_) => reader.read_long(cursor)?.1,
+            DataType::Float(_) => reader.read_float(cursor)?.1,
+            DataType::Double(_) => reader.read_double(cursor)?.1,
+            DataType::Timestamp(t) => {
+                let next = reader.read_long(cursor)?.1;
+                if TimestampNtz::is_compact(t.precision()) {
+                    next
+                } else {
+                    reader.read_int(next)?.1
+                }
+            }
+            DataType::TimestampLTz(t) => {
+                let next = reader.read_long(cursor)?.1;
+                if TimestampLtz::is_compact(t.precision()) {
+                    next
+                } else {
+                    reader.read_int(next)?.1
+                }
+            }
+            DataType::Decimal(t) if Decimal::is_compact_precision(t.precision()) => {
+                reader.read_long(cursor)?.1
+            }
+            DataType::Decimal(_)
+            | DataType::Char(_)
+            | DataType::String(_)
+            | DataType::Bytes(_)
+            | DataType::Binary(_)
+            | DataType::Array(_)
+            | DataType::Row(_)
+            | DataType::Map(_) => reader.read_bytes(cursor)?.1,
+        })
     }
 
     pub fn deserialize(&self, reader: &CompactedRowReader<'a>) -> Result<GenericRow<'a>> {
@@ -82,6 +141,14 @@ impl<'a> CompactedRowDeserializer<'a> {
             let dtype = &data_field.data_type;
             if dtype.is_nullable() && reader.is_null_at(col_pos) {
                 row.set_field(col_pos, Datum::Null);
+                continue;
+            }
+            if self
+                .selected
+                .as_ref()
+                .is_some_and(|selected| !selected[col_pos])
+            {
+                cursor = self.skip_field(reader, dtype, cursor)?;
                 continue;
             }
             let (datum, next_cursor) = match dtype {
@@ -367,6 +434,29 @@ mod row_type_tests {
     use crate::row::field_getter::FieldGetter;
     use crate::row::{DataGetters, Datum, GenericRow, InternalRow};
 
+    #[test]
+    fn projection_skips_fixed_floats_and_variable_integers_correctly() {
+        use crate::row::binary::BinaryWriter;
+        let row_type = RowType::with_data_types(vec![
+            DataTypes::float(),
+            DataTypes::double(),
+            DataTypes::bigint(),
+            DataTypes::int(),
+        ]);
+        let mut writer = CompactedRowWriter::new(4);
+        writer.write_float(1.25);
+        writer.write_double(-8.5);
+        writer.write_long(123456789);
+        writer.write_int(23);
+        let bytes = writer.to_bytes();
+        let reader = CompactedRowReader::new(4, bytes.as_ref(), 0, bytes.len());
+        let decoder = CompactedRowDeserializer::new_from_owned(row_type)
+            .with_projection(&[3])
+            .unwrap();
+        let projected = decoder.deserialize(&reader).unwrap();
+        assert_eq!(projected.get_int(3).unwrap(), 23);
+    }
+
     fn round_trip<F>(outer_row_type: &RowType, outer_row: &GenericRow, verify: F)
     where
         F: FnOnce(&GenericRow),
@@ -394,6 +484,18 @@ mod row_type_tests {
             bytes.len(),
         );
         let result = deser.deserialize(&reader).expect("deserialize");
+        for (index, getter) in field_getters.iter().enumerate() {
+            let selected = deser
+                .clone()
+                .with_projection(&[index])
+                .unwrap()
+                .deserialize(&reader)
+                .unwrap();
+            assert_eq!(
+                getter.get_field(&selected).unwrap(),
+                getter.get_field(&result).unwrap()
+            );
+        }
         verify(&result);
     }
 
@@ -539,6 +641,7 @@ mod row_type_tests {
             12,
             Datum::TimestampLtz(TimestampLtz::new(1_769_163_227_123)),
         );
+        round_trip(&inner_row_type, &inner, |_| {});
 
         let mut outer = GenericRow::new(1);
         outer.set_field(0, Datum::Row(Box::new(inner)));

@@ -301,3 +301,14 @@ profiles is still `yeqf`/`w8ap`/`cf5y`, not established by these foundation test
 Pre-commit review additionally rejects clock-unrepresentable scan deadlines as
 errors instead of panicking, and rejects ACK budgets below one millisecond before
 client conversion. Both have regression tests; final reviewed unit count is 20.
+
+## 9. Reading Arrow in gpze (working tree)
+
+A08 now uses selective compacted field traversal and selected-only Arrow builders
+in the client. Projection, duplicate references, old/new field-ID alignment and
+row-only KV COUNT are supported without the connector's full-row/count workaround.
+Preview limits select record ranges before materialization. See
+[arrow-read-inventory.md](arrow-read-inventory.md) for before/after boundaries,
+semantic changes in validation of unrequested values, concrete buffer evidence
+and retained log/format materializations. This does not eliminate raw/decode peaks
+or replace pending resource stress/throughput profiles.

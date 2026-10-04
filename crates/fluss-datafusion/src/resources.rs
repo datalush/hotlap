@@ -115,6 +115,26 @@ mod tests {
     use arrow::datatypes::Int32Type;
     use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool};
 
+    fn buffer_locations(data: &ArrayData) -> Vec<(usize, usize, usize)> {
+        let mut locations = vec![(0, data.offset(), data.len())];
+        locations.extend(
+            data.buffers()
+                .iter()
+                .map(|buffer| (buffer.as_ptr() as usize, buffer.len(), 0)),
+        );
+        if let Some(nulls) = data.nulls() {
+            locations.push((
+                nulls.buffer().as_ptr() as usize,
+                nulls.offset(),
+                nulls.len(),
+            ));
+        }
+        for child in data.child_data() {
+            locations.extend(buffer_locations(child));
+        }
+        locations
+    }
+
     #[test]
     fn lease_survives_projection_slice_and_source_drop_without_payload_copy() {
         let original = RecordBatch::try_from_iter(vec![
@@ -140,13 +160,7 @@ mod tests {
         let pointers: Vec<_> = original
             .columns()
             .iter()
-            .map(|a| {
-                a.to_data()
-                    .buffers()
-                    .iter()
-                    .map(Buffer::as_ptr)
-                    .collect::<Vec<_>>()
-            })
+            .map(|array| buffer_locations(&array.to_data()))
             .collect();
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
         let consumer = MemoryConsumer::new("source").register(&pool);
@@ -155,15 +169,7 @@ mod tests {
         let reserved = pool.reserved();
         assert!(reserved > 0);
         for (column, expected) in first.columns().iter().zip(pointers) {
-            assert_eq!(
-                column
-                    .to_data()
-                    .buffers()
-                    .iter()
-                    .map(Buffer::as_ptr)
-                    .collect::<Vec<_>>(),
-                expected
-            );
+            assert_eq!(buffer_locations(&column.to_data()), expected);
         }
         let retained = first.project(&[2]).unwrap().slice(1, 1);
         drop(first);

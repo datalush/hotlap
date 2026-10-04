@@ -876,6 +876,23 @@ async fn check_memory_pool(
     );
     drop(first);
     assert_eq!(pool.reserved(), 0);
+    let count_query = slow.sql("SELECT COUNT(*) FROM kv").await?;
+    let count_source = source_plan(&count_query.create_physical_plan().await?);
+    let count_batches =
+        collect_plan(Arc::clone(&count_source), Arc::new(count_query.task_ctx())).await?;
+    assert!(
+        count_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>()
+            > 0
+    );
+    assert!(count_batches.iter().all(|batch| batch.num_columns() == 0));
+    assert_eq!(
+        metric(&count_source.metrics().unwrap(), "arrow_decoded_bytes"),
+        0,
+        "KV COUNT must not build unrequested Arrow value columns"
+    );
     assert_eq!(
         metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
         0

@@ -26,6 +26,7 @@ use crate::row::column_vector::TypedBatch;
 use crate::row::column_writer::{ColumnWriter, round_up_to_8};
 use crate::row::{ColumnarRow, InternalRow};
 use arrow::array::{Array, ArrayBuilder, ArrayRef, new_null_array};
+use arrow::record_batch::RecordBatchOptions;
 use arrow::{
     array::RecordBatch,
     buffer::Buffer,
@@ -247,9 +248,15 @@ impl ArrowRecordBatchInnerBuilder for RowAppendRecordBatchBuilder {
             })
             .collect();
 
-        Ok(Arc::new(RecordBatch::try_new(
+        Ok(Arc::new(RecordBatch::try_new_with_options(
             self.table_schema.clone(),
             arrays?,
+            &RecordBatchOptions::new().with_row_count(
+                self.table_schema
+                    .fields()
+                    .is_empty()
+                    .then_some(self.records_count as usize),
+            ),
         )?))
     }
 
