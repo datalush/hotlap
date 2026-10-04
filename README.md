@@ -217,6 +217,55 @@ Wrong table IDs, missing buckets, offsets outside retention and schema or
 topology changes fail rather than silently completing. `LogReadOptions` in
 Rust and Python keeps these read settings separate from connection settings.
 
+### SQL writes through the same providers
+
+DataFusion `INSERT INTO` consumes Arrow batches and uses the Rust Fluss
+writer, including from Python over FFI. On a log it appends; on a KV table
+it **upserts full rows** using the primary key. The `count` returned by a
+finite INSERT counts input rows acknowledged by Fluss, not distinct KV keys.
+If the registered tables have the columns `id` and `value`, for example:
+
+```python
+from fluss_connectors.datafusion import WriteOptions
+
+# Supply optional per-connection defaults when opening a *new* Connection:
+# connection = Connection(settings, WriteOptions(ack_timeout_ms=10_000, max_retries=2))
+ctx.sql("INSERT INTO events (id, value) VALUES (1, 'new event')").collect()
+ctx.sql("INSERT INTO current (id, value) VALUES (1, 'new state')").collect()
+ctx.sql("INSERT INTO events SELECT id, value FROM another_finite_source").collect()
+```
+
+Each INSERT creates an independent Fluss writer. Its ACKs are checked after
+each input batch (also for sparse continuous inputs), writer memory remains
+bounded by the Fluss client settings, and this provider caps its own writer
+retry budget (default 3) and ACK wait (default 30s). A batch may mix Fluss
+partitions: its rows are routed individually by the client, including when
+old and new partitions have different bucket counts after rescale. An
+INSERT may have already committed some rows when a later batch errors or
+the statement is cancelled; **there is no rollback or exactly-once job
+checkpoint**. Retries of a log INSERT may append duplicates. SQL overwrite,
+update and merge are not implemented. Rust KV providers now implement
+`DELETE ... WHERE` (or all snapshot-selected keys without WHERE), using
+DataFusion predicates and Fluss deletes. It requires a table policy allowing
+deletes and does not offer conditional deletion or global isolation.
+SQL DELETE is not yet transported through the current DataFusion Python FFI.
+
+The current Rust sink charges its retained input batch to the DataFusion
+memory pool; the client writer buffer has its own per-execution limit.
+Its timeout covers enqueue plus ACK for one batch; cancellation cooperatively
+stops the blocking row loop and aborts the writer, without rollback of writes
+already sent. Fire-and-forget `writer_acks=0` is rejected for SQL DML.
+These post-dev2 changes are in the working tree: the installed dev2 wheel
+still contains the previous INSERT implementation, not Rust DELETE or this
+additional hardening. A new uniquely versioned wheel is required to ship them.
+
+A continuous `INSERT INTO destination SELECT ... FROM live_source` sends and
+acknowledges batches while the source is running. Like other unbounded DML,
+its `count` result does not appear until the input ends: start consuming its
+DataFusion `execute_stream()` in an async task and cancel the task to stop.
+For a sparse SQL filter use a small DataFusion session `batch_size` as above;
+it controls DataFusion's FilterExec coalescing, not the Fluss writer's ACK.
+
 The opt-in live FFI check queries populated log and KV tables on the isolated
 lab using `../lab/.env` and these installed wheels:
 

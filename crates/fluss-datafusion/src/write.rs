@@ -1,0 +1,446 @@
+// SPDX-License-Identifier: Apache-2.0
+//! DML sink: hand DataFusion's Arrow input to the existing Fluss writers.
+
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use arrow::datatypes::SchemaRef;
+use async_trait::async_trait;
+use datafusion::common::{DataFusionError, Result, SchemaExt};
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::MemoryConsumer;
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
+use fluss::client::{AppendWriter, FlussConnection, UpsertWriter};
+use fluss::metadata::TablePath;
+use fluss::row::ColumnarRow;
+use futures::StreamExt;
+
+/// The client controls batching/buffer sizes and ACKs; these bounds prevent an
+/// INSERT from inheriting the client's unlimited default writer retry budget.
+#[derive(Clone, Copy, Debug)]
+pub struct FlussWriteOptions {
+    pub ack_timeout: Duration,
+    pub max_retries: i32,
+}
+
+impl Default for FlussWriteOptions {
+    fn default() -> Self {
+        Self {
+            ack_timeout: Duration::from_secs(30),
+            max_retries: 3,
+        }
+    }
+}
+
+impl FlussWriteOptions {
+    /// Reject zero or unbounded deadlines/retry budgets before planning DML.
+    pub fn validate(self) -> Result<Self> {
+        if self.ack_timeout.is_zero() || self.ack_timeout > Duration::from_secs(3600) {
+            return Err(DataFusionError::Plan(
+                "Fluss write ACK timeout must be in 1ms..=3600s".into(),
+            ));
+        }
+        if self.max_retries < 1 {
+            return Err(DataFusionError::Plan(
+                "Fluss writer retries must be positive".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WriteKind {
+    Log,
+    Kv,
+    DeleteKv,
+}
+
+pub(crate) struct FlussWriteTarget {
+    pub(crate) connection: Arc<FlussConnection>,
+    pub(crate) path: TablePath,
+    pub(crate) table_id: i64,
+    pub(crate) schema_id: i32,
+    pub(crate) schema: SchemaRef,
+    pub(crate) kind: WriteKind,
+    pub(crate) options: FlussWriteOptions,
+}
+
+struct FlussSink {
+    connection: Arc<FlussConnection>,
+    path: TablePath,
+    table_id: i64,
+    schema_id: i32,
+    schema: SchemaRef,
+    kind: WriteKind,
+    options: FlussWriteOptions,
+}
+
+impl fmt::Debug for FlussSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlussSink")
+            .field("path", &self.path)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+pub(crate) fn plan_insert(
+    target: FlussWriteTarget,
+    input: Arc<dyn ExecutionPlan>,
+    insert_op: InsertOp,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if insert_op != InsertOp::Append {
+        return Err(DataFusionError::NotImplemented(format!(
+            "Fluss does not support {insert_op}; INSERT INTO is append for logs and upsert for KV"
+        )));
+    }
+    target
+        .schema
+        .logically_equivalent_names_and_types(&input.schema())?;
+    let sink = FlussSink {
+        connection: target.connection,
+        path: target.path,
+        table_id: target.table_id,
+        schema_id: target.schema_id,
+        schema: target.schema,
+        kind: target.kind,
+        options: target.options.validate()?,
+    };
+    Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+}
+
+impl DisplayAs for FlussSink {
+    fn fmt_as(&self, _format: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "FlussWriteSink: kind={:?}, table={}",
+            self.kind, self.path
+        )
+    }
+}
+
+/// Each INSERT uses its own writer client, so flushing/closing it cannot
+/// acknowledge or cancel another INSERT on the shared read connection.
+struct CloseWriterOnDrop {
+    connection: Option<Arc<FlussConnection>>,
+    timeout: Duration,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CloseWriterOnDrop {
+    async fn close(mut self) -> Result<()> {
+        if let Some(connection) = &self.connection {
+            connection.close(self.timeout).await.map_err(fluss_error)?;
+        }
+        self.connection.take();
+        Ok(())
+    }
+}
+
+impl Drop for CloseWriterOnDrop {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(connection) = self.connection.take() {
+            // Abort synchronously: cancellation must also wake a blocking
+            // enqueue, and must not depend on another runtime task running.
+            connection.abort_writes();
+        }
+    }
+}
+
+enum FlussWriter {
+    Log(AppendWriter),
+    Kv(UpsertWriter),
+    DeleteKv(UpsertWriter),
+}
+
+impl FlussWriter {
+    fn enqueue(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+        row_type: Arc<fluss::metadata::RowType>,
+        cancelled: &AtomicBool,
+    ) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        // Build typed column views once; route *each* row so a DataFusion
+        // batch may contain several Fluss partitions/buckets safely.
+        let mut row =
+            ColumnarRow::new(Arc::new(batch.clone()), row_type, 0, None).map_err(fluss_error)?;
+        for id in 0..batch.num_rows() {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(DataFusionError::Execution(
+                    "Fluss write cancelled; in-flight writes may have been committed".into(),
+                ));
+            }
+            row.set_row_id(id);
+            match self {
+                Self::Log(writer) => {
+                    drop(writer.append(&row).map_err(fluss_error)?);
+                }
+                Self::Kv(writer) => {
+                    drop(writer.upsert(&row).map_err(fluss_error)?);
+                }
+                Self::DeleteKv(writer) => {
+                    drop(writer.delete(&row).map_err(fluss_error)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<()> {
+        match self {
+            Self::Log(writer) => writer.flush().await.map_err(fluss_error),
+            Self::Kv(writer) | Self::DeleteKv(writer) => writer.flush().await.map_err(fluss_error),
+        }
+    }
+}
+
+#[async_trait]
+impl DataSink for FlussSink {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut input: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> Result<u64> {
+        let mut config = self.connection.config().clone();
+        validate_ack_policy(&config.writer_acks)?;
+        config.writer_retries = config.writer_retries.min(self.options.max_retries);
+        config.writer_buffer_wait_timeout_ms = config
+            .writer_buffer_wait_timeout_ms
+            .min(self.options.ack_timeout.as_millis() as u64);
+        let connection = Arc::new(FlussConnection::new(config).await.map_err(fluss_error)?);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let close = CloseWriterOnDrop {
+            connection: Some(Arc::clone(&connection)),
+            timeout: self.options.ack_timeout,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let table = connection
+            .get_table(&self.path)
+            .await
+            .map_err(fluss_error)?;
+        self.check_identity(&table)?;
+        if matches!(self.kind, WriteKind::DeleteKv) {
+            validate_delete_policy(table.get_table_info().get_properties())?;
+        }
+        if table.get_table_info().is_partitioned() {
+            // WriterClient routes synchronously from its metadata cache. Old
+            // partitions can have different counts after a table rescale.
+            let ids = connection
+                .get_admin()
+                .map_err(fluss_error)?
+                .list_partition_infos(&self.path)
+                .await
+                .map_err(fluss_error)?
+                .iter()
+                .map(|partition| partition.get_partition_id())
+                .collect::<Vec<_>>();
+            connection
+                .get_metadata()
+                .check_and_update_partition_metadata_by_ids(&self.path, &ids)
+                .await
+                .map_err(fluss_error)?;
+        }
+        let row_type = Arc::new(table.get_table_info().get_row_type().clone());
+        let writer = Arc::new(match self.kind {
+            WriteKind::Log => FlussWriter::Log(
+                table
+                    .new_append()
+                    .map_err(fluss_error)?
+                    .create_writer()
+                    .map_err(fluss_error)?,
+            ),
+            WriteKind::Kv => FlussWriter::Kv(
+                table
+                    .new_upsert()
+                    .map_err(fluss_error)?
+                    .create_writer()
+                    .map_err(fluss_error)?,
+            ),
+            WriteKind::DeleteKv => FlussWriter::DeleteKv(
+                table
+                    .new_upsert()
+                    .map_err(fluss_error)?
+                    .create_writer()
+                    .map_err(fluss_error)?,
+            ),
+        });
+        let mut confirmed = 0_u64;
+        while let Some(next) = input.next().await {
+            let batch = next?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let current = connection
+                .get_table(&self.path)
+                .await
+                .map_err(fluss_error)?;
+            self.check_identity(&current)?;
+            if matches!(self.kind, WriteKind::DeleteKv) {
+                validate_delete_policy(current.get_table_info().get_properties())?;
+            }
+            self.schema
+                .logically_equivalent_names_and_types(&batch.schema())?;
+            validate_required_values(&self.schema, &batch)?;
+            let rows = batch.num_rows() as u64;
+            let deadline = tokio::time::Instant::now() + self.options.ack_timeout;
+            // Own a reservation until the blocking task releases its retained
+            // batch, even when its async caller is cancelled. Source/operator
+            // reservations remain separate and may overlap conservatively.
+            let reservation =
+                MemoryConsumer::new("FlussWriteBatch").register(&context.runtime_env().memory_pool);
+            reservation.try_grow(batch.get_array_memory_size())?;
+            // Fluss's bounded writer memory limiter can wait synchronously.
+            // Do not block the Tokio worker needed by its sender task.
+            let batch_writer = Arc::clone(&writer);
+            let batch_row_type = Arc::clone(&row_type);
+            let stop = Arc::clone(&cancelled);
+            let enqueue = tokio::task::spawn_blocking(move || {
+                let _reservation = reservation;
+                batch_writer.enqueue(batch, batch_row_type, &stop)
+            });
+            tokio::time::timeout_at(deadline, enqueue)
+                .await
+                .map_err(|_| write_timeout())?
+                .map_err(|error| DataFusionError::External(Box::new(error)))??;
+            // Confirm *each* input batch, including a singleton from a sparse
+            // unbounded source. Waiting for EOF would never flush streaming DML.
+            tokio::time::timeout_at(deadline, writer.flush())
+                .await
+                .map_err(|_| write_timeout())??;
+            confirmed = confirmed.checked_add(rows).ok_or_else(|| {
+                DataFusionError::Execution("Fluss inserted row count overflowed".into())
+            })?;
+        }
+        close.close().await?;
+        Ok(confirmed)
+    }
+}
+
+impl FlussSink {
+    fn check_identity(&self, table: &fluss::client::FlussTable<'_>) -> Result<()> {
+        let info = table.get_table_info();
+        if info.table_id != self.table_id || info.get_schema_id() != self.schema_id {
+            return Err(DataFusionError::Execution(
+                "Fluss write destination changed table identity or schema; plan again".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn fluss_error(error: fluss::error::Error) -> DataFusionError {
+    DataFusionError::External(Box::new(error))
+}
+
+fn write_timeout() -> DataFusionError {
+    DataFusionError::Execution(
+        "Fluss write enqueue/ACK timed out; in-flight writes may have been committed".into(),
+    )
+}
+
+fn validate_ack_policy(acks: &str) -> Result<()> {
+    if acks.eq_ignore_ascii_case("all")
+        || acks.parse::<i16>().is_ok_and(|ack| ack == -1 || ack == 1)
+    {
+        Ok(())
+    } else {
+        Err(DataFusionError::Plan(
+            "Fluss SQL writes require writer_acks=all, -1 or 1 for server-confirmed counts".into(),
+        ))
+    }
+}
+
+pub(crate) fn validate_delete_policy(
+    properties: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let behavior = properties
+        .get("table.delete.behavior")
+        .map(String::as_str)
+        .unwrap_or_else(|| {
+            if properties.contains_key("table.merge-engine") {
+                "ignore"
+            } else {
+                "allow"
+            }
+        });
+    if behavior.eq_ignore_ascii_case("allow") {
+        Ok(())
+    } else {
+        Err(DataFusionError::Plan(format!(
+            "Fluss SQL DELETE requires table.delete.behavior=allow; effective behavior is {behavior}"
+        )))
+    }
+}
+
+fn validate_required_values(
+    schema: &SchemaRef,
+    batch: &arrow::record_batch::RecordBatch,
+) -> Result<()> {
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if !field.is_nullable() && column.null_count() != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "Fluss write column '{}' is required but contains null values",
+                field.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn server_confirmed_counts_require_an_ack_policy() {
+        for policy in ["all", "ALL", "-1", "1"] {
+            assert!(validate_ack_policy(policy).is_ok());
+        }
+        for policy in ["0", "2", "garbage"] {
+            assert!(validate_ack_policy(policy).is_err());
+        }
+    }
+
+    #[test]
+    fn deletes_never_report_success_for_an_ignoring_merge_engine() {
+        use std::collections::HashMap;
+        assert!(validate_delete_policy(&HashMap::new()).is_ok());
+        let mut config = HashMap::from([("table.merge-engine".into(), "versioned".into())]);
+        assert!(validate_delete_policy(&config).is_err());
+        config.insert("table.delete.behavior".into(), "allow".into());
+        assert!(validate_delete_policy(&config).is_ok());
+        for behavior in ["ignore", "disable"] {
+            config.insert("table.delete.behavior".into(), behavior.into());
+            assert!(validate_delete_policy(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn nullable_input_cannot_hide_nulls_in_a_required_destination() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
+        )])
+        .unwrap();
+        assert!(validate_required_values(&schema, &batch).is_err());
+        assert!(validate_required_values(&schema, &batch.slice(0, 1)).is_ok());
+    }
+}

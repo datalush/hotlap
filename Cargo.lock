@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "fluss-datafusion-python"
-version = "0.1.0"
+version = "0.1.1-dev.2"
 dependencies = [
  "datafusion",
  "datafusion-ffi",

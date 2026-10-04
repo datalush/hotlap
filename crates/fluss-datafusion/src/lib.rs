@@ -18,9 +18,11 @@ mod metrics;
 mod offsets;
 mod partitions;
 mod scan;
+mod write;
 
 pub use catalog::FlussCatalog;
 pub use kv_table::FlussKvTable;
 pub use log_options::{LogReadMode, LogReadOptions, LogStart};
 pub use log_progress::LogDelivery;
 pub use log_table::FlussLogTable;
+pub use write::FlussWriteOptions;

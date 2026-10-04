@@ -9,6 +9,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result};
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -23,6 +24,7 @@ use crate::log_progress::LogDelivery;
 use crate::offsets::{OffsetWindow, SharedCaptures};
 use crate::partitions::{DEFAULT_MAX_ASSIGNED_BUCKETS, PartitionFilter};
 use crate::scan::{PartitionedOffsets, ScanSpec};
+use crate::write::{FlussWriteOptions, FlussWriteTarget, WriteKind, plan_insert};
 
 /// Append-only log table with parallel batch or continuous physical partitions.
 pub struct FlussLogTable {
@@ -39,6 +41,7 @@ pub struct FlussLogTable {
     max_partitions: Option<usize>,
     max_assigned_buckets: usize,
     deliveries: tokio::sync::broadcast::Sender<LogDelivery>,
+    write_options: FlussWriteOptions,
 }
 
 impl FlussLogTable {
@@ -105,6 +108,7 @@ impl FlussLogTable {
             max_partitions: None,
             max_assigned_buckets: DEFAULT_MAX_ASSIGNED_BUCKETS,
             deliveries: tokio::sync::broadcast::channel(1024).0,
+            write_options: FlussWriteOptions::default(),
         })
     }
 
@@ -134,6 +138,12 @@ impl FlussLogTable {
             ));
         }
         self.max_assigned_buckets = limit;
+        Ok(self)
+    }
+
+    /// Bound per-execution ACK waits and writer retries for DataFusion INSERT.
+    pub fn with_write_options(mut self, options: FlussWriteOptions) -> Result<Self> {
+        self.write_options = options.validate()?;
         Ok(self)
     }
 
@@ -267,6 +277,27 @@ impl TableProvider for FlussLogTable {
             groups,
             description,
         )))
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        plan_insert(
+            FlussWriteTarget {
+                connection: Arc::clone(&self.connection),
+                path: self.path.clone(),
+                table_id: self.table_id,
+                schema_id: self.schema_id,
+                schema: Arc::clone(&self.schema),
+                kind: WriteKind::Log,
+                options: self.write_options,
+            },
+            input,
+            insert_op,
+        )
     }
 }
 

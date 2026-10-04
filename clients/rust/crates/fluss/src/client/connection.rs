@@ -96,6 +96,15 @@ impl FlussConnection {
         Ok(())
     }
 
+    /// Abort this connection's writer without waiting for a graceful drain.
+    /// Reads are unaffected. In-flight server writes cannot be rolled back.
+    pub fn abort_writes(&self) {
+        let writer = self.writer_client.write().take();
+        if let Some(writer) = writer {
+            writer.abort();
+        }
+    }
+
     pub fn get_metadata(&self) -> Arc<Metadata> {
         self.metadata.clone()
     }

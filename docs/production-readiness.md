@@ -1,7 +1,8 @@
 # Production-readiness status
 
-The native DataFusion providers are read-only SQL sources for Fluss logs and
-current KV state. Their consistency guarantees are described in
+The native DataFusion providers scan Fluss logs and current KV state, and
+implement SQL `INSERT INTO` through the existing Rust Fluss writers. Their
+consistency guarantees are described in
 [reading-semantics.md](reading-semantics.md). A KV scan has one snapshot **per
 bucket**, not an atomic cross-bucket snapshot.
 
@@ -54,6 +55,35 @@ bucket**, not an atomic cross-bucket snapshot.
 - An execution-time budget (default 16,384 selected partition/bucket pairs)
   rejects larger scans instead of silently omitting buckets. Use
   `with_max_assigned_buckets` to choose a deliberate larger budget.
+- SQL `INSERT INTO` appended log rows, performed an `INSERT ... SELECT`
+  between Fluss tables and upserted KV keys; counts reflected acknowledged
+  inputs, while subsequent SQL scans checked actual values. Two concurrent
+  inserts used separate writers. A physical INSERT plan refused to write to
+  a table dropped and recreated under the same path. Mixed-partition Arrow
+  batches routed across old two-bucket and new three-bucket layouts for both
+  log and KV. A 4 MiB SQL input completed with only a 2 MiB Fluss writer
+  buffer (routing rows on Tokio's blocking pool instead of stalling its
+  sender). One `INSERT ... SELECT` from an unbounded Fluss log delivered
+  and acknowledged each batch before source EOF; cancellation stopped the
+  query and later source writes did not reach the destination. Python 55 FFI
+  separately checked finite log/KV INSERTs and a continuous INSERT visible
+  to another query before cancellation. Rust-release wheels for the write
+  change (`fluss-datafusion-native` and `fluss-connectors` 0.1.1.dev2) were
+  installed with the pinned DataFusion Python 55 release wheel in a fresh
+  Python 3.12 virtualenv: all six Python tests and `uv pip check` passed.
+  The same wheels in `lab/python-lab` passed its two targeted DataFusion
+  integration tests. Partial writes cannot be rolled back or reported as
+  a fully successful operation.
+- Subsequent Rust working-tree hardening charges retained sink batches to the
+  query pool and shares a deadline between enqueue/ACK. The 4 MiB input still
+  completed with a 2 MiB writer buffer, released pool reservations, and a
+  one-byte DataFusion pool rejected an INSERT before its row was written.
+  Unit tests reject fire-and-forget ACK policies and nulls in required columns.
+  SQL DELETE KV passed exact filtering, no matches, all rows and partitioned
+  deletion after rescale; configured/implicit ignore policies are rejected.
+  These additions are not in the already-installed dev2 wheel. Cancelling
+  under a blocked ACK or saturated buffer still requires targeted verification;
+  Python DELETE/MERGE FFI, MERGE planning and sustained acceptance are pending.
 
 ## Verified in a separate Docker server profile
 

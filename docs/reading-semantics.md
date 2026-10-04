@@ -131,8 +131,46 @@ prefetch or batches retained by downstream operators: size the client fetch
 settings and DataFusion target parallelism accordingly. With the default
 unbounded DataFusion pool, it is accounting rather than a memory limit.
 
-The read-only catalog discovers names once; reload it after creating tables.
+The catalog discovers names once; reload it after creating tables.
 It selects the log or KV provider from the table's primary-key metadata.
+
+`INSERT INTO` is a sink operation on either provider. The target schema and
+table ID/schema ID are checked before writing and on each input batch.
+DataFusion passes one asynchronous stream of Arrow batches to a writer
+isolated for that statement. The existing Fluss client does the per-row
+routing; this is necessary when a batch mixes partitions with different
+historical bucket counts. On append-only logs, INSERT appends. On KV tables,
+INSERT performs full-row upsert; duplicate keys in one input count as two
+submitted rows, and unordered parallel inputs have no guaranteed winner.
+The sink waits for ACK after each batch, even when the input never ends.
+The final `count` is available only after the source reaches EOF. Cancellation
+or a later failure leaves already committed rows intact; no cross-batch
+rollback, source/sink checkpoint, or exactly-once execution is promised.
+Writer buffer budgets and ACK policy belong to Fluss Config; separate sink
+options cap ACK waiting and retry attempts.
+
+The sink reserves its retained Arrow batch in the DataFusion pool before
+enqueueing it. That reservation travels with the blocking worker and is
+released when the worker drops its batch, even after async cancellation.
+Reservations from input operators may overlap conservatively with it; the
+Fluss writer's encoded buffer is a separate per-writer budget. A single
+deadline covers enqueueing and flushing one batch. Cancellation marks the
+row loop stopped and aborts the dedicated writer synchronously, waking any
+producer waiting for buffer space; requests already sent may still commit.
+Counts require `writer_acks=all`, `-1`, or `1`; fire-and-forget ACK mode is
+rejected. Required destination columns are checked for nulls before enqueue.
+
+Rust `DELETE FROM kv WHERE ...` composes the existing finite KV scan with
+DataFusion's exact predicate evaluation and submits selected keys to the
+Fluss delete writer. No filter selects all snapshot rows; no matches returns
+zero. The count is acknowledged delete operations on selected snapshot rows,
+not proof of how many rows existed at the instant the deletes reached the
+server. Concurrent changes can be overwritten by a delete selected earlier:
+there is no conditional write or statement-wide isolation. Table policy must
+allow deletes; `ignore`/`disable`, including implicit `ignore` for a configured
+merge engine, is rejected before sending. DataFusion FFI 55.1 does **not**
+carry `delete_from`, so this SQL DELETE path is not available through the
+current Python provider; coordinated FFI support and MERGE remain pending.
 
 The DuckDB/Polars/pandas Python adapters take **already bounded** PyArrow
 results from the existing binding; they are not live Fluss table providers.

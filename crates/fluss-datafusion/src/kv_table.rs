@@ -8,8 +8,11 @@ use std::time::Duration;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DataFusionError, Result};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+use datafusion::datasource::provider_as_source;
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::streaming::StreamingTableExec;
@@ -22,20 +25,26 @@ use crate::kv_scan::KvScanSpec;
 use crate::log_table::bucket_groups;
 use crate::offsets::SharedCaptures;
 use crate::partitions::{DEFAULT_MAX_ASSIGNED_BUCKETS, PartitionFilter};
+use crate::write::{
+    FlussWriteOptions, FlussWriteTarget, WriteKind, plan_insert, validate_delete_policy,
+};
 
 /// Each execution opens a fresh snapshot per bucket. There is no global
 /// cross-bucket transaction or shared snapshot across repeated SQL queries.
+#[derive(Clone)]
 pub struct FlussKvTable {
     connection: Arc<FlussConnection>,
     path: TablePath,
     schema: SchemaRef,
     table_id: i64,
+    schema_id: i32,
     buckets: i32,
     partitioned: bool,
     partition_keys: Vec<String>,
     timeout: Duration,
     max_partitions: Option<usize>,
     max_assigned_buckets: usize,
+    write_options: FlussWriteOptions,
 }
 
 impl FlussKvTable {
@@ -59,6 +68,7 @@ impl FlussKvTable {
         }
         let schema = to_arrow_schema(info.get_row_type()).map_err(fluss_error)?;
         let table_id = info.table_id;
+        let schema_id = info.get_schema_id();
         let buckets = info.get_num_buckets();
         let partitioned = info.is_partitioned();
         let partition_keys = info.get_partition_keys().iter().cloned().collect();
@@ -71,12 +81,14 @@ impl FlussKvTable {
             path,
             schema,
             table_id,
+            schema_id,
             buckets,
             partitioned,
             partition_keys,
             timeout,
             max_partitions: None,
             max_assigned_buckets: DEFAULT_MAX_ASSIGNED_BUCKETS,
+            write_options: FlussWriteOptions::default(),
         })
     }
 
@@ -99,6 +111,12 @@ impl FlussKvTable {
             ));
         }
         self.max_assigned_buckets = limit;
+        Ok(self)
+    }
+
+    /// Bound per-execution ACK waits and writer retries for DataFusion INSERT.
+    pub fn with_write_options(mut self, options: FlussWriteOptions) -> Result<Self> {
+        self.write_options = options.validate()?;
         Ok(self)
     }
 }
@@ -199,6 +217,74 @@ impl TableProvider for FlussKvTable {
             groups,
             description,
         )))
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        plan_insert(
+            FlussWriteTarget {
+                connection: Arc::clone(&self.connection),
+                path: self.path.clone(),
+                table_id: self.table_id,
+                schema_id: self.schema_id,
+                schema: Arc::clone(&self.schema),
+                kind: WriteKind::Kv,
+                options: self.write_options,
+            },
+            input,
+            insert_op,
+        )
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let table = self
+            .connection
+            .get_table(&self.path)
+            .await
+            .map_err(fluss_error)?;
+        validate_delete_policy(table.get_table_info().get_properties())?;
+        // Let DataFusion evaluate SQL predicates on the finite KV snapshot;
+        // pass full selected rows to the existing key-encoding delete writer.
+        let mut builder = LogicalPlanBuilder::scan(
+            self.path.table(),
+            provider_as_source(Arc::new(self.clone())),
+            None,
+        )?;
+        for filter in filters {
+            let filter = filter
+                .transform_up(|expr| {
+                    if let Expr::Column(mut column) = expr {
+                        column.relation = None;
+                        Ok(Transformed::yes(Expr::Column(column)))
+                    } else {
+                        Ok(Transformed::no(expr))
+                    }
+                })?
+                .data;
+            builder = builder.filter(filter)?;
+        }
+        let input = state.create_physical_plan(&builder.build()?).await?;
+        plan_insert(
+            FlussWriteTarget {
+                connection: Arc::clone(&self.connection),
+                path: self.path.clone(),
+                table_id: self.table_id,
+                schema_id: self.schema_id,
+                schema: Arc::clone(&self.schema),
+                kind: WriteKind::DeleteKv,
+                options: self.write_options,
+            },
+            input,
+            InsertOp::Append,
+        )
     }
 }
 

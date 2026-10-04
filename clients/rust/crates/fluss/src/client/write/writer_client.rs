@@ -260,6 +260,20 @@ impl WriterClient {
         Ok(())
     }
 
+    /// Stop producing immediately and wake producers waiting for buffer space.
+    /// Already sent requests may still be applied by the server: this is not
+    /// rollback. Intended for cancellation of a dedicated writer session.
+    pub fn abort(&self) {
+        self.accumulate.close();
+        if let Some(handle) = self.sender_join_handle.lock().take() {
+            handle.abort();
+        }
+        self.shutdown_tx.lock().take();
+        self.accumulate.abort_batches(broadcast::Error::Client {
+            message: "Writer aborted; in-flight writes may have been committed".into(),
+        });
+    }
+
     pub async fn flush(&self) -> Result<()> {
         self.accumulate.begin_flush()?;
         self.accumulate.await_flush_completion().await?;
