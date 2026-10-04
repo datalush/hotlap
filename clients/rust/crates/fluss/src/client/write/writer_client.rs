@@ -119,11 +119,7 @@ impl WriterClient {
     }
 
     pub fn send(&self, record: &WriteRecord<'_>) -> Result<ResultHandle> {
-        if self.accumulate.is_closed() {
-            return Err(Error::WriterClosed {
-                message: "Cannot send: writer is closed".to_string(),
-            });
-        }
+        self.check_open()?;
         let physical_table_path = &record.physical_table_path;
         let cluster = self.metadata.get_cluster();
         // A dropped table is missing here once its metadata is evicted. Report the
@@ -145,18 +141,50 @@ impl WriterClient {
             &cluster,
         )?;
 
+        self.send_assigned(record, &cluster, bucket_assigner, bucket_id)
+    }
+
+    /// A batch splitter must use the same immutable metadata snapshot for
+    /// grouping and enqueue. Re-hashing a representative key against a newer
+    /// table layout could send the other rows in that group to the wrong bucket.
+    pub(crate) fn cluster(&self) -> Arc<Cluster> {
+        self.metadata.get_cluster()
+    }
+
+    pub(crate) fn send_assigned(
+        &self,
+        record: &WriteRecord<'_>,
+        cluster: &Arc<Cluster>,
+        bucket_assigner: Arc<dyn BucketAssigner>,
+        bucket_id: BucketId,
+    ) -> Result<ResultHandle> {
+        self.check_open()?;
+        if matches!(
+            record.record(),
+            crate::client::Record::Log(crate::client::LogWriteRecord::RecordBatch(_))
+        ) && record.estimated_record_size() > self.max_request_size as usize
+        {
+            return Err(Error::IllegalArgument {
+                message: format!(
+                    "Arrow batch estimate exceeds writer_request_max_size={}",
+                    self.max_request_size
+                ),
+            });
+        }
+        let bucket_key = record.bucket_key.as_ref();
+
         let mut result = self.accumulate.append(
             record,
             bucket_id,
-            &cluster,
+            cluster,
             bucket_assigner.abort_if_batch_full(),
         )?;
 
         if result.abort_record_for_new_batch {
             let prev_bucket_id = bucket_id;
-            bucket_assigner.on_new_batch(&cluster, prev_bucket_id);
-            let bucket_id = bucket_assigner.assign_bucket(bucket_key, &cluster)?;
-            result = self.accumulate.append(record, bucket_id, &cluster, false)?;
+            bucket_assigner.on_new_batch(cluster, prev_bucket_id);
+            let bucket_id = bucket_assigner.assign_bucket(bucket_key, cluster)?;
+            result = self.accumulate.append(record, bucket_id, cluster, false)?;
         }
 
         if result.batch_is_full || result.new_batch_created {
@@ -165,13 +193,29 @@ impl WriterClient {
 
         Ok(result.result_handle.expect("result_handle should exist"))
     }
-    fn assign_bucket(
+    pub(crate) fn check_open(&self) -> Result<()> {
+        if self.accumulate.is_closed() {
+            return Err(Error::WriterClosed {
+                message: "Cannot send: writer is closed".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn arrow_batch_size(&self) -> usize {
+        (self.config.writer_batch_size as usize)
+            .min(self.config.writer_buffer_memory_size)
+            .min(self.max_request_size as usize)
+    }
+
+    pub(crate) fn assign_bucket(
         &self,
         table_info: &Arc<TableInfo>,
         bucket_key: Option<&Bytes>,
         table_path: &Arc<PhysicalTablePath>,
         cluster: &Arc<Cluster>,
     ) -> Result<(Arc<dyn BucketAssigner>, BucketId)> {
+        self.check_open()?;
         let current = cluster.get_table(table_path.get_table_path())?;
         let partition_id = cluster.get_partition_id(table_path);
         let count = if current.is_partitioned() {

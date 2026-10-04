@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Source reservations follow Arrow buffer ownership, not the next stream poll.
+//! Source and columnar sink reservations follow Arrow buffer ownership.
 
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};

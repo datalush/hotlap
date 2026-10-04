@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 pub(crate) mod broadcast;
-mod bucket_assigner;
+pub(crate) mod bucket_assigner;
 
 mod sender;
 mod write_format;
@@ -75,7 +75,10 @@ impl<'a> WriteRecord<'a> {
                 );
                 crate::record::kv::RECORD_BATCH_HEADER_SIZE + record_size
             }
-            Record::Log(_) => 0, // Arrow batches use record count, not byte size
+            Record::Log(LogWriteRecord::RecordBatch(batch)) => {
+                crate::record::estimate_append_batch_size(batch).unwrap_or(usize::MAX)
+            }
+            Record::Log(LogWriteRecord::InternalRow(_)) => 0,
         }
     }
 }

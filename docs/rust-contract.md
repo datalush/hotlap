@@ -178,7 +178,7 @@ allocator, scheduler or engine-recovery loop.
 | Decoded pending source batches | Client produces them; connector charges decoded bounded/streaming reader queues after polling, before output | Queue accounting implemented in `tq3s`; pre-decode/unfinished-poll transients and hard bounds remain `gpze`/`w8ap` |
 | Offered source batches | Arrow buffer owners retain whole-batch backing-storage leases across clones/slices/projections until final buffer drop | Implemented in `tq3s`; retained batches can remain charged after stream completion/cancellation |
 | Operator-retained state | Native DF operators use their real session pool where their implementation reserves it | Preserve native context/planning: `re7r`, `tq3s` |
-| Sink input batch held by worker | Charge before enqueue and keep guard alive until worker no longer holds it, including cancellation | Existing guard retained; saturation verification: `yeqf` |
+| Sink input/gather Arrow batches | Log backing leases follow client-held buffers beyond enqueue/worker drop; KV worker guard covers row encoding; client routing scratch is admitted against the same pool | Implemented columnar ownership in `3etr`; saturation/actual byte verification: `yeqf` |
 | Encoded writer queue | Existing client buffer limiter and permits; admission/release across send/ACK/abort | Audit actual buffers vs estimates: `3etr`, `yeqf` |
 | MERGE key set and encoding scratch | Account necessary keys/overhead with DF pool; scratch scales with key work, not arbitrary non-key payload | Current conservative full-batch estimate: `yeqf`, `9h56` |
 | Remote files/download slots | Existing client disk-byte and concurrency permits, actual written bytes and cleanup | Retain separate budget: `w8ap` |
@@ -253,6 +253,15 @@ connection close can retroactively undo requests already applied by Fluss.
   EOF. A terminal error is not replaced by a successful partial-count batch.
 - Supported ACK modes are `all`/`-1` and `1`. ACK=1 is not the same replication
   guarantee as `all`; retain the policy in diagnostics. ACK=0 is rejected.
+
+### Arrow batch implementation (`3etr`)
+
+The log sink now uses the client's Arrow batch route for finite and continuous
+input. Mixed partitions use effective layouts; contiguous groups share backings,
+interleaved groups use Arrow take, and byte slices preserve client backpressure.
+Input and cast/gather leases use the real session pool until final buffer release.
+See [arrow-write-inventory.md](arrow-write-inventory.md) for named copy boundaries,
+KV's required row-format encoding, admission estimates and verification.
 
 ### Independent operation knowledge (`bqrq`)
 

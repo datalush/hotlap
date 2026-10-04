@@ -724,7 +724,11 @@ async fn sql_insert_routes_mixed_partitions_after_rescale() -> TestResult<()> {
             ready_partition(&admin, path, "north", 2).await?;
             ready_partition(&admin, path, "south", 2).await?;
         }
-        let ctx = SessionContext::new();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new().with_target_partitions(1),
+            Arc::new(RuntimeEnvBuilder::new().with_memory_pool(Arc::clone(&pool)).build()?),
+        );
         ctx.register_table("events", Arc::new(
             FlussLogTable::open(Arc::clone(&connection), log.clone(), Duration::from_secs(45)).await?
         ))?;
@@ -753,6 +757,72 @@ async fn sql_insert_routes_mixed_partitions_after_rescale() -> TestResult<()> {
             let result = ctx.sql(&format!("SELECT COUNT(*) FROM {dest} WHERE region = 'west'")).await?.collect().await?;
             assert_eq!(result[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0), 1);
         }
+        // One physical input batch interleaves old/new partitions and many
+        // bucket keys. Check exact native bucket membership and per-bucket
+        // input order, not merely the total across all buckets.
+        let ids = (1000..1096).rev().collect::<Vec<i32>>();
+        let regions = (0..ids.len()).map(|i| if i % 2 == 0 { "north" } else { "west" }).collect::<Vec<_>>();
+        let values = ids.iter().enumerate().map(|(i, id)| (i % 7 != 0).then(|| format!("arrow-{id}"))).collect::<Vec<_>>();
+        ctx.register_batch("mixed_arrow", RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int32Array::from(ids.clone())) as ArrayRef),
+            ("region", Arc::new(StringArray::from(regions.clone())) as ArrayRef),
+            ("value", Arc::new(StringArray::from(values.clone())) as ArrayRef),
+        ])?)?;
+        // Earlier KV SELECT results remain retained in this scope, with their
+        // own source leases. Only this INSERT's additional charge must vanish.
+        let reserved_before_insert = pool.reserved();
+        assert_eq!(rows_written(&ctx.sql("INSERT INTO events SELECT id, region, value FROM mixed_arrow").await?.collect().await?), 96);
+        assert_eq!(pool.reserved(), reserved_before_insert, "ACKed slices/gathers must release sink leases without freeing retained source results");
+        let partitions = admin.list_partition_infos(&log).await?;
+        connection.get_metadata().update_table_metadata(&log).await?;
+        connection.get_metadata().check_and_update_partition_metadata_by_ids(&log, &partitions.iter().map(|p| p.get_partition_id()).collect::<Vec<_>>()).await?;
+        let table = connection.get_table(&log).await?;
+        let mut counts = std::collections::HashMap::new();
+        let mut starts = std::collections::HashMap::new();
+        let mut expected = std::collections::HashMap::<_, Vec<_>>::new();
+        for partition in &partitions {
+            if !["north", "west"].contains(&partition.get_partition_name().as_str()) { continue; }
+            let count = partition.get_bucket_count().expect("coordinator reports effective layout");
+            assert_eq!(count, if partition.get_partition_name() == "north" { 2 } else { 3 });
+            counts.insert(partition.get_partition_id(), count);
+            for bucket in 0..count { starts.insert((partition.get_partition_id(), bucket), 0); }
+        }
+        // The existing native row API is the reference: do not reproduce its
+        // private hash/routing implementation inside the connector's tests.
+        let reference = table.new_append()?.create_writer()?;
+        for (index, &id) in ids.iter().enumerate() {
+            let mut row = GenericRow::new(3);
+            row.set_field(0, id);
+            row.set_field(1, regions[index].to_owned());
+            row.set_field(2, format!("reference-{id}"));
+            reference.append(&row)?;
+        }
+        reference.flush().await?;
+        let expected_values = ids.iter().copied().zip(values).collect::<std::collections::HashMap<_, _>>();
+        let scanner = table.new_scan().create_record_batch_log_scanner()?;
+        scanner.subscribe_partition_buckets_with_counts(&starts, counts).await?;
+        let mut observed = std::collections::HashMap::<_, Vec<_>>::new();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while observed.values().map(Vec::len).sum::<usize>() < ids.len() || expected.values().map(Vec::len).sum::<usize>() < ids.len() {
+                for batch in scanner.poll(Duration::from_secs(1)).await? {
+                    let ids = batch.batch().column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                    let values = batch.batch().column(2).as_any().downcast_ref::<StringArray>().unwrap();
+                    for row in 0..ids.len() {
+                        if ids.value(row) < 1000 { continue; }
+                        let bucket = (batch.bucket().partition_id().unwrap(), batch.bucket().bucket_id());
+                        if !values.is_null(row) && values.value(row).starts_with("reference-") {
+                            expected.entry(bucket).or_default().push((ids.value(row), expected_values[&ids.value(row)].clone()));
+                        } else {
+                            observed.entry(bucket).or_default().push((ids.value(row), (!values.is_null(row)).then(|| values.value(row).to_owned())));
+                        }
+                    }
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }).await??;
+        assert_eq!(observed, expected);
+        assert_eq!(expected.len(), 5, "exercise all old2/new3 destination groups");
+        for (partition, bucket) in starts.keys() { scanner.unsubscribe_partition(*partition, *bucket).await?; }
         let merged = ctx.sql(
             "MERGE INTO state AS t USING (VALUES (1, 'north', 'merged'), (12, 'west', 'merge-insert')) AS s(id, region, value) ON t.id = s.id AND t.region = s.region WHEN MATCHED THEN UPDATE SET value = s.value WHEN NOT MATCHED THEN INSERT (id, region, value) VALUES (s.id, s.region, s.value)"
         ).await?.collect().await?;

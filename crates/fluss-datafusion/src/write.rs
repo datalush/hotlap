@@ -156,8 +156,43 @@ impl FlussWriter {
         batch: arrow::record_batch::RecordBatch,
         row_type: Arc<fluss::metadata::RowType>,
         cancelled: &AtomicBool,
+        reservation: &datafusion::execution::memory_pool::MemoryReservation,
     ) -> Result<()> {
         if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        if let Self::Log(writer) = self {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(DataFusionError::Execution(
+                    "Fluss write cancelled; in-flight writes may have been committed".into(),
+                ));
+            }
+            // Client owns routing and byte slicing for both finite/continuous
+            // input. Its abort wakes enqueue and interrupts the routing loop.
+            reservation.try_grow(
+                writer
+                    .estimated_arrow_routing_bytes(&batch)
+                    .map_err(fluss_error)?,
+            )?;
+            drop(
+                writer
+                    .append_arrow_batch_with_retainer(batch, |materialized| {
+                        crate::resources::reserve_batch(
+                            materialized,
+                            reservation,
+                            usize::MAX,
+                            &datafusion::physical_plan::metrics::Gauge::new(),
+                        )
+                        .map_err(|error| {
+                            fluss::error::Error::UnexpectedError {
+                                message: "Fluss Arrow materialization memory admission failed"
+                                    .into(),
+                                source: Some(Box::new(error)),
+                            }
+                        })
+                    })
+                    .map_err(fluss_error)?,
+            );
             return Ok(());
         }
         // Build typed column views once; route *each* row so a DataFusion
@@ -191,9 +226,7 @@ impl FlussWriter {
             }
             row.set_row_id(id);
             match self {
-                Self::Log(writer) => {
-                    drop(writer.append(&row).map_err(fluss_error)?);
-                }
+                Self::Log(_) => unreachable!("log append is columnar"),
                 Self::Kv(writer) => {
                     drop(writer.upsert(&row).map_err(fluss_error)?);
                 }
@@ -346,7 +379,20 @@ impl DataSink for FlussWriteTarget {
             validate_required_values(&destination_schema, &batch)?;
             let reservation =
                 MemoryConsumer::new("FlussWriteBatch").register(&context.runtime_env().memory_pool);
-            reservation.try_grow(batch.get_array_memory_size())?;
+            let batch = if matches!(self.kind, WriteKind::Log) {
+                // Prebuilt client batches retain Arrow beyond enqueue and may
+                // outlive this task on cancellation. Reuse the read-side lease
+                // mechanism so their buffers carry the reservation until drop.
+                crate::resources::reserve_batch(
+                    batch,
+                    &reservation,
+                    usize::MAX,
+                    &datafusion::physical_plan::metrics::Gauge::new(),
+                )?
+            } else {
+                reservation.try_grow(batch.get_array_memory_size())?;
+                batch
+            };
             if let Some(converter) = &key_converter {
                 let actions = batch
                     .column(batch.num_columns() - 1)
@@ -394,8 +440,7 @@ impl DataSink for FlussWriteTarget {
             let batch_row_type = Arc::clone(&row_type);
             let stop = Arc::clone(&cancelled);
             let enqueue = tokio::task::spawn_blocking(move || {
-                let _reservation = reservation;
-                batch_writer.enqueue(batch, batch_row_type, &stop)
+                batch_writer.enqueue(batch, batch_row_type, &stop, &reservation)
             });
             tokio::time::timeout_at(deadline, enqueue)
                 .await
@@ -544,5 +589,50 @@ mod tests {
         .unwrap();
         assert!(validate_required_values(&schema, &batch).is_err());
         assert!(validate_required_values(&schema, &batch.slice(0, 1)).is_ok());
+    }
+
+    #[test]
+    fn columnar_sink_leases_cover_slices_and_independent_gathers_after_worker_drop() {
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use datafusion::physical_plan::metrics::Gauge;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let worker = MemoryConsumer::new("FlussWriteBatch").register(&pool);
+        let original = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+        )])
+        .unwrap();
+        let input =
+            crate::resources::reserve_batch(original, &worker, usize::MAX, &Gauge::new()).unwrap();
+        let slice = input.slice(1, 2);
+        let first = pool.reserved();
+        let indices = arrow::array::UInt32Array::from(vec![0, 2]);
+        let gathered = RecordBatch::try_new(
+            input.schema(),
+            vec![arrow::compute::take(input.column(0), &indices, None).unwrap()],
+        )
+        .unwrap();
+        let gathered =
+            crate::resources::reserve_batch(gathered, &worker, usize::MAX, &Gauge::new()).unwrap();
+        assert!(pool.reserved() > first);
+        drop(input);
+        drop(worker);
+        // A client queue may retain either independent materialization after
+        // the worker/query has gone; neither depends on an async scope guard.
+        assert!(pool.reserved() > first);
+        drop(slice);
+        assert!(pool.reserved() > 0);
+        assert_eq!(
+            gathered
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .as_ref(),
+            &[1, 3]
+        );
+        drop(gathered);
+        assert_eq!(pool.reserved(), 0);
     }
 }

@@ -348,3 +348,19 @@ limits, 100-row concurrent producer/slow-consumer evidence, all nine live cases,
 three repeated remote profiles, the initial failover timeout and evidence reuse.
 This resolves the retained-queue/unfinished-poll foundation without claiming
 pre-decompression protection, total RSS limits or benchmark acceptance.
+
+## 12. Arrow write route in 3etr (working tree)
+
+A03–A05 now use the client Arrow route for log INSERT, finite and continuous.
+Removed first-row partition inference, table-count bucket grouping and its
+unconditional take helper. Existing WriterClient assigners and one immutable
+metadata snapshot own grouping/enqueue, with effective old/new partition counts.
+Contiguous groups use slices; interleaved groups use Arrow take in input order;
+byte-target slicing preserves pressure on the existing client limiter.
+
+The sink reuses buffer-owned leases for retained log input and cast/gather output,
+including non-Fluss input providers. Routing scratch uses a client estimate in
+the native session pool. KV upsert/delete retains its required row-format wire
+encoding and typed view, not an Arrow-log surrogate. Wire encoding, post-allocation
+admission, conservative nested/scratch estimates and final resource/fault profiles
+remain explicit. See [arrow-write-inventory.md](arrow-write-inventory.md).

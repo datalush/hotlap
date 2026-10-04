@@ -181,9 +181,28 @@ impl ArrowRecordBatchInnerBuilder for PrebuiltRecordBatchBuilder {
     fn estimated_size_in_bytes(&self) -> usize {
         self.arrow_record_batch
             .as_ref()
-            .map(|batch| batch.get_array_memory_size())
+            .map(|batch| append_batch_body_size(batch))
             .unwrap_or(0)
     }
+}
+
+/// Logical bytes to encode, distinct from the backing capacities retained by
+/// a sliced batch. The owner of those backings accounts for them separately.
+fn append_batch_body_size(batch: &RecordBatch) -> usize {
+    batch.columns().iter().fold(0usize, |size, column| {
+        let data = column.to_data();
+        size.saturating_add(
+            data.get_slice_memory_size()
+                .unwrap_or_else(|_| data.get_buffer_memory_size()),
+        )
+    })
+}
+
+pub(crate) fn estimate_append_batch_size(batch: &RecordBatch) -> Result<usize> {
+    // Uncompressed framing is conservative for the client's byte admission.
+    // Compression/statistics scratch remains part of the existing encoder.
+    let overhead = estimate_arrow_ipc_overhead(&batch.schema(), None)?;
+    Ok(append_batch_body_size(batch).saturating_add(overhead))
 }
 
 pub struct RowAppendRecordBatchBuilder {
