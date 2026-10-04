@@ -312,3 +312,25 @@ Preview limits select record ranges before materialization. See
 semantic changes in validation of unrequested values, concrete buffer evidence
 and retained log/format materializations. This does not eliminate raw/decode peaks
 or replace pending resource stress/throughput profiles.
+
+## 10. Source progress in pceb (working tree)
+
+A11 now has separate bounded `LogProgress` observations without changing legacy
+`LogDelivery`: initial ranges for every executing physical partition (empty
+buckets included), offered batches, excluded ranges and terminal status. Identity
+is assigned before the first output, shared across partitions; observations do
+not contain error payloads/credentials or engine checkpoint state.
+
+Client read-only metadata reports fetch offsets, queued batch bases and remaining
+stopping bounds. The connector clamps resumable source advancement to the first
+unoffered buffered batch and finite stop, including buckets unsubscribed after
+fetch completion. This covers pruned trailing ranges without skipping queued data.
+Loss is exposed by standard broadcast Lagged errors; consumers must reject missing
+initializations/incomplete evidence, and explicit offset maps retain validation.
+A12's overlapping same-context execution limitation remains documented.
+
+Live regressions verify all-pruned multibucket advancement/completion, same-filter
+resume after a new append and rejection of incomplete offsets; all empty buckets
+initialize without batches; idle streaming initializes and cancellation terminates.
+Existing reexecution, concurrent contexts and topology/error cases remain native
+DataFusion/client contracts, not a new scheduler or observer-driven retry loop.

@@ -26,7 +26,9 @@ use fluss::record::ScanBatch;
 use fluss::rpc::message::OffsetSpec;
 
 use crate::log_options::{LogReadMode, LogReadOptions, LogStart};
-use crate::log_progress::LogDelivery;
+use crate::log_progress::{
+    LogDelivery, LogProgress, LogReadPosition, LogTermination, safe_frontier,
+};
 use crate::metrics::{PartitionMetrics, ReaderLifetime, ReportOnce};
 use crate::offsets::{
     Capture, OffsetWindow, SharedCaptures, ensure_retained, validate_offsets, validate_window,
@@ -62,6 +64,7 @@ pub(crate) struct ScanSpec {
     pub(crate) captures: Arc<SharedCaptures<OffsetWindow>>,
     pub(crate) metrics: ExecutionPlanMetricsSet,
     pub(crate) deliveries: tokio::sync::broadcast::Sender<LogDelivery>,
+    pub(crate) progress: tokio::sync::broadcast::Sender<LogProgress>,
     pub(crate) execution_ids: Arc<SharedCaptures<u64>>,
     pub(crate) deadlines: Arc<SharedCaptures<Instant>>,
 }
@@ -125,7 +128,9 @@ struct ReadState {
     deadline: Option<Instant>,
     last_topology_check: Instant,
     capture: Capture<OffsetWindow>,
-    execution_capture: Capture<u64>,
+    execution_id: u64,
+    positions: HashMap<TableBucket, (i64, Option<i64>)>,
+    terminal: bool,
     partition_capture: Option<Capture<PartitionedOffsets>>,
     // Keep the execution identity alive for late partitions of this query.
     _context: Arc<TaskContext>,
@@ -184,6 +189,16 @@ impl ReadState {
             MemoryConsumer::new("FlussLogScan").register(&ctx.runtime_env().memory_pool);
         let capture = source.spec.captures.for_partition(&ctx, source.index);
         let execution_capture = source.spec.execution_ids.for_partition(&ctx, source.index);
+        if execution_capture.get().is_none() {
+            let _ = execution_capture.set(Ok(Arc::new(
+                NEXT_EXECUTION_ID.fetch_add(1, Ordering::Relaxed),
+            )));
+        }
+        let execution_id = **execution_capture
+            .get()
+            .expect("execution initialized")
+            .as_ref()
+            .map_err(|error| DataFusionError::Execution(error.clone()))?;
         let partition_capture = source.spec.partitioned.then(|| {
             source
                 .spec
@@ -205,7 +220,9 @@ impl ReadState {
             deadline,
             last_topology_check: Instant::now(),
             capture,
-            execution_capture,
+            execution_id,
+            positions: HashMap::new(),
+            terminal: false,
             partition_capture,
             _context: ctx,
             _lifetime: lifetime,
@@ -217,10 +234,17 @@ impl ReadState {
     fn into_stream(self) -> SendableRecordBatchStream {
         let schema = Arc::clone(&self.source.spec.schema);
         let stream = futures::stream::try_unfold(self, |mut state| async move {
-            state
-                .next_batch()
-                .await
-                .map(|batch| batch.map(|batch| (batch, state)))
+            match state.next_batch().await {
+                Ok(Some(batch)) => Ok(Some((batch, state))),
+                Ok(None) => {
+                    state.terminate(LogTermination::Completed);
+                    Ok(None)
+                }
+                Err(error) => {
+                    state.terminate(LogTermination::Failed);
+                    Err(error)
+                }
+            }
         });
         Box::pin(RecordBatchStreamAdapter::new(schema, stream))
     }
@@ -232,10 +256,13 @@ impl ReadState {
         loop {
             match self.poll_reader().await? {
                 RecordBatchReadOutcome::Batch(batch) => {
-                    return self.prepare_output_batch(batch).await.map(Some);
+                    return self.prepare_output_batch(batch).map(Some);
                 }
-                RecordBatchReadOutcome::Finished => return Ok(None),
-                RecordBatchReadOutcome::TimedOut => {}
+                RecordBatchReadOutcome::Finished => {
+                    self.publish_excluded();
+                    return Ok(None);
+                }
+                RecordBatchReadOutcome::TimedOut => self.publish_excluded(),
             }
         }
     }
@@ -251,18 +278,48 @@ impl ReadState {
                         .scanner_remote_log_operation_timeout_ms,
                 )
             });
-            let reader = tokio::time::timeout(timeout, self.start_reader())
-                .await
-                .map_err(|_| {
-                    if self.deadline.is_some() {
-                        expired()
-                    } else {
-                        DataFusionError::Execution(
-                            "Fluss streaming log source initialization timed out".into(),
-                        )
-                    }
-                })??;
+            let (reader, ranges) = tokio::time::timeout(timeout, async {
+                let ranges = self.ranges().await?;
+                let reader = self.start_reader(ranges.clone()).await?;
+                Ok::<_, DataFusionError>((reader, ranges))
+            })
+            .await
+            .map_err(|_| {
+                if self.deadline.is_some() {
+                    expired()
+                } else {
+                    DataFusionError::Execution(
+                        "Fluss streaming log source initialization timed out".into(),
+                    )
+                }
+            })??;
             self.reader = Some(reader);
+            let positions: Vec<_> = ranges
+                .into_iter()
+                .map(|range| LogReadPosition {
+                    bucket: range.bucket,
+                    start_offset: range.starting_offset,
+                    stop_offset: (self.source.spec.options.mode == LogReadMode::Batch)
+                        .then_some(range.stopping_offset),
+                })
+                .collect();
+            self.positions = positions
+                .iter()
+                .map(|position| {
+                    (
+                        position.bucket.clone(),
+                        (position.start_offset, position.stop_offset),
+                    )
+                })
+                .collect();
+            let _ = self.source.spec.progress.send(LogProgress::Initialized {
+                execution_id: self.execution_id,
+                table_id: self.source.spec.table_id,
+                schema_id: self.source.spec.schema_id,
+                partition: self.source.index,
+                partitions: self.source.group_count,
+                positions,
+            });
         }
         Ok(())
     }
@@ -296,10 +353,14 @@ impl ReadState {
         Ok(result)
     }
 
-    async fn prepare_output_batch(&self, batch: ScanBatch) -> Result<RecordBatch> {
+    fn prepare_output_batch(&mut self, batch: ScanBatch) -> Result<RecordBatch> {
         let bucket = batch.bucket().clone();
         let base_offset = batch.base_offset();
-        let next_offset = batch.last_offset() + 1;
+        let next_offset = batch.last_offset().checked_add(1).ok_or_else(|| {
+            DataFusionError::Execution(
+                "Fluss offered offset overflows the log position range".into(),
+            )
+        })?;
         let rows = batch.num_records();
         let decoded = batch.into_batch();
         self.metrics.record_decoded_batch(&decoded);
@@ -311,28 +372,46 @@ impl ReadState {
             _ => decoded,
         };
         self.metrics.record_output_batch(&output);
-        let execution_id = self
-            .execution_capture
-            .get_or_init(|| async {
-                Ok(Arc::new(NEXT_EXECUTION_ID.fetch_add(1, Ordering::Relaxed)))
-            })
-            .await
-            .as_ref()
-            .map_err(|error: &String| DataFusionError::Execution(error.clone()))?;
         // The source has handed the batch to DataFusion; the engine must still
         // acknowledge its own processing and output before checkpointing it.
-        let _ = self.source.spec.deliveries.send(LogDelivery {
-            execution_id: **execution_id,
+        let position = self.positions.get_mut(&bucket).ok_or_else(|| {
+            DataFusionError::Execution("Fluss offered an unassigned log bucket".into())
+        })?;
+        if base_offset < position.0
+            || next_offset < base_offset
+            || position.1.is_some_and(|stop| next_offset > stop)
+        {
+            return Err(DataFusionError::Execution(
+                "Fluss offered log range regressed or exceeded the captured stop".into(),
+            ));
+        }
+        if base_offset > position.0 {
+            let _ = self.source.spec.progress.send(LogProgress::Excluded {
+                execution_id: self.execution_id,
+                bucket: bucket.clone(),
+                base_offset: position.0,
+                next_offset: base_offset,
+            });
+        }
+        position.0 = next_offset;
+        let delivery = LogDelivery {
+            execution_id: self.execution_id,
             bucket,
             base_offset,
             next_offset,
             rows,
-        });
+        };
+        let _ = self.source.spec.deliveries.send(delivery.clone());
+        let _ = self
+            .source
+            .spec
+            .progress
+            .send(LogProgress::Offered(delivery));
+        self.publish_excluded();
         Ok(output)
     }
 
-    async fn start_reader(&self) -> Result<ActiveReader> {
-        let ranges = self.ranges().await?;
+    async fn start_reader(&self, ranges: Vec<BoundedLogReadRange>) -> Result<ActiveReader> {
         let table = self.current_table().await?;
         self.ensure_retention_before_start(&ranges).await?;
         let scanner = self.projected_scanner(&table)?;
@@ -772,6 +851,71 @@ impl ReadState {
                     .ok_or_else(expired)
             })
             .transpose()
+    }
+
+    fn terminate(&mut self, status: LogTermination) {
+        if !self.terminal {
+            self.terminal = true;
+            let _ = self.source.spec.progress.send(LogProgress::Terminated {
+                execution_id: self.execution_id,
+                partition: self.source.index,
+                status,
+            });
+        }
+    }
+
+    fn publish_excluded(&mut self) {
+        if self.source.spec.progress.receiver_count() == 0 {
+            return;
+        }
+        let Some(reader) = &self.reader else {
+            return;
+        };
+        let (consumed, queued) = match reader {
+            ActiveReader::Bounded(reader) => (reader.consumed_offsets(), reader.buffered_offsets()),
+            ActiveReader::Streaming(scanner, queue) => (
+                scanner.get_subscribed_buckets(),
+                queue
+                    .iter()
+                    .map(|batch| (batch.bucket().clone(), batch.base_offset()))
+                    .collect(),
+            ),
+            ActiveReader::EmptyStreaming => return,
+        };
+        let consumed: HashMap<_, _> = consumed.into_iter().collect();
+        let mut pending = HashMap::<TableBucket, i64>::new();
+        for (bucket, offset) in queued {
+            pending
+                .entry(bucket)
+                .and_modify(|first| *first = (*first).min(offset))
+                .or_insert(offset);
+        }
+        for (bucket, (last, stop)) in &mut self.positions {
+            let fetched = consumed.get(bucket).copied().unwrap_or_else(|| {
+                if let ActiveReader::Bounded(reader) = reader
+                    && !reader.has_remaining_range(bucket)
+                {
+                    return stop.unwrap_or(*last);
+                }
+                *last
+            });
+            let next = safe_frontier(fetched, pending.get(bucket).copied(), *stop);
+            if next > *last {
+                let _ = self.source.spec.progress.send(LogProgress::Excluded {
+                    execution_id: self.execution_id,
+                    bucket: bucket.clone(),
+                    base_offset: *last,
+                    next_offset: next,
+                });
+                *last = next;
+            }
+        }
+    }
+}
+
+impl Drop for ReadState {
+    fn drop(&mut self) {
+        self.terminate(LogTermination::Cancelled);
     }
 }
 

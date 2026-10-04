@@ -494,6 +494,26 @@ impl RecordBatchLogReader {
             .sum()
     }
 
+    /// Fetch progress, not a delivered/processed checkpoint. Completed ranges
+    /// can disappear here before their buffered batches have been returned.
+    pub fn consumed_offsets(&self) -> Vec<(TableBucket, i64)> {
+        self.scanner.get_subscribed_buckets()
+    }
+
+    /// Earliest buffered batch positions; no Arrow storage is exposed/cloned.
+    pub fn buffered_offsets(&self) -> Vec<(TableBucket, i64)> {
+        self.buffer
+            .iter()
+            .map(|batch| (batch.bucket().clone(), batch.base_offset()))
+            .collect()
+    }
+
+    /// True while this assigned bucket still has an unmet stopping bound.
+    /// A false result alone says nothing about data remaining in the buffer.
+    pub fn has_remaining_range(&self, bucket: &TableBucket) -> bool {
+        self.stopping_offsets.contains_key(bucket)
+    }
+
     /// Fetch the next [`ScanBatch`] while waiting for at most `timeout`.
     ///
     /// Unlike [`next_batch`](Self::next_batch), this method returns

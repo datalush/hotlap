@@ -141,10 +141,15 @@ Rules:
   present identity mechanism; `pceb` must document/test that boundary, not infer
   identity from arbitrary pointer reuse. Sequential reexecution captures anew.
 
-Current `LogDelivery` only reports offered batches. Initialization, excluded
-range advancement and terminal observations are **pending `pceb`**, not existing
-exports. A small extension of the observation model is preferable to a generic
-event bus/checkpoint service.
+`LogDelivery` retains its offered-batch-only meaning. `subscribe_progress()` now
+returns the bounded Tokio broadcast receiver for `LogProgress`: Initialized
+(execution/table/schema, partition/count and `LogReadPosition` ranges), Offered,
+Excluded and Terminated (`LogTermination`). Consume/handle `RecvError::Lagged` or
+`TryRecvError::Lagged` as incomplete evidence; the source cannot attest to a
+consumer that discarded events. Do not derive a complete resume map without all
+partition initializations. Existing explicit-offset validation rejects missing,
+stale or out-of-range bucket mappings; query/selection compatibility and processed
+checkpoints remain the engine's responsibility. This is not a checkpoint service.
 
 ## 3. Memory and ownership
 

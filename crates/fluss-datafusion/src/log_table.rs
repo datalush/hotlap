@@ -41,6 +41,7 @@ pub struct FlussLogTable {
     max_partitions: Option<usize>,
     max_assigned_buckets: usize,
     deliveries: tokio::sync::broadcast::Sender<LogDelivery>,
+    progress: tokio::sync::broadcast::Sender<crate::LogProgress>,
     write_options: FlussWriteOptions,
 }
 
@@ -119,6 +120,7 @@ impl FlussLogTable {
             max_partitions: None,
             max_assigned_buckets: DEFAULT_MAX_ASSIGNED_BUCKETS,
             deliveries: tokio::sync::broadcast::channel(1024).0,
+            progress: tokio::sync::broadcast::channel(1024).0,
             write_options: FlussWriteOptions::default(),
         })
     }
@@ -128,6 +130,13 @@ impl FlussLogTable {
     /// Multiple concurrent queries share the provider but have distinct IDs.
     pub fn subscribe_deliveries(&self) -> tokio::sync::broadcast::Receiver<LogDelivery> {
         self.deliveries.subscribe()
+    }
+
+    /// Subscribe before execution for assignment (including empty buckets),
+    /// offered/pruned positions and per-partition completion/failure/cancel.
+    /// Lagged or missing initialization means incomplete progress, not a checkpoint.
+    pub fn subscribe_progress(&self) -> tokio::sync::broadcast::Receiver<crate::LogProgress> {
+        self.progress.subscribe()
     }
 
     /// Cap physical partitions; the default uses DataFusion's target partitions.
@@ -272,6 +281,7 @@ impl TableProvider for FlussLogTable {
             captures: Arc::new(SharedCaptures::<OffsetWindow>::default()),
             metrics: metrics.clone(),
             deliveries: self.deliveries.clone(),
+            progress: self.progress.clone(),
             execution_ids: Arc::new(SharedCaptures::<u64>::default()),
             deadlines: Arc::new(SharedCaptures::default()),
         });

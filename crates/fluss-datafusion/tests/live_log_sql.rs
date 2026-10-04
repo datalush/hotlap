@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Optional isolated-lab integration: run with FLUSS_* from ../lab/.env.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +69,7 @@ async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<
         )
         .await?;
         let mut delivered = source.subscribe_deliveries();
+        let mut observed = source.subscribe_progress();
         ctx.register_table("live", Arc::new(source))?;
         let query = ctx.sql("SELECT id FROM live").await?;
         let plan = query.create_physical_plan().await?;
@@ -81,6 +82,13 @@ async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<
                 .is_err(),
             "no new records must not end the stream"
         );
+        let fluss_datafusion::LogProgress::Initialized { positions, .. } = observed.try_recv()?
+        else {
+            panic!("idle streaming execution must publish its initial assignment");
+        };
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].start_offset, 0);
+        assert!(positions[0].stop_offset.is_none());
         let table = connection.get_table(&path).await?;
         let writer = table.new_append()?.create_writer()?;
         let mut execution_id = None;
@@ -137,6 +145,14 @@ async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<
         );
         retained_batches.clear();
         assert_eq!(pool.reserved(), 0);
+        let mut cancelled = false;
+        while let Ok(event) = observed.try_recv() {
+            if let fluss_datafusion::LogProgress::Terminated { status, .. } = event {
+                assert_eq!(status, fluss_datafusion::LogTermination::Cancelled);
+                cancelled = true;
+            }
+        }
+        assert!(cancelled);
         assert_eq!(
             metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
             0
@@ -506,7 +522,8 @@ async fn bounded_log_and_kv_sql_against_native_sni() -> TestResult<()> {
         check_explain_metrics(&ctx).await?;
         check_catalog(&ctx, &connection, &log_path, total).await?;
         check_timeout_and_kv(&connection, &log_path, &kv_path).await?;
-        check_kv_sql(&ctx, &connection, &log_path, &kv_path).await
+        check_kv_sql(&ctx, &connection, &log_path, &kv_path).await?;
+        check_log_progress(&connection, &log_path).await
     }
     .await;
 
@@ -577,6 +594,145 @@ async fn create_known_tables(
         return Err(error);
     }
     Ok((log, kv))
+}
+
+async fn check_log_progress(connection: &Arc<FlussConnection>, path: &TablePath) -> TestResult<()> {
+    use fluss_datafusion::{LogProgress, LogTermination};
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2));
+    let provider = FlussLogTable::open(Arc::clone(connection), path.clone(), SCAN_TIMEOUT).await?;
+    let mut observer = provider.subscribe_progress();
+    ctx.register_table("progress_log", Arc::new(provider))?;
+    let full = ctx
+        .sql("SELECT id FROM progress_log")
+        .await?
+        .collect()
+        .await?;
+    let full_rows: usize = full.iter().map(RecordBatch::num_rows).sum();
+    let mut offered = 0;
+    while let Ok(event) = observer.try_recv() {
+        match event {
+            LogProgress::Offered(batch) => offered += batch.rows,
+            LogProgress::Excluded { .. } => {
+                panic!("fetch completion must not exclude unoffered queued data")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(offered, full_rows);
+    let result = ctx
+        .sql("SELECT id FROM progress_log WHERE id > 1000000")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    let mut starts = HashMap::new();
+    let mut stops = HashMap::new();
+    let mut next = HashMap::new();
+    let mut initialized = HashSet::new();
+    let mut completed = HashSet::new();
+    let mut identity = None;
+    while let Ok(event) = observer.try_recv() {
+        match event {
+            LogProgress::Initialized {
+                execution_id,
+                partition,
+                partitions,
+                positions,
+                ..
+            } => {
+                if let Some(previous) = identity {
+                    assert_eq!(previous, execution_id);
+                }
+                identity = Some(execution_id);
+                assert_eq!(partitions, 2);
+                assert!(initialized.insert(partition));
+                for position in positions {
+                    starts.insert(position.bucket.clone(), position.start_offset);
+                    next.insert(position.bucket.clone(), position.start_offset);
+                    stops.insert(position.bucket, position.stop_offset.unwrap());
+                }
+            }
+            LogProgress::Excluded {
+                bucket,
+                base_offset,
+                next_offset,
+                ..
+            } => {
+                assert_eq!(next[&bucket], base_offset);
+                assert!(next_offset >= base_offset && next_offset <= stops[&bucket]);
+                next.insert(bucket, next_offset);
+            }
+            LogProgress::Offered(_) => panic!("all-pruned source must not offer value batches"),
+            LogProgress::Terminated {
+                partition, status, ..
+            } => {
+                assert_eq!(status, LogTermination::Completed);
+                completed.insert(partition);
+            }
+        }
+    }
+    assert_eq!(initialized.len(), 2);
+    assert_eq!(completed, initialized);
+    assert_eq!(stops.len(), 2);
+    assert_eq!(next, stops);
+    assert!(stops.values().sum::<i64>() > starts.values().sum::<i64>());
+
+    let table = connection.get_table(path).await?;
+    let writer = table.new_append()?.create_writer()?;
+    let mut row = GenericRow::new(3);
+    row.set_field(0, "progress-resume");
+    row.set_field(1, 1_000_001_i32);
+    row.set_field(2, "new");
+    writer.append(&row)?;
+    writer.flush().await?;
+    let resumed = FlussLogTable::open_with_options(
+        Arc::clone(connection),
+        path.clone(),
+        LogReadOptions {
+            start: LogStart::Offsets(next.clone()),
+            ..LogReadOptions::batch(SCAN_TIMEOUT)
+        },
+    )
+    .await?;
+    ctx.register_table("resumed_progress", Arc::new(resumed))?;
+    let rows = ctx
+        .sql("SELECT id FROM resumed_progress WHERE id > 1000000")
+        .await?
+        .collect()
+        .await?;
+    let ids: Vec<_> = rows
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, [1_000_001]);
+    let missing = next.keys().next().unwrap().clone();
+    next.remove(&missing);
+    let incomplete = FlussLogTable::open_with_options(
+        Arc::clone(connection),
+        path.clone(),
+        LogReadOptions {
+            start: LogStart::Offsets(next),
+            ..LogReadOptions::batch(SCAN_TIMEOUT)
+        },
+    )
+    .await?;
+    ctx.register_table("incomplete_progress", Arc::new(incomplete))?;
+    assert!(
+        ctx.sql("SELECT * FROM incomplete_progress")
+            .await?
+            .collect()
+            .await
+            .is_err()
+    );
+    Ok(())
 }
 
 async fn check_kv_sql(
@@ -1788,7 +1944,46 @@ async fn empty_log_and_new_offsets_on_each_query() -> TestResult<()> {
     let admin = connection.get_admin()?;
     let ctx = SessionContext::new();
     let result = async {
-        register_log(&ctx, &connection, path.table(), SCAN_TIMEOUT).await?;
+        let provider =
+            FlussLogTable::open(Arc::clone(&connection), path.clone(), SCAN_TIMEOUT).await?;
+        let mut progress = provider.subscribe_progress();
+        ctx.register_table("log", Arc::new(provider))?;
+        assert_eq!(count_sql(&ctx, "SELECT COUNT(*) FROM log").await?, 0);
+        let mut empty_buckets = HashSet::new();
+        let mut initialized = HashSet::new();
+        let mut completed = HashSet::new();
+        while let Ok(event) = progress.try_recv() {
+            match event {
+                fluss_datafusion::LogProgress::Initialized {
+                    partition,
+                    positions,
+                    ..
+                } => {
+                    initialized.insert(partition);
+                    for position in positions {
+                        assert_eq!(position.start_offset, 0);
+                        assert_eq!(position.stop_offset, Some(0));
+                        empty_buckets.insert(position.bucket);
+                    }
+                }
+                fluss_datafusion::LogProgress::Terminated {
+                    partition, status, ..
+                } => {
+                    assert_eq!(status, fluss_datafusion::LogTermination::Completed);
+                    completed.insert(partition);
+                }
+                _ => panic!("empty source cannot offer or exclude rows"),
+            }
+        }
+        assert_eq!(completed, initialized);
+        assert_eq!(
+            empty_buckets.len(),
+            connection
+                .get_table(&path)
+                .await?
+                .get_table_info()
+                .get_num_buckets() as usize
+        );
         let df = ctx.sql("SELECT * FROM log").await?;
         let source = source_plan(&df.create_physical_plan().await?);
         check_late_partition(&connection, &path, &admin, &df, &source).await?;

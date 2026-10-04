@@ -113,6 +113,19 @@ offset, and execution ID. Server-side pruning may leave gaps and downstream
 SQL may filter entire batches. These are neither prefetched offsets nor
 processed/committed sink checkpoints. Treat a lagged observer as an error.
 
+`subscribe_progress()` adds initial per-partition assignment, including empty
+buckets, under the shared execution ID; streaming ranges have no stop. Offered
+events retain the delivery contract. Excluded ranges advance only up to the first
+batch still queued for that bucket (and no farther than a finite stop), so fetch
+completion cannot skip unoffered rows. Completed bounded ranges remain observable
+after the client unsubscribes; idle all-pruned streams can advance without output.
+Each executing partition reports Completed, Failed or Cancelled; a missing
+initialization/terminal or a broadcast Lagged error makes evidence incomplete.
+For finite complete assignment, collect every partition initialization. LIMIT can
+stop before all partitions run: never fill unknown positions by guessing.
+Resume uses a complete validated offset map with the same selection semantics;
+offered/excluded progress still does not mean processed or committed work.
+
 `EXPLAIN ANALYZE` identifies log versus KV scans, table and projected
 columns, optional log batch predicate and partition pruning. Partition
 counts describe discovered and selected partitions (recorded once, not once
