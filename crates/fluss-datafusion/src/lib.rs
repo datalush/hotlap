@@ -14,6 +14,7 @@ mod kv_table;
 mod log_options;
 mod log_progress;
 mod log_table;
+mod merge;
 mod metrics;
 mod offsets;
 mod partitions;

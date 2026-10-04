@@ -59,6 +59,7 @@ pub(crate) enum WriteKind {
     Log,
     Kv,
     DeleteKv,
+    MergeKv,
 }
 
 pub(crate) struct FlussWriteTarget {
@@ -158,6 +159,7 @@ enum FlussWriter {
     Log(AppendWriter),
     Kv(UpsertWriter),
     DeleteKv(UpsertWriter),
+    MergeKv(UpsertWriter),
 }
 
 impl FlussWriter {
@@ -172,6 +174,25 @@ impl FlussWriter {
         }
         // Build typed column views once; route *each* row so a DataFusion
         // batch may contain several Fluss partitions/buckets safely.
+        let actions = if matches!(self, Self::MergeKv(_)) {
+            Some(
+                batch
+                    .column(batch.num_columns() - 1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution("Invalid Fluss MERGE action column".into())
+                    })?
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let batch = if actions.is_some() {
+            batch.project(&(0..batch.num_columns() - 1).collect::<Vec<_>>())?
+        } else {
+            batch
+        };
         let mut row =
             ColumnarRow::new(Arc::new(batch.clone()), row_type, 0, None).map_err(fluss_error)?;
         for id in 0..batch.num_rows() {
@@ -191,6 +212,13 @@ impl FlussWriter {
                 Self::DeleteKv(writer) => {
                     drop(writer.delete(&row).map_err(fluss_error)?);
                 }
+                Self::MergeKv(writer) => {
+                    if actions.as_ref().unwrap().value(id) {
+                        drop(writer.delete(&row).map_err(fluss_error)?);
+                    } else {
+                        drop(writer.upsert(&row).map_err(fluss_error)?);
+                    }
+                }
             }
         }
         Ok(())
@@ -199,7 +227,9 @@ impl FlussWriter {
     async fn flush(&self) -> Result<()> {
         match self {
             Self::Log(writer) => writer.flush().await.map_err(fluss_error),
-            Self::Kv(writer) | Self::DeleteKv(writer) => writer.flush().await.map_err(fluss_error),
+            Self::Kv(writer) | Self::DeleteKv(writer) | Self::MergeKv(writer) => {
+                writer.flush().await.map_err(fluss_error)
+            }
         }
     }
 }
@@ -255,6 +285,30 @@ impl DataSink for FlussSink {
                 .map_err(fluss_error)?;
         }
         let row_type = Arc::new(table.get_table_info().get_row_type().clone());
+        let destination_schema = fluss::record::to_arrow_schema(&row_type).map_err(fluss_error)?;
+        let key_indices = table
+            .get_table_info()
+            .get_primary_keys()
+            .iter()
+            .map(|name| destination_schema.index_of(name))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let key_converter = if matches!(self.kind, WriteKind::MergeKv) {
+            Some(arrow::row::RowConverter::new(
+                key_indices
+                    .iter()
+                    .map(|&index| {
+                        arrow::row::SortField::new(
+                            destination_schema.field(index).data_type().clone(),
+                        )
+                    })
+                    .collect(),
+            )?)
+        } else {
+            None
+        };
+        let mut seen_keys = std::collections::HashSet::<Vec<u8>>::new();
+        let key_reservation =
+            MemoryConsumer::new("FlussMergeKeys").register(&context.runtime_env().memory_pool);
         let writer = Arc::new(match self.kind {
             WriteKind::Log => FlussWriter::Log(
                 table
@@ -271,6 +325,13 @@ impl DataSink for FlussSink {
                     .map_err(fluss_error)?,
             ),
             WriteKind::DeleteKv => FlussWriter::DeleteKv(
+                table
+                    .new_upsert()
+                    .map_err(fluss_error)?
+                    .create_writer()
+                    .map_err(fluss_error)?,
+            ),
+            WriteKind::MergeKv => FlussWriter::MergeKv(
                 table
                     .new_upsert()
                     .map_err(fluss_error)?
@@ -294,15 +355,51 @@ impl DataSink for FlussSink {
             }
             self.schema
                 .logically_equivalent_names_and_types(&batch.schema())?;
-            validate_required_values(&self.schema, &batch)?;
+            validate_required_values(&destination_schema, &batch)?;
+            let reservation =
+                MemoryConsumer::new("FlussWriteBatch").register(&context.runtime_env().memory_pool);
+            reservation.try_grow(batch.get_array_memory_size())?;
+            if let Some(converter) = &key_converter {
+                let actions = batch
+                    .column(batch.num_columns() - 1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .ok_or_else(|| DataFusionError::Execution("Invalid MERGE actions".into()))?;
+                if actions.true_count() != 0 {
+                    validate_delete_policy(current.get_table_info().get_properties())?;
+                }
+                let columns = key_indices
+                    .iter()
+                    .map(|&i| batch.column(i).clone())
+                    .collect::<Vec<_>>();
+                let scratch = MemoryConsumer::new("FlussMergeKeyEncoding")
+                    .register(&context.runtime_env().memory_pool);
+                scratch.try_grow(
+                    batch
+                        .get_array_memory_size()
+                        .saturating_mul(2)
+                        .saturating_add(batch.num_rows().saturating_mul(32)),
+                )?;
+                let encoded = converter.convert_columns(&columns)?;
+                scratch.try_resize(encoded.size())?;
+                for key in encoded.iter() {
+                    if seen_keys.contains(key.as_ref()) {
+                        return Err(DataFusionError::Execution(
+                            "Fluss MERGE has multiple modifying actions for one primary key; earlier batches may already be committed".into(),
+                        ));
+                    }
+                    // Conservative allowance for encoded bytes and hash-table
+                    // overhead; this set lasts until the finite MERGE ends.
+                    key_reservation
+                        .try_grow(key.as_ref().len().saturating_mul(2).saturating_add(64))?;
+                    seen_keys.insert(key.as_ref().to_vec());
+                }
+            }
             let rows = batch.num_rows() as u64;
             let deadline = tokio::time::Instant::now() + self.options.ack_timeout;
             // Own a reservation until the blocking task releases its retained
             // batch, even when its async caller is cancelled. Source/operator
             // reservations remain separate and may overlap conservatively.
-            let reservation =
-                MemoryConsumer::new("FlussWriteBatch").register(&context.runtime_env().memory_pool);
-            reservation.try_grow(batch.get_array_memory_size())?;
             // Fluss's bounded writer memory limiter can wait synchronously.
             // Do not block the Tokio worker needed by its sender task.
             let batch_writer = Arc::clone(&writer);

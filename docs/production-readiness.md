@@ -83,7 +83,15 @@ bucket**, not an atomic cross-bucket snapshot.
   deletion after rescale; configured/implicit ignore policies are rejected.
   These additions are not in the already-installed dev2 wheel. Cancelling
   under a blocked ACK or saturated buffer still requires targeted verification;
-  Python DELETE/MERGE FFI, MERGE planning and sustained acceptance are pending.
+  Python DELETE/MERGE FFI and sustained acceptance are pending.
+- Rust working-tree MERGE passed a finite VALUES source combining UPDATE,
+  DELETE and INSERT, a false-predicate/no-op clause, first-clause precedence,
+  NOT MATCHED BY SOURCE deletion, and explicit rejection of duplicate
+  modifying keys with the tested current batch left unapplied. It composes
+  DataFusion join/filter/CASE operators; no new SQL evaluator was added.
+  Primary-key changes, incomplete INSERT column lists and unbounded MERGE
+  sources are explicitly unsupported. Full MERGE validation, concurrency,
+  failure injection, and matching Python FFI/release artifacts remain open.
 
 ## Verified in a separate Docker server profile
 

@@ -244,11 +244,22 @@ old and new partitions have different bucket counts after rescale. An
 INSERT may have already committed some rows when a later batch errors or
 the statement is cancelled; **there is no rollback or exactly-once job
 checkpoint**. Retries of a log INSERT may append duplicates. SQL overwrite,
-update and merge are not implemented. Rust KV providers now implement
+update is not implemented directly. Rust KV providers now implement
 `DELETE ... WHERE` (or all snapshot-selected keys without WHERE), using
 DataFusion predicates and Fluss deletes. It requires a table policy allowing
 deletes and does not offer conditional deletion or global isolation.
 SQL DELETE is not yet transported through the current DataFusion Python FFI.
+
+Rust KV providers also compose finite-source `MERGE INTO` with DataFusion
+full joins, exact predicates and first-matching-clause CASE expressions.
+Matched UPDATE/DELETE, NOT MATCHED INSERT and NOT MATCHED BY SOURCE actions
+are supported; INSERT must provide every destination column and UPDATE
+cannot change primary/partition keys. Multiple modifying actions for one
+key fail explicitly, with duplicate-key tracking charged to the query pool.
+This is not statement-wide rollback: earlier batches may have committed
+before a later duplicate/error is detected. Continuous MERGE sources are
+rejected; continuous append/upsert still use `INSERT ... SELECT`.
+Python SQL MERGE, like DELETE, still requires a coordinated FFI extension.
 
 The current Rust sink charges its retained input batch to the DataFusion
 memory pool; the client writer buffer has its own per-execution limit.

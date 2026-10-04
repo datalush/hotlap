@@ -198,6 +198,35 @@ async fn insert_log_and_upsert_kv_from_sql() -> TestResult<()> {
                 .value(0),
             0
         );
+        ctx.sql("INSERT INTO state (id, value) VALUES (1, 'before'), (2, 'delete')").await?.collect().await?;
+        let merged = ctx.sql(
+            "MERGE INTO state AS t USING (VALUES (1, 'after', 'u'), (2, 'gone', 'd'), (3, 'new', 'i')) AS s(id, value, op) ON t.id = s.id WHEN MATCHED AND s.op = 'd' THEN DELETE WHEN MATCHED THEN UPDATE SET value = s.value WHEN NOT MATCHED THEN INSERT (id, value) VALUES (s.id, s.value)"
+        ).await?.collect().await?;
+        assert_eq!(rows_written(&merged), 3);
+        let merged_rows = ctx.sql("SELECT value FROM state ORDER BY id").await?.collect().await?;
+        let values = merged_rows.iter().flat_map(|batch| {
+            let col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            (0..col.len()).map(|i|col.value(i).to_owned()).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        assert_eq!(values, ["after", "new"]);
+        let no_op = ctx.sql(
+            "MERGE INTO state AS t USING (VALUES (1, 'unused')) AS s(id, value) ON t.id = s.id WHEN MATCHED AND s.value = 'never' THEN UPDATE SET value = s.value"
+        ).await?.collect().await?;
+        assert_eq!(rows_written(&no_op), 0);
+        let priority = ctx.sql(
+            "MERGE INTO state AS t USING (VALUES (1, 'first')) AS s(id, value) ON t.id = s.id WHEN MATCHED THEN UPDATE SET value = s.value WHEN MATCHED THEN DELETE"
+        ).await?.collect().await?;
+        assert_eq!(rows_written(&priority), 1);
+        let by_source = ctx.sql(
+            "MERGE INTO state AS t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN NOT MATCHED BY SOURCE THEN DELETE"
+        ).await?.collect().await?;
+        assert_eq!(rows_written(&by_source), 1);
+        let duplicates = ctx.sql(
+            "MERGE INTO state AS t USING (VALUES (1, 'a'), (1, 'b')) AS s(id, value) ON t.id = s.id WHEN MATCHED THEN UPDATE SET value = s.value"
+        ).await?.collect().await.expect_err("multiple source matches must not silently overwrite a key");
+        assert!(duplicates.to_string().contains("multiple modifying actions"), "{duplicates}");
+        let preserved = ctx.sql("SELECT value FROM state WHERE id = 1").await?.collect().await?;
+        assert_eq!(preserved[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "first");
         let ctx_ref = &ctx;
         let insert_once = |id: i32| async move {
             let sql = format!("INSERT INTO events (id, value) VALUES ({id}, 'parallel')");
@@ -628,7 +657,13 @@ async fn sql_insert_routes_mixed_partitions_after_rescale() -> TestResult<()> {
             let result = ctx.sql(&format!("SELECT COUNT(*) FROM {dest} WHERE region = 'west'")).await?.collect().await?;
             assert_eq!(result[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0), 1);
         }
-        assert_eq!(rows_written(&ctx.sql("DELETE FROM state WHERE region = 'west'").await?.collect().await?), 1);
+        let merged = ctx.sql(
+            "MERGE INTO state AS t USING (VALUES (1, 'north', 'merged'), (12, 'west', 'merge-insert')) AS s(id, region, value) ON t.id = s.id AND t.region = s.region WHEN MATCHED THEN UPDATE SET value = s.value WHEN NOT MATCHED THEN INSERT (id, region, value) VALUES (s.id, s.region, s.value)"
+        ).await?.collect().await?;
+        assert_eq!(rows_written(&merged), 2);
+        let updated = ctx.sql("SELECT value FROM state WHERE id = 1 AND region = 'north'").await?.collect().await?;
+        assert_eq!(updated[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "merged");
+        assert_eq!(rows_written(&ctx.sql("DELETE FROM state WHERE region = 'west'").await?.collect().await?), 2);
         let result = ctx.sql("SELECT COUNT(*) FROM state WHERE region = 'west'").await?.collect().await?;
         assert_eq!(result[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0), 0);
         Ok(())

@@ -170,7 +170,20 @@ there is no conditional write or statement-wide isolation. Table policy must
 allow deletes; `ignore`/`disable`, including implicit `ignore` for a configured
 merge engine, is rejected before sending. DataFusion FFI 55.1 does **not**
 carry `delete_from`, so this SQL DELETE path is not available through the
-current Python provider; coordinated FFI support and MERGE remain pending.
+current Python provider; coordinated FFI support remains pending.
+
+The Rust working tree now plans finite-source MERGE using DataFusion full
+joins and ordered CASE expressions. Predicates use SQL three-valued logic;
+only the first eligible WHEN clause modifies each joined row. Matched
+UPDATE/DELETE, unmatched INSERT and NOT MATCHED BY SOURCE use the existing
+upsert/delete writer. INSERT requires all target columns; updating primary
+or partition keys and unbounded MERGE sources is rejected explicitly.
+The sink detects repeated modifying actions for a primary key across input
+batches and budgets the encoded-key set in DataFusion memory. Detection of
+a duplicate in a later batch cannot undo earlier confirmed modifications.
+Snapshot selection remains per bucket, without conditional writes or global
+isolation. This MERGE implementation and DELETE are still Rust-only until
+the matching host/provider FFI transports those operations.
 
 The DuckDB/Polars/pandas Python adapters take **already bounded** PyArrow
 results from the existing binding; they are not live Fluss table providers.

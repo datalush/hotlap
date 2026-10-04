@@ -9,9 +9,9 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{DFSchemaRef, DataFusionError, Result};
 use datafusion::datasource::provider_as_source;
-use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::dml::{InsertOp, MergeIntoClause};
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -280,6 +280,46 @@ impl TableProvider for FlussKvTable {
                 schema_id: self.schema_id,
                 schema: Arc::clone(&self.schema),
                 kind: WriteKind::DeleteKv,
+                options: self.write_options,
+            },
+            input,
+            InsertOp::Append,
+        )
+    }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: DFSchemaRef,
+        on: Expr,
+        clauses: Vec<MergeIntoClause>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let table = self
+            .connection
+            .get_table(&self.path)
+            .await
+            .map_err(fluss_error)?;
+        let primary_keys = table.get_table_info().get_primary_keys().clone();
+        let input = crate::merge::plan_merge_input(
+            state,
+            Arc::new(self.clone()),
+            source,
+            merge_schema,
+            on,
+            clauses,
+            &primary_keys,
+        )
+        .await?;
+        let schema = input.schema();
+        plan_insert(
+            FlussWriteTarget {
+                connection: Arc::clone(&self.connection),
+                path: self.path.clone(),
+                table_id: self.table_id,
+                schema_id: self.schema_id,
+                schema,
+                kind: WriteKind::MergeKv,
                 options: self.write_options,
             },
             input,
