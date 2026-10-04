@@ -24,6 +24,7 @@ pub(crate) struct PartitionMetrics {
     pub(crate) buckets_assigned: Count,
     pub(crate) peak_batch_bytes: Gauge,
     pub(crate) active_streams: Gauge,
+    pub(crate) retained_source_bytes: Gauge,
 }
 
 impl PartitionMetrics {
@@ -67,6 +68,9 @@ impl PartitionMetrics {
             active_streams: builder()
                 .with_category(MetricCategory::Rows)
                 .gauge("fluss_active_partition_streams", partition),
+            retained_source_bytes: builder()
+                .with_category(MetricCategory::Bytes)
+                .gauge("fluss_retained_source_buffer_bytes", partition),
         }
     }
 

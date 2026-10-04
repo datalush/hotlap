@@ -8,6 +8,7 @@
 
 mod capabilities;
 mod catalog;
+mod error;
 mod execution;
 mod filter;
 mod kv_scan;
@@ -25,9 +26,11 @@ mod write;
 
 pub use capabilities::{FlussCapabilities, FlussInsertCapability, FlussReadCapability};
 pub use catalog::FlussCatalog;
+pub use error::{
+    FlussOperationTimeout, FlussReadInvalidated, FlussReadInvalidation, FlussScanTimeout,
+};
 pub use kv_table::FlussKvTable;
 pub use log_options::{LogReadMode, LogReadOptions, LogStart};
 pub use log_progress::{LogDelivery, LogProgress, LogReadPosition, LogTermination};
 pub use log_table::FlussLogTable;
-pub use resources::FlussScanTimeout;
 pub use write::FlussWriteOptions;

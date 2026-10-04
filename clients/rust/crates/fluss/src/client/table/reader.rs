@@ -538,7 +538,12 @@ impl RecordBatchLogReader {
                 return Ok(RecordBatchReadOutcome::TimedOut);
             }
 
-            let scan_batches = self.scanner.poll(timeout - elapsed).await?;
+            // This reader returns one batch per call. Decode only one rather
+            // than retaining up to a full bulk poll before consumer admission.
+            let scan_batches = self
+                .scanner
+                .poll_with_batch_limit(timeout - elapsed, 1)
+                .await?;
             let empty = scan_batches.is_empty();
             let mut completed =
                 filter_batches(scan_batches, &mut self.stopping_offsets, &mut self.buffer);

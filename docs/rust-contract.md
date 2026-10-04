@@ -157,6 +157,22 @@ MemoryPool is admission/accounting for registered consumers, not an allocator
 that automatically covers process RSS. Do not advertise `pool_limit` as a total
 memory cap, or assume a `RecordBatch::clone` duplicates payload memory.
 
+Both providers expose `with_max_retained_batch_bytes(bytes)` (positive, default
+64 MiB). It rejects an admitted batch whose original Arrow backing capacities
+exceed the ceiling, independently of available pool capacity. The native pool
+remains the shared policy; no separate pool/counter allocator is introduced.
+This is post-decode **retention admission**, not a promise to prevent decoder
+allocation/expansion. The limit is shown in EXPLAIN, and the native gauge
+`fluss_retained_source_buffer_bytes` follows buffer leases, including retained
+outputs after stream completion/drop. It is conservative for shared/projected
+backings and does not equal process RSS or the entire pool's reservations.
+
+The engine/application selects budgets/concurrency and the MemoryPool. The
+connector admits/retains against that pool and propagates native client settings;
+the client/Arrow owns format parsing and limits during allocation. Pre-decode
+inspection/codec hardening belongs there, not in a connector IPC parser, global
+allocator, scheduler or engine-recovery loop.
+
 | Resource | Owner and required contract | Current gap / task |
 | --- | --- | --- |
 | Decoded pending source batches | Client produces them; connector charges decoded bounded/streaming reader queues after polling, before output | Queue accounting implemented in `tq3s`; pre-decode/unfinished-poll transients and hard bounds remain `gpze`/`w8ap` |
@@ -308,8 +324,10 @@ Continue using `datafusion::common::Result` and `DataFusionError`. Preserve
 
 Source deadline expiry now carries `FlussScanTimeout` with read semantics inside
 `DataFusionError::External`, without parsing its display string. Connector-generated
-identity/retention and other operation-deadline errors still include plain
-Execution strings. `w8ap`/`yeqf`/`bqrq` must make these inspectable where callers
+source identity/schema/topology/retention checks now use `FlussReadInvalidated`
+with typed reasons; streaming operation expiry uses `FlussOperationTimeout`.
+Some shared-capture/validation failures still have native diagnostic strings;
+`yeqf`/`bqrq` must make write-specific decisions inspectable where callers
 need machine decisions. A small connector-specific error payload implementing
 `std::error::Error` can be boxed in the existing DataFusion error; do not wrap
 every client variant in another hierarchy or introduce an automatic retry policy.

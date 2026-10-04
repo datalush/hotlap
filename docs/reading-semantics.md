@@ -157,6 +157,18 @@ storage before projection, so retaining one projected buffer may conservatively
 keep the entire batch charge. Array header wrappers allocate metadata; custom
 buffer capacity reflects the visible view while the lease charges the original
 backing capacities. Decoded/output byte metrics need not equal pool reservations.
+Log and KV providers accept `with_max_retained_batch_bytes(bytes)`, default 64 MiB,
+as an independent per-batch retention ceiling. Exceeding it produces native
+ResourcesExhausted even with an unbounded pool. This check occurs after decode.
+`fluss_retained_source_buffer_bytes` records live backing-storage leases rather
+than just the latest pull; its value persists while consumers retain buffers.
+
+Native source pulls now decode at most one batch through the client's limited
+poll API. The connector's streaming decoded queue is removed; the bounded reader
+also requests one batch rather than a bulk poll. The client bulk API remains
+available with its existing soft byte cap. Batch polling does not await another
+fetch after consuming output. See [read pressure verification](read-pressure-verification.md)
+for bounds, cancellation and repeated remote/pressure evidence.
 
 Batch log and KV partitions share a source-execution deadline initialized by the
 first executing partition. A late partition receives the same deadline, not a
@@ -164,6 +176,11 @@ fresh timeout. Sequential reexecution/new contexts create fresh deadline scopes.
 The deadline does not bound arbitrary downstream SQL work. Source expiry is an
 inspectable `FlussScanTimeout` inside DataFusion's External error; client network/
 storage errors preserve their original causes. Streaming idle remains unbounded.
+Streaming initialization and topology operations use the connection remote-log
+operation timeout; poll adds its normal idle interval to that finite allowance.
+`FlussOperationTimeout` distinguishes that failure from a completion deadline.
+Local identity/schema/topology/retention changes expose `FlussReadInvalidated`
+reasons through DataFusion External errors without replacing protocol causes.
 
 The catalog discovers names once; reload it after creating tables.
 It selects the log or KV provider from the table's primary-key metadata.

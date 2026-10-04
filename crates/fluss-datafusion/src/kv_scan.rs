@@ -37,6 +37,7 @@ pub(crate) struct KvScanSpec {
     pub(crate) timeout: Duration,
     pub(crate) metrics: ExecutionPlanMetricsSet,
     pub(crate) deadlines: Arc<SharedCaptures<Instant>>,
+    pub(crate) max_retained_batch_bytes: usize,
 }
 
 impl KvScanSpec {
@@ -179,7 +180,12 @@ impl KvReadState {
             match batch {
                 Some(batch) => {
                     self.metrics.record_decoded_batch(&batch);
-                    let batch = crate::resources::reserve_batch(batch, &self.reservation)?;
+                    let batch = crate::resources::reserve_batch(
+                        batch,
+                        &self.reservation,
+                        self.partition.spec.max_retained_batch_bytes,
+                        &self.metrics.retained_source_bytes,
+                    )?;
                     self.metrics.record_output_batch(&batch);
                     return Ok(Some(batch));
                 }
@@ -271,17 +277,25 @@ impl KvReadState {
             .await
             .map_err(fluss_error)?;
         let info = table.get_table_info();
+        let current_schema = to_arrow_schema(info.get_row_type()).map_err(fluss_error)?;
         if info.table_id != spec.table_id
             || (!spec.partitioned && info.get_num_buckets() != spec.buckets)
             || !info.has_primary_key()
             || info.is_partitioned() != spec.partitioned
-            || to_arrow_schema(info.get_row_type())
-                .map_err(fluss_error)?
-                .as_ref()
-                != spec.full_schema.as_ref()
+            || current_schema.as_ref() != spec.full_schema.as_ref()
         {
-            return Err(DataFusionError::Execution(
-                "Fluss KV table schema or topology changed; plan again".into(),
+            let reason = if info.table_id != spec.table_id {
+                crate::FlussReadInvalidation::Identity
+            } else if !info.has_primary_key()
+                || current_schema.as_ref() != spec.full_schema.as_ref()
+            {
+                crate::FlussReadInvalidation::Schema
+            } else {
+                crate::FlussReadInvalidation::Topology
+            };
+            return Err(crate::error::invalidated(
+                reason,
+                "Fluss KV table schema or topology changed; plan again",
             ));
         }
         let scan = table.new_scan();

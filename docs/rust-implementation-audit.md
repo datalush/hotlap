@@ -334,3 +334,17 @@ resume after a new append and rejection of incomplete offsets; all empty buckets
 initialize without batches; idle streaming initializes and cancellation terminates.
 Existing reexecution, concurrent contexts and topology/error cases remain native
 DataFusion/client contracts, not a new scheduler or observer-driven retry loop.
+
+## 11. Reading hardening in w8ap (working tree)
+
+Native limited batch polling reduces decoded pending work to one batch per source
+pull and removes streaming VecDeque state. No post-decode network await remains
+in the batch poll. Streaming initialization/topology/poll waits are finite without
+making idle a completion deadline. Small typed source causes moved to `error.rs`,
+separate from leases; original protocol errors remain unchanged.
+
+See [read-pressure-verification.md](read-pressure-verification.md) for current
+limits, 100-row concurrent producer/slow-consumer evidence, all nine live cases,
+three repeated remote profiles, the initial failover timeout and evidence reuse.
+This resolves the retained-queue/unfinished-poll foundation without claiming
+pre-decompression protection, total RSS limits or benchmark acceptance.

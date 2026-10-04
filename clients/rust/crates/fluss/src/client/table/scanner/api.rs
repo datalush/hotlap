@@ -76,7 +76,23 @@ impl RecordBatchLogScanner {
 
     /// Poll for batches with metadata (bucket and offset information).
     pub async fn poll(&self, timeout: Duration) -> Result<Vec<ScanBatch>> {
-        self.inner.poll_batches(timeout).await
+        self.poll_with_batch_limit(timeout, 100).await
+    }
+
+    /// Bound decoded batches returned by a poll (1..=100), independently of
+    /// raw fetch/prefetch limits. One oversized batch can still require decode
+    /// allocation; this is a batch-count bound, not a pre-decompression byte cap.
+    pub async fn poll_with_batch_limit(
+        &self,
+        timeout: Duration,
+        max_batches: usize,
+    ) -> Result<Vec<ScanBatch>> {
+        if !(1..=100).contains(&max_batches) {
+            return Err(Error::IllegalArgument {
+                message: "Arrow poll batch limit must be in 1..=100".into(),
+            });
+        }
+        self.inner.poll_batches(timeout, max_batches).await
     }
 
     pub async fn subscribe(&self, bucket: i32, offset: i64) -> Result<()> {

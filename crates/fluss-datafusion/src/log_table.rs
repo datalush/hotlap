@@ -43,6 +43,7 @@ pub struct FlussLogTable {
     deliveries: tokio::sync::broadcast::Sender<LogDelivery>,
     progress: tokio::sync::broadcast::Sender<crate::LogProgress>,
     write_options: FlussWriteOptions,
+    max_retained_batch_bytes: usize,
 }
 
 impl FlussLogTable {
@@ -122,6 +123,7 @@ impl FlussLogTable {
             deliveries: tokio::sync::broadcast::channel(1024).0,
             progress: tokio::sync::broadcast::channel(1024).0,
             write_options: FlussWriteOptions::default(),
+            max_retained_batch_bytes: crate::resources::DEFAULT_MAX_RETAINED_BATCH_BYTES,
         })
     }
 
@@ -137,6 +139,14 @@ impl FlussLogTable {
     /// Lagged or missing initialization means incomplete progress, not a checkpoint.
     pub fn subscribe_progress(&self) -> tokio::sync::broadcast::Receiver<crate::LogProgress> {
         self.progress.subscribe()
+    }
+
+    /// Post-decode backing-storage ceiling per admitted batch (default 64 MiB).
+    /// Does not cap transient decoding/RSS; the execution's DataFusion pool is
+    /// still the shared admission policy. Zero is rejected.
+    pub fn with_max_retained_batch_bytes(mut self, bytes: usize) -> Result<Self> {
+        self.max_retained_batch_bytes = crate::resources::validate_batch_limit(bytes)?;
+        Ok(self)
     }
 
     /// Cap physical partitions; the default uses DataFusion's target partitions.
@@ -246,7 +256,7 @@ impl TableProvider for FlussLogTable {
             })
             .flatten();
         let description = format!(
-            "kind=log, mode={:?}, table={}, projection={}, projected_columns={:?}, batch_pruning={predicate:?}, partition_pruning={partition_filter:?}",
+            "kind=log, mode={:?}, table={}, projection={}, projected_columns={:?}, batch_pruning={predicate:?}, partition_pruning={partition_filter:?}, max_retained_batch_bytes={}",
             self.options.mode,
             self.path,
             if projection.is_some_and(Vec::is_empty) {
@@ -260,7 +270,8 @@ impl TableProvider for FlussLogTable {
                 .fields()
                 .iter()
                 .map(|field| field.name())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            self.max_retained_batch_bytes,
         );
         let spec = Arc::new(ScanSpec {
             connection: Arc::clone(&self.connection),
@@ -284,6 +295,7 @@ impl TableProvider for FlussLogTable {
             progress: self.progress.clone(),
             execution_ids: Arc::new(SharedCaptures::<u64>::default()),
             deadlines: Arc::new(SharedCaptures::default()),
+            max_retained_batch_bytes: self.max_retained_batch_bytes,
         });
         let inner = StreamingTableExec::try_new(
             schema,

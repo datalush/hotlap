@@ -220,10 +220,36 @@ async fn batch_scan_fails_when_retention_removed_its_next_offset() -> Result<()>
         Some("requested offset was deleted by retention".into());
     LogFetcher::handle_fetch_response(response, test_response_context(&fetcher, &metadata)).await;
     let error = fetcher
-        .collect_batches()
+        .collect_batches_limited(100)
         .await
         .expect_err("a lost offset must fail the scan");
     assert!(error.to_string().contains("out of range"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn limited_decode_keeps_other_completed_batches_for_later_polls() -> Result<()> {
+    let path = TablePath::new("db", "tbl");
+    let info = build_table_info(path.clone(), 1, 2);
+    let metadata = Arc::new(Metadata::new_for_test(build_cluster_arc(&path, 1, 2)));
+    let status = Arc::new(LogScannerStatus::new());
+    for bucket in 0..2 {
+        status.assign_scan_bucket(TableBucket::new(1, bucket), 0);
+    }
+    let fetcher = filtering_fetcher(&info, &metadata, status, None)?;
+    for bucket in 0..2 {
+        let mut response = filtered_response(None, Some(1));
+        response.tables_resp[0].buckets_resp[0].bucket_id = bucket;
+        response.tables_resp[0].buckets_resp[0].records =
+            Some(build_records(&info, Arc::new(path.clone()))?);
+        LogFetcher::handle_fetch_response(response, test_response_context(&fetcher, &metadata))
+            .await;
+    }
+    let first = fetcher.collect_batches_limited(1).await?;
+    let second = fetcher.collect_batches_limited(1).await?;
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_ne!(first[0].bucket(), second[0].bucket());
     Ok(())
 }
 
@@ -250,7 +276,7 @@ async fn batch_scan_does_not_hide_retention_error_after_decoding_other_bucket() 
     LogFetcher::handle_fetch_response(lost, test_response_context(&fetcher, &metadata)).await;
 
     let error = fetcher
-        .collect_batches()
+        .collect_batches_limited(100)
         .await
         .expect_err("decoded rows cannot hide a later missing range");
     assert!(error.to_string().contains("out of range"));

@@ -7,38 +7,40 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{ArrayData, make_array};
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use datafusion::common::Result;
+use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::memory_pool::MemoryReservation;
+use datafusion::physical_plan::metrics::Gauge;
 
-/// Inspectable source-execution deadline error boxed in DataFusion's External
-/// variant. A source budget is not a SQL-wide deadline or a write outcome.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FlussScanTimeout {
-    pub read: crate::FlussReadCapability,
+pub(crate) const DEFAULT_MAX_RETAINED_BATCH_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) fn validate_batch_limit(bytes: usize) -> Result<usize> {
+    if bytes == 0 {
+        return Err(DataFusionError::Plan(
+            "Fluss max retained batch bytes must be positive".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
-impl std::fmt::Display for FlussScanTimeout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.read {
-            crate::FlussReadCapability::Log(_) => {
-                f.write_str("Fluss bounded log scan timed out; result is incomplete")
-            }
-            crate::FlussReadCapability::KvSnapshot => {
-                f.write_str("Fluss KV snapshot scan timed out")
-            }
-        }
+struct BatchLease {
+    _reservation: Mutex<MemoryReservation>,
+    retained_bytes: Gauge,
+    bytes: usize,
+}
+impl Drop for BatchLease {
+    fn drop(&mut self) {
+        self.retained_bytes.sub(self.bytes);
     }
 }
-impl std::error::Error for FlussScanTimeout {}
 
 /// The original buffer deallocates its storage. Mutex supplies the unwind-safe
 /// owner required by Arrow; the immutable reservation guard is never locked.
 struct ReservedBuffer {
     _buffer: Buffer,
-    _reservation: Arc<Mutex<MemoryReservation>>,
+    _reservation: Arc<BatchLease>,
 }
 
-fn reserve_buffer(buffer: &Buffer, reservation: &Arc<Mutex<MemoryReservation>>) -> Buffer {
+fn reserve_buffer(buffer: &Buffer, reservation: &Arc<BatchLease>) -> Buffer {
     let owner = Arc::new(ReservedBuffer {
         _buffer: buffer.clone(),
         _reservation: Arc::clone(reservation),
@@ -54,7 +56,7 @@ fn reserve_buffer(buffer: &Buffer, reservation: &Arc<Mutex<MemoryReservation>>) 
     }
 }
 
-fn reserve_data(data: ArrayData, reservation: &Arc<Mutex<MemoryReservation>>) -> Result<ArrayData> {
+fn reserve_data(data: ArrayData, reservation: &Arc<BatchLease>) -> Result<ArrayData> {
     let buffers = data
         .buffers()
         .iter()
@@ -87,15 +89,30 @@ fn reserve_data(data: ArrayData, reservation: &Arc<Mutex<MemoryReservation>>) ->
 pub(crate) fn reserve_batch(
     batch: RecordBatch,
     consumer: &MemoryReservation,
+    max_bytes: usize,
+    retained_bytes: &Gauge,
 ) -> Result<RecordBatch> {
-    let reservation = consumer.new_empty();
     let bytes = batch
         .columns()
         .iter()
         .map(|column| column.get_buffer_memory_size())
-        .sum();
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| {
+            DataFusionError::ResourcesExhausted("Fluss source backing byte count overflowed".into())
+        })?;
+    if bytes > max_bytes {
+        return Err(DataFusionError::ResourcesExhausted(format!(
+            "Fluss source batch retains {bytes} backing bytes, exceeding max_retained_batch_bytes={max_bytes}; decoding precedes this admission limit"
+        )));
+    }
+    let reservation = consumer.new_empty();
     reservation.try_grow(bytes)?;
-    let reservation = Arc::new(Mutex::new(reservation));
+    retained_bytes.add(bytes);
+    let reservation = Arc::new(BatchLease {
+        _reservation: Mutex::new(reservation),
+        retained_bytes: retained_bytes.clone(),
+        bytes,
+    });
     let columns = batch
         .columns()
         .iter()
@@ -164,10 +181,13 @@ mod tests {
             .collect();
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
         let consumer = MemoryConsumer::new("source").register(&pool);
-        let first = reserve_batch(original.clone(), &consumer).unwrap();
-        let second = reserve_batch(original, &consumer).unwrap();
+        let retained_bytes = Gauge::new();
+        let first =
+            reserve_batch(original.clone(), &consumer, usize::MAX, &retained_bytes).unwrap();
+        let second = reserve_batch(original, &consumer, usize::MAX, &retained_bytes).unwrap();
         let reserved = pool.reserved();
         assert!(reserved > 0);
+        assert_eq!(retained_bytes.value(), reserved);
         for (column, expected) in first.columns().iter().zip(pointers) {
             assert_eq!(buffer_locations(&column.to_data()), expected);
         }
@@ -193,6 +213,7 @@ mod tests {
         );
         drop(retained);
         assert_eq!(pool.reserved(), 0);
+        assert_eq!(retained_bytes.value(), 0);
     }
 
     #[test]
@@ -205,12 +226,39 @@ mod tests {
         let size = batch.column(0).get_buffer_memory_size();
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(size));
         let consumer = MemoryConsumer::new("source").register(&pool);
-        let first = reserve_batch(batch.clone(), &consumer).unwrap();
-        assert!(reserve_batch(batch, &consumer).is_err());
+        let retained_bytes = Gauge::new();
+        let first = reserve_batch(batch.clone(), &consumer, usize::MAX, &retained_bytes).unwrap();
+        assert!(reserve_batch(batch.clone(), &consumer, usize::MAX, &retained_bytes).is_err());
+        assert!(reserve_batch(batch, &consumer, size - 1, &retained_bytes).is_err());
         assert_eq!(pool.reserved(), size);
+        assert_eq!(retained_bytes.value(), size);
         drop(consumer);
         assert_eq!(pool.reserved(), size);
         drop(first);
         assert_eq!(pool.reserved(), 0);
+        assert_eq!(retained_bytes.value(), 0);
+    }
+
+    #[test]
+    fn batch_ceiling_checks_backing_storage_independently_of_pool_capacity() {
+        let original = RecordBatch::try_from_iter(vec![(
+            "x",
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+        )])
+        .unwrap();
+        let bytes = original.column(0).get_buffer_memory_size();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes * 10));
+        let consumer = MemoryConsumer::new("source").register(&pool);
+        let retained = Gauge::new();
+        assert!(validate_batch_limit(0).is_err());
+        assert!(reserve_batch(original.slice(0, 1), &consumer, bytes - 1, &retained).is_err());
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(retained.value(), 0);
+        let admitted = reserve_batch(original, &consumer, bytes, &retained).unwrap();
+        assert_eq!(pool.reserved(), bytes);
+        assert_eq!(retained.value(), bytes);
+        drop(admitted);
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(retained.value(), 0);
     }
 }

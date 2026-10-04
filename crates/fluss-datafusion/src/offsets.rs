@@ -37,9 +37,12 @@ pub(super) fn validate_window(
 
 pub(super) fn ensure_retained(captured: i64, current: i64, bucket: i32) -> DataFusionResult<()> {
     if current > captured {
-        return Err(DataFusionError::Execution(format!(
-            "Fluss bucket {bucket} lost retained log offsets needed by this scan: captured start {captured}, current earliest {current}"
-        )));
+        return Err(crate::error::invalidated(
+            crate::FlussReadInvalidation::Retention,
+            format!(
+                "Fluss bucket {bucket} lost retained log offsets needed by this scan: captured start {captured}, current earliest {current}"
+            ),
+        ));
     }
     Ok(())
 }
@@ -285,7 +288,16 @@ mod tests {
     fn retention_must_not_advance_past_a_captured_start() {
         assert!(ensure_retained(5, 5, 0).is_ok());
         assert!(ensure_retained(5, 4, 0).is_ok());
-        assert!(ensure_retained(5, 6, 0).is_err());
+        let DataFusionError::External(cause) = ensure_retained(5, 6, 0).unwrap_err() else {
+            panic!("retention must preserve an inspectable cause");
+        };
+        assert_eq!(
+            cause
+                .downcast_ref::<crate::FlussReadInvalidated>()
+                .unwrap()
+                .reason,
+            crate::FlussReadInvalidation::Retention
+        );
         assert!(
             validate_window(
                 Arc::new(HashMap::from([(0, 6)])),

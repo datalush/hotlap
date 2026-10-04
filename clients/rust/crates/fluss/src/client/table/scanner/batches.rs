@@ -21,13 +21,15 @@ use super::{CompletedFetch, FetchResult, LogFetcher, Result, ScanBatch, warn};
 
 impl LogFetcher {
     /// Collect completed fetches as ScanBatches (with bucket and offset metadata)
-    pub(super) async fn collect_batches(&self) -> Result<Vec<ScanBatch>> {
+    pub(super) async fn collect_batches_limited(
+        &self,
+        max_batches: usize,
+    ) -> Result<Vec<ScanBatch>> {
         // Limit memory usage with both batch count and byte size constraints.
         // Max 100 batches per poll, but also check total bytes (soft cap ~64MB).
-        const MAX_BATCHES: usize = 100;
         const MAX_BYTES: usize = 64 * 1024 * 1024; // 64MB soft cap
         let mut result: Vec<ScanBatch> = Vec::new();
-        let mut batches_remaining = MAX_BATCHES;
+        let mut batches_remaining = max_batches;
         let mut bytes_consumed: usize = 0;
 
         {

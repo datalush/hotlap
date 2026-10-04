@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Lazy per-partition read state: capture offsets, open reader, yield Arrow batches.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,6 +67,7 @@ pub(crate) struct ScanSpec {
     pub(crate) progress: tokio::sync::broadcast::Sender<LogProgress>,
     pub(crate) execution_ids: Arc<SharedCaptures<u64>>,
     pub(crate) deadlines: Arc<SharedCaptures<Instant>>,
+    pub(crate) max_retained_batch_bytes: usize,
 }
 
 impl ScanSpec {
@@ -141,7 +142,7 @@ struct ReadState {
 
 enum ActiveReader {
     Bounded(RecordBatchLogReader),
-    Streaming(RecordBatchLogScanner, VecDeque<ScanBatch>),
+    Streaming(RecordBatchLogScanner),
     EmptyStreaming,
 }
 
@@ -149,10 +150,7 @@ impl ActiveReader {
     fn buffered_arrow_bytes(&self) -> usize {
         match self {
             Self::Bounded(reader) => reader.buffered_arrow_bytes(),
-            Self::Streaming(_, buffer) => buffer
-                .iter()
-                .map(|batch| batch.batch().get_array_memory_size())
-                .sum(),
+            Self::Streaming(_) => 0,
             Self::EmptyStreaming => 0,
         }
     }
@@ -163,12 +161,17 @@ impl ActiveReader {
                 .next_batch_with_timeout(wait)
                 .await
                 .map_err(fluss_error),
-            Self::Streaming(scanner, buffer) => {
-                if let Some(batch) = buffer.pop_front() {
-                    return Ok(RecordBatchReadOutcome::Batch(batch));
+            Self::Streaming(scanner) => {
+                let batches = scanner
+                    .poll_with_batch_limit(wait, 1)
+                    .await
+                    .map_err(fluss_error)?;
+                if batches.len() > 1 {
+                    return Err(DataFusionError::Execution(
+                        "Fluss scanner exceeded the single-batch decode bound".into(),
+                    ));
                 }
-                buffer.extend(scanner.poll(wait).await.map_err(fluss_error)?);
-                Ok(buffer.pop_front().map_or(
+                Ok(batches.into_iter().next().map_or(
                     RecordBatchReadOutcome::TimedOut,
                     RecordBatchReadOutcome::Batch,
                 ))
@@ -288,9 +291,7 @@ impl ReadState {
                 if self.deadline.is_some() {
                     expired()
                 } else {
-                    DataFusionError::Execution(
-                        "Fluss streaming log source initialization timed out".into(),
-                    )
+                    operation_timeout("initialization")
                 }
             })??;
             self.reader = Some(reader);
@@ -326,10 +327,19 @@ impl ReadState {
 
     async fn poll_reader(&mut self) -> Result<RecordBatchReadOutcome> {
         let remaining = self.remaining()?;
+        let operation_limit = Duration::from_millis(
+            self.source
+                .spec
+                .connection
+                .config()
+                .scanner_remote_log_operation_timeout_ms,
+        );
         if self.source.spec.options.mode == LogReadMode::Streaming
             && self.last_topology_check.elapsed() >= Duration::from_secs(5)
         {
-            self.check_streaming_topology().await?;
+            tokio::time::timeout(operation_limit, self.check_streaming_topology())
+                .await
+                .map_err(|_| operation_timeout("metadata/topology"))??;
             self.last_topology_check = Instant::now();
         }
         // Inspect scanner progress regularly even when every fetched batch
@@ -346,7 +356,12 @@ impl ReadState {
                 .await
                 .map_err(|_| expired())?
         } else {
-            poll.await
+            // Idle waiting is intentional and distinct from the operation
+            // allowance; otherwise a short configured limit would expire
+            // every healthy idle poll rather than following the stream.
+            tokio::time::timeout(operation_limit.saturating_add(poll_wait), poll)
+                .await
+                .map_err(|_| operation_timeout("poll"))?
         }?;
         self.reservation
             .try_resize(self.reader.as_ref().unwrap().buffered_arrow_bytes())?;
@@ -364,7 +379,12 @@ impl ReadState {
         let rows = batch.num_records();
         let decoded = batch.into_batch();
         self.metrics.record_decoded_batch(&decoded);
-        let decoded = crate::resources::reserve_batch(decoded, &self.reservation)?;
+        let decoded = crate::resources::reserve_batch(
+            decoded,
+            &self.reservation,
+            self.source.spec.max_retained_batch_bytes,
+            &self.metrics.retained_source_bytes,
+        )?;
         let output = match &self.source.spec.projection {
             Some(indices) if indices.is_empty() || !self.source.spec.project_at_source => {
                 decoded.project(indices)?
@@ -456,7 +476,7 @@ impl ReadState {
                     .await
                     .map_err(fluss_error)?;
             }
-            return Ok(ActiveReader::Streaming(scanner, VecDeque::new()));
+            return Ok(ActiveReader::Streaming(scanner));
         }
         if let Some(capture) = &self.partition_capture {
             let snapshot = capture
@@ -582,8 +602,16 @@ impl ReadState {
             || (self.source.spec.options.mode == LogReadMode::Streaming
                 && info.get_schema_id() != self.source.spec.schema_id)
         {
-            return Err(DataFusionError::Execution(
-                "Fluss table topology changed; plan again".into(),
+            let reason = if info.table_id != self.source.spec.table_id {
+                crate::FlussReadInvalidation::Identity
+            } else if info.get_schema_id() != self.source.spec.schema_id {
+                crate::FlussReadInvalidation::Schema
+            } else {
+                crate::FlussReadInvalidation::Topology
+            };
+            return Err(crate::error::invalidated(
+                reason,
+                "Fluss table topology changed; plan again",
             ));
         }
         Ok(table)
@@ -614,8 +642,9 @@ impl ReadState {
                         now.get_partition_id() != old.0 || now.get_bucket_count() != Some(old.1)
                     })
             {
-                return Err(DataFusionError::Execution(
-                    "Fluss partition topology changed during streaming; start a new scan explicitly".into(),
+                return Err(crate::error::invalidated(
+                    crate::FlussReadInvalidation::Topology,
+                    "Fluss partition topology changed during streaming; start a new scan explicitly",
                 ));
             }
         }
@@ -650,8 +679,9 @@ impl ReadState {
             &self.source.spec.schema
         };
         if scanner.schema() != *expected_schema {
-            return Err(DataFusionError::Execution(
-                "Fluss table schema changed; plan again".into(),
+            return Err(crate::error::invalidated(
+                crate::FlussReadInvalidation::Schema,
+                "Fluss table schema changed; plan again",
             ));
         }
         Ok(scanner)
@@ -873,13 +903,7 @@ impl ReadState {
         };
         let (consumed, queued) = match reader {
             ActiveReader::Bounded(reader) => (reader.consumed_offsets(), reader.buffered_offsets()),
-            ActiveReader::Streaming(scanner, queue) => (
-                scanner.get_subscribed_buckets(),
-                queue
-                    .iter()
-                    .map(|batch| (batch.bucket().clone(), batch.base_offset()))
-                    .collect(),
-            ),
+            ActiveReader::Streaming(scanner) => (scanner.get_subscribed_buckets(), Vec::new()),
             ActiveReader::EmptyStreaming => return,
         };
         let consumed: HashMap<_, _> = consumed.into_iter().collect();
@@ -927,4 +951,8 @@ fn expired() -> DataFusionError {
 
 fn fluss_error(error: fluss::error::Error) -> DataFusionError {
     DataFusionError::External(Box::new(error))
+}
+
+fn operation_timeout(operation: &'static str) -> DataFusionError {
+    DataFusionError::External(Box::new(crate::FlussOperationTimeout { operation }))
 }

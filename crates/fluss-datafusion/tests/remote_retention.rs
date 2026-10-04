@@ -1661,7 +1661,8 @@ async fn check_slow_remote_consumer(ctx: &SessionContext) -> TestResult<()> {
     let task_ctx = Arc::new(query.task_ctx());
     let pool = Arc::clone(&task_ctx.runtime_env().memory_pool);
     let mut stream = source.execute(0, task_ctx)?;
-    assert!(stream.next().await.expect("first remote batch")?.num_rows() > 0);
+    let first = stream.next().await.expect("first remote batch")?;
+    assert!(first.num_rows() > 0);
     let reserved = pool.reserved();
     assert!(reserved > 0);
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1675,6 +1676,11 @@ async fn check_slow_remote_consumer(ctx: &SessionContext) -> TestResult<()> {
         "remote prefetch must honor the default four-file limit"
     );
     drop(stream);
+    assert!(
+        pool.reserved() > 0,
+        "retained remote batch still owns its source lease"
+    );
+    drop(first);
     assert_eq!(pool.reserved(), 0);
     wait_for(Duration::from_secs(5), || async {
         remote_temp_files().map(|files| files == 0)

@@ -31,7 +31,12 @@ impl LogScannerInner {
         // where the caller drops this future.
         let _poll_guard = PollGuard::new(self);
         let start = Instant::now();
-        let deadline = start + timeout;
+        let deadline =
+            start
+                .checked_add(timeout)
+                .ok_or_else(|| crate::error::Error::IllegalArgument {
+                    message: "Scanner poll timeout exceeds the clock range".into(),
+                })?;
 
         loop {
             // Try to collect fetches
@@ -95,16 +100,27 @@ impl LogScannerInner {
         self.log_fetcher.collect_fetches().await
     }
 
-    pub(super) async fn poll_batches(&self, timeout: Duration) -> Result<Vec<ScanBatch>> {
+    pub(super) async fn poll_batches(
+        &self,
+        timeout: Duration,
+        max_batches: usize,
+    ) -> Result<Vec<ScanBatch>> {
         let _poll_guard = PollGuard::new(self);
         let start = Instant::now();
-        let deadline = start + timeout;
+        let deadline =
+            start
+                .checked_add(timeout)
+                .ok_or_else(|| crate::error::Error::IllegalArgument {
+                    message: "Scanner poll timeout exceeds the clock range".into(),
+                })?;
 
         loop {
-            let batches = self.poll_for_batches().await?;
+            let batches = self.poll_for_batches(max_batches).await?;
 
             if !batches.is_empty() {
-                self.log_fetcher.send_fetches().await?;
+                // Do not await metadata/network work after consuming batches:
+                // cancellation would lose them while offsets already advanced.
+                // The next poll sends more fetches when buffered data is drained.
                 return Ok(batches);
             }
 
@@ -126,13 +142,16 @@ impl LogScannerInner {
         }
     }
 
-    async fn poll_for_batches(&self) -> Result<Vec<ScanBatch>> {
-        let result = self.log_fetcher.collect_batches().await?;
+    async fn poll_for_batches(&self, max_batches: usize) -> Result<Vec<ScanBatch>> {
+        let result = self
+            .log_fetcher
+            .collect_batches_limited(max_batches)
+            .await?;
         if !result.is_empty() {
             return Ok(result);
         }
 
         self.log_fetcher.send_fetches().await?;
-        self.log_fetcher.collect_batches().await
+        self.log_fetcher.collect_batches_limited(max_batches).await
     }
 }

@@ -311,6 +311,7 @@ async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<
             14
         );
         drop(filtered_stream);
+        check_continuous_pressure(&connection, &path).await?;
         Ok(())
     }
     .await;
@@ -318,6 +319,102 @@ async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<
     result?;
     cleanup?;
     connection.close(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
+async fn check_continuous_pressure(
+    connection: &Arc<FlussConnection>,
+    path: &TablePath,
+) -> TestResult<()> {
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let ctx = SessionContext::new_with_config_rt(
+        SessionConfig::new().with_target_partitions(1),
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build()?,
+        ),
+    );
+    let provider = FlussLogTable::open_with_options(
+        Arc::clone(connection),
+        path.clone(),
+        LogReadOptions {
+            start: LogStart::Latest,
+            ..LogReadOptions::default()
+        },
+    )
+    .await?;
+    ctx.register_table("pressure", Arc::new(provider))?;
+    let query = ctx.sql("SELECT id FROM pressure").await?;
+    let source = source_plan(&query.create_physical_plan().await?);
+    let mut stream = source.execute(0, Arc::new(query.task_ctx()))?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), stream.next())
+            .await
+            .is_err()
+    );
+    let producer_connection = Arc::clone(connection);
+    let producer_path = path.clone();
+    let producer = tokio::spawn(async move {
+        let table = producer_connection.get_table(&producer_path).await?;
+        let writer = table.new_append()?.create_writer()?;
+        for group in 0..20 {
+            for offset in 0..5 {
+                let mut row = GenericRow::new(1);
+                row.set_field(0, 1000_i32 + group * 5 + offset);
+                writer.append(&row)?;
+            }
+            writer.flush().await?;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        Ok::<_, fluss::error::Error>(())
+    });
+    let consumed: TestResult<()> = async {
+        let mut ids = HashSet::new();
+        while ids.len() < 100 {
+            let batch = tokio::time::timeout(Duration::from_secs(12), stream.next())
+                .await?
+                .ok_or("continuous source ended under pressure")??;
+            let held = pool.reserved();
+            assert!(held > 0 && held <= 1024 * 1024);
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            assert_eq!(
+                pool.reserved(),
+                held,
+                "producer activity must not decode more Arrow behind a paused consumer"
+            );
+            for id in batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+            {
+                assert!(ids.insert(*id), "pressure scan duplicated {id}");
+            }
+            drop(batch);
+            assert_eq!(
+                pool.reserved(),
+                0,
+                "single-batch pull must not retain decoded queued batches"
+            );
+        }
+        assert_eq!(ids, (1000..1100).collect());
+        Ok(())
+    }
+    .await;
+    drop(stream);
+    if consumed.is_err() {
+        producer.abort();
+    }
+    let produced = producer.await;
+    consumed?;
+    produced??;
+    assert_eq!(pool.reserved(), 0);
+    assert_eq!(
+        metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
+        0
+    );
     Ok(())
 }
 
@@ -959,6 +1056,45 @@ async fn check_memory_pool(
         );
     }
 
+    // Provider retention policy must reject an oversized batch even when the
+    // DataFusion pool is unbounded. This is post-decode admission, not an RSS cap.
+    let bounded = SessionContext::new();
+    bounded.register_table(
+        "log",
+        Arc::new(
+            FlussLogTable::open(Arc::clone(connection), log.clone(), SCAN_TIMEOUT)
+                .await?
+                .with_max_retained_batch_bytes(1)?,
+        ),
+    )?;
+    bounded.register_table(
+        "kv",
+        Arc::new(
+            FlussKvTable::open(Arc::clone(connection), kv.clone(), SCAN_TIMEOUT)
+                .await?
+                .with_max_retained_batch_bytes(1)?,
+        ),
+    )?;
+    for table in ["log", "kv"] {
+        let query = bounded.sql(&format!("SELECT * FROM {table}")).await?;
+        let plan = query.create_physical_plan().await?;
+        let source = source_plan(&plan);
+        let error = collect_plan(plan, Arc::new(query.task_ctx()))
+            .await
+            .expect_err("retention ceiling must apply independently of the host pool");
+        assert!(
+            error.to_string().contains("max_retained_batch_bytes=1"),
+            "{error}"
+        );
+        assert_eq!(
+            metric(
+                &source.metrics().unwrap(),
+                "fluss_retained_source_buffer_bytes"
+            ),
+            0
+        );
+    }
+
     let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
     // Executing a late source partition must not restart the scan budget,
     // even when the earlier partition has not yet polled its stream.
@@ -1018,6 +1154,13 @@ async fn check_memory_pool(
     assert!(first.num_rows() > 0);
     let held = pool.reserved();
     assert!(held > 0 && held <= 8 * 1024 * 1024);
+    assert_eq!(
+        metric(
+            &source.metrics().unwrap(),
+            "fluss_retained_source_buffer_bytes"
+        ),
+        held
+    );
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
         pool.reserved(),
@@ -1032,6 +1175,13 @@ async fn check_memory_pool(
     );
     drop(first);
     assert_eq!(pool.reserved(), 0);
+    assert_eq!(
+        metric(
+            &source.metrics().unwrap(),
+            "fluss_retained_source_buffer_bytes"
+        ),
+        0
+    );
     let count_query = slow.sql("SELECT COUNT(*) FROM kv").await?;
     let count_source = source_plan(&count_query.create_physical_plan().await?);
     let count_batches =
@@ -2391,7 +2541,7 @@ async fn coordinator_failover_keeps_or_rejects_an_open_bounded_log_scan() -> Tes
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
         })
-        .await?;
+        .await.map_err(|_| "coordinator replacement UID did not change within 120s")?;
         isolated_kubectl(
             &kubeconfig,
             &[
@@ -2413,7 +2563,7 @@ async fn coordinator_failover_keeps_or_rejects_an_open_bounded_log_scan() -> Tes
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
         })
-        .await?;
+        .await.map_err(|_| "cluster health did not become Green within 90s after coordinator replacement")?;
         let fresh_count = tokio::time::timeout(Duration::from_secs(90), async {
             loop {
                 if let Ok(count) = count_sql(&ctx, "SELECT COUNT(*) FROM log").await {
@@ -2425,7 +2575,7 @@ async fn coordinator_failover_keeps_or_rejects_an_open_bounded_log_scan() -> Tes
         if fresh_count != 512 {
             return Err(format!("fresh query returned {fresh_count} instead of 512 rows").into());
         }
-        match ongoing? {
+        match ongoing.map_err(|_| "open source did not finish or fail within its 45s failover bound")? {
             Ok(()) => {
                 let observed = seen.len();
                 seen.sort_unstable();

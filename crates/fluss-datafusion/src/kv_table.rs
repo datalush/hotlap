@@ -46,6 +46,7 @@ pub struct FlussKvTable {
     max_assigned_buckets: usize,
     write_options: FlussWriteOptions,
     delete_allowed: bool,
+    max_retained_batch_bytes: usize,
 }
 
 impl FlussKvTable {
@@ -103,7 +104,16 @@ impl FlussKvTable {
             max_assigned_buckets: DEFAULT_MAX_ASSIGNED_BUCKETS,
             write_options: FlussWriteOptions::default(),
             delete_allowed,
+            max_retained_batch_bytes: crate::resources::DEFAULT_MAX_RETAINED_BATCH_BYTES,
         })
+    }
+
+    /// Post-decode backing-storage ceiling per admitted batch (default 64 MiB).
+    /// This bounds retention, not decoder transient allocations or total RSS.
+    /// Zero is rejected; the execution's DataFusion pool remains authoritative.
+    pub fn with_max_retained_batch_bytes(mut self, bytes: usize) -> Result<Self> {
+        self.max_retained_batch_bytes = crate::resources::validate_batch_limit(bytes)?;
+        Ok(self)
     }
 
     /// Cap physical partitions; the default uses DataFusion's target partitions.
@@ -194,7 +204,7 @@ impl TableProvider for FlussKvTable {
             ));
         }
         let description = format!(
-            "kind=kv_snapshot, table={}, projection={}, projected_columns={:?}, partition_pruning={partition_filter:?}",
+            "kind=kv_snapshot, table={}, projection={}, projected_columns={:?}, partition_pruning={partition_filter:?}, max_retained_batch_bytes={}",
             self.path,
             if projection.is_some_and(Vec::is_empty) {
                 "row_count_only"
@@ -205,7 +215,8 @@ impl TableProvider for FlussKvTable {
                 .fields()
                 .iter()
                 .map(|field| field.name())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            self.max_retained_batch_bytes,
         );
         let metrics = ExecutionPlanMetricsSet::new();
         let spec = Arc::new(KvScanSpec {
@@ -223,6 +234,7 @@ impl TableProvider for FlussKvTable {
             timeout: self.timeout,
             metrics: metrics.clone(),
             deadlines: Arc::new(SharedCaptures::default()),
+            max_retained_batch_bytes: self.max_retained_batch_bytes,
         });
         let inner =
             StreamingTableExec::try_new(schema, spec.partitions(&groups), None, [], false, None)?;
