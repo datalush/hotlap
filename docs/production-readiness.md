@@ -18,10 +18,12 @@ bucket**, not an atomic cross-bucket snapshot.
 - KV pagination, updates, deletes, schema evolution and cancellation. Losing
   the tabletserver leader invalidates an open KV snapshot; a *new* scanner
   succeeds after recovery, rather than continuing on a different snapshot.
-- DataFusion's memory pool accounts for the most recently decoded source
-  batch. With a restrictive pool, scans fail instead of returning partial
-  results. A stalled consumer does not pull another KV page; cancelling it
-  releases the reservation.
+- DataFusion's memory pool accounts for decoded reader queues and retained
+  source backing buffers after admission. Leases follow the last Arrow buffer
+  owner, including clones/slices/projections retained after stream cancellation.
+  Restrictive pools fail explicitly; transient decode/raw client allocations
+  remain outside pre-allocation protection and total RSS is not bounded by this
+  counter. A stalled KV consumer does not pull another page.
 - Batch logs capture earliest retained and latest offsets. If retention passes a
   captured start before subscription, the read fails. A unit test injects an
   out-of-range response *after* another bucket produced data and checks that
@@ -30,8 +32,9 @@ bucket**, not an atomic cross-bucket snapshot.
   an isolated log created in native-sni delivered rows appended after the
   query started, without EOF between writes. Source-side delivery events
   carried the correct next offsets and execution ID. Pausing its consumer left
-  the shared 8 MiB DataFusion pool reservation stable, and dropping the stream
-  released it. An explicit batch scan resumed from offset 1 without replaying
+   the shared 8 MiB DataFusion pool reservation stable. Dropping the stream
+   releases its queue; retained output buffers remain charged until released.
+   An explicit batch scan resumed from offset 1 without replaying
   row 0, while an invalid offset failed; a fresh partition added during an
   open partitioned streaming scan caused an explicit topology error instead
   of disappearing silently. The Python 55 FFI stream independently received
@@ -92,6 +95,17 @@ bucket**, not an atomic cross-bucket snapshot.
   Primary-key changes, incomplete INSERT column lists and unbounded MERGE
   sources are explicitly unsupported. Full MERGE validation, concurrency,
   failure injection, and matching Python FFI/release artifacts remain open.
+
+Rust-first planning cleanup (`re7r`, working tree) passed 15 unit tests and all
+four real `write_sql` integrations in debug with eight jobs. DELETE/MERGE helper
+graphs invoke a caller-installed planner; DELETE uses its native UDF registry,
+and MERGE uses a three-partition MemTable source with aliases. Native sink
+distribution consumes every partition without connector-inserted coalescing;
+the same physical INSERT plan was executed twice and all six operations verified.
+Capabilities are exposed as an immutable metadata/mode view, not authorization.
+See [the audit resolution](rust-implementation-audit.md#7-resolution-in-re7r-2026-10-04-working-tree)
+for dispositions and the upstream DELETE alias limitation. This does not certify
+the deferred FFI/Python path or resolve the remaining resource acceptance tasks.
 
 ## Verified in a separate Docker server profile
 

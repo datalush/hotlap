@@ -24,7 +24,11 @@ use futures::StreamExt;
 /// INSERT from inheriting the client's unlimited default writer retry budget.
 #[derive(Clone, Copy, Debug)]
 pub struct FlussWriteOptions {
+    /// Shared enqueue/flush-ACK deadline for one input batch. Does not include
+    /// destination preparation or idle waiting for the next input batch.
     pub ack_timeout: Duration,
+    /// Positive cap on the existing client's writer retry budget, not a second
+    /// retry loop or a guarantee that replaying the statement is safe.
     pub max_retries: i32,
 }
 
@@ -40,7 +44,9 @@ impl Default for FlussWriteOptions {
 impl FlussWriteOptions {
     /// Reject zero or unbounded deadlines/retry budgets before planning DML.
     pub fn validate(self) -> Result<Self> {
-        if self.ack_timeout.is_zero() || self.ack_timeout > Duration::from_secs(3600) {
+        if self.ack_timeout < Duration::from_millis(1)
+            || self.ack_timeout > Duration::from_secs(3600)
+        {
             return Err(DataFusionError::Plan(
                 "Fluss write ACK timeout must be in 1ms..=3600s".into(),
             ));
@@ -72,17 +78,7 @@ pub(crate) struct FlussWriteTarget {
     pub(crate) options: FlussWriteOptions,
 }
 
-struct FlussSink {
-    connection: Arc<FlussConnection>,
-    path: TablePath,
-    table_id: i64,
-    schema_id: i32,
-    schema: SchemaRef,
-    kind: WriteKind,
-    options: FlussWriteOptions,
-}
-
-impl fmt::Debug for FlussSink {
+impl fmt::Debug for FlussWriteTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FlussSink")
             .field("path", &self.path)
@@ -91,8 +87,8 @@ impl fmt::Debug for FlussSink {
     }
 }
 
-pub(crate) fn plan_insert(
-    target: FlussWriteTarget,
+pub(crate) fn plan_write(
+    mut target: FlussWriteTarget,
     input: Arc<dyn ExecutionPlan>,
     insert_op: InsertOp,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -104,19 +100,11 @@ pub(crate) fn plan_insert(
     target
         .schema
         .logically_equivalent_names_and_types(&input.schema())?;
-    let sink = FlussSink {
-        connection: target.connection,
-        path: target.path,
-        table_id: target.table_id,
-        schema_id: target.schema_id,
-        schema: target.schema,
-        kind: target.kind,
-        options: target.options.validate()?,
-    };
-    Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+    target.options = target.options.validate()?;
+    Ok(Arc::new(DataSinkExec::new(input, Arc::new(target), None)))
 }
 
-impl DisplayAs for FlussSink {
+impl DisplayAs for FlussWriteTarget {
     fn fmt_as(&self, _format: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -235,7 +223,7 @@ impl FlussWriter {
 }
 
 #[async_trait]
-impl DataSink for FlussSink {
+impl DataSink for FlussWriteTarget {
     fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -427,7 +415,7 @@ impl DataSink for FlussSink {
     }
 }
 
-impl FlussSink {
+impl FlussWriteTarget {
     fn check_identity(&self, table: &fluss::client::FlussTable<'_>) -> Result<()> {
         let info = table.get_table_info();
         if info.table_id != self.table_id || info.get_schema_id() != self.schema_id {
@@ -513,6 +501,23 @@ mod tests {
         for policy in ["0", "2", "garbage"] {
             assert!(validate_ack_policy(policy).is_err());
         }
+    }
+
+    #[test]
+    fn submillisecond_ack_budget_cannot_become_a_zero_client_timeout() {
+        let options = FlussWriteOptions {
+            ack_timeout: Duration::from_nanos(1),
+            ..Default::default()
+        };
+        assert!(options.validate().is_err());
+        assert!(
+            FlussWriteOptions {
+                ack_timeout: Duration::from_millis(1),
+                ..options
+            }
+            .validate()
+            .is_ok()
+        );
     }
 
     #[test]

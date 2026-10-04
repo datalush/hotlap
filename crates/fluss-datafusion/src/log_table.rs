@@ -24,7 +24,7 @@ use crate::log_progress::LogDelivery;
 use crate::offsets::{OffsetWindow, SharedCaptures};
 use crate::partitions::{DEFAULT_MAX_ASSIGNED_BUCKETS, PartitionFilter};
 use crate::scan::{PartitionedOffsets, ScanSpec};
-use crate::write::{FlussWriteOptions, FlussWriteTarget, WriteKind, plan_insert};
+use crate::write::{FlussWriteOptions, FlussWriteTarget, WriteKind, plan_write};
 
 /// Append-only log table with parallel batch or continuous physical partitions.
 pub struct FlussLogTable {
@@ -45,6 +45,17 @@ pub struct FlussLogTable {
 }
 
 impl FlussLogTable {
+    /// Support of this provider's selected read mode and append writes.
+    /// This does not establish authorization or unchanged destination metadata.
+    pub fn capabilities(&self) -> crate::FlussCapabilities {
+        crate::FlussCapabilities {
+            read: crate::FlussReadCapability::Log(self.options.mode),
+            insert: crate::FlussInsertCapability::Append,
+            delete: false,
+            merge: false,
+        }
+    }
+
     /// Legacy bounded source. Use `open_with_options` to select streaming or
     /// an explicit start position; this constructor stays batch for existing
     /// consumers that expect `collect()` to finish.
@@ -262,6 +273,7 @@ impl TableProvider for FlussLogTable {
             metrics: metrics.clone(),
             deliveries: self.deliveries.clone(),
             execution_ids: Arc::new(SharedCaptures::<u64>::default()),
+            deadlines: Arc::new(SharedCaptures::default()),
         });
         let inner = StreamingTableExec::try_new(
             schema,
@@ -285,7 +297,7 @@ impl TableProvider for FlussLogTable {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan_insert(
+        plan_write(
             FlussWriteTarget {
                 connection: Arc::clone(&self.connection),
                 path: self.path.clone(),

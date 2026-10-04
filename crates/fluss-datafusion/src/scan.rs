@@ -63,6 +63,7 @@ pub(crate) struct ScanSpec {
     pub(crate) metrics: ExecutionPlanMetricsSet,
     pub(crate) deliveries: tokio::sync::broadcast::Sender<LogDelivery>,
     pub(crate) execution_ids: Arc<SharedCaptures<u64>>,
+    pub(crate) deadlines: Arc<SharedCaptures<Instant>>,
 }
 
 impl ScanSpec {
@@ -108,7 +109,13 @@ impl PartitionStream for FlussPartition {
     }
 
     fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
-        ReadState::new(self.clone(), ctx).into_stream()
+        match ReadState::new(self.clone(), ctx) {
+            Ok(state) => state.into_stream(),
+            Err(error) => Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(self.schema()),
+                futures::stream::once(async { Err(error) }),
+            )),
+        }
     }
 }
 
@@ -134,6 +141,17 @@ enum ActiveReader {
 }
 
 impl ActiveReader {
+    fn buffered_arrow_bytes(&self) -> usize {
+        match self {
+            Self::Bounded(reader) => reader.buffered_arrow_bytes(),
+            Self::Streaming(_, buffer) => buffer
+                .iter()
+                .map(|batch| batch.batch().get_array_memory_size())
+                .sum(),
+            Self::EmptyStreaming => 0,
+        }
+    }
+
     async fn poll(&mut self, wait: Duration) -> Result<RecordBatchReadOutcome> {
         match self {
             Self::Bounded(reader) => reader
@@ -159,7 +177,7 @@ impl ActiveReader {
 }
 
 impl ReadState {
-    fn new(source: FlussPartition, ctx: Arc<TaskContext>) -> Self {
+    fn new(source: FlussPartition, ctx: Arc<TaskContext>) -> Result<Self> {
         let metrics = PartitionMetrics::new(&source.spec.metrics, source.index, &source.bucket_ids);
         let lifetime = ReaderLifetime::new(metrics.active_streams.clone());
         let reservation =
@@ -173,8 +191,15 @@ impl ReadState {
                 .for_partition(&ctx, source.index)
         });
         let deadline = (source.spec.options.mode == LogReadMode::Batch)
-            .then(|| Instant::now() + source.spec.options.batch_timeout);
-        Self {
+            .then(|| {
+                source.spec.deadlines.deadline_for_partition(
+                    &ctx,
+                    source.index,
+                    source.spec.options.batch_timeout,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
             source,
             reader: None,
             deadline,
@@ -186,7 +211,7 @@ impl ReadState {
             _lifetime: lifetime,
             metrics,
             reservation,
-        }
+        })
     }
 
     fn into_stream(self) -> SendableRecordBatchStream {
@@ -201,10 +226,8 @@ impl ReadState {
     }
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        // DataFusion cannot request another source batch until it consumes the
-        // previous one. Keep that batch charged to the shared query pool until
-        // the next pull (or stream cancellation/drop).
-        self.reservation.free();
+        // Queue bytes remain charged until the reader relinquishes them.
+        // Offered batches have independent leases attached to Arrow buffers.
         self.ensure_reader_started().await?;
         loop {
             match self.poll_reader().await? {
@@ -261,13 +284,16 @@ impl ReadState {
             .as_mut()
             .expect("reader initialized")
             .poll(poll_wait);
-        if let Some(remaining) = remaining {
+        let result = if let Some(remaining) = remaining {
             tokio::time::timeout(remaining, poll)
                 .await
                 .map_err(|_| expired())?
         } else {
             poll.await
-        }
+        }?;
+        self.reservation
+            .try_resize(self.reader.as_ref().unwrap().buffered_arrow_bytes())?;
+        Ok(result)
     }
 
     async fn prepare_output_batch(&self, batch: ScanBatch) -> Result<RecordBatch> {
@@ -276,9 +302,8 @@ impl ReadState {
         let next_offset = batch.last_offset() + 1;
         let rows = batch.num_records();
         let decoded = batch.into_batch();
-        self.reservation
-            .try_resize(decoded.get_array_memory_size())?;
         self.metrics.record_decoded_batch(&decoded);
+        let decoded = crate::resources::reserve_batch(decoded, &self.reservation)?;
         let output = match &self.source.spec.projection {
             Some(indices) if indices.is_empty() || !self.source.spec.project_at_source => {
                 decoded.project(indices)?
@@ -751,7 +776,9 @@ impl ReadState {
 }
 
 fn expired() -> DataFusionError {
-    DataFusionError::Execution("Fluss bounded log scan timed out; result is incomplete".into())
+    DataFusionError::External(Box::new(crate::FlussScanTimeout {
+        read: crate::FlussReadCapability::Log(LogReadMode::Batch),
+    }))
 }
 
 fn fluss_error(error: fluss::error::Error) -> DataFusionError {

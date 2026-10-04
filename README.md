@@ -13,6 +13,8 @@ crates/fluss-datafusion/    Batch/streaming log and snapshot KV providers
 crates/fluss-datafusion-python/   DataFusion Python FFI bridge for those providers
 python/fluss_connectors/   DataFusion, DuckDB, Polars and pandas integration
 docs/reading-semantics.md  Contracts to satisfy before claiming full scans
+docs/rust-contract.md     Rust-first target contract and pending acceptance requirements
+docs/rust-implementation-audit.md  Source-grounded audit and transitory-code inventory
 docs/production-readiness.md  Verified guarantees, limits, and checks
 ```
 

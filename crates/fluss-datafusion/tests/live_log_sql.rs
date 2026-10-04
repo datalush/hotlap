@@ -84,6 +84,7 @@ async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<
         let table = connection.get_table(&path).await?;
         let writer = table.new_append()?.create_writer()?;
         let mut execution_id = None;
+        let mut retained_batches = Vec::new();
         for id in [11_i32, 12_i32] {
             if id == 12 {
                 let held = pool.reserved();
@@ -121,6 +122,7 @@ async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<
                 assert_eq!(progress.execution_id, previous);
             }
             execution_id = Some(progress.execution_id);
+            retained_batches.push(batch);
         }
         assert!(
             tokio::time::timeout(Duration::from_millis(900), stream.next())
@@ -129,6 +131,11 @@ async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<
         );
         drop(stream);
         tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            pool.reserved() > 0,
+            "retained streaming buffers must stay charged after cancellation"
+        );
+        retained_batches.clear();
         assert_eq!(pool.reserved(), 0);
         assert_eq!(
             metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
@@ -797,6 +804,44 @@ async fn check_memory_pool(
     }
 
     let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+    // Executing a late source partition must not restart the scan budget,
+    // even when the earlier partition has not yet polled its stream.
+    let deadline_ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2));
+    let deadline_budget = Duration::from_millis(100);
+    deadline_ctx.register_table(
+        "log",
+        Arc::new(FlussLogTable::open(Arc::clone(connection), log.clone(), deadline_budget).await?),
+    )?;
+    deadline_ctx.register_table(
+        "kv",
+        Arc::new(FlussKvTable::open(Arc::clone(connection), kv.clone(), deadline_budget).await?),
+    )?;
+    for table in ["log", "kv"] {
+        let query = deadline_ctx.sql(&format!("SELECT * FROM {table}")).await?;
+        let source = source_plan(&query.create_physical_plan().await?);
+        assert!(source.output_partitioning().partition_count() > 1);
+        let context = Arc::new(query.task_ctx());
+        let early = source.execute(0, Arc::clone(&context))?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut late = source.execute(1, context)?;
+        let error = late
+            .next()
+            .await
+            .expect("late source partition returns a deadline error")
+            .expect_err("late partition must not receive a new timeout budget");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        let datafusion::common::DataFusionError::External(cause) = &error else {
+            panic!("source deadline must preserve an inspectable cause: {error}");
+        };
+        assert!(
+            cause
+                .downcast_ref::<fluss_datafusion::FlussScanTimeout>()
+                .is_some()
+        );
+        drop(late);
+        drop(early);
+    }
     let slow = SessionContext::new_with_config_rt(
         SessionConfig::new().with_target_partitions(1),
         Arc::new(
@@ -824,6 +869,12 @@ async fn check_memory_pool(
         "a stalled consumer must not pull more pages"
     );
     drop(stream);
+    assert_eq!(
+        pool.reserved(),
+        held,
+        "retained Arrow data still owns the reservation"
+    );
+    drop(first);
     assert_eq!(pool.reserved(), 0);
     assert_eq!(
         metric(&source.metrics().unwrap(), "fluss_active_partition_streams"),
@@ -832,7 +883,7 @@ async fn check_memory_pool(
 
     // Distinct queries against the same provider share DataFusion's pool.
     // Pausing both consumers retains two decoded-batch reservations, while
-    // dropping either stream releases only its own reservation.
+    // retained buffers, rather than the next pull/stream drop, own the leases.
     let shared_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
     let shared = SessionContext::new_with_config_rt(
         SessionConfig::new().with_target_partitions(1),
@@ -860,11 +911,13 @@ async fn check_memory_pool(
     assert!(both_reserved > first_reserved);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(shared_pool.reserved(), both_reserved);
-    drop(first_batch);
-    drop(second_batch);
     drop(first);
+    assert_eq!(shared_pool.reserved(), both_reserved);
+    drop(first_batch);
     assert!(shared_pool.reserved() > 0 && shared_pool.reserved() < both_reserved);
     drop(second);
+    assert!(shared_pool.reserved() > 0);
+    drop(second_batch);
     assert_eq!(shared_pool.reserved(), 0);
     for _ in 0..10 {
         let mut stream = source.execute(0, Arc::new(query.task_ctx()))?;

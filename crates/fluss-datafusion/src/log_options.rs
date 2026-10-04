@@ -34,7 +34,9 @@ pub enum LogStart {
 pub struct LogReadOptions {
     pub mode: LogReadMode,
     pub start: LogStart,
-    /// Whole-query deadline for Batch only. In Streaming, idle periods are
+    /// Shared source-execution scan deadline for Batch, starting when the first
+    /// partition executes; not a deadline for the complete SQL query. In Streaming,
+    /// idle periods are
     /// normal; network timeouts remain configured on the Fluss connection.
     pub batch_timeout: Duration,
 }

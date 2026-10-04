@@ -1,5 +1,9 @@
 # Reading semantics before engine adapters
 
+This document describes the current implementation. The canonical Rust-first
+target contract and explicitly pending requirements are in
+[rust-contract.md](rust-contract.md); its decisions are not all implemented yet.
+
 The Rust client in `clients/rust/crates/fluss` already returns Arrow
 `RecordBatch` objects. Its Python binding is in
 `clients/rust/bindings/python`. Neither should be reimplemented here.
@@ -120,16 +124,31 @@ Projection is identified as `server` for initial-schema logs,
 `full_rows_for_count` for a zero-column scan. These are not network-byte or
 server-only snapshot-opening measurements.
 
-Each source holds its most recently decoded Arrow batch against the shared
-DataFusion `MemoryPool` until the next pull or stream drop. When the configured
-pool cannot reserve that batch, the query fails rather than returning a partial
-result. The batch is decoded before its size is known and reserved; the pool
-does not prevent that transient allocation. An evolved log scan charges the
-full decoded batch before locally projecting the requested columns. This
-reservation does **not** account for Fluss fetch buffers, remote
-prefetch or batches retained by downstream operators: size the client fetch
-settings and DataFusion target parallelism accordingly. With the default
-unbounded DataFusion pool, it is accounting rather than a memory limit.
+Each source reserves decoded Arrow backing buffers in the shared DataFusion pool.
+The reservation is attached through Arrow's custom-allocation ownership API,
+without copying values/offsets/validity buffers. Clones, slices and projections
+keep the conservative whole-batch lease until the last retained source buffer is
+dropped, even after the source stream ends or is cancelled. Downstream operators
+that materialize new arrays account their own output/state; these leases cover
+retained source buffers, not every possible SQL result allocation.
+
+Decoded log batches waiting in the bounded/streaming reader are charged as a
+separate queue reservation after polling, before offering output. On admission
+failure, the source errors and releases its owned queue. Raw responses, batches
+inside an unfinished client poll, decompression and remote files have separate
+client limits: this is not a pre-decode or total RSS cap. The client poll's 64 MiB
+decoded/raw cap is soft. An evolved scan reserves the full decoded backing
+storage before projection, so retaining one projected buffer may conservatively
+keep the entire batch charge. Array header wrappers allocate metadata; custom
+buffer capacity reflects the visible view while the lease charges the original
+backing capacities. Decoded/output byte metrics need not equal pool reservations.
+
+Batch log and KV partitions share a source-execution deadline initialized by the
+first executing partition. A late partition receives the same deadline, not a
+fresh timeout. Sequential reexecution/new contexts create fresh deadline scopes.
+The deadline does not bound arbitrary downstream SQL work. Source expiry is an
+inspectable `FlussScanTimeout` inside DataFusion's External error; client network/
+storage errors preserve their original causes. Streaming idle remains unbounded.
 
 The catalog discovers names once; reload it after creating tables.
 It selects the log or KV provider from the table's primary-key metadata.

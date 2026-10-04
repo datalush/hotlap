@@ -36,6 +36,7 @@ pub(crate) struct KvScanSpec {
     pub(crate) partition_captures: Arc<SharedCaptures<PartitionSelection>>,
     pub(crate) timeout: Duration,
     pub(crate) metrics: ExecutionPlanMetricsSet,
+    pub(crate) deadlines: Arc<SharedCaptures<Instant>>,
 }
 
 impl KvScanSpec {
@@ -81,6 +82,20 @@ impl PartitionStream for KvPartition {
     }
 
     fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let deadline =
+            match self
+                .spec
+                .deadlines
+                .deadline_for_partition(&ctx, self.index, self.spec.timeout)
+            {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    return Box::pin(RecordBatchStreamAdapter::new(
+                        Arc::clone(self.schema()),
+                        futures::stream::once(async { Err(error) }),
+                    ));
+                }
+            };
         let metrics = PartitionMetrics::new(&self.spec.metrics, self.index, &self.bucket_ids);
         let reservation =
             MemoryConsumer::new("FlussKvScan").register(&ctx.runtime_env().memory_pool);
@@ -94,7 +109,7 @@ impl PartitionStream for KvPartition {
             next_bucket: 0,
             reader: None,
             first_page: false,
-            deadline: Instant::now() + self.spec.timeout,
+            deadline,
             _context: ctx,
             _lifetime: ReaderLifetime::new(metrics.active_streams.clone()),
             metrics,
@@ -127,7 +142,6 @@ struct KvReadState {
 
 impl KvReadState {
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        self.reservation.free();
         self.ensure_buckets().await?;
         loop {
             if self.reader.is_none() {
@@ -164,8 +178,8 @@ impl KvReadState {
             self.first_page = false;
             match batch {
                 Some(batch) => {
-                    self.reservation.try_resize(batch.get_array_memory_size())?;
                     self.metrics.record_decoded_batch(&batch);
+                    let batch = crate::resources::reserve_batch(batch, &self.reservation)?;
                     let output = if self
                         .partition
                         .spec
@@ -299,7 +313,9 @@ impl KvReadState {
 }
 
 fn expired() -> DataFusionError {
-    DataFusionError::Execution("Fluss KV snapshot scan timed out".into())
+    DataFusionError::External(Box::new(crate::FlussScanTimeout {
+        read: crate::FlussReadCapability::KvSnapshot,
+    }))
 }
 
 fn fluss_error(error: fluss::error::Error) -> DataFusionError {

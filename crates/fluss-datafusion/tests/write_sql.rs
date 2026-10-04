@@ -2,13 +2,23 @@
 //! Opt-in SQL INSERT tests against isolated native-sni tables.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Array, ArrayRef, Int32Array, StringArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, StringArray, UInt64Array};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
+use datafusion::catalog::Session;
+use datafusion::datasource::MemTable;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::logical_expr::{ColumnarValue, LogicalPlan, Volatility, create_udf};
 use datafusion::physical_plan::collect as collect_plan;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use fluss::client::FlussConnection;
 use fluss::config::Config;
@@ -17,10 +27,36 @@ use fluss::metadata::{
 };
 use fluss::row::GenericRow;
 use fluss::rpc::message::OffsetSpec;
-use fluss_datafusion::{FlussKvTable, FlussLogTable, LogReadOptions};
+use fluss_datafusion::{
+    FlussInsertCapability, FlussKvTable, FlussLogTable, FlussReadCapability, LogReadMode,
+    LogReadOptions,
+};
 use futures::StreamExt;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// Observe SELECT helper graphs planned inside DELETE/MERGE, not just the
+/// outer DML. A direct DefaultPhysicalPlanner bypass cannot satisfy this probe.
+#[derive(Debug)]
+struct RecordingPlanner {
+    helper_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl QueryPlanner for RecordingPlanner {
+    async fn create_physical_plan(
+        &self,
+        logical: &LogicalPlan,
+        session: &dyn Session,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        if !matches!(logical, LogicalPlan::Dml(_)) {
+            self.helper_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        DefaultPhysicalPlanner::default()
+            .create_physical_plan(logical, session)
+            .await
+    }
+}
 
 fn rows_written(batches: &[arrow::record_batch::RecordBatch]) -> u64 {
     assert_eq!(batches.len(), 1);
@@ -87,24 +123,41 @@ async fn insert_log_and_upsert_kv_from_sql() -> TestResult<()> {
                 false,
             )
             .await?;
-        let ctx = SessionContext::new();
+        let helper_calls = Arc::new(AtomicUsize::new(0));
+        let ctx = SessionContext::new_with_state(
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(SessionConfig::new().with_target_partitions(4))
+                .with_query_planner(Arc::new(RecordingPlanner { helper_calls: Arc::clone(&helper_calls) }))
+                .build(),
+        );
+        ctx.register_udf(create_udf(
+            "is_two",
+            vec![DataType::Int32],
+            DataType::Boolean,
+            Volatility::Immutable,
+            Arc::new(|args| {
+                let arrays = ColumnarValue::values_to_arrays(args)?;
+                let input = arrays[0].as_any().downcast_ref::<Int32Array>().unwrap();
+                let output: BooleanArray = input.iter().map(|id| id.map(|id| id == 2)).collect();
+                Ok(ColumnarValue::Array(Arc::new(output)))
+            }),
+        ));
+        let log_provider = FlussLogTable::open(Arc::clone(&connection), log.clone(), Duration::from_secs(45)).await?;
+        assert_eq!(log_provider.capabilities().read, FlussReadCapability::Log(LogReadMode::Batch));
+        assert_eq!(log_provider.capabilities().insert, FlussInsertCapability::Append);
+        assert!(!log_provider.capabilities().delete && !log_provider.capabilities().merge);
+        let kv_provider = FlussKvTable::open(Arc::clone(&connection), kv.clone(), Duration::from_secs(45)).await?;
+        assert_eq!(kv_provider.capabilities().read, FlussReadCapability::KvSnapshot);
+        assert_eq!(kv_provider.capabilities().insert, FlussInsertCapability::FullRowUpsert);
+        assert!(kv_provider.capabilities().delete && kv_provider.capabilities().merge);
         ctx.register_table(
             "events",
-            Arc::new(
-                FlussLogTable::open(
-                    Arc::clone(&connection),
-                    log.clone(),
-                    Duration::from_secs(45),
-                )
-                .await?,
-            ),
+            Arc::new(log_provider),
         )?;
         ctx.register_table(
             "state",
-            Arc::new(
-                FlussKvTable::open(Arc::clone(&connection), kv.clone(), Duration::from_secs(45))
-                    .await?,
-            ),
+            Arc::new(kv_provider),
         )?;
         assert_eq!(
             rows_written(
@@ -162,15 +215,22 @@ async fn insert_log_and_upsert_kv_from_sql() -> TestResult<()> {
             })
             .collect();
         assert_eq!(found, ["updated"]);
+        let alias_error = ctx
+            .sql("DELETE FROM state AS selected WHERE is_two(selected.id)")
+            .await
+            .expect_err("DataFusion 55.1 cannot resolve this DELETE target alias");
+        assert!(alias_error.to_string().contains("selected"), "{alias_error}");
+        let before_delete = helper_calls.load(Ordering::Relaxed);
         assert_eq!(
             rows_written(
-                &ctx.sql("DELETE FROM state WHERE state.id = 2 AND value = 'two'")
+                &ctx.sql("DELETE FROM state WHERE is_two(state.id) AND value = 'two'")
                     .await?
                     .collect()
                     .await?
             ),
             1
         );
+        assert!(helper_calls.load(Ordering::Relaxed) > before_delete, "DELETE must use the caller's planner for its selection graph");
         assert_eq!(
             rows_written(
                 &ctx.sql("DELETE FROM state WHERE id = 2")
@@ -199,10 +259,21 @@ async fn insert_log_and_upsert_kv_from_sql() -> TestResult<()> {
             0
         );
         ctx.sql("INSERT INTO state (id, value) VALUES (1, 'before'), (2, 'delete')").await?.collect().await?;
+        let merge_source = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef),
+            ("value", Arc::new(StringArray::from(vec!["after", "gone", "new"])) as ArrayRef),
+            ("op", Arc::new(StringArray::from(vec!["u", "d", "i"])) as ArrayRef),
+        ])?;
+        ctx.register_table("merge_input", Arc::new(MemTable::try_new(
+            merge_source.schema(),
+            (0..3).map(|index| vec![merge_source.slice(index, 1)]).collect(),
+        )?))?;
+        let before_merge = helper_calls.load(Ordering::Relaxed);
         let merged = ctx.sql(
-            "MERGE INTO state AS t USING (VALUES (1, 'after', 'u'), (2, 'gone', 'd'), (3, 'new', 'i')) AS s(id, value, op) ON t.id = s.id WHEN MATCHED AND s.op = 'd' THEN DELETE WHEN MATCHED THEN UPDATE SET value = s.value WHEN NOT MATCHED THEN INSERT (id, value) VALUES (s.id, s.value)"
+            "MERGE INTO state AS t USING merge_input AS s ON t.id = s.id WHEN MATCHED AND s.op = 'd' THEN DELETE WHEN MATCHED THEN UPDATE SET value = s.value WHEN NOT MATCHED THEN INSERT (id, value) VALUES (s.id, s.value)"
         ).await?.collect().await?;
         assert_eq!(rows_written(&merged), 3);
+        assert!(helper_calls.load(Ordering::Relaxed) > before_merge, "MERGE must use the caller's planner for its operator graph");
         let merged_rows = ctx.sql("SELECT value FROM state ORDER BY id").await?.collect().await?;
         let values = merged_rows.iter().flat_map(|batch| {
             let col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -250,6 +321,31 @@ async fn insert_log_and_upsert_kv_from_sql() -> TestResult<()> {
                 .value(0),
             6
         );
+
+        // A native provider with three physical partitions supplies INSERT.
+        // The standard optimizer must enforce the sink's single-partition
+        // requirement without our former FFI-motivated manual coalesce.
+        let mut partitions = Vec::new();
+        for id in [31, 32, 33] {
+            partitions.push(vec![RecordBatch::try_from_iter(vec![
+                ("id", Arc::new(Int32Array::from(vec![id])) as ArrayRef),
+                ("value", Arc::new(StringArray::from(vec!["external"])) as ArrayRef),
+            ])?]);
+        }
+        let source_schema = partitions[0][0].schema();
+        ctx.register_table("partitioned_input", Arc::new(MemTable::try_new(source_schema, partitions)?))?;
+        let source_plan = ctx.table("partitioned_input").await?.create_physical_plan().await?;
+        assert!(source_plan.output_partitioning().partition_count() > 1);
+        let insert = ctx.sql("INSERT INTO events SELECT * FROM partitioned_input").await?;
+        let plan = insert.create_physical_plan().await?;
+        assert_eq!(plan.children()[0].output_partitioning().partition_count(), 1);
+        assert_eq!(rows_written(&collect_plan(Arc::clone(&plan), Arc::new(insert.task_ctx())).await?), 3);
+        assert_eq!(rows_written(&collect_plan(plan, Arc::new(insert.task_ctx())).await?), 3);
+        let inserted = ctx.sql("SELECT id FROM events WHERE id >= 31 ORDER BY id").await?.collect().await?;
+        let ids: Vec<_> = inserted.iter().flat_map(|batch| {
+            batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap().values().to_vec()
+        }).collect();
+        assert_eq!(ids, [31,31,32,32,33,33]);
 
         let deferred = ctx
             .sql("INSERT INTO events (id, value) VALUES (99, 'stale-plan')")

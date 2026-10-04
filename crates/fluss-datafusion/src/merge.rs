@@ -280,5 +280,7 @@ pub(crate) async fn plan_merge_input(
         .filter(active)?
         .project(projected)?
         .build()?;
+    // This is a SELECT graph, not another MERGE statement: use the caller's
+    // logical optimization and planner without re-entering the DML operation.
     state.create_physical_plan(&logical).await
 }

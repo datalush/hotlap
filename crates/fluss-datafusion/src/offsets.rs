@@ -103,6 +103,30 @@ pub(super) fn validate_offsets(
     Ok(Arc::new(offsets))
 }
 
+impl SharedCaptures<std::time::Instant> {
+    /// Execution-time initialization shared with late partitions. Reexecution
+    /// uses the same context/partition generation rules as offset captures.
+    pub(super) fn deadline_for_partition(
+        &self,
+        context: &Arc<TaskContext>,
+        partition: usize,
+        timeout: std::time::Duration,
+    ) -> DataFusionResult<std::time::Instant> {
+        let capture = self.for_partition(context, partition);
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .map(Arc::new)
+            .ok_or_else(|| "Fluss scan timeout exceeds the clock range".to_owned());
+        let _ = capture.set(deadline);
+        capture
+            .get()
+            .expect("deadline initialized synchronously")
+            .as_ref()
+            .map(|deadline| **deadline)
+            .map_err(|error| DataFusionError::Plan(error.clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +145,48 @@ mod tests {
 
         let other = Arc::new(TaskContext::default());
         assert!(!Arc::ptr_eq(&next, &registry.for_partition(&other, 0)));
+    }
+
+    #[test]
+    fn late_partition_keeps_deadline_but_new_execution_gets_its_own() {
+        let registry = SharedCaptures::<std::time::Instant>::default();
+        let context = Arc::new(TaskContext::default());
+        let timeout = std::time::Duration::from_secs(5);
+        let first = registry
+            .deadline_for_partition(&context, 0, timeout)
+            .unwrap();
+        assert_eq!(
+            registry
+                .deadline_for_partition(&context, 1, timeout)
+                .unwrap(),
+            first
+        );
+        let next = registry
+            .deadline_for_partition(&context, 0, timeout)
+            .unwrap();
+        assert!(next >= first);
+        assert_eq!(
+            registry
+                .deadline_for_partition(&context, 1, timeout)
+                .unwrap(),
+            next
+        );
+        let independent = Arc::new(TaskContext::default());
+        let short = registry
+            .deadline_for_partition(&independent, 0, std::time::Duration::from_millis(1))
+            .unwrap();
+        assert!(short < first);
+    }
+
+    #[test]
+    fn unrepresentable_deadline_is_an_error_not_a_panic() {
+        let registry = SharedCaptures::<std::time::Instant>::default();
+        let context = Arc::new(TaskContext::default());
+        assert!(
+            registry
+                .deadline_for_partition(&context, 0, std::time::Duration::MAX)
+                .is_err()
+        );
     }
 
     #[tokio::test]

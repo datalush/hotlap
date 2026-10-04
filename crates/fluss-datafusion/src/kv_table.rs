@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! A bounded SQL scan of the current rows in a non-partitioned KV table.
+//! A bounded SQL snapshot scan and writes for partitioned or unpartitioned KV.
 
 use std::fmt;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use crate::log_table::bucket_groups;
 use crate::offsets::SharedCaptures;
 use crate::partitions::{DEFAULT_MAX_ASSIGNED_BUCKETS, PartitionFilter};
 use crate::write::{
-    FlussWriteOptions, FlussWriteTarget, WriteKind, plan_insert, validate_delete_policy,
+    FlussWriteOptions, FlussWriteTarget, WriteKind, plan_write, validate_delete_policy,
 };
 
 /// Each execution opens a fresh snapshot per bucket. There is no global
@@ -45,9 +45,21 @@ pub struct FlussKvTable {
     max_partitions: Option<usize>,
     max_assigned_buckets: usize,
     write_options: FlussWriteOptions,
+    delete_allowed: bool,
 }
 
 impl FlussKvTable {
+    /// Support based on the table policy observed at opening time.
+    /// Execution revalidates policy, identity/schema and permissions.
+    pub fn capabilities(&self) -> crate::FlussCapabilities {
+        crate::FlussCapabilities {
+            read: crate::FlussReadCapability::KvSnapshot,
+            insert: crate::FlussInsertCapability::FullRowUpsert,
+            delete: self.delete_allowed,
+            merge: true,
+        }
+    }
+
     /// Validate the table and capture its schema without fetching any rows.
     pub async fn open(
         connection: Arc<FlussConnection>,
@@ -72,6 +84,7 @@ impl FlussKvTable {
         let buckets = info.get_num_buckets();
         let partitioned = info.is_partitioned();
         let partition_keys = info.get_partition_keys().iter().cloned().collect();
+        let delete_allowed = validate_delete_policy(info.get_properties()).is_ok();
         if buckets < 1 {
             return Err(DataFusionError::Plan("Fluss table has no buckets".into()));
         }
@@ -89,6 +102,7 @@ impl FlussKvTable {
             max_partitions: None,
             max_assigned_buckets: DEFAULT_MAX_ASSIGNED_BUCKETS,
             write_options: FlussWriteOptions::default(),
+            delete_allowed,
         })
     }
 
@@ -208,6 +222,7 @@ impl TableProvider for FlussKvTable {
             partition_captures: Arc::new(SharedCaptures::default()),
             timeout: self.timeout,
             metrics: metrics.clone(),
+            deadlines: Arc::new(SharedCaptures::default()),
         });
         let inner =
             StreamingTableExec::try_new(schema, spec.partitions(&groups), None, [], false, None)?;
@@ -225,7 +240,7 @@ impl TableProvider for FlussKvTable {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan_insert(
+        plan_write(
             FlussWriteTarget {
                 connection: Arc::clone(&self.connection),
                 path: self.path.clone(),
@@ -272,7 +287,7 @@ impl TableProvider for FlussKvTable {
             builder = builder.filter(filter)?;
         }
         let input = state.create_physical_plan(&builder.build()?).await?;
-        plan_insert(
+        plan_write(
             FlussWriteTarget {
                 connection: Arc::clone(&self.connection),
                 path: self.path.clone(),
@@ -312,7 +327,7 @@ impl TableProvider for FlussKvTable {
         )
         .await?;
         let schema = input.schema();
-        plan_insert(
+        plan_write(
             FlussWriteTarget {
                 connection: Arc::clone(&self.connection),
                 path: self.path.clone(),

@@ -485,6 +485,15 @@ impl RecordBatchLogReader {
         }
     }
 
+    /// Decoded Arrow storage retained between polls, excluding raw fetches,
+    /// remote files and batches already returned to the caller.
+    pub fn buffered_arrow_bytes(&self) -> usize {
+        self.buffer
+            .iter()
+            .map(|batch| batch.batch().get_array_memory_size())
+            .sum()
+    }
+
     /// Fetch the next [`ScanBatch`] while waiting for at most `timeout`.
     ///
     /// Unlike [`next_batch`](Self::next_batch), this method returns
