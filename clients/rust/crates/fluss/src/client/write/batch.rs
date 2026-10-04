@@ -40,6 +40,7 @@ pub struct InnerWriteBatch {
     batch_sequence: i32,
     writer_id: i64,
     last_acked_sequence_at_send: i32,
+    pub(crate) memory_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl InnerWriteBatch {
@@ -61,6 +62,7 @@ impl InnerWriteBatch {
             batch_sequence: NO_BATCH_SEQUENCE,
             writer_id: NO_WRITER_ID,
             last_acked_sequence_at_send: -1,
+            memory_guard: None,
         }
     }
 
@@ -199,10 +201,18 @@ impl WriteBatch {
     }
 
     pub fn build(&mut self) -> Result<Bytes> {
-        match self {
+        let guard = self.inner_batch().memory_guard.clone();
+        let bytes = match self {
             WriteBatch::ArrowLog(batch) => batch.build(),
             WriteBatch::Kv(batch) => batch.build(),
-        }
+        }?;
+        Ok(match guard {
+            Some(guard) => Bytes::from_owner(AccountedBytes {
+                bytes,
+                _guard: guard,
+            }),
+            None => bytes,
+        })
     }
 
     pub fn complete(&self, write_result: BatchWriteResult) -> bool {
@@ -260,6 +270,16 @@ impl WriteBatch {
             WriteBatch::ArrowLog(batch) => batch.set_writer_state(writer_id, batch_base_sequence),
             WriteBatch::Kv(batch) => batch.set_writer_state(writer_id, batch_base_sequence),
         }
+    }
+}
+
+struct AccountedBytes {
+    bytes: Bytes,
+    _guard: Arc<dyn Send + Sync>,
+}
+impl AsRef<[u8]> for AccountedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
     }
 }
 
@@ -473,6 +493,50 @@ mod tests {
         let batch = InnerWriteBatch::new(1, Arc::new(physical_path), 1, 0);
         assert!(batch.complete(Ok(())));
         assert!(!batch.complete(Err(crate::client::broadcast::Error::Dropped)));
+    }
+
+    #[test]
+    fn encoded_bytes_keep_accounting_after_batch_and_queue_owner_drop() {
+        struct Guard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let path = crate::metadata::TablePath::new("db", "accounted");
+        let info = Arc::new(build_table_info(path.clone(), 1, 1));
+        let physical = Arc::new(PhysicalTablePath::of(Arc::new(path)));
+        let mut native = WriteBatch::Kv(KvWriteBatch::new(
+            1,
+            Arc::clone(&physical),
+            1,
+            1,
+            1024,
+            crate::metadata::KvFormat::COMPACTED,
+            None,
+            0,
+        ));
+        native.inner_batch_mut().memory_guard = Some(Arc::new(Guard(Arc::clone(&dropped))));
+        let record = WriteRecord::for_upsert(
+            info,
+            physical,
+            1,
+            Bytes::from_static(b"key"),
+            None,
+            WriteFormat::CompactedKv,
+            None,
+            Some(RowBytes::Owned(Bytes::from_static(b"value"))),
+        );
+        native.try_append(&record).unwrap();
+        let bytes = native.build().unwrap();
+        let retained = bytes.clone();
+        drop(native);
+        drop(bytes);
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(!retained.is_empty());
+        drop(retained);
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[test]

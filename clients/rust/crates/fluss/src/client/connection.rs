@@ -32,6 +32,7 @@ use parking_lot::RwLock;
 #[cfg(feature = "integration_tests")]
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub struct FlussConnection {
@@ -41,6 +42,8 @@ pub struct FlussConnection {
     writer_client: RwLock<Option<Arc<WriterClient>>>,
     admin_client: RwLock<Option<Arc<FlussAdmin>>>,
     lookup_client: RwLock<Option<Arc<LookupClient>>>,
+    writer_closed: AtomicBool,
+    writer_memory: RwLock<Option<Arc<dyn crate::client::WriterMemoryAccounting>>>,
 }
 
 impl FlussConnection {
@@ -80,6 +83,8 @@ impl FlussConnection {
             writer_client: Default::default(),
             admin_client: RwLock::new(None),
             lookup_client: Default::default(),
+            writer_closed: AtomicBool::new(false),
+            writer_memory: Default::default(),
         })
     }
 
@@ -89,20 +94,41 @@ impl FlussConnection {
     /// its buffers and wait for the background sender task to complete, bounded
     /// by the provided timeout.
     pub async fn close(&self, timeout: Duration) -> Result<()> {
-        let writer_client = self.writer_client.write().take();
+        self.writer_closed.store(true, Ordering::Release);
+        // Keep the client visible to abort_writes if this close is cancelled.
+        let writer_client = self.writer_client.read().clone();
         if let Some(client) = writer_client {
             client.close(timeout).await?;
         }
+        self.writer_client.write().take();
         Ok(())
     }
 
     /// Abort this connection's writer without waiting for a graceful drain.
     /// Reads are unaffected. In-flight server writes cannot be rolled back.
     pub fn abort_writes(&self) {
+        self.writer_closed.store(true, Ordering::Release);
         let writer = self.writer_client.write().take();
         if let Some(writer) = writer {
             writer.abort();
         }
+    }
+
+    /// Install caller accounting before creating writers. Reads/protocol
+    /// metadata retain their normal client policies.
+    pub fn set_writer_memory_accounting(
+        &self,
+        accounting: Arc<dyn crate::client::WriterMemoryAccounting>,
+    ) -> Result<()> {
+        let writer = self.writer_client.write();
+        if writer.is_some() || self.writer_closed.load(Ordering::Acquire) {
+            return Err(Error::IllegalArgument {
+                message: "Writer memory accounting must be configured before writer creation"
+                    .into(),
+            });
+        }
+        *self.writer_memory.write() = Some(accounting);
+        Ok(())
     }
 
     pub fn get_metadata(&self) -> Arc<Metadata> {
@@ -141,6 +167,11 @@ impl FlussConnection {
     }
 
     pub fn get_or_create_writer_client(&self) -> Result<Arc<WriterClient>> {
+        if self.writer_closed.load(Ordering::Acquire) {
+            return Err(Error::WriterClosed {
+                message: "Connection writes are closed".into(),
+            });
+        }
         // 1. Fast path: Attempt to acquire a read lock to check if the client already exists.
         if let Some(client) = self.writer_client.read().as_ref() {
             return Ok(client.clone());
@@ -148,6 +179,11 @@ impl FlussConnection {
 
         // 2. Slow path: Acquire the write lock.
         let mut writer_guard = self.writer_client.write();
+        if self.writer_closed.load(Ordering::Acquire) {
+            return Err(Error::WriterClosed {
+                message: "Connection writes are closed".into(),
+            });
+        }
 
         // 3. Double-check: Another thread might have initialized the client
         // while this thread was waiting for the write lock.
@@ -156,7 +192,11 @@ impl FlussConnection {
         }
 
         // 4. Initialize the client since we are certain it doesn't exist yet.
-        let new_client = Arc::new(WriterClient::new(self.args.clone(), self.metadata.clone())?);
+        let new_client = Arc::new(WriterClient::new_with_memory_accounting(
+            self.args.clone(),
+            self.metadata.clone(),
+            self.writer_memory.read().clone(),
+        )?);
 
         // 5. Store and return the newly created client.
         *writer_guard = Some(new_client.clone());

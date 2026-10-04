@@ -24,6 +24,12 @@ use futures::StreamExt;
 /// INSERT from inheriting the client's unlimited default writer retry budget.
 #[derive(Clone, Copy, Debug)]
 pub struct FlussWriteOptions {
+    /// Independent finite allowance for destination preparation and each
+    /// between-batch metadata check. Idle input has no completion deadline.
+    pub preparation_timeout: Duration,
+    /// Post-materialization input backing ceiling, including finite/continuous
+    /// input from other providers. Not an Arrow allocator or total RSS bound.
+    pub max_retained_batch_bytes: usize,
     /// Shared enqueue/flush-ACK deadline for one input batch. Does not include
     /// destination preparation or idle waiting for the next input batch.
     pub ack_timeout: Duration,
@@ -35,6 +41,8 @@ pub struct FlussWriteOptions {
 impl Default for FlussWriteOptions {
     fn default() -> Self {
         Self {
+            preparation_timeout: Duration::from_secs(30),
+            max_retained_batch_bytes: crate::resources::DEFAULT_MAX_RETAINED_BATCH_BYTES,
             ack_timeout: Duration::from_secs(30),
             max_retries: 3,
         }
@@ -44,6 +52,14 @@ impl Default for FlussWriteOptions {
 impl FlussWriteOptions {
     /// Reject zero or unbounded deadlines/retry budgets before planning DML.
     pub fn validate(self) -> Result<Self> {
+        if self.preparation_timeout < Duration::from_millis(1)
+            || self.preparation_timeout > Duration::from_secs(3600)
+        {
+            return Err(DataFusionError::Plan(
+                "Fluss write preparation timeout must be in 1ms..=3600s".into(),
+            ));
+        }
+        crate::resources::validate_batch_limit(self.max_retained_batch_bytes)?;
         if self.ack_timeout < Duration::from_millis(1)
             || self.ack_timeout > Duration::from_secs(3600)
         {
@@ -145,9 +161,47 @@ impl Drop for CloseWriterOnDrop {
 
 enum FlussWriter {
     Log(AppendWriter),
-    Kv(UpsertWriter),
-    DeleteKv(UpsertWriter),
-    MergeKv(UpsertWriter),
+    Kv(
+        UpsertWriter,
+        datafusion::execution::memory_pool::MemoryReservation,
+    ),
+    DeleteKv(
+        UpsertWriter,
+        datafusion::execution::memory_pool::MemoryReservation,
+    ),
+    MergeKv(
+        UpsertWriter,
+        datafusion::execution::memory_pool::MemoryReservation,
+    ),
+}
+
+struct WriterPoolAccounting {
+    encoded: datafusion::execution::memory_pool::MemoryReservation,
+    transport: datafusion::execution::memory_pool::MemoryReservation,
+    routing: datafusion::execution::memory_pool::MemoryReservation,
+}
+fn writer_reservation(
+    consumer: &datafusion::execution::memory_pool::MemoryReservation,
+    bytes: usize,
+) -> fluss::error::Result<Arc<dyn Send + Sync>> {
+    let reservation = consumer.new_empty();
+    reservation
+        .try_grow(bytes)
+        .map_err(|error| fluss::error::Error::WriterMemoryAdmission {
+            source: Box::new(error),
+        })?;
+    Ok(Arc::new(std::sync::Mutex::new(reservation)))
+}
+impl fluss::client::WriterMemoryAccounting for WriterPoolAccounting {
+    fn reserve(&self, bytes: usize) -> fluss::error::Result<Arc<dyn Send + Sync>> {
+        writer_reservation(&self.encoded, bytes)
+    }
+    fn reserve_transport(&self, bytes: usize) -> fluss::error::Result<Arc<dyn Send + Sync>> {
+        writer_reservation(&self.transport, bytes)
+    }
+    fn reserve_routing(&self, bytes: usize) -> fluss::error::Result<Arc<dyn Send + Sync>> {
+        writer_reservation(&self.routing, bytes)
+    }
 }
 
 impl FlussWriter {
@@ -157,6 +211,7 @@ impl FlussWriter {
         row_type: Arc<fluss::metadata::RowType>,
         cancelled: &AtomicBool,
         reservation: &datafusion::execution::memory_pool::MemoryReservation,
+        max_bytes: usize,
     ) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -180,7 +235,7 @@ impl FlussWriter {
                         crate::resources::reserve_batch(
                             materialized,
                             reservation,
-                            usize::MAX,
+                            max_bytes,
                             &datafusion::physical_plan::metrics::Gauge::new(),
                         )
                         .map_err(|error| {
@@ -197,7 +252,24 @@ impl FlussWriter {
         }
         // Build typed column views once; route *each* row so a DataFusion
         // batch may contain several Fluss partitions/buckets safely.
-        let actions = if matches!(self, Self::MergeKv(_)) {
+        let encoding_scratch = match self {
+            Self::Kv(_, scratch) | Self::DeleteKv(_, scratch) | Self::MergeKv(_, scratch) => {
+                scratch
+            }
+            Self::Log(_) => unreachable!("log append is columnar"),
+        };
+        // Native KV/key encoders retain reusable row scratch across ACKs and
+        // idle input. Keep its conservative allowance with the writer owner,
+        // including a still-running worker after the async query is cancelled.
+        encoding_scratch.try_resize(
+            encoding_scratch.size().max(
+                batch
+                    .get_array_memory_size()
+                    .saturating_mul(2)
+                    .saturating_add(4096),
+            ),
+        )?;
+        let actions = if matches!(self, Self::MergeKv(_, _)) {
             Some(
                 batch
                     .column(batch.num_columns() - 1)
@@ -227,13 +299,13 @@ impl FlussWriter {
             row.set_row_id(id);
             match self {
                 Self::Log(_) => unreachable!("log append is columnar"),
-                Self::Kv(writer) => {
+                Self::Kv(writer, _) => {
                     drop(writer.upsert(&row).map_err(fluss_error)?);
                 }
-                Self::DeleteKv(writer) => {
+                Self::DeleteKv(writer, _) => {
                     drop(writer.delete(&row).map_err(fluss_error)?);
                 }
-                Self::MergeKv(writer) => {
+                Self::MergeKv(writer, _) => {
                     if actions.as_ref().unwrap().value(id) {
                         drop(writer.delete(&row).map_err(fluss_error)?);
                     } else {
@@ -248,7 +320,7 @@ impl FlussWriter {
     async fn flush(&self) -> Result<()> {
         match self {
             Self::Log(writer) => writer.flush().await.map_err(fluss_error),
-            Self::Kv(writer) | Self::DeleteKv(writer) | Self::MergeKv(writer) => {
+            Self::Kv(writer, _) | Self::DeleteKv(writer, _) | Self::MergeKv(writer, _) => {
                 writer.flush().await.map_err(fluss_error)
             }
         }
@@ -272,38 +344,45 @@ impl DataSink for FlussWriteTarget {
         config.writer_buffer_wait_timeout_ms = config
             .writer_buffer_wait_timeout_ms
             .min(self.options.ack_timeout.as_millis() as u64);
-        let connection = Arc::new(FlussConnection::new(config).await.map_err(fluss_error)?);
+        let preparation_deadline = tokio::time::Instant::now() + self.options.preparation_timeout;
+        let connection = Arc::new(
+            tokio::time::timeout_at(preparation_deadline, FlussConnection::new(config))
+                .await
+                .map_err(|_| write_phase_timeout(crate::FlussWritePhase::Preparation))?
+                .map_err(fluss_error)?,
+        );
+        connection
+            .set_writer_memory_accounting(Arc::new(WriterPoolAccounting {
+                encoded: MemoryConsumer::new("FlussWriteEncoded")
+                    .register(&context.runtime_env().memory_pool),
+                transport: MemoryConsumer::new("FlussWriteTransport")
+                    .register(&context.runtime_env().memory_pool),
+                routing: MemoryConsumer::new("FlussWriteRoutingMetadata")
+                    .register(&context.runtime_env().memory_pool),
+            }))
+            .map_err(fluss_error)?;
         let cancelled = Arc::new(AtomicBool::new(false));
         let close = CloseWriterOnDrop {
             connection: Some(Arc::clone(&connection)),
             timeout: self.options.ack_timeout,
             cancelled: Arc::clone(&cancelled),
         };
-        let table = connection
-            .get_table(&self.path)
+        let table = tokio::time::timeout_at(preparation_deadline, connection.get_table(&self.path))
             .await
+            .map_err(|_| write_phase_timeout(crate::FlussWritePhase::Preparation))?
             .map_err(fluss_error)?;
         self.check_identity(&table)?;
         if matches!(self.kind, WriteKind::DeleteKv) {
             validate_delete_policy(table.get_table_info().get_properties())?;
         }
+        let mut partitions = std::collections::HashMap::new();
         if table.get_table_info().is_partitioned() {
-            // WriterClient routes synchronously from its metadata cache. Old
-            // partitions can have different counts after a table rescale.
-            let ids = connection
-                .get_admin()
-                .map_err(fluss_error)?
-                .list_partition_infos(&self.path)
-                .await
-                .map_err(fluss_error)?
-                .iter()
-                .map(|partition| partition.get_partition_id())
-                .collect::<Vec<_>>();
-            connection
-                .get_metadata()
-                .check_and_update_partition_metadata_by_ids(&self.path, &ids)
-                .await
-                .map_err(fluss_error)?;
+            tokio::time::timeout_at(
+                preparation_deadline,
+                refresh_write_partitions(&connection, &self.path, &mut partitions),
+            )
+            .await
+            .map_err(|_| write_phase_timeout(crate::FlussWritePhase::Preparation))??;
         }
         let row_type = Arc::new(table.get_table_info().get_row_type().clone());
         let destination_schema = fluss::record::to_arrow_schema(&row_type).map_err(fluss_error)?;
@@ -330,6 +409,8 @@ impl DataSink for FlussWriteTarget {
         let mut seen_keys = std::collections::HashSet::<Vec<u8>>::new();
         let key_reservation =
             MemoryConsumer::new("FlussMergeKeys").register(&context.runtime_env().memory_pool);
+        let encoding_scratch = MemoryConsumer::new("FlussKvEncodingScratch")
+            .register(&context.runtime_env().memory_pool);
         let writer = Arc::new(match self.kind {
             WriteKind::Log => FlussWriter::Log(
                 table
@@ -344,6 +425,7 @@ impl DataSink for FlussWriteTarget {
                     .map_err(fluss_error)?
                     .create_writer()
                     .map_err(fluss_error)?,
+                encoding_scratch,
             ),
             WriteKind::DeleteKv => FlussWriter::DeleteKv(
                 table
@@ -351,6 +433,7 @@ impl DataSink for FlussWriteTarget {
                     .map_err(fluss_error)?
                     .create_writer()
                     .map_err(fluss_error)?,
+                encoding_scratch,
             ),
             WriteKind::MergeKv => FlussWriter::MergeKv(
                 table
@@ -358,25 +441,49 @@ impl DataSink for FlussWriteTarget {
                     .map_err(fluss_error)?
                     .create_writer()
                     .map_err(fluss_error)?,
+                encoding_scratch,
             ),
         });
+        if tokio::time::Instant::now() >= preparation_deadline {
+            return Err(write_phase_timeout(crate::FlussWritePhase::Preparation));
+        }
         let mut confirmed = 0_u64;
         while let Some(next) = input.next().await {
             let batch = next?;
             if batch.num_rows() == 0 {
                 continue;
             }
-            let current = connection
-                .get_table(&self.path)
-                .await
-                .map_err(fluss_error)?;
+            let metadata_deadline = tokio::time::Instant::now() + self.options.preparation_timeout;
+            let current =
+                tokio::time::timeout_at(metadata_deadline, connection.get_table(&self.path))
+                    .await
+                    .map_err(|_| write_phase_timeout(crate::FlussWritePhase::Metadata))?
+                    .map_err(fluss_error)?;
             self.check_identity(&current)?;
+            if current.get_table_info().is_partitioned() {
+                tokio::time::timeout_at(
+                    metadata_deadline,
+                    refresh_write_partitions(&connection, &self.path, &mut partitions),
+                )
+                .await
+                .map_err(|_| write_phase_timeout(crate::FlussWritePhase::Metadata))??;
+            }
+            // Include validation, admission and MERGE key preparation in this
+            // batch's one enqueue/ACK budget; no separate retry allowance.
+            let deadline = tokio::time::Instant::now() + self.options.ack_timeout;
             if matches!(self.kind, WriteKind::DeleteKv) {
                 validate_delete_policy(current.get_table_info().get_properties())?;
             }
             self.schema
                 .logically_equivalent_names_and_types(&batch.schema())?;
             validate_required_values(&destination_schema, &batch)?;
+            let retained_bytes = crate::resources::batch_backing_bytes(&batch)?;
+            if retained_bytes > self.options.max_retained_batch_bytes {
+                return Err(DataFusionError::ResourcesExhausted(format!(
+                    "Fluss write input retains {retained_bytes} backing bytes, exceeding max_retained_batch_bytes={}",
+                    self.options.max_retained_batch_bytes
+                )));
+            }
             let reservation =
                 MemoryConsumer::new("FlussWriteBatch").register(&context.runtime_env().memory_pool);
             let batch = if matches!(self.kind, WriteKind::Log) {
@@ -386,7 +493,7 @@ impl DataSink for FlussWriteTarget {
                 crate::resources::reserve_batch(
                     batch,
                     &reservation,
-                    usize::MAX,
+                    self.options.max_retained_batch_bytes,
                     &datafusion::physical_plan::metrics::Gauge::new(),
                 )?
             } else {
@@ -409,8 +516,10 @@ impl DataSink for FlussWriteTarget {
                 let scratch = MemoryConsumer::new("FlussMergeKeyEncoding")
                     .register(&context.runtime_env().memory_pool);
                 scratch.try_grow(
-                    batch
-                        .get_array_memory_size()
+                    columns
+                        .iter()
+                        .map(|column| column.get_array_memory_size())
+                        .sum::<usize>()
                         .saturating_mul(2)
                         .saturating_add(batch.num_rows().saturating_mul(32)),
                 )?;
@@ -430,7 +539,9 @@ impl DataSink for FlussWriteTarget {
                 }
             }
             let rows = batch.num_rows() as u64;
-            let deadline = tokio::time::Instant::now() + self.options.ack_timeout;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(write_timeout());
+            }
             // Own a reservation until the blocking task releases its retained
             // batch, even when its async caller is cancelled. Source/operator
             // reservations remain separate and may overlap conservatively.
@@ -439,8 +550,9 @@ impl DataSink for FlussWriteTarget {
             let batch_writer = Arc::clone(&writer);
             let batch_row_type = Arc::clone(&row_type);
             let stop = Arc::clone(&cancelled);
+            let max_bytes = self.options.max_retained_batch_bytes;
             let enqueue = tokio::task::spawn_blocking(move || {
-                batch_writer.enqueue(batch, batch_row_type, &stop, &reservation)
+                batch_writer.enqueue(batch, batch_row_type, &stop, &reservation, max_bytes)
             });
             tokio::time::timeout_at(deadline, enqueue)
                 .await
@@ -477,9 +589,52 @@ fn fluss_error(error: fluss::error::Error) -> DataFusionError {
 }
 
 fn write_timeout() -> DataFusionError {
-    DataFusionError::Execution(
-        "Fluss write enqueue/ACK timed out; in-flight writes may have been committed".into(),
-    )
+    write_phase_timeout(crate::FlussWritePhase::EnqueueAndAck)
+}
+
+fn write_phase_timeout(phase: crate::FlussWritePhase) -> DataFusionError {
+    DataFusionError::External(Box::new(crate::FlussWriteTimeout { phase }))
+}
+
+async fn refresh_write_partitions(
+    connection: &FlussConnection,
+    path: &TablePath,
+    known: &mut std::collections::HashMap<String, (i64, i32)>,
+) -> Result<()> {
+    let admin = connection.get_admin().map_err(fluss_error)?;
+    let latest = admin
+        .list_partition_infos(path)
+        .await
+        .map_err(fluss_error)?;
+    let mut current = std::collections::HashMap::new();
+    for partition in &latest {
+        let count = partition.get_bucket_count().ok_or_else(|| {
+            DataFusionError::Execution("Fluss write partition layout is unavailable".into())
+        })?;
+        current.insert(
+            partition.get_partition_name().clone(),
+            (partition.get_partition_id(), count),
+        );
+    }
+    if known
+        .iter()
+        .any(|(name, layout)| current.get(name) != Some(layout))
+    {
+        return Err(DataFusionError::Execution("Fluss write partition identity/layout changed; replan; earlier writes may already be committed".into()));
+    }
+    connection
+        .get_metadata()
+        .check_and_update_partition_metadata_by_ids(
+            path,
+            &latest
+                .iter()
+                .map(|p| p.get_partition_id())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(fluss_error)?;
+    *known = current;
+    Ok(())
 }
 
 fn validate_ack_policy(acks: &str) -> Result<()> {
@@ -537,6 +692,60 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+
+    #[test]
+    fn writer_accounting_uses_the_real_pool_and_guards_survive_adapter_drop() {
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use fluss::client::WriterMemoryAccounting;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(2048));
+        let adapter = WriterPoolAccounting {
+            encoded: MemoryConsumer::new("encoder").register(&pool),
+            transport: MemoryConsumer::new("transport").register(&pool),
+            routing: MemoryConsumer::new("routing").register(&pool),
+        };
+        let first = adapter.reserve(1024).unwrap();
+        let second = adapter.reserve(512).unwrap();
+        let error = adapter.reserve(1024).err().unwrap();
+        assert!(matches!(
+            error,
+            fluss::error::Error::WriterMemoryAdmission { .. }
+        ));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<DataFusionError>()
+                .is_some()
+        );
+        assert_eq!(pool.reserved(), 1536);
+        drop(adapter);
+        drop(first);
+        assert_eq!(pool.reserved(), 512);
+        drop(second);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[test]
+    fn preparation_and_input_limits_cannot_be_unbounded_by_zero_or_bad_units() {
+        let options = FlussWriteOptions::default();
+        assert_eq!(options.preparation_timeout, Duration::from_secs(30));
+        assert_eq!(options.max_retained_batch_bytes, 64 * 1024 * 1024);
+        assert!(
+            FlussWriteOptions {
+                preparation_timeout: Duration::from_nanos(1),
+                ..options
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            FlussWriteOptions {
+                max_retained_batch_bytes: 0,
+                ..options
+            }
+            .validate()
+            .is_err()
+        );
+    }
 
     #[test]
     fn server_confirmed_counts_require_an_ack_policy() {

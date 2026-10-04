@@ -724,7 +724,7 @@ async fn sql_insert_routes_mixed_partitions_after_rescale() -> TestResult<()> {
             ready_partition(&admin, path, "north", 2).await?;
             ready_partition(&admin, path, "south", 2).await?;
         }
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16 * 1024 * 1024));
         let ctx = SessionContext::new_with_config_rt(
             SessionConfig::new().with_target_partitions(1),
             Arc::new(RuntimeEnvBuilder::new().with_memory_pool(Arc::clone(&pool)).build()?),

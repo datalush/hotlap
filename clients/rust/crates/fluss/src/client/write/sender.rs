@@ -503,7 +503,9 @@ impl Sender {
                 // Record send latency for the request round trip regardless of
                 // outcome, so it is captured before the success/error branch.
                 let send_start = Instant::now();
-                let response_result = connection.request($request).await;
+                let response_result = connection
+                    .request_with_memory_accounting($request, self.accumulator.memory_accounting())
+                    .await;
                 self.metrics
                     .record_send_latency_ms(send_start.elapsed().as_secs_f64() * 1000.0);
                 match response_result {
@@ -517,6 +519,16 @@ impl Sender {
                         .await
                     }
                     Err(e) => {
+                        if matches!(e, crate::error::Error::WriterMemoryAdmission { .. }) {
+                            self.accumulator.record_local_failure(e);
+                            return self.handle_batches_with_local_error(
+                                table_buckets
+                                    .iter()
+                                    .filter_map(|b| records_by_bucket.remove(b))
+                                    .collect(),
+                                "Write RPC memory admission rejected before send".into(),
+                            );
+                        }
                         self.handle_batches_with_error(
                             table_buckets
                                 .iter()

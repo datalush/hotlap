@@ -364,3 +364,24 @@ the native session pool. KV upsert/delete retains its required row-format wire
 encoding and typed view, not an Arrow-log surrogate. Wire encoding, post-allocation
 admission, conservative nested/scratch estimates and final resource/fault profiles
 remain explicit. See [arrow-write-inventory.md](arrow-write-inventory.md).
+
+## 13. Native write bounds in yeqf (working tree)
+
+A09 now has a common finite destination preparation scope, between-batch metadata
+budget and typed write phase timeouts; validation/key preparation shares batch ACK
+budget. Input ceiling applies to finite/continuous/non-Fluss inputs. A10's MERGE
+scratch uses selected keys rather than full payload; reusable KV value encoder
+scratch is separately owned with the writer.
+
+A14 preserves dedicated execution isolation and fixes limiter close/acquire,
+append-after-close and cancelled-close sender ownership races. Encoder guards
+follow native batches/Bytes, framed RPC guards survive bounded cancellation-safe
+drain, and persistent routing/queue metadata remains charged during idle input.
+Caller admission runs outside native queue locks. No replacement pool/allocator,
+transport or retry coordinator is introduced.
+
+Real Docker cases exercise both log/KV saturation, ACK/metadata/bootstrap stalls,
+idle, concurrent cancellation, source failure, table/schema/partition invalidation
+and ACK policies; four SQL regressions remain passing. Detailed ownership,
+estimates, observed recovery, test-probe hang/cleanup and separate 30s frame bound
+are recorded in [write-pressure-verification.md](write-pressure-verification.md).

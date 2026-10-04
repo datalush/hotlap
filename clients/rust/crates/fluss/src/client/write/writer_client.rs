@@ -47,6 +47,7 @@ pub struct WriterClient {
     accumulate: Arc<RecordAccumulator>,
     shutdown_tx: Mutex<Option<mpsc::Sender<()>>>,
     sender_join_handle: Mutex<Option<JoinHandle<()>>>,
+    sender_abort_handle: tokio::task::AbortHandle,
     metadata: Arc<Metadata>,
     bucket_assigners: DashMap<Arc<PhysicalTablePath>, BucketAssignerBinding>,
     idempotence_manager: Arc<IdempotenceManager>,
@@ -56,10 +57,19 @@ struct BucketAssignerBinding {
     partition_id: Option<PartitionId>,
     bucket_count: i32,
     assigner: Arc<dyn BucketAssigner>,
+    _memory_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl WriterClient {
     pub fn new(config: Config, metadata: Arc<Metadata>) -> Result<Self> {
+        Self::new_with_memory_accounting(config, metadata, None)
+    }
+
+    pub(crate) fn new_with_memory_accounting(
+        config: Config,
+        metadata: Arc<Metadata>,
+        accounting: Option<Arc<dyn crate::client::WriterMemoryAccounting>>,
+    ) -> Result<Self> {
         let ack = Self::get_ack(&config)?;
 
         let idempotence_manager = Arc::new(IdempotenceManager::new(
@@ -69,9 +79,10 @@ impl WriterClient {
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        let accumulator = Arc::new(RecordAccumulator::new(
+        let accumulator = Arc::new(RecordAccumulator::new_with_memory_accounting(
             config.clone(),
             Arc::clone(&idempotence_manager),
+            accounting,
         ));
 
         // Writer metrics are emitted unlabeled (global per process). Resolve the
@@ -95,11 +106,13 @@ impl WriterClient {
             }
         });
 
+        let sender_abort_handle = join_handle.abort_handle();
         Ok(Self {
             max_request_size: config.writer_request_max_size,
             config,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             sender_join_handle: Mutex::new(Some(join_handle)),
+            sender_abort_handle,
             accumulate: accumulator,
             metadata,
             bucket_assigners: Default::default(),
@@ -238,6 +251,11 @@ impl WriterClient {
             {
                 Arc::clone(&binding.assigner)
             } else {
+                let memory_guard = self
+                    .accumulate
+                    .memory_accounting()
+                    .map(|accounting| accounting.reserve_routing(4096))
+                    .transpose()?;
                 let assigner = Self::create_bucket_assigner(
                     table_info,
                     Arc::clone(table_path),
@@ -250,6 +268,7 @@ impl WriterClient {
                         partition_id,
                         bucket_count: count,
                         assigner: Arc::clone(&assigner),
+                        _memory_guard: memory_guard,
                     },
                 );
                 assigner
@@ -309,9 +328,9 @@ impl WriterClient {
     /// rollback. Intended for cancellation of a dedicated writer session.
     pub fn abort(&self) {
         self.accumulate.close();
-        if let Some(handle) = self.sender_join_handle.lock().take() {
-            handle.abort();
-        }
+        // Remains available even while a cancelled close future owned the join
+        // handle. Dropping a Tokio JoinHandle alone would detach the sender.
+        self.sender_abort_handle.abort();
         self.shutdown_tx.lock().take();
         self.accumulate.abort_batches(broadcast::Error::Client {
             message: "Writer aborted; in-flight writes may have been committed".into(),
@@ -355,5 +374,38 @@ impl WriterClient {
                 ))),
             }
         }
+    }
+}
+
+impl Drop for WriterClient {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn abort_still_stops_sender_after_a_close_future_was_cancelled() {
+        let metadata = Arc::new(Metadata::new_for_test(Arc::new(Cluster::default())));
+        let mut client = WriterClient::new(Config::default(), metadata).unwrap();
+        client.sender_abort_handle.abort();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        client.sender_abort_handle = handle.abort_handle();
+        client.sender_join_handle = Mutex::new(Some(handle));
+        let mut closing = Box::pin(client.close(Duration::from_secs(60)));
+        assert!(futures::poll!(closing.as_mut()).is_pending());
+        drop(closing);
+        client.abort();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.sender_abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(client.accumulate.is_closed());
     }
 }

@@ -570,6 +570,18 @@ where
         R: RequestBody + Send + WriteType<Vec<u8>>,
         R::ResponseBody: ReadType<Cursor<Vec<u8>>>,
     {
+        self.request_with_memory_accounting(msg, None).await
+    }
+
+    pub(crate) async fn request_with_memory_accounting<R>(
+        &self,
+        msg: R,
+        accounting: Option<&Arc<dyn crate::client::WriterMemoryAccounting>>,
+    ) -> Result<R::ResponseBody, Error>
+    where
+        R: RequestBody + Send + WriteType<Vec<u8>>,
+        R::ResponseBody: ReadType<Cursor<Vec<u8>>>,
+    {
         let api_version = self.resolve_api_version(R::API_KEY)?;
         let request_id = self.request_id.fetch_add(1, Ordering::SeqCst) & 0x7FFFFFFF;
         let header = RequestHeader {
@@ -586,6 +598,9 @@ where
             .map_err(RpcError::WriteMessageError)?;
         // write message body
         msg.write(&mut buf).map_err(RpcError::WriteMessageError)?;
+        let memory_guard = accounting
+            .map(|accounting| accounting.reserve_transport(buf.capacity()))
+            .transpose()?;
 
         let (tx, rx) = channel();
 
@@ -605,7 +620,7 @@ where
         let request_body_bytes = buf.len().saturating_sub(REQUEST_HEADER_LENGTH) as u64;
         let mut request_metrics = RequestMetricsLifecycle::begin(R::API_KEY, request_body_bytes);
 
-        self.send_message(buf)
+        self.send_message(buf, memory_guard)
             .await
             .inspect_err(|_| request_metrics.complete(0))?;
         _cleanup_on_cancel.message_sent();
@@ -645,8 +660,12 @@ where
         Ok(body)
     }
 
-    async fn send_message(&self, msg: Vec<u8>) -> Result<(), RpcError> {
-        match self.send_message_inner(msg).await {
+    async fn send_message(
+        &self,
+        msg: Vec<u8>,
+        guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<(), RpcError> {
+        match self.send_message_inner(msg, guard).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 // need to poison the stream because message framing might be out-of-sync
@@ -656,14 +675,32 @@ where
         }
     }
 
-    async fn send_message_inner(&self, msg: Vec<u8>) -> Result<(), RpcError> {
+    async fn send_message_inner(
+        &self,
+        msg: Vec<u8>,
+        guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<(), RpcError> {
         let mut stream_write = Arc::clone(&self.stream_write).lock_owned().await;
+        let state = Arc::clone(&self.state);
 
         // use a wrapper so that cancellation doesn't cancel the send operation and leaves half-send messages on the wire
         let fut = CancellationSafeFuture::new(async move {
-            stream_write.write_message(&msg).await?;
-            stream_write.flush().await?;
-            Ok(())
+            // A cancelled frame still finishes to preserve framing, but cannot
+            // retain its bytes indefinitely against a silent peer. Its owner
+            // retains the caller's reservation through that bounded drain.
+            let _memory_guard = guard;
+            let result = tokio::time::timeout(Duration::from_secs(30), async {
+                stream_write.write_message(&msg).await?;
+                stream_write.flush().await?;
+                Ok::<_, RpcError>(())
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(RpcError::ConnectionError(
+                    "RPC frame write timed out after 30s; connection must be discarded".into(),
+                ))
+            });
+            result.map_err(|error| RpcError::Poisoned(state.lock().poison(error)))
         });
 
         fut.await
@@ -794,6 +831,29 @@ impl Drop for CleanupRequestStateOnCancel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_stalled_frame_keeps_lease_until_bounded_drain_and_poisons_connection() {
+        struct Guard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let (client, _silent_peer) = tokio::io::duplex(8);
+        let connection = ServerConnectionInner::new(client, 4096, Arc::from("writer-drain-test"));
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard: Arc<dyn Send + Sync> = Arc::new(Guard(Arc::clone(&released)));
+        let mut sending = Box::pin(connection.send_message_inner(vec![1; 1024], Some(guard)));
+        assert!(futures::poll!(sending.as_mut()).is_pending());
+        drop(sending);
+        tokio::task::yield_now().await;
+        assert!(!released.load(Ordering::Acquire));
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(released.load(Ordering::Acquire));
+        assert!(connection.is_poisoned());
+    }
     use crate::error::Error;
     use crate::rpc::ApiKey;
     use crate::rpc::api_version::ApiVersion;

@@ -506,6 +506,52 @@ pub struct FlussTestingCluster {
 }
 
 impl FlussTestingCluster {
+    /// Pause only a server owned by this RAII fixture, for real blocked
+    /// requests/ACKs without a replacement protocol or transport.
+    pub async fn pause_tablet_server(&self, id: u16) -> Result<(), String> {
+        let server = self
+            .tablet_servers
+            .get(&id)
+            .ok_or_else(|| format!("Unknown fixture tablet {id}"))?;
+        docker_client()
+            .await
+            .ok_or("Docker unavailable")?
+            .pause_container(server.id())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn resume_tablet_server(&self, id: u16) -> Result<(), String> {
+        let server = self
+            .tablet_servers
+            .get(&id)
+            .ok_or_else(|| format!("Unknown fixture tablet {id}"))?;
+        docker_client()
+            .await
+            .ok_or("Docker unavailable")?
+            .unpause_container(server.id())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn pause_coordinator(&self) -> Result<(), String> {
+        docker_client()
+            .await
+            .ok_or("Docker unavailable")?
+            .pause_container(self.coordinator_server.id())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn resume_coordinator(&self) -> Result<(), String> {
+        docker_client()
+            .await
+            .ok_or("Docker unavailable")?
+            .unpause_container(self.coordinator_server.id())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub fn stop(&self) {
         let names = self.container_names.clone();
         run_blocking(async move {

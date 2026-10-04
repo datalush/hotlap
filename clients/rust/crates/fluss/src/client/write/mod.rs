@@ -44,6 +44,21 @@ pub(crate) use idempotence::IdempotenceManager;
 pub use write_format::WriteFormat;
 pub(crate) use writer_client::WriterClient;
 
+/// Caller-owned admission policy for encoder and transport buffers. Guards
+/// follow native buffer ownership; the client still controls its own limiter,
+/// routing, protocol and retries. No allocator or global pool is installed.
+/// Admission must return promptly or fail, rather than waiting for other
+/// registered consumers to release memory. Blocking buffer waits stay native.
+pub trait WriterMemoryAccounting: Send + Sync {
+    fn reserve(&self, bytes: usize) -> crate::error::Result<Arc<dyn Send + Sync>>;
+    fn reserve_transport(&self, bytes: usize) -> crate::error::Result<Arc<dyn Send + Sync>> {
+        self.reserve(bytes)
+    }
+    fn reserve_routing(&self, bytes: usize) -> crate::error::Result<Arc<dyn Send + Sync>> {
+        self.reserve(bytes)
+    }
+}
+
 #[allow(dead_code)]
 pub struct WriteRecord<'a> {
     record: Record<'a>,

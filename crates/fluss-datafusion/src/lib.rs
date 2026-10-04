@@ -28,6 +28,7 @@ pub use capabilities::{FlussCapabilities, FlussInsertCapability, FlussReadCapabi
 pub use catalog::FlussCatalog;
 pub use error::{
     FlussOperationTimeout, FlussReadInvalidated, FlussReadInvalidation, FlussScanTimeout,
+    FlussWritePhase, FlussWriteTimeout,
 };
 pub use kv_table::FlussKvTable;
 pub use log_options::{LogReadMode, LogReadOptions, LogStart};

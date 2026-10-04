@@ -113,6 +113,14 @@ pub enum Error {
     )]
     BufferExhausted { message: String },
 
+    #[snafu(
+        visibility(pub(crate)),
+        display("Fluss writer memory admission failed: {:?}", source)
+    )]
+    WriterMemoryAdmission {
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
     #[snafu(visibility(pub(crate)), display("Fluss API Error: {}.", api_error))]
     FlussAPIError { api_error: ApiError },
 

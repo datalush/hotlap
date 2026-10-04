@@ -92,14 +92,7 @@ pub(crate) fn reserve_batch(
     max_bytes: usize,
     retained_bytes: &Gauge,
 ) -> Result<RecordBatch> {
-    let bytes = batch
-        .columns()
-        .iter()
-        .map(|column| column.get_buffer_memory_size())
-        .try_fold(0usize, |total, bytes| total.checked_add(bytes))
-        .ok_or_else(|| {
-            DataFusionError::ResourcesExhausted("Fluss source backing byte count overflowed".into())
-        })?;
+    let bytes = batch_backing_bytes(&batch)?;
     if bytes > max_bytes {
         return Err(DataFusionError::ResourcesExhausted(format!(
             "Fluss source batch retains {bytes} backing bytes, exceeding max_retained_batch_bytes={max_bytes}; decoding precedes this admission limit"
@@ -123,6 +116,17 @@ pub(crate) fn reserve_batch(
         columns,
         &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
     )?)
+}
+
+pub(crate) fn batch_backing_bytes(batch: &RecordBatch) -> Result<usize> {
+    batch
+        .columns()
+        .iter()
+        .map(|column| column.get_buffer_memory_size())
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+        .ok_or_else(|| {
+            DataFusionError::ResourcesExhausted("Fluss Arrow backing byte count overflowed".into())
+        })
 }
 
 #[cfg(test)]

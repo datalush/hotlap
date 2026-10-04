@@ -87,8 +87,20 @@ impl MemoryLimiter {
         }
 
         let mut used = self.state.lock();
-        let deadline = Instant::now() + self.wait_timeout;
-        while *used + size > self.max_memory {
+        let deadline = Instant::now()
+            .checked_add(self.wait_timeout)
+            .ok_or_else(|| Error::IllegalArgument {
+                message: "Writer buffer wait timeout exceeds the clock range".into(),
+            })?;
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Error::WriterClosed {
+                    message: "Memory limiter is closed".into(),
+                });
+            }
+            if size <= self.max_memory.saturating_sub(*used) {
+                break;
+            }
             self.waiting_count.fetch_add(1, Ordering::Relaxed);
             let result = self.cond.wait_until(&mut used, deadline);
             self.waiting_count.fetch_sub(1, Ordering::Relaxed);
@@ -98,7 +110,7 @@ impl MemoryLimiter {
                     message: "Memory limiter is closed".to_string(),
                 });
             }
-            if result.timed_out() && *used + size > self.max_memory {
+            if result.timed_out() && size > self.max_memory.saturating_sub(*used) {
                 return Err(Error::BufferExhausted {
                     message: format!(
                         "Failed to allocate {} bytes for write batch within {}ms. \
@@ -150,6 +162,9 @@ impl MemoryLimiter {
 
     /// Mark the limiter as closed and wake all blocked producers.
     fn close(&self) {
+        // Serialize the condition change with acquire's predicate/wait. A
+        // notification before that thread enters wait must not be lost.
+        let _state = self.state.lock();
         self.closed.store(true, Ordering::Release);
         self.cond.notify_all();
     }
@@ -205,10 +220,19 @@ pub struct RecordAccumulator {
     /// Per-bucket backpressure throttle expiry timestamps in milliseconds.
     throttle_expiry_ms: DashMap<TableBucket, i64>,
     max_throttle_ms: i64,
+    memory_accounting: Option<Arc<dyn crate::client::WriterMemoryAccounting>>,
 }
 
 impl RecordAccumulator {
     pub fn new(config: Config, idempotence_manager: Arc<IdempotenceManager>) -> Self {
+        Self::new_with_memory_accounting(config, idempotence_manager, None)
+    }
+
+    pub(crate) fn new_with_memory_accounting(
+        config: Config,
+        idempotence_manager: Arc<IdempotenceManager>,
+        memory_accounting: Option<Arc<dyn crate::client::WriterMemoryAccounting>>,
+    ) -> Self {
         let batch_timeout_ms = config.writer_batch_timeout_ms;
         let max_throttle_ms = config
             .writer_kv_backpressure_max_throttle_ms
@@ -233,7 +257,18 @@ impl RecordAccumulator {
             sender_wakeup: Notify::new(),
             throttle_expiry_ms: Default::default(),
             max_throttle_ms,
+            memory_accounting,
         }
+    }
+
+    pub(crate) fn memory_accounting(
+        &self,
+    ) -> Option<&Arc<dyn crate::client::WriterMemoryAccounting>> {
+        self.memory_accounting.as_ref()
+    }
+
+    pub(crate) fn record_local_failure(&self, error: Error) {
+        self.first_write_failure.lock().get_or_insert(error);
     }
 
     /// Total writer buffer memory in bytes (constant).
@@ -281,10 +316,16 @@ impl RecordAccumulator {
         cluster: &Cluster,
         record: &WriteRecord,
         dq: &mut VecDeque<WriteBatch>,
-        permit: MemoryPermit,
+        permits: (MemoryPermit, Option<Arc<dyn Send + Sync>>),
         alloc_size: usize,
         compression_ratio_estimator: Arc<ArrowCompressionRatioEstimator>,
     ) -> Result<RecordAppendResult> {
+        let (permit, encoding_guard) = permits;
+        if self.is_closed() {
+            return Err(Error::WriterClosed {
+                message: "Cannot append: writer is closed".into(),
+            });
+        }
         let physical_table_path = &record.physical_table_path;
         let table_path = physical_table_path.get_table_path();
         let table_info = cluster.get_table(table_path)?;
@@ -330,6 +371,7 @@ impl RecordAccumulator {
                 current_time_ms(),
             )),
         };
+        batch.inner_batch_mut().memory_guard = encoding_guard;
 
         let batch_id = batch.batch_id();
 
@@ -369,14 +411,50 @@ impl RecordAccumulator {
             None
         };
 
+        // Persistent empty queue/routing entries are retained even after ACK.
+        // Admit their own guards, outside shard/deque locks, rather than charge
+        // them only as a worker's temporary routing scratch.
+        let path_guard = if !self.write_batches.contains_key(physical_table_path) {
+            self.memory_accounting
+                .as_ref()
+                .map(|accounting| accounting.reserve_routing(4096))
+                .transpose()?
+        } else {
+            None
+        };
+        let bucket_guard = if self
+            .write_batches
+            .get(physical_table_path)
+            .is_none_or(|entry| !entry.batches.contains_key(&bucket_id))
+        {
+            self.memory_accounting
+                .as_ref()
+                .map(|accounting| accounting.reserve_routing(512))
+                .transpose()?
+        } else {
+            None
+        };
         let (dq, compression_ratio_estimator, dynamic_target) = {
             let mut binding = self
                 .write_batches
                 .entry(Arc::clone(physical_table_path))
                 .or_insert_with(|| {
-                    BucketAndWriteBatches::new(is_partitioned_table, partition_id, &self.config)
+                    let mut entry = BucketAndWriteBatches::new(
+                        is_partitioned_table,
+                        partition_id,
+                        &self.config,
+                    );
+                    entry._memory_guard = path_guard;
+                    entry
                 });
             let bucket_and_batches = binding.value_mut();
+            if !bucket_and_batches.batches.contains_key(&bucket_id)
+                && let Some(guard) = bucket_guard
+            {
+                bucket_and_batches
+                    .bucket_memory_guards
+                    .insert(bucket_id, guard);
+            }
             let dq = bucket_and_batches
                 .batches
                 .entry(bucket_id)
@@ -394,6 +472,11 @@ impl RecordAccumulator {
         };
 
         let mut dq_guard = dq.lock();
+        if self.is_closed() {
+            return Err(Error::WriterClosed {
+                message: "Cannot append: writer is closed".into(),
+            });
+        }
         if let Some(append_result) = self.try_append(record, &mut dq_guard)? {
             return Ok(append_result);
         }
@@ -413,8 +496,33 @@ impl RecordAccumulator {
         let alloc_size = batch_size.max(record_size);
         let permit = self.memory_limiter.acquire(alloc_size)?;
 
+        // Caller policy runs outside the queue lock as well. A pool's own
+        // synchronization must never stall the sender while it needs this
+        // deque to drain/release permits or process shutdown.
+        let encoding_bytes = match record.record() {
+            Record::Log(LogWriteRecord::RecordBatch(_)) => {
+                record.estimated_record_size().checked_mul(4)
+            }
+            Record::Kv(_) => alloc_size.checked_mul(2),
+            _ => alloc_size.checked_mul(4),
+        }
+        .and_then(|n| n.checked_add(4096))
+        .ok_or_else(|| Error::IllegalArgument {
+            message: "Writer encoding reservation overflowed".into(),
+        })?;
+        let encoding_guard = self
+            .memory_accounting
+            .as_ref()
+            .map(|accounting| accounting.reserve(encoding_bytes))
+            .transpose()?;
+
         // Re-acquire dq lock after memory is available
         let mut dq_guard = dq.lock();
+        if self.is_closed() {
+            return Err(Error::WriterClosed {
+                message: "Cannot append: writer is closed".into(),
+            });
+        }
         // Re-try: another thread may have created a batch while we waited
         if let Some(append_result) = self.try_append(record, &mut dq_guard)? {
             return Ok(append_result); // permit drops here, memory released
@@ -424,7 +532,7 @@ impl RecordAccumulator {
             cluster,
             record,
             &mut dq_guard,
-            permit,
+            (permit, encoding_guard),
             alloc_size,
             compression_ratio_estimator,
         )
@@ -982,6 +1090,7 @@ impl RecordAccumulator {
     }
 
     pub fn abort_batches(&self, error: broadcast::Error) {
+        self.closed.store(true, Ordering::Release);
         self.memory_limiter.close();
         // Complete batches still in deques (not yet drained).
         for mut entry in self.write_batches.iter_mut() {
@@ -1222,6 +1331,8 @@ struct BucketAndWriteBatches {
     compression_ratio_estimator: Arc<ArrowCompressionRatioEstimator>,
     /// `None` when `writer_dynamic_batch_size_enabled` is false.
     dynamic_batch_size: Option<DynamicWriteBatchSizeEstimator>,
+    _memory_guard: Option<Arc<dyn Send + Sync>>,
+    bucket_memory_guards: HashMap<BucketId, Arc<dyn Send + Sync>>,
 }
 
 impl BucketAndWriteBatches {
@@ -1238,6 +1349,8 @@ impl BucketAndWriteBatches {
             batches: Default::default(),
             compression_ratio_estimator: Arc::new(ArrowCompressionRatioEstimator::default()),
             dynamic_batch_size,
+            _memory_guard: None,
+            bucket_memory_guards: Default::default(),
         }
     }
 }
@@ -1674,6 +1787,30 @@ mod tests {
         let mut batches = accumulator.drain(cluster.clone(), &nodes, 1024 * 1024)?;
         let mut drained = batches.remove(&1).expect("drained batches");
         Ok(drained.pop().expect("batch"))
+    }
+
+    #[test]
+    fn closed_accumulator_cannot_append_even_into_an_existing_batch() {
+        let path = TablePath::new("db", "closed");
+        let cluster = Arc::new(build_cluster(&path, 1, 1));
+        let accumulator = RecordAccumulator::new(Config::default(), disabled_idempotence());
+        let info = Arc::new(build_table_info(path.clone(), 1, 1));
+        let physical = Arc::new(PhysicalTablePath::of(Arc::new(path)));
+        let row = GenericRow {
+            values: vec![Datum::Int32(1)],
+        };
+        let record = WriteRecord::for_append(info, physical, 1, &row);
+        accumulator.append(&record, 0, &cluster, false).unwrap();
+        accumulator.close();
+        assert!(matches!(
+            accumulator.append(&record, 0, &cluster, false),
+            Err(Error::WriterClosed { .. })
+        ));
+        accumulator.abort_batches(broadcast::Error::Dropped);
+        assert_eq!(
+            accumulator.buffer_available_bytes(),
+            accumulator.buffer_total_bytes()
+        );
     }
 
     #[test]

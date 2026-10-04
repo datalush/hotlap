@@ -59,3 +59,25 @@ pub(crate) fn invalidated(
         message: message.into(),
     }))
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlussWritePhase {
+    Preparation,
+    Metadata,
+    EnqueueAndAck,
+}
+
+#[derive(Debug)]
+pub struct FlussWriteTimeout {
+    pub phase: FlussWritePhase,
+}
+impl std::fmt::Display for FlussWriteTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.phase {
+            FlussWritePhase::Preparation => f.write_str("Fluss write destination preparation timed out before input submission"),
+            FlussWritePhase::Metadata => f.write_str("Fluss write metadata operation timed out; earlier batches may already have committed"),
+            FlussWritePhase::EnqueueAndAck => f.write_str("Fluss write enqueue/ACK timed out; in-flight writes may have committed"),
+        }
+    }
+}
+impl std::error::Error for FlussWriteTimeout {}

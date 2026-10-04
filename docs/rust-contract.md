@@ -179,8 +179,8 @@ allocator, scheduler or engine-recovery loop.
 | Offered source batches | Arrow buffer owners retain whole-batch backing-storage leases across clones/slices/projections until final buffer drop | Implemented in `tq3s`; retained batches can remain charged after stream completion/cancellation |
 | Operator-retained state | Native DF operators use their real session pool where their implementation reserves it | Preserve native context/planning: `re7r`, `tq3s` |
 | Sink input/gather Arrow batches | Log backing leases follow client-held buffers beyond enqueue/worker drop; KV worker guard covers row encoding; client routing scratch is admitted against the same pool | Implemented columnar ownership in `3etr`; saturation/actual byte verification: `yeqf` |
-| Encoded writer queue | Existing client buffer limiter and permits; admission/release across send/ACK/abort | Audit actual buffers vs estimates: `3etr`, `yeqf` |
-| MERGE key set and encoding scratch | Account necessary keys/overhead with DF pool; scratch scales with key work, not arbitrary non-key payload | Current conservative full-batch estimate: `yeqf`, `9h56` |
+| Encoded writer queue, RPC frames, persistent routing | Client limiter plus real DF pool guards owned by batches/Bytes/frames/cache entries | Implemented `yeqf`; estimates and allocation peaks need sustained profiles `pc5n` |
+| MERGE key set and encoding scratch | Selected PK representation/overhead in DF pool; row-format value encoding has its separate writer allowance | Selected-key scratch implemented `yeqf`; semantic coverage `9h56` |
 | Remote files/download slots | Existing client disk-byte and concurrency permits, actual written bytes and cleanup | Retain separate budget: `w8ap` |
 | Raw responses/decompression/temporary allocations | Explicit client limits/transient behavior; not magically included by the emitted-batch reservation | Measure/document applicable bounds: `gpze`, `w8ap` |
 
@@ -213,10 +213,10 @@ value equality or the name of an Arrow API (`gpze`, `3etr`, `pc5n`).
 | Batch source execution | A common source budget starts when its first physical partition executes; includes discovery/capture/open/poll/decode waits. Not a whole SQL query deadline | Shared partition deadline implemented in `tq3s`; further operation/failure coverage in `w8ap` |
 | KV source execution | Same source-budget principle, including page waits; invalid snapshot fails rather than restarting | Shared deadline implemented in `tq3s`; snapshot/failure coverage remains `w8ap` |
 | Streaming source | No completion timeout for ordinary idle input; network/storage/metadata operations have finite applicable waits | Preserve idle behavior; effective operation limits verified by `w8ap` |
-| Provider/catalog preparation | Finite preparation using existing client connect/handshake/operation limits and a bounded preparation scope where those do not cover it | Inventory actual coverage in `tq3s`/`yeqf`; no unlimited wait hidden behind an ACK timeout |
-| Enqueue + ACK for one input batch | One deadline, not an independent full allowance for each stage; include retries/backpressure within it | `ack_timeout` currently covers enqueue+flush; `yeqf` verifies saturated paths |
+| Write destination preparation/metadata | Shared finite connection/table/partition scope, independent bounded check between batches | `preparation_timeout` implemented `yeqf`, default30s; read catalog has its separate contract |
+| Enqueue + ACK for one input batch | One deadline starts before validation/admission/key encoding; native retries/backpressure share it | Implemented `yeqf`, typed EnqueueAndAck cause, saturated log/KV cases |
 | Waiting for the next streaming input batch | Normal input wait, not expiry of an outstanding batch ACK | Preserve: no unsent batch means no ACK clock to expire |
-| Writer cleanup | Bounded graceful completion on success; cooperative abort/unblocking on failure/drop | Existing abort is not joined completion; verify bounded cleanup in `yeqf`/`cf5y` |
+| Writer cleanup | Graceful bound on success, cooperative native abort/closure on drop; partial RPC frames have independent finite drain | AbortHandle/limiter races corrected `yeqf`; small-frame recovery observed≤3s, stalled frame bound30s; complete fault matrix `cf5y` |
 
 Keep existing `FlussWriteOptions` names/defaults during refactoring:
 `ack_timeout = 30s`, `max_retries = 3`. `ack_timeout` must be representable as
@@ -225,6 +225,14 @@ Validation now rejects positive sub-millisecond durations so client conversion
 cannot silently produce a zero timeout. Retry budget is positive (zero currently unsupported)
 and caps the existing client mechanism; do not define it as a new connector loop
 or promise a fixed number of physical network sends without checking client usage.
+
+Rust write options additionally expose `preparation_timeout=30s` (1ms..=3600s)
+and positive `max_retained_batch_bytes=64 MiB`. The write ceiling applies after
+materialization to all input providers, not only Fluss source output. Encoding,
+framed transport, routing cache and reusable KV scratch consumers use the same
+native session pool; reservations follow their respective owners, including idle
+writers and cancelled frame drains. See [write-pressure-verification.md](write-pressure-verification.md)
+for admission estimates, RPC/kernel cleanup boundaries and real log/KV fault cases.
 
 Do not rename `batch_timeout` or call it a SQL-wide deadline. Public doc comments
 reflect the shared source-execution deadline, not a query-wide limit.
