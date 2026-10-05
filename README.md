@@ -45,6 +45,19 @@ The dependency stack remains DataFusion 55.1 / Arrow 59. The core backport prese
 empty optimized DELETE/UPDATE selection and rejects unsupported row restrictions;
 see [vendor provenance](vendor/README.md).
 
+The runnable native example uses an explicit provider, the normal DataFusion
+parser/planner/operators and a bounded host pool. Results are printed batch by
+batch rather than collected into an unbounded output Vec:
+
+```sh
+FLUSS_BOOTSTRAP=localhost:9123 DATAFUSION_POOL_MIB=64 DATAFUSION_TARGET_PARTITIONS=2 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 cargo run --locked -p fluss-datafusion --example native_query -- my_database my_table log 'SELECT COUNT(*) FROM fluss_source'
+```
+
+Use `kv` for a primary-key table. Fluss TLS/SASL settings use `FLUSS_CA_FILE`,
+`FLUSS_USER` and `FLUSS_PASSWORD`; engine memory/concurrency remain separate
+`DATAFUSION_*` settings. The default SQL is COUNT; supplied SQL is planned by
+DataFusion with the registered name `fluss_source`.
+
 ## Build and verification
 
 Functional builds use DEBUG and eight jobs. Release is for profiles/delivery.
@@ -92,3 +105,5 @@ an active delivery phase or a dependency of Rust validation.
 - [Write observations](docs/write-observation-contract.md)
 - [DELETE](docs/delete-contract.md) and [MERGE](docs/merge-contract.md)
 - [Continuous INSERT acceptance](docs/streaming-write-acceptance.md)
+- [Native engine acceptance](docs/native-engine-acceptance.md)
+- [Native failures](docs/native-failure-verification.md)

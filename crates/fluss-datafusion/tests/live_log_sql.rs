@@ -2092,7 +2092,22 @@ async fn empty_log_and_new_offsets_on_each_query() -> TestResult<()> {
     let connection = connect().await?;
     let path = create_empty_log(&connection).await?;
     let admin = connection.get_admin()?;
-    let ctx = SessionContext::new();
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16 * 1024 * 1024));
+    let mut config = SessionConfig::new()
+        .with_target_partitions(2)
+        .with_batch_size(64);
+    // Native sort reservations are per partition: two default 10 MiB spill
+    // reservations cannot fit this 16 MiB host pool, even for 512 tiny rows.
+    // The engine/application supplies the policy; the provider must not alter it.
+    config.options_mut().execution.sort_spill_reservation_bytes = 1024 * 1024;
+    let ctx = SessionContext::new_with_config_rt(
+        config,
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build()?,
+        ),
+    );
     let result = async {
         let provider =
             FlussLogTable::open(Arc::clone(&connection), path.clone(), SCAN_TIMEOUT).await?;
@@ -2152,6 +2167,18 @@ async fn empty_log_and_new_offsets_on_each_query() -> TestResult<()> {
     let cleanup = admin.drop_table(&path, true).await;
     result?;
     cleanup?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while pool.reserved() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "caller pool retains {} bytes after reference operators/reexecution/failure",
+            pool.reserved()
+        )
+    })?;
     connection.close(Duration::from_secs(5)).await?;
     Ok(())
 }
@@ -2323,6 +2350,10 @@ async fn check_reference_queries(ctx: &SessionContext) -> TestResult<()> {
         "SELECT optional, id FROM {table} WHERE id >= 100 AND id < 200 AND optional IS NULL ORDER BY id",
         "SELECT id FROM {table} WHERE id > 2147483648 OR optional IS NULL ORDER BY id",
         "SELECT id, optional FROM {table} WHERE id > 100 AND optional < 120 ORDER BY id",
+        "SELECT optional IS NULL AS missing, COUNT(*) AS n, SUM(id) AS total FROM {table} GROUP BY optional IS NULL ORDER BY missing",
+        "SELECT l.id, r.optional FROM {table} AS l INNER JOIN reference AS r ON l.optional = r.id WHERE l.id >= 100 AND l.id < 140 ORDER BY l.id",
+        "SELECT l.id, r.optional FROM {table} AS l LEFT JOIN reference AS r ON l.optional = r.id WHERE l.id >= 100 AND l.id < 110 ORDER BY l.id",
+        "SELECT id, optional FROM {table} ORDER BY optional NULLS FIRST, id DESC LIMIT 7",
     ] {
         let actual = sql_rows(ctx, &query.replace("{table}", "log")).await?;
         let expected = sql_rows(ctx, &query.replace("{table}", "reference")).await?;

@@ -436,6 +436,7 @@ async fn delete_policy_matches_effective_server_behavior() -> TestResult<()> {
 #[ignore = "requires native-sni and FLUSS_* credentials; writes isolated Fluss tables"]
 async fn insert_log_and_upsert_kv_from_sql() -> TestResult<()> {
     let connection = connect().await?;
+    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16 * 1024 * 1024));
     let admin = connection.get_admin()?;
     let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let log = TablePath::new("datafusion_tests", format!("insert_log_{suffix}"));
@@ -471,9 +472,11 @@ async fn insert_log_and_upsert_kv_from_sql() -> TestResult<()> {
             SessionStateBuilder::new()
                 .with_default_features()
                 .with_config(SessionConfig::new().with_target_partitions(4))
+                .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().with_memory_pool(Arc::clone(&pool)).build()?))
                 .with_query_planner(Arc::new(RecordingPlanner { helper_calls: Arc::clone(&helper_calls) }))
                 .build(),
         );
+        assert!(Arc::ptr_eq(&ctx.runtime_env().memory_pool, &pool), "the caller's bounded pool must reach the actual session runtime");
         ctx.register_udf(create_udf(
             "is_two",
             vec![DataType::Int32],
@@ -632,7 +635,7 @@ async fn insert_log_and_upsert_kv_from_sql() -> TestResult<()> {
         )?))?;
         let before_merge = helper_calls.load(Ordering::Relaxed);
         let merged = ctx.sql(
-            "MERGE INTO state AS t USING merge_input AS s ON t.id = s.id WHEN MATCHED AND s.op = 'd' THEN DELETE WHEN MATCHED THEN UPDATE SET value = s.value WHEN NOT MATCHED THEN INSERT (id, value) VALUES (s.id, s.value)"
+            "MERGE INTO state AS t USING merge_input AS s ON t.id = s.id WHEN MATCHED AND is_two(t.id) AND s.op = 'd' THEN DELETE WHEN MATCHED THEN UPDATE SET value = s.value WHEN NOT MATCHED THEN INSERT (id, value) VALUES (s.id, s.value)"
         ).await?.collect().await?;
         assert_eq!(rows_written(&merged), 3);
         assert!(helper_calls.load(Ordering::Relaxed) > before_merge, "MERGE must use the caller's planner for its operator graph");
@@ -685,6 +688,16 @@ async fn insert_log_and_upsert_kv_from_sql() -> TestResult<()> {
         );
 
         // A native provider with three physical partitions supplies INSERT.
+        if let Ok(example) = std::env::var("FLUSS_NATIVE_QUERY_EXAMPLE") {
+            for (path, mode, expected) in [(&log, "log", 6), (&kv, "kv", 1)] {
+                let output = std::process::Command::new(&example)
+                    .args(["datafusion_tests", path.table(), mode])
+                    .output()?;
+                assert!(output.status.success(), "native example failed: {}", String::from_utf8_lossy(&output.stderr));
+                let text = String::from_utf8(output.stdout)?;
+                assert!(text.lines().any(|line| line.trim_matches(|ch: char| ch == '|' || ch.is_whitespace()).parse::<i64>() == Ok(expected)), "wrong native example COUNT: {text}");
+            }
+        }
         // The standard optimizer must enforce the sink's single-partition
         // requirement without our former FFI-motivated manual coalesce.
         let mut partitions = Vec::new();
@@ -739,6 +752,18 @@ async fn insert_log_and_upsert_kv_from_sql() -> TestResult<()> {
     result?;
     log_cleanup?;
     kv_cleanup?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while pool.reserved() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "caller runtime retains {} bytes after SQL executions/plans/results drop",
+            pool.reserved()
+        )
+    })?;
     connection.close(Duration::from_secs(5)).await?;
     Ok(())
 }
