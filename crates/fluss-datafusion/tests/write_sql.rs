@@ -945,6 +945,334 @@ async fn wait_latest(
     Ok(())
 }
 
+async fn await_write_confirmation(
+    receiver: &mut tokio::sync::broadcast::Receiver<fluss_datafusion::FlussWriteProgress>,
+    total: u64,
+) -> TestResult<u64> {
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            match receiver.recv().await? {
+                fluss_datafusion::FlussWriteProgress::BatchOutcome {
+                    execution_id,
+                    outcome: fluss_datafusion::FlussWriteBatchOutcome::Confirmed,
+                    counts,
+                    ..
+                } if counts.confirmed == total => {
+                    return Ok::<_, Box<dyn std::error::Error>>(execution_id);
+                }
+                fluss_datafusion::FlussWriteProgress::Terminated(summary) => {
+                    panic!("stream terminated before ACK: {summary:?}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await?
+}
+
+async fn cancelled_write_summary(
+    receiver: &mut tokio::sync::broadcast::Receiver<fluss_datafusion::FlussWriteProgress>,
+) -> TestResult<fluss_datafusion::FlussWriteSummary> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let fluss_datafusion::FlussWriteProgress::Terminated(summary) =
+                receiver.recv().await?
+            {
+                return Ok::<_, Box<dyn std::error::Error>>(summary);
+            }
+        }
+    })
+    .await?
+}
+
+async fn table_count(ctx: &SessionContext, table: &str) -> TestResult<i64> {
+    let result = ctx
+        .sql(&format!("SELECT COUNT(*) FROM {table}"))
+        .await?
+        .collect()
+        .await?;
+    Ok(result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "native-sni real streaming source to isolated log/KV old2/new3 sinks"]
+async fn streaming_source_routes_log_kv_confirms_sparse_batches_and_replays_explicitly()
+-> TestResult<()> {
+    let connection = connect().await?;
+    let admin = connection.get_admin()?;
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let source = TablePath::new("datafusion_tests", format!("stream_accept_source_{suffix}"));
+    let log = TablePath::new("datafusion_tests", format!("stream_accept_log_{suffix}"));
+    let kv = TablePath::new("datafusion_tests", format!("stream_accept_kv_{suffix}"));
+    let mut running: Vec<
+        Option<tokio::task::JoinHandle<datafusion::common::Result<Vec<RecordBatch>>>>,
+    > = Vec::new();
+    let result = std::panic::AssertUnwindSafe(async {
+        let fields = || {
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("region", DataTypes::string())
+                .column("value", DataTypes::string())
+        };
+        admin
+            .create_table(
+                &source,
+                &TableDescriptor::builder()
+                    .schema(fields().build()?)
+                    .distributed_by(Some(1), vec!["id".into()])
+                    .build()?,
+                false,
+            )
+            .await?;
+        admin
+            .create_table(
+                &log,
+                &TableDescriptor::builder()
+                    .schema(fields().build()?)
+                    .partitioned_by(vec!["region"])
+                    .distributed_by(Some(2), vec!["id".into()])
+                    .build()?,
+                false,
+            )
+            .await?;
+        admin
+            .create_table(
+                &kv,
+                &TableDescriptor::builder()
+                    .schema(fields().primary_key(vec!["region", "id"])?.build()?)
+                    .partitioned_by(vec!["region"])
+                    .distributed_by(Some(2), vec!["id".into()])
+                    .build()?,
+                false,
+            )
+            .await?;
+        for path in [&log, &kv] {
+            ready_partition(&admin, path, "north", 2).await?;
+            admin
+                .alter_table(
+                    path,
+                    false,
+                    AlterTableChanges {
+                        modify_bucket_count: Some(3),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            ready_partition(&admin, path, "west", 3).await?;
+        }
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(32 * 1024 * 1024));
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_batch_size(1),
+            Arc::new(
+                RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::clone(&pool))
+                    .build()?,
+            ),
+        );
+        ctx.register_table(
+            "feed",
+            Arc::new(
+                FlussLogTable::open_with_options(
+                    Arc::clone(&connection),
+                    source.clone(),
+                    LogReadOptions::default(),
+                )
+                .await?,
+            ),
+        )?;
+        let options = fluss_datafusion::FlussWriteOptions {
+            ack_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let log_provider = FlussLogTable::open(
+            Arc::clone(&connection),
+            log.clone(),
+            Duration::from_secs(30),
+        )
+        .await?
+        .with_write_options(options)?;
+        let mut log_writes = log_provider.subscribe_writes();
+        ctx.register_table("events", Arc::new(log_provider))?;
+        let kv_provider =
+            FlussKvTable::open(Arc::clone(&connection), kv.clone(), Duration::from_secs(30))
+                .await?
+                .with_write_options(options)?;
+        let mut kv_writes = kv_provider.subscribe_writes();
+        ctx.register_table("state", Arc::new(kv_provider))?;
+        for table in ["events", "state"] {
+            let query = ctx
+                .sql(&format!(
+                    "INSERT INTO {table} SELECT id,region,value FROM feed WHERE id % 2 = 0"
+                ))
+                .await?;
+            running.push(Some(tokio::spawn(async move { query.collect().await })));
+        }
+        let producer = connection
+            .get_table(&source)
+            .await?
+            .new_append()?
+            .create_writer()?;
+        let ids = (1..=24).collect::<Vec<i32>>();
+        let regions = ids
+            .iter()
+            .map(|id| if (id / 2) % 2 == 0 { "north" } else { "west" })
+            .collect::<Vec<_>>();
+        let input = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int32Array::from(ids)) as ArrayRef),
+            ("region", Arc::new(StringArray::from(regions)) as ArrayRef),
+            (
+                "value",
+                Arc::new(StringArray::from(vec!["first"; 24])) as ArrayRef,
+            ),
+        ])?;
+        producer.append_arrow_batch(input)?;
+        producer.flush().await?;
+        let log_id = await_write_confirmation(&mut log_writes, 12).await?;
+        let kv_id = await_write_confirmation(&mut kv_writes, 12).await?;
+        assert_ne!(log_id, kv_id);
+        assert_eq!(table_count(&ctx, "events").await?, 12);
+        assert_eq!(table_count(&ctx, "state").await?, 12);
+        for table in ["events", "state"] {
+            let result = ctx
+                .sql(&format!(
+                    "SELECT region,COUNT(*) FROM {table} GROUP BY region ORDER BY region"
+                ))
+                .await?
+                .collect()
+                .await?;
+            let mut groups = Vec::new();
+            for batch in result {
+                let names = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let counts = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    groups.push((names.value(row).to_owned(), counts.value(row)));
+                }
+            }
+            assert_eq!(groups, [("north".into(), 6), ("west".into(), 6)]);
+        }
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(
+            running
+                .iter()
+                .all(|task| !task.as_ref().unwrap().is_finished()),
+            "idle beyond ACK allowance has no count/EOF"
+        );
+        for (id, region) in [(26, "west"), (28, "north")] {
+            let mut row = GenericRow::new(3);
+            row.set_field(0, id);
+            row.set_field(1, region.to_owned());
+            row.set_field(2, "sparse".to_owned());
+            producer.append(&row)?;
+            producer.flush().await?;
+            if id == 26 {
+                await_write_confirmation(&mut log_writes, 13).await?;
+                await_write_confirmation(&mut kv_writes, 13).await?;
+                let log_task = running[0].take().unwrap();
+                log_task.abort();
+                assert!(log_task.await.unwrap_err().is_cancelled());
+                let summary = cancelled_write_summary(&mut log_writes).await?;
+                assert_eq!(
+                    summary.status,
+                    fluss_datafusion::FlussWriteTermination::Cancelled
+                );
+                assert_eq!(summary.counts.confirmed, 13);
+                assert_eq!(summary.counts.uncertain, 0);
+            } else {
+                await_write_confirmation(&mut kv_writes, 14).await?;
+                assert!(
+                    !running[1].as_ref().unwrap().is_finished(),
+                    "peer survives other sink cancellation"
+                );
+            }
+        }
+        let kv_task = running[1].take().unwrap();
+        kv_task.abort();
+        assert!(kv_task.await.unwrap_err().is_cancelled());
+        let stopped = cancelled_write_summary(&mut kv_writes).await?;
+        assert_eq!(stopped.counts.confirmed, 14);
+        assert_eq!(stopped.counts.uncertain, 0);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while pool.reserved() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert_eq!(table_count(&ctx, "events").await?, 13);
+        assert_eq!(table_count(&ctx, "state").await?, 14);
+
+        // Explicit earliest replay is a new execution, not exactly-once job recovery.
+        for table in ["events", "state"] {
+            let query = ctx
+                .sql(&format!(
+                    "INSERT INTO {table} SELECT id,region,value FROM feed WHERE id % 2 = 0"
+                ))
+                .await?;
+            running.push(Some(tokio::spawn(async move { query.collect().await })));
+        }
+        let replay_log = await_write_confirmation(&mut log_writes, 14).await?;
+        let replay_kv = await_write_confirmation(&mut kv_writes, 14).await?;
+        assert_ne!(replay_log, log_id);
+        assert_ne!(replay_kv, kv_id);
+        assert_eq!(
+            table_count(&ctx, "events").await?,
+            27,
+            "append replay duplicates already-confirmed input"
+        );
+        assert_eq!(
+            table_count(&ctx, "state").await?,
+            14,
+            "upsert replay confirms14 operations but retains14 keys"
+        );
+        for index in [2, 3] {
+            let task = running[index].take().unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        let replay_log_summary = cancelled_write_summary(&mut log_writes).await?;
+        let replay_kv_summary = cancelled_write_summary(&mut kv_writes).await?;
+        assert_eq!(replay_log_summary.counts.confirmed, 14);
+        assert_eq!(replay_kv_summary.counts.confirmed, 14);
+        assert_eq!(replay_log_summary.counts.uncertain, 0);
+        assert_eq!(replay_kv_summary.counts.uncertain, 0);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while pool.reserved() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .catch_unwind()
+    .await;
+    for task in running.into_iter().flatten() {
+        task.abort();
+        let _ = task.await;
+    }
+    for path in [&source, &log, &kv] {
+        admin.drop_table(path, true).await?;
+    }
+    connection.close(Duration::from_secs(3)).await?;
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires native-sni and FLUSS_* credentials; writes isolated streaming tables"]
 async fn streaming_sql_insert_confirms_before_input_ends() -> TestResult<()> {

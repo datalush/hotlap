@@ -631,6 +631,32 @@ async fn cases(
 
         eprintln!("kv={kv}: ACK timeout passed");
 
+        // Explicit cancellation of an enqueued singleton awaiting ACK, as
+        // distinct from the producer blocked on buffer admission above.
+        let (cancel_ctx, cancel_feed, cancel_pool, cancel_gate) =
+            context(Arc::clone(&connection), &path, kv, options).await?;
+        let mut cancel_writes = observe(&cancel_ctx, kv).await?;
+        let cancel_ack = start(&cancel_ctx).await?;
+        cancel_feed.send(Ok(batch(9150, 1, 1))).await?;
+        confirmation(&mut cancel_writes, 1).await?;
+        let release = cancel_gate.arm();
+        cancel_feed.send(Ok(batch(9151, 1, 1))).await?;
+        tokio::time::timeout(Duration::from_secs(1), cancel_gate.entered.notified()).await?;
+        cluster.pause_tablet_server(0).await?;
+        drop(release);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!cancel_ack.is_finished());
+        cancel_ack.abort();
+        assert!(cancel_ack.await.unwrap_err().is_cancelled());
+        let cancelled_ack = summary(&mut cancel_writes).await?;
+        assert_eq!(cancelled_ack.status, FlussWriteTermination::Cancelled);
+        assert_eq!(cancelled_ack.stage, fluss_datafusion::FlussWriteStage::Ack);
+        assert_eq!(cancelled_ack.counts.confirmed, 1);
+        assert_eq!(cancelled_ack.counts.uncertain, 1);
+        released(&cancel_pool).await?;
+        cluster.resume_tablet_server(0).await?;
+        eprintln!("kv={kv}: explicit cancellation waiting for ACK passed");
+
         // A stalled metadata RPC gets a distinct finite between-batch scope.
         let (metadata_ctx, metadata_feed, metadata_pool, _) = context(
             Arc::clone(&connection),

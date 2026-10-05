@@ -273,6 +273,12 @@ KV's required row-format encoding, admission estimates and verification.
 
 ### Independent operation knowledge (`bqrq`)
 
+Joint continuous INSERT acceptance is documented in
+[streaming-write-acceptance.md](streaming-write-acceptance.md): actual Fluss source
+to log/KV old2/new3 sinks, sparse ACK/idle/cancel, private peer independence and
+explicit replay's log duplication vs PK upsert operation/key counts. Controlled
+native Docker cases cover errors, backpressure and cancellation at input/buffer/ACK.
+
 Use execution/batch identity and cumulative confirmed-operation counts. At least
 distinguish these facts; exact public Rust names remain an implementation detail:
 
