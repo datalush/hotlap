@@ -45,11 +45,17 @@ pub struct FlussKvTable {
     max_partitions: Option<usize>,
     max_assigned_buckets: usize,
     write_options: FlussWriteOptions,
+    writes: tokio::sync::broadcast::Sender<crate::FlussWriteProgress>,
     delete_allowed: bool,
     max_retained_batch_bytes: usize,
 }
 
 impl FlussKvTable {
+    /// Bounded INSERT/DELETE/MERGE observations, separate from the final SQL
+    /// count. Handle broadcast Lagged as incomplete batch history.
+    pub fn subscribe_writes(&self) -> tokio::sync::broadcast::Receiver<crate::FlussWriteProgress> {
+        self.writes.subscribe()
+    }
     /// Support based on the table policy observed at opening time.
     /// Execution revalidates policy, identity/schema and permissions.
     pub fn capabilities(&self) -> crate::FlussCapabilities {
@@ -103,6 +109,10 @@ impl FlussKvTable {
             max_partitions: None,
             max_assigned_buckets: DEFAULT_MAX_ASSIGNED_BUCKETS,
             write_options: FlussWriteOptions::default(),
+            writes: tokio::sync::broadcast::channel(
+                crate::write_progress::WRITE_OBSERVATION_CAPACITY,
+            )
+            .0,
             delete_allowed,
             max_retained_batch_bytes: crate::resources::DEFAULT_MAX_RETAINED_BATCH_BYTES,
         })
@@ -261,6 +271,8 @@ impl TableProvider for FlussKvTable {
                 schema: Arc::clone(&self.schema),
                 kind: WriteKind::Kv,
                 options: self.write_options,
+                writes: self.writes.clone(),
+                metrics: Default::default(),
             },
             input,
             insert_op,
@@ -308,6 +320,8 @@ impl TableProvider for FlussKvTable {
                 schema: Arc::clone(&self.schema),
                 kind: WriteKind::DeleteKv,
                 options: self.write_options,
+                writes: self.writes.clone(),
+                metrics: Default::default(),
             },
             input,
             InsertOp::Append,
@@ -348,6 +362,8 @@ impl TableProvider for FlussKvTable {
                 schema,
                 kind: WriteKind::MergeKv,
                 options: self.write_options,
+                writes: self.writes.clone(),
+                metrics: Default::default(),
             },
             input,
             InsertOp::Append,

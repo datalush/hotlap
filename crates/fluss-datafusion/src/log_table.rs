@@ -43,6 +43,7 @@ pub struct FlussLogTable {
     deliveries: tokio::sync::broadcast::Sender<LogDelivery>,
     progress: tokio::sync::broadcast::Sender<crate::LogProgress>,
     write_options: FlussWriteOptions,
+    writes: tokio::sync::broadcast::Sender<crate::FlussWriteProgress>,
     max_retained_batch_bytes: usize,
 }
 
@@ -123,6 +124,10 @@ impl FlussLogTable {
             deliveries: tokio::sync::broadcast::channel(1024).0,
             progress: tokio::sync::broadcast::channel(1024).0,
             write_options: FlussWriteOptions::default(),
+            writes: tokio::sync::broadcast::channel(
+                crate::write_progress::WRITE_OBSERVATION_CAPACITY,
+            )
+            .0,
             max_retained_batch_bytes: crate::resources::DEFAULT_MAX_RETAINED_BATCH_BYTES,
         })
     }
@@ -139,6 +144,12 @@ impl FlussLogTable {
     /// Lagged or missing initialization means incomplete progress, not a checkpoint.
     pub fn subscribe_progress(&self) -> tokio::sync::broadcast::Receiver<crate::LogProgress> {
         self.progress.subscribe()
+    }
+
+    /// Bounded native append observations. Subscribe before execution and handle
+    /// Lagged explicitly; confirmations are not engine checkpoints or final SQL count.
+    pub fn subscribe_writes(&self) -> tokio::sync::broadcast::Receiver<crate::FlussWriteProgress> {
+        self.writes.subscribe()
     }
 
     /// Post-decode backing-storage ceiling per admitted batch (default 64 MiB).
@@ -328,6 +339,8 @@ impl TableProvider for FlussLogTable {
                 schema: Arc::clone(&self.schema),
                 kind: WriteKind::Log,
                 options: self.write_options,
+                writes: self.writes.clone(),
+                metrics: Default::default(),
             },
             input,
             insert_op,

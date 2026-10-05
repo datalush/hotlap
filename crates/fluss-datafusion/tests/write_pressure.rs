@@ -23,7 +23,8 @@ use fluss::metadata::{
 };
 use fluss::rpc::message::OffsetSpec;
 use fluss_datafusion::{
-    FlussKvTable, FlussLogTable, FlussWriteOptions, FlussWritePhase, FlussWriteTimeout,
+    FlussKvTable, FlussLogTable, FlussWriteBatchOutcome, FlussWriteOptions, FlussWritePhase,
+    FlussWriteProgress, FlussWriteSummary, FlussWriteTermination, FlussWriteTimeout,
 };
 use fluss_test_cluster::{FlussTestingCluster, FlussTestingClusterBuilder};
 use futures::FutureExt;
@@ -254,6 +255,91 @@ async fn start(
     Ok(tokio::spawn(async move { query.collect().await }))
 }
 
+async fn observe(
+    ctx: &SessionContext,
+    kv: bool,
+) -> TestResult<tokio::sync::broadcast::Receiver<FlussWriteProgress>> {
+    let provider = ctx.table_provider("sink").await?;
+    let provider = provider.as_ref() as &dyn std::any::Any;
+    Ok(if kv {
+        provider
+            .downcast_ref::<FlussKvTable>()
+            .unwrap()
+            .subscribe_writes()
+    } else {
+        provider
+            .downcast_ref::<FlussLogTable>()
+            .unwrap()
+            .subscribe_writes()
+    })
+}
+
+async fn confirmation(
+    receiver: &mut tokio::sync::broadcast::Receiver<FlussWriteProgress>,
+    total: u64,
+) -> TestResult<u64> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match receiver.recv().await? {
+                FlussWriteProgress::BatchOutcome {
+                    execution_id,
+                    outcome: FlussWriteBatchOutcome::Confirmed,
+                    counts,
+                    ..
+                } if counts.confirmed == total => {
+                    break Ok::<_, Box<dyn std::error::Error>>(execution_id);
+                }
+                FlussWriteProgress::Terminated(summary) => {
+                    panic!("terminated before expected ACK: {summary:?}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await?
+}
+
+async fn summary(
+    receiver: &mut tokio::sync::broadcast::Receiver<FlussWriteProgress>,
+) -> TestResult<FlussWriteSummary> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let FlussWriteProgress::Terminated(summary) = receiver.recv().await? {
+                break Ok::<_, Box<dyn std::error::Error>>(summary);
+            }
+        }
+    })
+    .await?
+}
+
+fn metric(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>, name: &str) -> usize {
+    let metrics = plan.metrics().expect("native sink metrics");
+    metrics
+        .iter()
+        .find(|metric| metric.value().name() == name)
+        .unwrap_or_else(|| panic!("missing {name}"))
+        .value()
+        .as_usize()
+}
+
+async fn start_with_plan(
+    ctx: &SessionContext,
+) -> TestResult<(
+    tokio::task::JoinHandle<Result<Vec<RecordBatch>>>,
+    Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+)> {
+    let query = ctx
+        .sql("INSERT INTO sink SELECT id, value FROM feed")
+        .await?;
+    let task = Arc::new(query.task_ctx());
+    let plan = query.create_physical_plan().await?;
+    let running_plan = Arc::clone(&plan);
+    Ok((
+        tokio::spawn(async move { datafusion::physical_plan::collect(running_plan, task).await }),
+        plan,
+    ))
+}
+
 async fn latest(admin: &FlussAdmin, path: &TablePath, minimum: i64) -> TestResult<()> {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -382,8 +468,10 @@ async fn cases(
             ..Default::default()
         };
         let (ctx, feed, pool, gate) = context(Arc::clone(&connection), &path, kv, options).await?;
-        let ongoing = start(&ctx).await?;
+        let mut writes = observe(&ctx, kv).await?;
+        let (ongoing, write_plan) = start_with_plan(&ctx).await?;
         feed.send(Ok(batch(1, 1, 1))).await?;
+        let write_id = confirmation(&mut writes, 1).await?;
         latest(&admin, &path, 1).await?;
         eprintln!("warm ACK kv={kv}, reserved={}", pool.reserved());
         idle(&pool, kv).await?;
@@ -408,6 +496,9 @@ async fn cases(
             }
         }).await.map_err(|_| "writer did not reach full client buffer")?;
         eprintln!("kv={kv}: buffer full");
+        assert_eq!(metric(&write_plan, "fluss_write_active_executions"), 1);
+        assert_eq!(metric(&write_plan, "fluss_write_pending_operations"), 256);
+        assert!(metric(&write_plan, "fluss_write_encoded_bytes") > 0);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!ongoing.is_finished());
         let surviving = start(&survivor).await?;
@@ -417,6 +508,27 @@ async fn cases(
         eprintln!("kv={kv}: awaiting cancellation");
         assert!(ongoing.await.unwrap_err().is_cancelled());
         released(&pool).await?;
+        let cancelled = summary(&mut writes).await?;
+        assert_eq!(cancelled.execution_id, write_id);
+        assert_eq!(cancelled.status, FlussWriteTermination::Cancelled);
+        assert_eq!(cancelled.counts.confirmed, 1);
+        assert_eq!(cancelled.counts.received, 257);
+        assert_eq!(cancelled.counts.uncertain, 256);
+        assert_eq!(cancelled.counts.pending, 0);
+        assert_eq!(metric(&write_plan, "fluss_write_confirmed_operations"), 1);
+        assert_eq!(metric(&write_plan, "fluss_write_uncertain_operations"), 256);
+        assert_eq!(metric(&write_plan, "fluss_write_pending_operations"), 0);
+        assert_eq!(metric(&write_plan, "fluss_write_active_executions"), 0);
+        for name in [
+            "fluss_write_retained_arrow_bytes",
+            "fluss_write_encoded_bytes",
+            "fluss_write_transport_bytes",
+            "fluss_write_routing_metadata_bytes",
+            "fluss_write_routing_scratch_bytes",
+            "fluss_write_kv_scratch_bytes",
+        ] {
+            assert_eq!(metric(&write_plan, name), 0, "released owner: {name}");
+        }
         eprintln!("kv={kv}: cancelled writer resources released");
         assert!(
             feed.send(Ok(batch(9000, 1, 1))).await.is_err(),
@@ -445,6 +557,7 @@ async fn cases(
         // A fresh private execution remains usable after the cancelled one.
         let (fresh, input, fresh_pool, _) =
             context(Arc::clone(&connection), &path, kv, options).await?;
+        let mut fresh_writes = observe(&fresh, kv).await?;
         let completed = start(&fresh).await?;
         input.send(Ok(batch(9002, 1, 1))).await?;
         drop(input);
@@ -454,6 +567,12 @@ async fn cases(
                 .is_empty()
         );
         released(&fresh_pool).await?;
+        let completed_summary = summary(&mut fresh_writes).await?;
+        assert_eq!(completed_summary.status, FlussWriteTermination::Completed);
+        assert_eq!(completed_summary.counts.confirmed, 1);
+        assert_eq!(completed_summary.counts.uncertain, 0);
+        assert!(completed_summary.input_exhausted);
+        assert_ne!(completed_summary.execution_id, write_id);
         eprintln!("kv={kv}: concurrent and restarted writes passed");
         let found = fresh
             .sql("SELECT id FROM sink WHERE id = 9002")
@@ -470,8 +589,10 @@ async fn cases(
         };
         let (ack_ctx, ack_feed, ack_pool, ack_gate) =
             context(Arc::clone(&connection), &path, kv, ack_options).await?;
+        let mut ack_writes = observe(&ack_ctx, kv).await?;
         let ack = start(&ack_ctx).await?;
         ack_feed.send(Ok(batch(9100, 1, 1))).await?;
+        confirmation(&mut ack_writes, 1).await?;
         tokio::time::sleep(Duration::from_millis(250)).await;
         idle(&ack_pool, kv).await?;
         let release = ack_gate.arm();
@@ -484,6 +605,11 @@ async fn cases(
             .unwrap_err();
         assert_timeout(error, FlussWritePhase::EnqueueAndAck);
         released(&ack_pool).await?;
+        let uncertain = summary(&mut ack_writes).await?;
+        assert_eq!(uncertain.status, FlussWriteTermination::Failed);
+        assert_eq!(uncertain.counts.confirmed, 1);
+        assert_eq!(uncertain.counts.uncertain, 1);
+        assert_eq!(uncertain.counts.rejected_before_enqueue, 0);
         cluster.resume_tablet_server(0).await?;
 
         eprintln!("kv={kv}: ACK timeout passed");
@@ -545,6 +671,7 @@ async fn cases(
             },
         )
         .await?;
+        let mut quota_writes = observe(&quota_ctx, kv).await?;
         let quota = start(&quota_ctx).await?;
         quota_feed.send(Ok(batch(9400, 1, 1))).await?;
         let error = tokio::time::timeout(Duration::from_secs(3), quota)
@@ -555,6 +682,10 @@ async fn cases(
             "{error}"
         );
         released(&quota_pool).await?;
+        let rejected = summary(&mut quota_writes).await?;
+        assert_eq!(rejected.status, FlussWriteTermination::Failed);
+        assert_eq!(rejected.counts.rejected_before_enqueue, 1);
+        assert_eq!(rejected.counts.uncertain, 0);
         let absent = quota_ctx
             .sql("SELECT id FROM sink WHERE id = 9400")
             .await?
@@ -567,8 +698,10 @@ async fn cases(
         // previously visible operation; no successful partial count is emitted.
         let (error_ctx, error_feed, error_pool, _) =
             context(Arc::clone(&connection), &path, kv, options).await?;
+        let mut error_writes = observe(&error_ctx, kv).await?;
         let source_error = start(&error_ctx).await?;
         error_feed.send(Ok(batch(9500, 1, 1))).await?;
+        confirmation(&mut error_writes, 1).await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
         idle(&error_pool, kv).await?;
         error_feed
@@ -584,6 +717,11 @@ async fn cases(
                 .contains("fixture input failed")
         );
         released(&error_pool).await?;
+        let failed = summary(&mut error_writes).await?;
+        assert_eq!(failed.status, FlussWriteTermination::Failed);
+        assert_eq!(failed.counts.confirmed, 1);
+        assert_eq!(failed.counts.uncertain, 0);
+        assert!(!failed.input_exhausted);
         let confirmed = error_ctx
             .sql("SELECT id FROM sink WHERE id = 9500")
             .await?

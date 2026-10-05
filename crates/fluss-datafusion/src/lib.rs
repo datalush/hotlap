@@ -23,6 +23,7 @@ mod partitions;
 mod resources;
 mod scan;
 mod write;
+mod write_progress;
 
 pub use capabilities::{FlussCapabilities, FlussInsertCapability, FlussReadCapability};
 pub use catalog::FlussCatalog;
@@ -35,3 +36,7 @@ pub use log_options::{LogReadMode, LogReadOptions, LogStart};
 pub use log_progress::{LogDelivery, LogProgress, LogReadPosition, LogTermination};
 pub use log_table::FlussLogTable;
 pub use write::FlussWriteOptions;
+pub use write_progress::{
+    FlussWriteAck, FlussWriteBatchOutcome, FlussWriteCounts, FlussWriteOperation,
+    FlussWriteProgress, FlussWriteStage, FlussWriteSummary, FlussWriteTermination,
+};

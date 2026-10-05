@@ -298,7 +298,13 @@ reusing client result handles and standard async primitives. Do not retain every
 row indefinitely or infer row-level outcomes from a single aggregate `flush()`
 error. Detect observer lag and preserve known cumulative lower bounds; no generic
 event framework, implicit statement retry, compensations or reconciliation loop.
-Current sink only returns final count/error; this richer API is **pending `bqrq`**.
+Both providers now expose `subscribe_writes()` for bounded `FlussWriteProgress`
+events and `FlussWriteSummary` terminal snapshots. Whole-batch native flush success
+confirms the batch before EOF; a failed attempted batch remains conservatively
+uncertain. Native DataSink metrics follow execution and resource-owner lifetimes.
+Original count/error behavior remains intact. See
+[write-observation-contract.md](write-observation-contract.md) for exact granularity,
+lag/completeness rules, metric scope and the engine's reconciliation boundary.
 
 ### DELETE/MERGE boundaries
 
