@@ -33,6 +33,7 @@ also records a rebuild with an initially empty target; these are distinct checks
 | Owned saturation/socket-recovery matrix | 2 passed in 121.78s |
 | Four-case writer/routing/projection functional smoke | Passed in 19.26s, 1s warmup/2s measurement |
 | Real unbounded-reader/concurrent-INSERT functional smoke | Passed in 8.11s, 1s/2s, exact complete prefix and cancellation |
+| RustFS remote-read pressure smoke (after endpoint recovery) | Passed in 14.66s from clean `6f9749f`, 64 log rows, 1s/2s |
 | Native example build/execution | Offline build; log/KV counts 6/1 with 16 MiB pool and target partitions 2 |
 | Root and client/test-cluster clippy | All-targets passed with `-D warnings` |
 | Root/client formatting and diff check | Passed |
@@ -59,7 +60,7 @@ added after the first writer matrix, with that mode disabled for its workload;
 the divisibility lint correction is equivalent. No production/measurement-policy
 change justifies repeating an hour of long profiles merely to change Git identity.
 
-## Current environment blocker: remote-read smoke
+## Remote-read smoke: initial blocker and verified recovery
 
 The attempted clean-checkout RustFS pressure smoke (64 rows, 1s warmup/2s measure)
 **did not pass**. Its preflight failed before creating a Fluss Docker fixture:
@@ -68,13 +69,23 @@ A separate three-second health connection check also timed out. Read-only Docker
 Kubernetes inspection found no local RustFS service to use in that lab context;
 no lab deployment, credentials or endpoint configuration was changed.
 
-This is an unresolved external availability blocker, not a successful current
-remote regression. Historical/current pre-commit remote RELEASE results remain
-recorded in `native-profile-plan.md`, with matching executable source as above.
-The six-commit series can be recorded, but final phase/`rm21` closure must not
-pretend that every planned clean-checkout check passed. Restore the existing
-RustFS endpoint, repeat the short remote smoke, and append the result before
-closing the blocked acceptance gate. No owned profile/fault containers remain.
+That attempt remains a failed preflight in the verification history. After the
+user restored the existing endpoint, the exact same smoke command was rerun from
+clean Git checkout **`6f9749fabe1c490c90b776b221261e0f75cb11af`** and **passed in
+14.66s**. No source, lab credentials, endpoint settings or test limits changed.
+
+The run completed 8 warmup scans and 12 measured scans over 2.7s; sampled RSS peak
+110 MiB, process VmHWM 113 MiB, sampled pool peak 4 MiB, maximum temporary bytes
+100,320, and native remote downloads **2,006,400 bytes**. SELECT p50/p95/p99 upper
+bounds were 114/704/704ms with zero histogram overflow. Nonzero remote bytes verify
+the remote path rather than a local-only fallback. Row/value-shape, early cancel,
+pool/temp cleanup and prefix removal checks passed. No owned profile containers
+remain and the tested checkout stayed clean.
+
+The external blocker is resolved: every planned clean-checkout check now has a
+passing result. The short recovery smoke is functional DEBUG evidence; the scoped
+long RELEASE measurements remain separately recorded in `native-profile-plan.md`.
+Acceptance stays within those documented configurations and semantic boundaries.
 
 ## Reproduction commands
 

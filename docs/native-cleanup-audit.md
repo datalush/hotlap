@@ -80,8 +80,8 @@ clippy identified it; no profile policy/data path was changed. All source checks
 and the client/test-cluster all-target clippy, formatting and diff checks pass.
 
 These exports are not a clean Git checkout
-of an authorized commit. `rm21`/phase closure still requires the final committed
-source and final-profile evidence, rather than treating the old HEAD as current.
+of an authorized commit. They are historical source evidence, not a replacement
+for the clean Git/profile verification recorded below.
 
 ## Canonical documentation
 
@@ -96,11 +96,12 @@ source and final-profile evidence, rather than treating the old HEAD as current.
 - Entry points/build/example commands: root README. Its acceptance scope names
   native DataFusion directly rather than requiring an external Rust job engine.
 
-This inventory resolves dispositions; it does not close the issues or assert
-completed delivery before profiles, final-source verification and authorized
-commits are present.
+This inventory resolves the native cleanup dispositions. Acceptance is supported
+by the versioned source, scoped profiles and final clean-checkout verification;
+release/delivery outside this native cycle retains its own gates.
 
 The now-versioned series has [clean Git verification](native-checkout-verification.md).
-All listed native/code/example/fault checks passed; a planned RustFS smoke failed
-at external endpoint preflight. Phase closure retains that blocker rather than
-relabeling the source-export evidence as a complete current remote acceptance.
+All listed native/code/example/fault checks passed. The initial RustFS preflight
+failure is preserved as history; the unchanged remote smoke subsequently passed
+after the user restored the endpoint. No external lab installations or settings
+were modified to obtain that result, and no owned fixtures remain.

@@ -74,7 +74,7 @@ controls. The final isolated-source example also executes native log/KV SQL with
 separate host/runtime policy; see [source evidence](native-cleanup-audit.md).
 
 Clean Git execution of the versioned series is [recorded](native-checkout-verification.md),
-including the unresolved RustFS preflight for its remote smoke. Final closure
-retains that external availability gate;
+including the passing RustFS remote smoke after endpoint recovery. The native
+functional, profile and clean-source acceptance gates have verified evidence;
 profile-specific guarantees stay scoped to the recorded setup. ACK/offered offsets
 remain observations, not durable engine checkpoints or exactly-once recovery.
