@@ -38,7 +38,7 @@ const HEADER: &str = "\
 // under the License.
 
 // This file was generated from the canonical FlussApi.proto by
-// fluss-rust/crates/fluss/regen.sh, and should not be edited by hand.
+// clients/rust/crates/fluss/regen.sh, and should not be edited by hand.
 
 ";
 
@@ -47,24 +47,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .parent()
         .ok_or("the gen crate must live inside crates/fluss")?;
 
-    // The canonical proto in fluss-rpc is the source of truth whenever it is reachable, and
-    // regeneration refreshes the copy vendored under proto/. A source release carries only that
-    // copy, so fall back to it there.
-    let vendored_dir = fluss_dir.join("proto");
-    let canonical_dir = fluss_dir.join("../../../fluss-rpc/src/main/proto");
-    let include_dir = if canonical_dir.join("FlussApi.proto").exists() {
-        canonical_dir
-    } else if vendored_dir.join("FlussApi.proto").exists() {
-        vendored_dir.clone()
-    } else {
-        return Err("no FlussApi.proto found in fluss-rpc or proto/".into());
-    };
+    // Hotlap carries the canonical protocol schema with its native Rust client.
+    let include_dir = fluss_dir.join("proto");
     let proto = include_dir.join("FlussApi.proto");
-
-    let vendored = vendored_dir.join("FlussApi.proto");
-    if proto != vendored {
-        fs::create_dir_all(&vendored_dir)?;
-        fs::copy(&proto, &vendored)?;
+    if !proto.exists() {
+        return Err("missing native client proto/FlussApi.proto".into());
     }
 
     let mut config = prost_build::Config::new();

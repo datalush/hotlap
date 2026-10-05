@@ -6,10 +6,10 @@
 mod profile;
 #[path = "support/s3_fault_proxy.rs"]
 mod s3_fault_proxy;
+#[path = "support/short_sts_proxy.rs"]
+mod short_sts_proxy;
 
 use std::collections::HashMap;
-use std::io::BufRead;
-use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,6 +32,7 @@ use fluss_test_cluster::FlussTestingClusterBuilder;
 use futures::{FutureExt, StreamExt};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use s3_fault_proxy::S3FaultProxy;
+use short_sts_proxy::ShortStsProxy;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -202,43 +203,6 @@ async fn s3_test_rows(connection: &Arc<FlussConnection>, path: &TablePath) -> Te
     .await
 }
 
-struct ShortStsProxy(Child);
-
-impl ShortStsProxy {
-    fn start(host: &str, policy: &str) -> TestResult<(Self, String)> {
-        let script = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/support/short_sts_proxy.py"
-        );
-        let mut child = std::process::Command::new("python3")
-            .args([script, host, policy])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let mut line = String::new();
-        let startup: TestResult<u16> = (|| {
-            std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line)?;
-            Ok(line.trim().parse()?)
-        })();
-        let port = match startup {
-            Ok(port) => port,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
-        Ok((Self(child), format!("http://{host}:{port}")))
-    }
-}
-
-impl Drop for ShortStsProxy {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[test]
 #[ignore = "real 900-second RustFS STS expiry; Docker, RustFS env and FLUSS_FAULT_PROXY_HOST"]
 fn datafusion_renews_real_rustfs_sts_after_expiry() -> TestResult<()> {
@@ -248,8 +212,6 @@ fn datafusion_renews_real_rustfs_sts_after_expiry() -> TestResult<()> {
     let (mut conf, mut test_objects) = rustfs_profile()?;
     let policy = rustfs_read_policy(&test_objects);
     conf.insert("s3.assumed.role.policy".into(), policy.clone());
-    let (_sts, endpoint) = ShortStsProxy::start(&host, &policy)?;
-    conf.insert("s3.assumed.role.sts.endpoint".into(), endpoint);
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     metrics::with_local_recorder(&recorder, || {
@@ -257,6 +219,8 @@ fn datafusion_renews_real_rustfs_sts_after_expiry() -> TestResult<()> {
             .enable_all()
             .build()?
             .block_on(async {
+                let (_sts, endpoint) = ShortStsProxy::start(&host, &policy).await?;
+                conf.insert("s3.assumed.role.sts.endpoint".into(), endpoint);
                 let proxy = S3FaultProxy::start(
                     &host,
                     &test_objects.endpoint,

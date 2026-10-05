@@ -1,5 +1,10 @@
 # Native source/cleanup inventory — rm21, prad, 7yt8
 
+This records the verified native-acceptance cycle before the Hotlap layout change.
+Current source disposition is in [Hotlap layout](hotlap-layout.md): the formerly
+excluded imported bindings and Java/reference tree are now removed from the
+working tree, with their history/licensing provenance preserved in Git.
+
 Working-tree audit, 2026-10-05. Phase 4 accepts the actual native DataFusion engine;
 phase 6 removes substituted infrastructure and prepares native delivery. Neither
 phase implements or accepts Python/FFI bindings.

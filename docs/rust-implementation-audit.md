@@ -4,6 +4,10 @@ Historical snapshot — the FFI/Python paths and roadmap references in the origi
 inventory below are retained as audit history, not active build/delivery instructions.
 Those project integrations have now been removed; the active workspace is Rust only.
 
+The later [Hotlap migration](hotlap-layout.md) also retires the copied Java tree,
+imported non-Rust bindings and their tooling. Paths below describe the original
+audit snapshot, not current build dependencies.
+
 Date: 2026-10-04. Scope: first architectural audit of the current working tree,
 not production acceptance or an implementation refactor.
 

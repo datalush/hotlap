@@ -1,4 +1,4 @@
-# Rust, Maven, and Python build outputs (also inside the copied clients)
+# Rust build outputs and retired local tool artifacts
 target/
 **/target/
 .venv/
@@ -23,7 +23,4 @@ build/
 .idea/
 .vscode/
 .DS_Store
-
-# Imported Google Storage test fixture contains a PEM private key (not needed
-# to build the Java client); keep it out of the new repository.
-/clients/java/fluss-filesystems/fluss-fs-gs/src/test/resources/fake-service-account.json
+.kata.local.toml

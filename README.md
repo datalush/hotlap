@@ -1,21 +1,23 @@
-# Fluss Rust–DataFusion
+# Hotlap
 
-Native Rust providers for Apache Fluss logs and primary-key tables, built on the
-existing Fluss Rust client and DataFusion/Arrow. The active project is **Rust only**:
-FFI/Python integration and its development host/adapters have been removed.
-Bindings may be reconsidered only after complete Rust and consuming-engine acceptance.
+Hotlap is a native Rust query engine built on DataFusion/Arrow and the Fluss Rust
+client. Its Fluss integration supports finite/continuous log reads, KV snapshots,
+SQL DML, bounded observations and cooperative resource ownership.
+`fluss-rs` and `fluss-datafusion` retain their component names and responsibilities;
+Hotlap does not introduce another SQL engine, allocator or scheduler.
 
 ```text
 clients/rust/crates/fluss/  Native protocol, metadata, routing, Arrow codecs and writers
-clients/java/              Imported Fluss server/client reference source
 crates/fluss-datafusion/   Native providers, planning adapters, observations and tests
 vendor/datafusion-55.1.0/  Published core with documented generic DELETE/UPDATE backport
 docs/                     Contracts, ownership boundaries and verification evidence
 ```
 
-The imported client trees originate at `dc427e1290847b4a569b6745fcb87b256292bf6a`.
-Their Apache licenses/notices remain intact. The client validation workspace contains
-only Rust crates; imported upstream bindings are excluded from that workspace.
+The imported Rust client originates at `dc427e1290847b4a569b6745fcb87b256292bf6a`.
+Its Apache licenses/notices remain intact. Java/reference and non-Rust bindings
+are removed from the current tree; their provenance remains in Git history.
+The client includes the protocol schema needed for regeneration without Java.
+See [Hotlap layout and migration](docs/hotlap-layout.md).
 
 ## Native API and semantics
 

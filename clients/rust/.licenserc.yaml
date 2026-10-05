@@ -21,7 +21,7 @@ header:
     copyright-owner: Apache Software Foundation
 
   paths:
-    - 'fluss-rust/**'
+    - '**'
 
   paths-ignore:
     # bare (gitignore-style) patterns match the basename at any depth
@@ -32,12 +32,9 @@ header:
     - 'NOTICE'
     - 'NOTICE-bin'
     - 'DISCLAIMER'
-    - 'fluss-rust/bindings/python/fluss/py.typed'
-    - 'fluss-rust/**/mix.lock'
-    - 'fluss-rust/website/**'
     - '**/*.md'
-    - 'fluss-rust/**/DEPENDENCIES.*.tsv'
-    - 'fluss-rust/**/*.env'
+    - '**/DEPENDENCIES.*.tsv'
+    - '**/*.env'
     # Cross-language encoding fixtures.
-    - 'fluss-rust/**/testdata/*.hex'
+    - '**/testdata/*.hex'
   comment: on-failure
