@@ -956,6 +956,7 @@ async fn cases(
         eprintln!("kv={kv}: live schema invalidation passed");
     }
     delete_cases(&connection, cluster).await?;
+    merge_cases(&connection, cluster).await?;
     connection.close(Duration::from_secs(2)).await?;
     Ok(())
 }
@@ -1122,6 +1123,203 @@ async fn delete_cases(
     let remaining = ctx.sql("SELECT id FROM sink").await?.collect().await?;
     assert!(remaining.iter().map(RecordBatch::num_rows).sum::<usize>() <= 64 - confirmed as usize);
     eprintln!("DELETE selection/update/delete races and partial ACK failure passed");
+    Ok(())
+}
+
+async fn merge_cases(
+    connection: &Arc<FlussConnection>,
+    cluster: &FlussTestingCluster,
+) -> TestResult<()> {
+    let path = TablePath::new("writer_pressure", "merge_contract");
+    let admin = connection.get_admin()?;
+    admin
+        .create_table(
+            &path,
+            &TableDescriptor::builder()
+                .schema(
+                    FlussSchema::builder()
+                        .column("id", DataTypes::int())
+                        .column("value", DataTypes::string())
+                        .primary_key(vec!["id"])?
+                        .build()?,
+                )
+                .distributed_by(Some(1), vec!["id".into()])
+                .build()?,
+            false,
+        )
+        .await?;
+    let gate = EncodingGate::new();
+    let pool: Arc<dyn MemoryPool> = Arc::new(ObservedPool {
+        inner: GreedyMemoryPool::new(16 * 1024 * 1024),
+        gate: Arc::clone(&gate),
+    });
+    let ctx = SessionContext::new_with_config_rt(
+        SessionConfig::new()
+            .with_target_partitions(1)
+            .with_batch_size(1),
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build()?,
+        ),
+    );
+    ctx.register_table(
+        "sink",
+        Arc::new(
+            FlussKvTable::open(
+                Arc::clone(connection),
+                path.clone(),
+                Duration::from_secs(20),
+            )
+            .await?
+            .with_write_options(FlussWriteOptions {
+                ack_timeout: Duration::from_millis(800),
+                ..Default::default()
+            })?,
+        ),
+    )?;
+    ctx.sql("INSERT INTO sink VALUES (1, 'old')")
+        .await?
+        .collect()
+        .await?;
+
+    let release = gate.arm();
+    let query = ctx.sql("MERGE INTO sink AS t USING (VALUES(1,'merge')) AS s(id,value) ON t.id=s.id WHEN MATCHED AND t.value='old' THEN UPDATE SET value=s.value").await?;
+    let merging = tokio::spawn(async move { query.collect().await });
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified()).await?;
+    ctx.sql("INSERT INTO sink VALUES (1,'concurrent')")
+        .await?
+        .collect()
+        .await?;
+    drop(release);
+    let result = tokio::time::timeout(Duration::from_secs(3), merging).await???;
+    assert_eq!(
+        result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+    let actual = ctx
+        .sql("SELECT value FROM sink WHERE id=1")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(
+        actual[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "merge",
+        "snapshot predicate is not compare-and-set"
+    );
+    drop(actual);
+
+    let release = gate.arm();
+    let query = ctx.sql("MERGE INTO sink AS t USING (VALUES(2,'insert')) AS s(id,value) ON t.id=s.id WHEN NOT MATCHED THEN INSERT(id,value) VALUES(s.id,s.value)").await?;
+    let merging = tokio::spawn(async move { query.collect().await });
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified()).await?;
+    ctx.sql("INSERT INTO sink VALUES (2,'concurrent')")
+        .await?
+        .collect()
+        .await?;
+    drop(release);
+    let result = tokio::time::timeout(Duration::from_secs(3), merging).await???;
+    assert_eq!(
+        result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+    let actual = ctx
+        .sql("SELECT value FROM sink WHERE id=2")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(
+        actual[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "insert",
+        "native upsert is not conditional INSERT"
+    );
+    drop(actual);
+    released(&pool).await?;
+
+    let values = (100..164)
+        .map(|id| format!("({id},'partial')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = ctx.sql(&format!("MERGE INTO sink AS t USING (VALUES {values}) AS s(id,value) ON t.id=s.id WHEN NOT MATCHED THEN INSERT(id,value) VALUES(s.id,s.value)")).await?;
+    let task = Arc::new(query.task_ctx());
+    let plan = query.create_physical_plan().await?;
+    let running = Arc::clone(&plan);
+    let mut writes = observe(&ctx, true).await?;
+    let release = gate.arm_after(1);
+    let merging =
+        tokio::spawn(async move { datafusion::physical_plan::collect(running, task).await });
+    tokio::time::timeout(Duration::from_secs(3), gate.entered.notified()).await?;
+    let confirmed = loop {
+        if let FlussWriteProgress::BatchOutcome {
+            outcome: FlussWriteBatchOutcome::Confirmed,
+            counts,
+            ..
+        } = writes.try_recv()?
+        {
+            break counts.confirmed;
+        }
+    };
+    assert!(confirmed > 0 && confirmed < 64);
+    assert!(
+        metric(&plan, "fluss_write_merge_key_bytes") > 0,
+        "persistent duplicate-key state is admitted and visible"
+    );
+    cluster.pause_tablet_server(0).await?;
+    drop(release);
+    assert_timeout(
+        tokio::time::timeout(Duration::from_secs(3), merging)
+            .await??
+            .unwrap_err(),
+        FlussWritePhase::EnqueueAndAck,
+    );
+    let partial = summary(&mut writes).await?;
+    assert_eq!(
+        partial.operation,
+        fluss_datafusion::FlussWriteOperation::Merge
+    );
+    assert_eq!(partial.status, FlussWriteTermination::Failed);
+    assert_eq!(partial.counts.confirmed, confirmed);
+    assert!(partial.counts.uncertain > 0);
+    assert_eq!(metric(&plan, "fluss_write_merge_key_bytes"), 0);
+    assert_eq!(metric(&plan, "fluss_write_kv_scratch_bytes"), 0);
+    // DataFusion's retained HashJoin build-side state may still own the target
+    // snapshot buffers while this physical plan is held for metric inspection.
+    // Those source leases remain charged; dropping only the query future is
+    // not permission to free externally retained plan/operator buffers.
+    drop(plan);
+    released(&pool).await?;
+    cluster.resume_tablet_server(0).await?;
+    let actual = ctx
+        .sql("SELECT id FROM sink WHERE id>=100")
+        .await?
+        .collect()
+        .await?;
+    let stored = actual.iter().map(RecordBatch::num_rows).sum::<usize>();
+    assert!(
+        stored >= confirmed as usize && stored <= partial.counts.received as usize,
+        "only submitted prefix can apply: {partial:?}, stored={stored}"
+    );
+    eprintln!("MERGE snapshot/update/insert races and partial ACK failure passed");
     Ok(())
 }
 

@@ -90,6 +90,144 @@ async fn connect() -> TestResult<Arc<FlussConnection>> {
 }
 
 #[tokio::test]
+#[ignore = "requires native-sni and FLUSS_* credentials; isolated MERGE semantics"]
+async fn merge_preserves_null_logic_precedence_and_rejects_unsupported_variants() -> TestResult<()>
+{
+    let connection = connect().await?;
+    let admin = connection.get_admin()?;
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let target = TablePath::new("datafusion_tests", format!("merge_contract_{suffix}"));
+    let feed = TablePath::new("datafusion_tests", format!("merge_feed_{suffix}"));
+    let first = TablePath::new("datafusion_tests", format!("merge_first_row_{suffix}"));
+    let fields = || {
+        Schema::builder()
+            .column("id", DataTypes::int())
+            .column("value", DataTypes::string())
+            .column("stamp", DataTypes::int())
+    };
+    let result = std::panic::AssertUnwindSafe(async {
+        admin.create_table(&target, &TableDescriptor::builder().schema(fields().primary_key(vec!["id"])?.build()?).distributed_by(Some(2), vec!["id".into()]).build()?, false).await?;
+        admin.create_table(&feed, &TableDescriptor::builder().schema(fields().build()?).distributed_by(Some(1), vec!["id".into()]).build()?, false).await?;
+        admin.create_table(&first, &TableDescriptor::builder().schema(fields().primary_key(vec!["id"])?.build()?).distributed_by(Some(1), vec!["id".into()]).property("table.merge-engine", "first_row").build()?, false).await?;
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2));
+        let provider = FlussKvTable::open(Arc::clone(&connection), target.clone(), Duration::from_secs(30)).await?;
+        let mut writes = provider.subscribe_writes();
+        ctx.register_table("state", Arc::new(provider))?;
+        ctx.sql("INSERT INTO state VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)").await?.collect().await?;
+        while writes.try_recv().is_ok() {}
+        let result = ctx.sql("MERGE INTO state AS t USING (VALUES (1, CAST(NULL AS VARCHAR), 100), (4, 'new', 40)) AS s(id,value,stamp) ON t.id = s.id WHEN MATCHED AND s.value = 'delete' THEN DELETE WHEN MATCHED THEN UPDATE SET value = s.value WHEN NOT MATCHED BY SOURCE AND t.id = 3 THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET stamp = t.stamp + 1 WHEN NOT MATCHED THEN INSERT (stamp,value,id) VALUES (s.stamp,s.value,s.id)").await?.collect().await?;
+        assert_eq!(rows_written(&result), 4);
+        let terminal = loop { if let fluss_datafusion::FlussWriteProgress::Terminated(summary) = writes.try_recv()? { break summary; } };
+        assert_eq!(terminal.operation, fluss_datafusion::FlussWriteOperation::Merge);
+        assert_eq!(terminal.counts.confirmed, 4);
+        let actual = ctx.sql("SELECT id,value,stamp FROM state ORDER BY id").await?.collect().await?;
+        let rows = actual.iter().flat_map(|batch| {
+            let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            let values = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let stamps = batch.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..batch.num_rows()).map(|i| (ids.value(i), (!values.is_null(i)).then(|| values.value(i).to_owned()), stamps.value(i))).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        assert_eq!(rows, [(1,None,10), (2,Some("two".into()),21), (4,Some("new".into()),40)]);
+        assert_eq!(rows_written(&ctx.sql("MERGE INTO state AS t USING (VALUES (1)) AS s(id) ON t.id=s.id WHEN MATCHED THEN UPDATE SET stamp=t.stamp+1 WHEN MATCHED THEN DELETE").await?.collect().await?), 1);
+        assert_eq!(rows_written(&ctx.sql("MERGE INTO state AS t USING (VALUES (2,'a'),(2,'b')) AS s(id,value) ON t.id=s.id WHEN MATCHED AND FALSE THEN UPDATE SET value=s.value").await?.collect().await?), 0, "duplicate no-op rows have no modifying actions");
+        assert_eq!(rows_written(&ctx.sql("MERGE INTO state AS t USING (VALUES (2,'chosen'),(2,'ignored')) AS s(id,value) ON t.id=s.id WHEN MATCHED AND s.value='chosen' THEN UPDATE SET value=s.value").await?.collect().await?), 1);
+        let changed = ctx.sql("SELECT value,stamp FROM state WHERE id=2").await?.collect().await?;
+        assert_eq!(changed[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "chosen");
+        assert_eq!(changed[0].column(1).as_any().downcast_ref::<Int32Array>().unwrap().value(0), 21, "unassigned target columns are preserved");
+
+        for (sql, expected) in [
+            ("MERGE INTO state AS t USING (VALUES (2)) AS s(id) ON t.id=s.id WHEN MATCHED THEN UPDATE SET id=s.id", "primary/partition key"),
+            ("MERGE INTO state AS t USING (VALUES (5,'partial')) AS s(id,value) ON t.id=s.id WHEN NOT MATCHED THEN INSERT (id,value) VALUES(s.id,s.value)", "every target column"),
+            ("MERGE INTO state AS t USING (VALUES (CAST(NULL AS INT),'invalid',99)) AS s(id,value,stamp) ON t.id=s.id WHEN NOT MATCHED THEN INSERT (id,value,stamp) VALUES(s.id,s.value,s.stamp)", "required"),
+        ] {
+            let error = match ctx.sql(sql).await { Ok(query) => query.collect().await.expect_err("unsupported MERGE must fail"), Err(error) => error };
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let first_provider = FlussKvTable::open(Arc::clone(&connection), first.clone(), Duration::from_secs(30)).await?;
+        assert!(!first_provider.capabilities().merge, "first-row upsert is not SQL row replacement");
+        ctx.register_table("first", Arc::new(first_provider))?;
+        ctx.sql("INSERT INTO first VALUES (1,'original',1)").await?.collect().await?;
+        let error = ctx.sql("MERGE INTO first AS t USING (VALUES (1,'new')) AS s(id,value) ON t.id=s.id WHEN MATCHED THEN UPDATE SET value=s.value").await?.collect().await.expect_err("configured merge engines do not implement ordinary SQL replacement");
+        assert!(error.to_string().contains("ordinary full-row KV replacement"), "{error}");
+        let preserved = ctx.sql("SELECT value FROM first").await?.collect().await?;
+        assert_eq!(preserved[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "original");
+        ctx.register_table("feed", Arc::new(FlussLogTable::open_with_options(Arc::clone(&connection), feed.clone(), LogReadOptions::default()).await?))?;
+        let error = ctx.sql("MERGE INTO state AS t USING feed AS s ON t.id=s.id WHEN MATCHED THEN UPDATE SET value=s.value").await?.collect().await.expect_err("MERGE source must be finite");
+        assert!(error.to_string().contains("finite source"), "{error}");
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }).catch_unwind().await;
+    for path in [&target, &feed, &first] {
+        admin.drop_table(path, true).await?;
+    }
+    connection.close(Duration::from_secs(3)).await?;
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires native-sni and FLUSS_* credentials; late MERGE duplicate with partial application"]
+async fn merge_duplicate_in_later_batch_preserves_earlier_ack_and_releases_state() -> TestResult<()>
+{
+    let connection = connect().await?;
+    let admin = connection.get_admin()?;
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let target = TablePath::new("datafusion_tests", format!("merge_duplicate_{suffix}"));
+    admin
+        .create_table(
+            &target,
+            &TableDescriptor::builder()
+                .schema(
+                    Schema::builder()
+                        .column("id", DataTypes::int())
+                        .column("value", DataTypes::string())
+                        .primary_key(vec!["id"])?
+                        .build()?,
+                )
+                .distributed_by(Some(1), vec!["id".into()])
+                .build()?,
+            false,
+        )
+        .await?;
+    let result = std::panic::AssertUnwindSafe(async {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16*1024*1024));
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new().with_target_partitions(1).with_batch_size(1), Arc::new(RuntimeEnvBuilder::new().with_memory_pool(Arc::clone(&pool)).build()?));
+        let provider = FlussKvTable::open(Arc::clone(&connection), target.clone(), Duration::from_secs(30)).await?;
+        let mut writes = provider.subscribe_writes();
+        ctx.register_table("state", Arc::new(provider))?;
+        ctx.sql("INSERT INTO state VALUES (1,'old')").await?.collect().await?;
+        while writes.try_recv().is_ok() {}
+        let error = ctx.sql("MERGE INTO state AS t USING (VALUES (1,'a'),(1,'b')) AS s(id,value) ON t.id=s.id WHEN MATCHED THEN UPDATE SET value=s.value").await?.collect().await.expect_err("a later modifying action for the same PK must fail");
+        assert!(error.to_string().contains("multiple modifying actions"), "{error}");
+        let terminal = loop { if let fluss_datafusion::FlussWriteProgress::Terminated(summary) = writes.try_recv()? { break summary; } };
+        assert_eq!(terminal.operation, fluss_datafusion::FlussWriteOperation::Merge);
+        assert_eq!(terminal.status, fluss_datafusion::FlussWriteTermination::Failed);
+        assert_eq!(terminal.counts.confirmed, 1);
+        assert_eq!(terminal.counts.rejected_before_enqueue, 1);
+        assert_eq!(terminal.counts.uncertain, 0);
+        // Native abort is synchronous, but the sender's remaining accumulator
+        // owners drop when Tokio processes its cancellation on the next tick.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while pool.reserved() != 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await?;
+        assert_eq!(pool.reserved(), 0, "merge keys/join/scratch released after failure");
+        let actual = ctx.sql("SELECT value FROM state WHERE id=1").await?.collect().await?;
+        let value = actual[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0);
+        assert!(["a","b"].contains(&value), "earlier ACK is not rolled back: {value}");
+        drop(actual);
+        assert_eq!(pool.reserved(), 0);
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }).catch_unwind().await;
+    admin.drop_table(&target, true).await?;
+    connection.close(Duration::from_secs(3)).await?;
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires native-sni and FLUSS_* credentials; isolated DELETE policy tables"]
 async fn delete_policy_matches_effective_server_behavior() -> TestResult<()> {
     let connection = connect().await?;
@@ -1051,6 +1189,8 @@ async fn sql_insert_routes_mixed_partitions_after_rescale() -> TestResult<()> {
             "MERGE INTO state AS t USING (VALUES (1, 'north', 'merged'), (12, 'west', 'merge-insert')) AS s(id, region, value) ON t.id = s.id AND t.region = s.region WHEN MATCHED THEN UPDATE SET value = s.value WHEN NOT MATCHED THEN INSERT (id, region, value) VALUES (s.id, s.region, s.value)"
         ).await?.collect().await?;
         assert_eq!(rows_written(&merged), 2);
+        let immutable_partition = ctx.sql("MERGE INTO state AS t USING (VALUES (1,'north','south')) AS s(id,region,new_region) ON t.id=s.id AND t.region=s.region WHEN MATCHED THEN UPDATE SET region=s.new_region").await?.collect().await.expect_err("MERGE cannot migrate a partition key");
+        assert!(immutable_partition.to_string().contains("primary/partition key"), "{immutable_partition}");
         let updated = ctx.sql("SELECT value FROM state WHERE id = 1 AND region = 'north'").await?.collect().await?;
         assert_eq!(updated[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "merged");
         assert_eq!(rows_written(&ctx.sql("DELETE FROM state WHERE region = 'west'").await?.collect().await?), 2);

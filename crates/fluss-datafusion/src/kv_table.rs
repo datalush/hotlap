@@ -27,6 +27,7 @@ use crate::offsets::SharedCaptures;
 use crate::partitions::{DEFAULT_MAX_ASSIGNED_BUCKETS, PartitionFilter};
 use crate::write::{
     FlussWriteOptions, FlussWriteTarget, WriteKind, plan_write, validate_delete_policy,
+    validate_merge_policy,
 };
 
 /// Each execution opens a fresh snapshot per bucket. There is no global
@@ -47,6 +48,7 @@ pub struct FlussKvTable {
     write_options: FlussWriteOptions,
     writes: tokio::sync::broadcast::Sender<crate::FlussWriteProgress>,
     delete_allowed: bool,
+    merge_allowed: bool,
     max_retained_batch_bytes: usize,
 }
 
@@ -63,7 +65,7 @@ impl FlussKvTable {
             read: crate::FlussReadCapability::KvSnapshot,
             insert: crate::FlussInsertCapability::FullRowUpsert,
             delete: self.delete_allowed,
-            merge: true,
+            merge: self.merge_allowed,
         }
     }
 
@@ -92,6 +94,7 @@ impl FlussKvTable {
         let partitioned = info.is_partitioned();
         let partition_keys = info.get_partition_keys().iter().cloned().collect();
         let delete_allowed = validate_delete_policy(info.get_properties()).is_ok();
+        let merge_allowed = validate_merge_policy(info.get_properties()).is_ok();
         if buckets < 1 {
             return Err(DataFusionError::Plan("Fluss table has no buckets".into()));
         }
@@ -114,6 +117,7 @@ impl FlussKvTable {
             )
             .0,
             delete_allowed,
+            merge_allowed,
             max_retained_batch_bytes: crate::resources::DEFAULT_MAX_RETAINED_BATCH_BYTES,
         })
     }
@@ -341,6 +345,7 @@ impl TableProvider for FlussKvTable {
             .get_table(&self.path)
             .await
             .map_err(fluss_error)?;
+        validate_merge_policy(table.get_table_info().get_properties())?;
         let primary_keys = table.get_table_info().get_primary_keys().clone();
         let input = crate::merge::plan_merge_input(
             state,

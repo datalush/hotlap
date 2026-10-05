@@ -328,11 +328,18 @@ that explicit failure rather than assuming supported live policy mutation.
 
 MERGE uses DataFusion join/filter/CASE semantics and SQL null logic, with first
 eligible clause precedence. Supported modifying actions are matched UPDATE/DELETE,
-unmatched INSERT and admitted NOT MATCHED BY SOURCE actions. Source must be finite;
+unmatched INSERT and admitted NOT MATCHED BY SOURCE actions. Source must be finite.
+Configured native merge-engine tables are rejected for SQL MERGE because ACKed
+first-row/versioned/aggregation upserts do not mean ordinary row replacement;
+capabilities and planning/execution enforce that boundary.
 INSERT supplies all destination columns; UPDATE cannot change PK/partition keys.
 Repeated modifying actions for one PK are rejected, including across batches,
 but discovery in a later batch cannot roll back earlier ACKed work. No atomic
 statement, concurrent-writer conflict resolution or automatic repair (`9h56`).
+The selected NOT MATCHED action uses native upsert, not conditional INSERT, and
+snapshot-predicate UPDATE is not CAS. Later duplicate rejection preserves earlier
+ACKs. See [merge-contract.md](merge-contract.md) for verified action/null/precedence,
+resource, duplicate and writer-concurrency semantics.
 
 ## 6. Errors: preserve causes, separate policy
 

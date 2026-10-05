@@ -413,6 +413,9 @@ impl FlussWriteTarget {
             .map_err(|_| write_phase_timeout(crate::FlussWritePhase::Preparation))?
             .map_err(fluss_error)?;
         self.check_identity(&table)?;
+        if matches!(self.kind, WriteKind::MergeKv) {
+            validate_merge_policy(table.get_table_info().get_properties())?;
+        }
         if matches!(self.kind, WriteKind::DeleteKv) {
             validate_delete_policy(table.get_table_info().get_properties())?;
         }
@@ -519,6 +522,9 @@ impl FlussWriteTarget {
                     .map_err(|_| write_phase_timeout(crate::FlussWritePhase::Metadata))?
                     .map_err(fluss_error)?;
             self.check_identity(&current)?;
+            if matches!(self.kind, WriteKind::MergeKv) {
+                validate_merge_policy(current.get_table_info().get_properties())?;
+            }
             if current.get_table_info().is_partitioned() {
                 tokio::time::timeout_at(
                     metadata_deadline,
@@ -757,6 +763,17 @@ pub(crate) fn validate_delete_policy(
             "Fluss SQL DELETE requires table.delete.behavior=allow; effective behavior is {behavior}"
         )))
     }
+}
+
+pub(crate) fn validate_merge_policy(
+    properties: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    if properties.contains_key("table.merge-engine") {
+        return Err(DataFusionError::NotImplemented(
+            "Fluss SQL MERGE requires ordinary full-row KV replacement; configured merge engines may ignore, version or aggregate upserts".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_required_values(
