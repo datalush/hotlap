@@ -1304,7 +1304,9 @@ impl RecordAccumulator {
             }
         }
         if let Some(error) = self.first_write_failure.lock().take() {
-            first_error.get_or_insert(error);
+            // The native stored cause is authoritative; handle broadcasts may
+            // only have a generic abort/build diagnostic for the same failure.
+            first_error = Some(error);
         }
         first_error.map_or(Ok(()), Err)
     }

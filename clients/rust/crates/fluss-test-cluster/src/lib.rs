@@ -534,6 +534,27 @@ impl FlussTestingCluster {
             .map_err(|e| e.to_string())
     }
 
+    /// Stop only this fixture's tablet immediately to close real RPC sockets
+    /// and invalidate its leader/snapshot. The container filesystem is retained.
+    pub async fn stop_tablet_server(&self, id: u16) -> Result<(), String> {
+        self.tablet_servers
+            .get(&id)
+            .ok_or_else(|| format!("Unknown fixture tablet {id}"))?
+            .stop_with_timeout(Some(0))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Restart a previously stopped tablet of this owned fixture.
+    pub async fn start_tablet_server(&self, id: u16) -> Result<(), String> {
+        self.tablet_servers
+            .get(&id)
+            .ok_or_else(|| format!("Unknown fixture tablet {id}"))?
+            .start()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn pause_coordinator(&self) -> Result<(), String> {
         docker_client()
             .await

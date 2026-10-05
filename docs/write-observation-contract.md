@@ -51,6 +51,12 @@ and is not the same replication guarantee as all/-1. Unsupported modes remain
 rejected by the existing write validation; initialization records no supported ACK
 policy for those attempts.
 
+Confirmation is a historical ACK fact, not proof that a server checkpoint or
+disk flush completed. An immediate crash of the single-replica `.6` fixture lost
+its just-ACKed prefix; the recovery test preserves it after a six-second server
+checkpoint window. See [native failure verification](native-failure-verification.md)
+for the observed boundary and the exact recovery profile.
+
 ## SQL compatibility and errors
 
 DataFusion's final `count` still counts confirmed operations, appears only after

@@ -148,3 +148,10 @@ Permissions/failover/reconciliation matrix `cf5y`, structured write knowledge
 `bqrq`, joint continuous acceptance `bsjm`, DELETE/MERGE concurrency semantics and
 profiles retain their separate acceptance. The active project has no FFI/Python
 integration; full native and consuming-engine acceptance precedes any new binding scope.
+
+The `cf5y` extension adds a separate owned socket-loss/restart fixture to this test
+target. Both pressure and recovery tests passed together, with exact post-restart
+data checks and pool cleanup. Real read-only/authorized SASL/ACL SQL is exercised
+by `tests/authorization.rs`. See [native failure verification](native-failure-verification.md)
+for fresh results, cause-preservation fixes and the ACK/checkpoint boundary observed
+in the single-replica server profile.

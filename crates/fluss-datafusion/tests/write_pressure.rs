@@ -435,24 +435,7 @@ async fn cases(
         })
         .await?,
     );
-    let metadata = connection.get_metadata();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            metadata
-                .update_tables_metadata(
-                    &std::collections::HashSet::new(),
-                    &std::collections::HashSet::new(),
-                    vec![],
-                )
-                .await?;
-            if metadata.get_cluster().get_tablet_server(0).is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        Ok::<_, fluss::error::Error>(())
-    })
-    .await??;
+    wait_for_tablet(&connection).await?;
     let admin = connection.get_admin()?;
     admin.create_database("writer_pressure", None, true).await?;
     for kv in [false, true] {
@@ -1347,6 +1330,207 @@ async fn merge_cases(
     );
     eprintln!("MERGE snapshot/update/insert races and partial ACK failure passed");
     Ok(())
+}
+
+async fn wait_for_tablet(connection: &FlussConnection) -> TestResult<()> {
+    let metadata = connection.get_metadata();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            metadata
+                .update_tables_metadata(
+                    &std::collections::HashSet::new(),
+                    &std::collections::HashSet::new(),
+                    vec![],
+                )
+                .await?;
+            if metadata.get_cluster().get_tablet_server(0).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<_, fluss::error::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+async fn connection_loss_cases(
+    connection: &Arc<FlussConnection>,
+    cluster: &FlussTestingCluster,
+) -> TestResult<()> {
+    let admin = connection.get_admin()?;
+    for kv in [false, true] {
+        let path = TablePath::new(
+            "writer_pressure",
+            if kv {
+                "connection_loss_kv"
+            } else {
+                "connection_loss_log"
+            },
+        );
+        let fields = FlussSchema::builder()
+            .column("id", DataTypes::int())
+            .column("value", DataTypes::string());
+        let fields = if kv {
+            fields.primary_key(vec!["id"])?
+        } else {
+            fields
+        };
+        admin
+            .create_table(
+                &path,
+                &TableDescriptor::builder()
+                    .schema(fields.build()?)
+                    .distributed_by(Some(1), vec!["id".into()])
+                    .build()?,
+                false,
+            )
+            .await?;
+        let options = FlussWriteOptions {
+            ack_timeout: Duration::from_secs(2),
+            preparation_timeout: Duration::from_secs(2),
+            max_retries: 1,
+            ..Default::default()
+        };
+        let (ctx, input, pool, gate) = context(Arc::clone(connection), &path, kv, options).await?;
+        let mut writes = observe(&ctx, kv).await?;
+        let ongoing = start(&ctx).await?;
+        input.send(Ok(batch(9900, 1, 1))).await?;
+        confirmation(&mut writes, 1).await?;
+        eprintln!("kv={kv}: connection-loss warm ACK received");
+        // The single-replica server checkpoints its high watermark every 5s.
+        // ACK alone does not imply that checkpoint has reached disk. Give the
+        // warm prefix a checkpoint window before crashing the process; the
+        // next batch is still stopped before it can enter native encoding.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let release = gate.arm();
+        input.send(Ok(batch(9901, 1, 1))).await?;
+        tokio::time::timeout(Duration::from_secs(1), gate.entered.notified()).await?;
+        cluster.stop_tablet_server(0).await?;
+        eprintln!("kv={kv}: tablet stopped and sockets closed");
+        drop(release);
+        let error = tokio::time::timeout(Duration::from_secs(4), ongoing)
+            .await??
+            .unwrap_err();
+        // Native retry exhaustion can return its protocol/connection error; if
+        // metadata loses the leader before another drain, the batch ACK bound
+        // expires instead. Neither is a successful/complete SQL result.
+        assert!(
+            matches!(error, DataFusionError::External(_)),
+            "native cause lost: {error}"
+        );
+        let partial = summary(&mut writes).await?;
+        assert_eq!(partial.status, FlussWriteTermination::Failed);
+        assert_eq!(partial.counts.confirmed, 1);
+        assert_eq!(partial.counts.uncertain, 1);
+        released(&pool).await?;
+        cluster.start_tablet_server(0).await?;
+        eprintln!("kv={kv}: tablet restarted, awaiting leader recovery");
+        let fresh_connection = Arc::new(cluster.get_fluss_connection().await);
+        let fresh_admin = fresh_connection.get_admin()?;
+        let mut last = String::new();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match fresh_admin
+                    .list_offsets(&path, &[0], OffsetSpec::Latest)
+                    .await
+                {
+                    Ok(offsets) if offsets.get(&0).is_some_and(|offset| *offset >= 1) => break,
+                    Ok(offsets) => last = format!("recovered offsets {offsets:?}"),
+                    Err(error) => last = error.to_string(),
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| format!("tablet/leader did not recover: {last}"))?;
+        let (fresh, new_input, fresh_pool, _) =
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match context(Arc::clone(&fresh_connection), &path, kv, options).await {
+                        Ok(context) => break context,
+                        Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                    }
+                }
+            })
+            .await?;
+        // The first ACKed row persists after real connection/leader loss. A
+        // new execution succeeds; the failed one is never transparently resumed.
+        let old = fresh
+            .sql("SELECT id FROM sink WHERE id=9900")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(old.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        drop(old);
+        let restarted = start(&fresh).await?;
+        new_input.send(Ok(batch(9902, 1, 1))).await?;
+        drop(new_input);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), restarted)
+                .await???
+                .is_empty()
+        );
+        let actual = fresh
+            .sql("SELECT id FROM sink ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        let ids = actual
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![9900, 9902],
+            "checkpointed prefix and new execution must be stored; the gated batch never reached the stopped server"
+        );
+        drop(actual);
+        released(&fresh_pool).await?;
+        eprintln!(
+            "kv={kv}: real socket/leader loss preserves ACK prefix and new execution recovers"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Docker and compatible Fluss image; crashes only this owned fixture"]
+async fn real_writer_connection_loss_and_recovery() -> TestResult<()> {
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let mut builder = FlussTestingClusterBuilder::new(format!("df-write-recovery-{suffix}"))
+        .with_port(20000 + (suffix % 20000) as u16);
+    let cluster = builder.build().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let connection = Arc::new(cluster.get_fluss_connection().await);
+        wait_for_tablet(&connection).await?;
+        connection
+            .get_admin()?
+            .create_database("writer_pressure", None, true)
+            .await?;
+        tokio::time::timeout(
+            Duration::from_secs(180),
+            connection_loss_cases(&connection, &cluster),
+        )
+        .await
+        .map_err(|_| "connection-loss matrix exceeded its 180s fixture deadline")?
+    })
+    .catch_unwind()
+    .await;
+    cluster.stop();
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

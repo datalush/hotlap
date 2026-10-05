@@ -216,10 +216,13 @@ impl CreateAclResult {
     pub fn from_pb(pb: &PbCreateAclRespInfo) -> Result<Self> {
         Ok(Self {
             acl: AclInfo::from_pb(&pb.acl)?,
-            error: pb.error_code.map(|code| AclError {
-                code,
-                message: pb.error_message.clone(),
-            }),
+            error: pb
+                .error_code
+                .filter(|code| *code != 0)
+                .map(|code| AclError {
+                    code,
+                    message: pb.error_message.clone(),
+                }),
         })
     }
 }
@@ -236,10 +239,13 @@ impl DropAclMatchingAcl {
     pub fn from_pb(pb: &PbDropAclsMatchingAcl) -> Result<Self> {
         Ok(Self {
             acl: AclInfo::from_pb(&pb.acl)?,
-            error: pb.error_code.map(|code| AclError {
-                code,
-                message: pb.error_message.clone(),
-            }),
+            error: pb
+                .error_code
+                .filter(|code| *code != 0)
+                .map(|code| AclError {
+                    code,
+                    message: pb.error_message.clone(),
+                }),
         })
     }
 }
@@ -261,10 +267,13 @@ impl DropAclsFilterResult {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             matching_acls,
-            error: pb.error_code.map(|code| AclError {
-                code,
-                message: pb.error_message.clone(),
-            }),
+            error: pb
+                .error_code
+                .filter(|code| *code != 0)
+                .map(|code| AclError {
+                    code,
+                    message: pb.error_message.clone(),
+                }),
         })
     }
 }
@@ -339,5 +348,41 @@ mod tests {
         };
         let pb = original.to_pb();
         assert_eq!(AclFilter::from_pb(&pb).unwrap(), original);
+    }
+
+    #[test]
+    fn acl_result_zero_code_is_success_and_nonzero_remains_an_error() {
+        let acl = AclInfo {
+            resource_name: "db.table".into(),
+            resource_type: ResourceType::Table,
+            principal_name: "reader".into(),
+            principal_type: "User".into(),
+            host: "*".into(),
+            operation_type: OperationType::Read,
+            permission_type: PermissionType::Allow,
+        }
+        .to_pb();
+        for code in [None, Some(0), Some(7)] {
+            let create = CreateAclResult::from_pb(&PbCreateAclRespInfo {
+                acl: acl.clone(),
+                error_code: code,
+                ..Default::default()
+            })
+            .unwrap();
+            let drop = DropAclMatchingAcl::from_pb(&PbDropAclsMatchingAcl {
+                acl: acl.clone(),
+                error_code: code,
+                ..Default::default()
+            })
+            .unwrap();
+            let filter = DropAclsFilterResult::from_pb(&PbDropAclsFilterResult {
+                error_code: code,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(create.error.is_some(), code == Some(7));
+            assert_eq!(drop.error.is_some(), code == Some(7));
+            assert_eq!(filter.error.is_some(), code == Some(7));
+        }
     }
 }

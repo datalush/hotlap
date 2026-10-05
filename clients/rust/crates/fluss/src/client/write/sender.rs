@@ -180,12 +180,15 @@ impl Sender {
         Ok(())
     }
 
-    fn maybe_abort_batches(&self, error: &crate::error::Error) {
+    fn maybe_abort_batches(&self, error: crate::error::Error) {
         if self.accumulator.has_incomplete() {
             warn!("Aborting write batches due to fatal error: {error}");
-            self.accumulator.abort_batches(broadcast::Error::Client {
-                message: format!("Writer ID allocation failed: {error}"),
-            });
+            let message = format!("Writer ID allocation failed: {error}");
+            // Broadcast handles carry a bounded client diagnostic, but flush
+            // must retain the original typed cause (notably authorization).
+            self.accumulator.record_local_failure(error);
+            self.accumulator
+                .abort_batches(broadcast::Error::Client { message });
         }
     }
 
@@ -194,7 +197,7 @@ impl Sender {
     async fn prepare_sends(&self) -> Result<(Vec<SendFuture<'_>>, Option<u64>)> {
         if let Err(e) = self.maybe_wait_for_writer_id().await {
             warn!("Failed to allocate writer ID after retries: {e}");
-            self.maybe_abort_batches(&e);
+            self.maybe_abort_batches(e);
             return Ok((vec![], None));
         }
         let (futures, delay, unknown_leaders) = self.drain_ready_sends()?;
@@ -352,7 +355,7 @@ impl Sender {
             Err(e) => {
                 self.handle_batches_with_error(
                     records_by_bucket.into_values().collect(),
-                    FlussError::NetworkException,
+                    e.api_error().unwrap_or(FlussError::NetworkException),
                     format!("Failed to connect destination node {destination}: {e}"),
                 )
                 .await?;
@@ -534,7 +537,7 @@ impl Sender {
                                 .iter()
                                 .filter_map(|b| records_by_bucket.remove(b))
                                 .collect(),
-                            FlussError::NetworkException,
+                            e.api_error().unwrap_or(FlussError::NetworkException),
                             format!("Failed to send write request: {e}"),
                         )
                         .await
@@ -1142,7 +1145,7 @@ impl Sender {
                         Ok(()) => need_drain = true,
                         Err(e) => {
                             warn!("Failed to allocate writer ID after retries: {e}");
-                            self.maybe_abort_batches(&e);
+                            self.maybe_abort_batches(e);
                         }
                     }
                 }

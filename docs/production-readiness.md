@@ -190,6 +190,14 @@ are not retried.
 
 ## Runtime limits to configure
 
+The native [permissions/failure matrix](native-failure-verification.md) verifies
+real read-only SASL/ACL SQL, typed authorization causes, partial write outcomes,
+socket loss and explicit recovery after same-tablet restart. Its single-replica
+`.6` crash test requires a six-second server checkpoint window for the initial
+ACKed prefix: an immediate crash previously recovered offset zero. An ACK is not
+an engine checkpoint or a promise of immediate crash durability. Replicated leader
+promotion and disk durability require acceptance under the chosen server profile.
+
 The default DataFusion memory pool is unbounded. Supply a bounded
 `RuntimeEnv` memory pool, set `target_partitions` (and optionally
 `with_max_partitions`), and choose a positive scan timeout. A reservation
