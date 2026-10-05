@@ -5,8 +5,8 @@ target contract and explicitly pending requirements are in
 [rust-contract.md](rust-contract.md); its decisions are not all implemented yet.
 
 The Rust client in `clients/rust/crates/fluss` already returns Arrow
-`RecordBatch` objects. Its Python binding is in
-`clients/rust/bindings/python`. Neither should be reimplemented here.
+`RecordBatch` objects. Native Rust client/codec behavior is reused rather than
+reimplemented. FFI/Python integration is outside the active project scope.
 
 `TableScan::limit(n).create_bucket_batch_scanner(bucket)` yields at most `n`
 rows **per bucket**. It is useful for explicit previews, but does not prove a
@@ -188,9 +188,10 @@ It selects the log or KV provider from the table's primary-key metadata.
 `INSERT INTO` is a sink operation on either provider. The target schema and
 table ID/schema ID are checked before writing and on each input batch.
 DataFusion passes one asynchronous stream of Arrow batches to a writer
-isolated for that statement. The existing Fluss client does the per-row
-routing; this is necessary when a batch mixes partitions with different
-historical bucket counts. On append-only logs, INSERT appends. On KV tables,
+isolated for that statement. The existing Fluss client owns row/block grouping
+and routing when batches mix partitions with different historical bucket counts.
+Compatible log blocks use views/slices and interleaved destination groups use
+Arrow gathers; KV retains its required row-format encoding. On logs INSERT appends. On KV tables,
 INSERT performs full-row upsert; duplicate keys in one input count as two
 submitted rows, and unordered parallel inputs have no guaranteed winner.
 The sink waits for ACK after each batch, even when the input never ends.
@@ -200,14 +201,13 @@ rollback, source/sink checkpoint, or exactly-once execution is promised.
 Writer buffer budgets and ACK policy belong to Fluss Config; separate sink
 options cap ACK waiting and retry attempts.
 
-The sink reserves its retained Arrow batch in the DataFusion pool before
-enqueueing it. That reservation travels with the blocking worker and is
-released when the worker drops its batch, even after async cancellation.
-Reservations from input operators may overlap conservatively with it; the
-Fluss writer's encoded buffer is a separate per-writer budget. A single
-deadline covers enqueueing and flushing one batch. Cancellation marks the
-row loop stopped and aborts the dedicated writer synchronously, waking any
-producer waiting for buffer space; requests already sent may still commit.
+The sink charges retained input/cast/gather buffers, native encoding/transport,
+routing metadata and key/row scratch to the real execution pool. Owners keep
+reservations through worker/buffer/frame lifetimes, even after cancellation.
+Input/operator charges can overlap conservatively; client queue slots have their
+own configured limiter. Preparation and metadata checks are finite; a shared
+enqueue/ACK deadline covers one batch, not idle input. Cancellation aborts the
+dedicated writer and wakes blocked producers; sent requests may still commit.
 Counts require `writer_acks=all`, `-1`, or `1`; fire-and-forget ACK mode is
 rejected. Required destination columns are checked for nulls before enqueue.
 
@@ -219,9 +219,9 @@ not proof of how many rows existed at the instant the deletes reached the
 server. Concurrent changes can be overwritten by a delete selected earlier:
 there is no conditional write or statement-wide isolation. Table policy must
 allow deletes; `ignore`/`disable`, including implicit `ignore` for a configured
-merge engine, is rejected before sending. DataFusion FFI 55.1 does **not**
-carry `delete_from`, so this SQL DELETE path is not available through the
-current Python provider; coordinated FFI support remains pending.
+merge engine, is rejected before sending. Optimized empty DELETE/UPDATE and
+unsupported row-restriction protection are backported in the native DataFusion
+core; see [DELETE contract](delete-contract.md) and vendor provenance.
 
 The Rust working tree now plans finite-source MERGE using DataFusion full
 joins and ordered CASE expressions. Predicates use SQL three-valued logic;
@@ -233,18 +233,11 @@ The sink detects repeated modifying actions for a primary key across input
 batches and budgets the encoded-key set in DataFusion memory. Detection of
 a duplicate in a later batch cannot undo earlier confirmed modifications.
 Snapshot selection remains per bucket, without conditional writes or global
-isolation. This MERGE implementation and DELETE are still Rust-only until
-the matching host/provider FFI transports those operations.
+isolation. Configured native merge-engine tables do not provide ordinary SQL row
+replacement and are rejected for SQL MERGE. Exact boundaries and evidence are in
+[MERGE contract](merge-contract.md).
 
-The DuckDB/Polars/pandas Python adapters take **already bounded** PyArrow
-results from the existing binding; they are not live Fluss table providers.
-The separate `fluss_datafusion_native` FFI wheel exposes Rust log and KV
-providers to DataFusion Python 55. Its new log API defaults to streaming:
-request `mode="batch"` before a finite `COUNT(*)` or `.collect()`. Consume
-continuous sources with `execute_stream()` / `execute_stream_partitioned()`;
-`LIMIT` can end a compatible streaming plan. DataFusion's `FilterExec`
-coalesces small filtered batches up to the configured session `batch_size`:
-with the default a sparse, nonterminating stream may wait for thousands of
-matching rows before yielding a result. Choose a smaller DataFusion batch
-size (e.g. 1 for single-event latency) explicitly if needed, trading batching
-efficiency for latency; the source must not add a second SQL filter.
+DataFusion's FilterExec can coalesce small batches up to the configured session
+batch_size. A smaller batch size can favor sparse streaming latency at a batching
+cost; the source does not add another SQL filter. The native source/sink acceptance
+and replay semantics are in [continuous INSERT acceptance](streaming-write-acceptance.md).

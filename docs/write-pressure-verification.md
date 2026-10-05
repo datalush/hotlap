@@ -139,12 +139,12 @@ Commands from repository root:
 
 ```sh
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 cargo test -p fluss-datafusion --locked --test write_pressure -- --ignored --test-threads=1
-CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --locked --test write_sql -- --ignored --test-threads=1
+CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --locked --test write_sql -- --ignored --test-threads=1
 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 cargo test -p fluss-datafusion --locked --lib
 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 CARGO_TARGET_DIR="$PWD/target" cargo test --manifest-path clients/rust/Cargo.toml -p fluss-rs --locked --lib
 ```
 
 Permissions/failover/reconciliation matrix `cf5y`, structured write knowledge
 `bqrq`, joint continuous acceptance `bsjm`, DELETE/MERGE concurrency semantics and
-profiles retain their separate acceptance. Python source only inherits new Rust
-defaults for its existing constructor; FFI builds/parity belong to the later phase.
+profiles retain their separate acceptance. The active project has no FFI/Python
+integration; full native and consuming-engine acceptance precedes any new binding scope.

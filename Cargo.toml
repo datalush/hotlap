@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fluss-datafusion", "crates/fluss-datafusion-python"]
+members = ["crates/fluss-datafusion"]
 exclude = ["clients/rust", "vendor/datafusion-55.1.0"]
 
 [workspace.package]
@@ -9,5 +9,5 @@ license = "Apache-2.0"
 rust-version = "1.94"
 
 [patch.crates-io]
-# Generic upstream DELETE/UPDATE planner backport; Arrow/FFI versions unchanged.
+# Generic upstream DELETE/UPDATE planner backport; Arrow versions unchanged.
 datafusion = { path = "vendor/datafusion-55.1.0" }

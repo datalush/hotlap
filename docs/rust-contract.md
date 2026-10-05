@@ -5,7 +5,9 @@ for the Rust-first cycle, not a declaration that all requirements are implemente
 Each pending requirement below names its implementation/acceptance task.
 [The audit](rust-implementation-audit.md) records source evidence;
 [reading semantics](reading-semantics.md) describes current implementation details.
-FFI/Python is deferred until `rm21` accepts Rust.
+FFI/Python has been removed from the active project. Reconsidering bindings
+requires complete native Rust and actual consuming-engine acceptance plus a new
+explicit scope decision; it is not a scheduled delivery phase.
 
 ## 1. API and responsibility decisions
 
@@ -398,11 +400,15 @@ causes rather than guessing. Error/Debug/metrics contexts must exclude secrets.
 
 Functional tests use DEBUG/8 jobs; profiles/benchmarks/delivery use RELEASE/8 jobs.
 Reuse historical evidence where the path is unchanged and repeat affected tests.
-This decision record requires no new wheels or performance runs. `rm21` accepts
-the Rust implementation of these requirements; `cc71` checks Python equivalence
-later and cannot redefine or block native Rust contracts.
+`rm21` accepts the native implementation after final faults/profiles and
+clean-checkout reproduction. Acceptance must also identify and validate the
+native DataFusion engine in this repository: caller planning/runtime policy,
+concurrency, source/sink lifecycle, cancellation/reexecution and recovery. Provider tests
+alone are not that engine acceptance, and bindings cannot substitute for it.
 
-Outside this cycle: persistent jobs/checkpoints, global recovery, business
-conflict policies, multi-bucket transactions, KV changelog/snapshot-changelog,
-automatic Python catalog, direct UPDATE/TRUNCATE. No claims of total RSS bounds,
-global ordering, statement rollback or whole-job exactly-once.
+Outside connector implementation: persistent jobs/checkpoints, global recovery,
+business conflict policies and multi-bucket transactions; they remain engine
+application responsibilities when needed, not a new scheduler/checkpoint gate for
+native DataFusion acceptance. KV changelog/snapshot-changelog and
+direct UPDATE/TRUNCATE remain separate extensions. No claims of total RSS bounds,
+global ordering, statement rollback or whole-job exactly-once from provider tests.

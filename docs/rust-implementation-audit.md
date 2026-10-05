@@ -1,5 +1,9 @@
 # Rust implementation audit — h3e4
 
+Historical snapshot — the FFI/Python paths and roadmap references in the original
+inventory below are retained as audit history, not active build/delivery instructions.
+Those project integrations have now been removed; the active workspace is Rust only.
+
 Date: 2026-10-04. Scope: first architectural audit of the current working tree,
 not production acceptance or an implementation refactor.
 
@@ -385,3 +389,19 @@ idle, concurrent cancellation, source failure, table/schema/partition invalidati
 and ACK policies; four SQL regressions remain passing. Detailed ownership,
 estimates, observed recovery, test-probe hang/cleanup and separate 30s frame bound
 are recorded in [write-pressure-verification.md](write-pressure-verification.md).
+
+## 14. FFI/Python removal — Rust and engine acceptance first
+
+Removed the project bridge crate, generic extension/resource/opaque-plan adapter
+crate, host patch/build script, Python engine adapters/examples/tests and Python
+package/lock/version configuration. Root workspace has only `fluss-datafusion`;
+the imported client validation workspace contains its Rust crates and excludes
+upstream language bindings. Original imported binding sources and historical
+evidence remain provenance, not active integrations or promised delivery.
+
+T03–T06 are retired by removal rather than preserved for a future rewrite. They
+do not gate Rust cleanup or release. New bindings require a fresh explicit decision
+after complete native DataFusion acceptance, including caller runtime/planning
+policy, lifecycle and recovery. No engine implementation is fabricated by this
+cleanup. The upstream generic native planner backport remains necessary for DELETE
+selection and is independent of foreign-language adapters.

@@ -118,8 +118,8 @@ fixed metric cardinality across 200 executions. The real Docker log/KV matrix no
 also observes ACK before EOF, source failure after ACK, whole-batch uncertainty on
 blocked ACK and saturated cancellation, pre-enqueue quota rejection, EOF completion
 and native sink metrics/owner-byte recovery. SQL INSERT/DELETE/MERGE regression counts
-remain the established contract. Joint streaming acceptance `bsjm` and later FFI/Python
-parity remain their own phases.
+remain the established contract. Joint streaming acceptance `bsjm` and final native
+fault/profile/consuming-engine acceptance remain their own gates.
 
 Verification: **29 core tests, the complete dual log/KV Docker matrix and all four
 native-sni SQL regressions passed**; core clippy all-targets/all-features

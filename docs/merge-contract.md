@@ -92,7 +92,7 @@ Do not force source reservations to zero merely to make a sink cleanup assertion
 Functional builds use DEBUG/8 jobs. This does not imply transaction isolation,
 exactly-once semantics, global snapshots or unbounded MERGE source support.
 Permissions/failover acceptance is `cf5y`; joint continuous INSERT acceptance is
-`bsjm`; binding parity remains the later FFI/Python phase.
+`bsjm`; full consuming-engine acceptance remains a native integration gate.
 
 Final verification: **7 native-sni SQL tests, 29 core tests and the complete Docker
 matrix including MERGE races/partial ACK passed**. Core clippy all-targets/all-features

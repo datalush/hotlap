@@ -6,6 +6,12 @@ consistency guarantees are described in
 [reading-semantics.md](reading-semantics.md). A KV scan has one snapshot **per
 bucket**, not an atomic cross-bucket snapshot.
 
+Active scope is native Rust plus validation of DataFusion in this repository.
+FFI/Python packages and experimental host integration have been removed; their
+historical checks do not constitute current acceptance. Final permissions/failover,
+sustained profiles, clean-checkout reproduction and engine lifecycle/recovery gates
+remain open even though the scoped provider milestones below are verified.
+
 ## Verified in the isolated native-sni laboratory
 
 - Mixed-layout partitions: existing two-bucket partitions remain readable
@@ -37,10 +43,8 @@ bucket**, not an atomic cross-bucket snapshot.
    An explicit batch scan resumed from offset 1 without replaying
   row 0, while an invalid offset failed; a fresh partition added during an
   open partitioned streaming scan caused an explicit topology error instead
-  of disappearing silently. The Python 55 FFI stream independently received
-  two late appends on another isolated log through an SQL filter, observed
-  progress and cancelled. The filtered stream used DataFusion session
-  `batch_size=1`; its default `FilterExec` coalescing can delay small
+   of disappearing silently. The filtered stream used DataFusion session
+   `batch_size=1`; its default `FilterExec` coalescing can delay small
   nonterminating results until more rows arrive (see reading semantics).
   This is not an engine checkpoint, continuous KV changelog, or a sustained
   streaming resource profile.
@@ -68,14 +72,8 @@ bucket**, not an atomic cross-bucket snapshot.
   buffer (routing rows on Tokio's blocking pool instead of stalling its
   sender). One `INSERT ... SELECT` from an unbounded Fluss log delivered
   and acknowledged each batch before source EOF; cancellation stopped the
-  query and later source writes did not reach the destination. Python 55 FFI
-  separately checked finite log/KV INSERTs and a continuous INSERT visible
-  to another query before cancellation. Rust-release wheels for the write
-  change (`fluss-datafusion-native` and `fluss-connectors` 0.1.1.dev2) were
-  installed with the pinned DataFusion Python 55 release wheel in a fresh
-  Python 3.12 virtualenv: all six Python tests and `uv pip check` passed.
-  The same wheels in `lab/python-lab` passed its two targeted DataFusion
-  integration tests. Partial writes cannot be rolled back or reported as
+   query and later source writes did not reach the destination.
+   Partial writes cannot be rolled back or reported as
   a fully successful operation.
 - Subsequent Rust working-tree hardening charges retained sink batches to the
   query pool and shares a deadline between enqueue/ACK. The 4 MiB input still
@@ -84,17 +82,26 @@ bucket**, not an atomic cross-bucket snapshot.
   Unit tests reject fire-and-forget ACK policies and nulls in required columns.
   SQL DELETE KV passed exact filtering, no matches, all rows and partitioned
   deletion after rescale; configured/implicit ignore policies are rejected.
-  These additions are not in the already-installed dev2 wheel. Cancelling
-  under a blocked ACK or saturated buffer still requires targeted verification;
-  Python DELETE/MERGE FFI and sustained acceptance are pending.
+   The final native Docker matrix verifies cancellation under blocked ACK and
+   saturated buffers, independent writers, timed preparation/metadata and pool
+   recovery. Detailed current ownership/bounds are in [write pressure](write-pressure-verification.md).
 - Rust working-tree MERGE passed a finite VALUES source combining UPDATE,
   DELETE and INSERT, a false-predicate/no-op clause, first-clause precedence,
   NOT MATCHED BY SOURCE deletion, and explicit rejection of duplicate
   modifying keys with the tested current batch left unapplied. It composes
   DataFusion join/filter/CASE operators; no new SQL evaluator was added.
   Primary-key changes, incomplete INSERT column lists and unbounded MERGE
-  sources are explicitly unsupported. Full MERGE validation, concurrency,
-  failure injection, and matching Python FFI/release artifacts remain open.
+   sources are explicitly unsupported. Final late-duplicate/concurrency/partial
+   ACK and source/key/scratch ownership cases pass; [MERGE contract](merge-contract.md)
+   records the native non-CAS and nontransactional boundaries.
+- Final [continuous INSERT acceptance](streaming-write-acceptance.md) uses the
+  real Fluss source toward log/KV old2/new3 destinations, sparse ACK/idle/cancel
+  and explicit earliest replay. The final SQL suite has eight opt-in cases;
+  controlled native Docker faults complement actual-source delivery/routing.
+- [Write observations](write-observation-contract.md) keep previous ACKs and
+  classify attempted unconfirmed batches conservatively. [DELETE](delete-contract.md)
+  includes the generic native DataFusion empty-input/restriction backport, whose
+  source/version/checksum provenance is in [vendor/README.md](../vendor/README.md).
 
 Rust-first planning cleanup (`re7r`, working tree) passed 15 unit tests and all
 four real `write_sql` integrations in debug with eight jobs. DELETE/MERGE helper
@@ -105,7 +112,7 @@ the same physical INSERT plan was executed twice and all six operations verified
 Capabilities are exposed as an immutable metadata/mode view, not authorization.
 See [the audit resolution](rust-implementation-audit.md#7-resolution-in-re7r-2026-10-04-working-tree)
 for dispositions and the upstream DELETE alias limitation. This does not certify
-the deferred FFI/Python path or resolve the remaining resource acceptance tasks.
+the consuming engine or resolve the remaining whole-system acceptance tasks.
 
 ## Verified in a separate Docker server profile
 
@@ -221,13 +228,12 @@ Cancelling a scan interrupts a queued retry instead of waiting for its
 backoff. The DataFusion scan timeout still bounds the complete source read.
 
 The source uses the Rust client copied in this repository. The Rust integration
-pins DataFusion 55.1 and Arrow 59 in `Cargo.lock`. The currently published
-DataFusion Python wheel uses major version 54; its TableProvider FFI cannot
-register this major-55 Rust provider. Do not substitute a bounded preview for
-a complete SQL table scan.
+pins DataFusion 55.1 and Arrow 59 in `Cargo.lock`, with the documented native core
+backport. Do not substitute a bounded preview for a complete SQL table scan.
 
 ## Verification commands
 
+Functional compilation uses `CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0`.
 ```bash
 cargo fmt --all --check
 cargo fmt --manifest-path clients/rust/Cargo.toml --all --check
@@ -242,8 +248,8 @@ With the isolated native-sni lab running and ignored credentials in
 `../lab/.env`:
 
 ```bash
-CARGO_BUILD_JOBS=2 KUBECONFIG=/tmp/opencode/native-sni.kubeconfig uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test live_log_sql -- --ignored --test-threads=1
-KUBECONFIG=/tmp/opencode/native-sni.kubeconfig CARGO_BUILD_JOBS=2 uv run --no-sync --env-file ../lab/.env cargo test --manifest-path clients/rust/Cargo.toml -p fluss-rs --lib client::table::kv_scanner::tests::leader_restart_invalidates_snapshot_without_restarting_reader -- --ignored
+CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 KUBECONFIG=/tmp/opencode/native-sni.kubeconfig uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --test live_log_sql -- --ignored --test-threads=1
+KUBECONFIG=/tmp/opencode/native-sni.kubeconfig CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test --manifest-path clients/rust/Cargo.toml -p fluss-rs --lib client::table::kv_scanner::tests::leader_restart_invalidates_snapshot_without_restarting_reader -- --ignored
 ```
 
 The first command restarts **only** the active coordinator pod for its failover
@@ -254,9 +260,9 @@ Run the independent Docker storage profile separately from the native-sni
 tests (both may bind port 9123):
 
 ```bash
-FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 cargo test -p fluss-datafusion --test remote_retention datafusion_reads_remote_and_rejects_lost_retention -- --ignored
-FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_reads_and_expires_rustfs_s3 -- --ignored
-FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_STS_READONLY_POLICY=1 CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_reads_and_expires_rustfs_s3 -- --ignored
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 cargo test -p fluss-datafusion --locked --test remote_retention datafusion_reads_remote_and_rejects_lost_retention -- --ignored
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --locked --test remote_retention datafusion_reads_and_expires_rustfs_s3 -- --ignored
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_STS_READONLY_POLICY=1 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_reads_and_expires_rustfs_s3 -- --ignored
 ```
 
 The third command enables a policy limited to the test's unique prefix and
@@ -269,7 +275,7 @@ from Docker for `FLUSS_FAULT_PROXY_HOST` (the reference host used
 `192.168.68.55`):
 
 ```bash
-FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_FAULT_PROXY_HOST=<host-IP> CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_handles_real_rustfs_http_failures -- --ignored
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_FAULT_PROXY_HOST=<host-IP> CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_handles_real_rustfs_http_failures -- --ignored
 ```
 
 Run the separate, approximately 16-minute real STS-expiry profile only when
@@ -277,14 +283,14 @@ that long verification is needed. Add `FLUSS_STS_PREFLIGHT=1` for a short setup
 check that stops before expiry:
 
 ```bash
-FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_FAULT_PROXY_HOST=<host-IP> CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_renews_real_rustfs_sts_after_expiry -- --ignored --nocapture
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_FAULT_PROXY_HOST=<host-IP> CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_renews_real_rustfs_sts_after_expiry -- --ignored --nocapture
 ```
 
 ## Reference resource-pressure profile
 
 The ignored `datafusion_resource_pressure_rustfs` test creates its **own**
 Docker Fluss cluster and a unique, removable prefix in the existing RustFS
-bucket. It runs against the Rust DataFusion provider, not the Python wheel.
+bucket. It runs against the native Rust DataFusion provider.
 Its default profile writes 4,800 log rows of 128 KiB (600 MiB decoded, larger
 than the 512 MiB pool) and 64 KV rows (8 MiB). Four queries run concurrently
 (two logs, two KV), with two physical partitions per query. It uses a shared
@@ -312,7 +318,7 @@ MiB; do not treat a one-MiB difference as an exact ordering of peaks.
 Run the long profile alone, with four CPU IDs allowed by the host affinity:
 
 ```bash
-FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.5 CARGO_BUILD_JOBS=1 uv run --no-sync --env-file ../lab/.env taskset -c 0-3 cargo test -p fluss-datafusion --test remote_retention datafusion_resource_pressure_rustfs -- --ignored --nocapture
+FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 CARGO_BUILD_JOBS=8 uv run --no-project --env-file ../lab/.env taskset -c 0-3 cargo test -p fluss-datafusion --locked --release --test remote_retention datafusion_resource_pressure_rustfs -- --ignored --nocapture
 ```
 
 For a functional smoke run before committing to 35 minutes, set
@@ -332,17 +338,10 @@ profile's single coordinator. The short HTTP profile verifies real transport
 expiry and successful renewal on one paused scan; failed credential renewal
 and the deadline after expiry are covered by deterministic client tests.
 A `.6` deployment must explicitly configure
-`s3.assumed.role.policy` to restrict root-signed STS sessions. A local Python
-3.12 installation of DataFusion Python 55.0.0 (upstream revision
-`5ef2856f5b02cddcd3d7d3559669d95ef181ccf4`, Rust engine 55.1), the
-separate Fluss FFI wheel, and this package executed real `COUNT(*)`, filtered
-and limited SQL queries on populated native-sni log and KV tables (9 and 3
-rows at the time of the check), plus eight limited queries across four Python
-workers. It used a 256 MiB DataFusion pool and two target partitions.
-Python 55 is not published to PyPI yet; installation from that pinned source
-and both built wheels into a fresh Python 3.12 environment passed all six
-Python tests and `uv pip check`. Installation is documented in the README.
-This live functional check is
-not a Python sustained-resource profile: only the Rust/Docker/RustFS workload
-has the 35-minute pressure evidence above. Other deployment profiles still
-require their own acceptance evidence.
+`s3.assumed.role.policy` to restrict root-signed STS sessions. The recorded
+35-minute Rust/Docker/RustFS workload is scoped evidence, not complete engine
+acceptance. Native DataFusion validation covers caller planning/runtime policy,
+concurrency, source/sink backpressure, cancellation/reexecution and recovery.
+Persistent jobs/checkpoints/reconciliation remain application responsibilities;
+no new scheduler is required for this gate. Other deployment profiles require their
+own acceptance evidence. Bindings are not an active deliverable or prerequisite.
