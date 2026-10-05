@@ -99,3 +99,8 @@ source and final-profile evidence, rather than treating the old HEAD as current.
 This inventory resolves dispositions; it does not close the issues or assert
 completed delivery before profiles, final-source verification and authorized
 commits are present.
+
+The now-versioned series has [clean Git verification](native-checkout-verification.md).
+All listed native/code/example/fault checks passed; a planned RustFS smoke failed
+at external endpoint preflight. Phase closure retains that blocker rather than
+relabeling the source-export evidence as a complete current remote acceptance.

@@ -89,7 +89,8 @@ local build outputs are never part of the source repository.
 
 Architecture, reads and finite/continuous writes have verified scoped milestones.
 Native functional/failure checks and final sustained profiles have scoped evidence.
-Clean Git reproduction of the versioned series is the remaining acceptance gate. The
+Clean Git verification is [recorded](docs/native-checkout-verification.md); its
+remote-read smoke currently awaits availability of the configured RustFS endpoint. The
 engine under acceptance is **DataFusion native in this repository**: caller
 SessionState/RuntimeEnv, planning/operators, concurrency/backpressure,
 cancellation/reexecution and recovery.

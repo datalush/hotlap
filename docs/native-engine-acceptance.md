@@ -73,6 +73,8 @@ Final-route profiles now pass: the 60s/300s four-case continuous writer matrix a
 controls. The final isolated-source example also executes native log/KV SQL with
 separate host/runtime policy; see [source evidence](native-cleanup-audit.md).
 
-`ydvk` awaits clean Git reproduction of the now-versioned series;
+Clean Git execution of the versioned series is [recorded](native-checkout-verification.md),
+including the unresolved RustFS preflight for its remote smoke. Final closure
+retains that external availability gate;
 profile-specific guarantees stay scoped to the recorded setup. ACK/offered offsets
 remain observations, not durable engine checkpoints or exactly-once recovery.
