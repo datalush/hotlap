@@ -88,8 +88,8 @@ local build outputs are never part of the source repository.
 ## Current acceptance scope
 
 Architecture, reads and finite/continuous writes have verified scoped milestones.
-Complete acceptance is still pending: profile-specific failure guarantees, final
-sustained profiles and clean-checkout reproduction of authorized commits. The
+Native functional/failure checks and final sustained profiles have scoped evidence.
+Clean Git reproduction of the versioned series is the remaining acceptance gate. The
 engine under acceptance is **DataFusion native in this repository**: caller
 SessionState/RuntimeEnv, planning/operators, concurrency/backpressure,
 cancellation/reexecution and recovery.
@@ -107,3 +107,4 @@ an active delivery phase or a dependency of Rust validation.
 - [Continuous INSERT acceptance](docs/streaming-write-acceptance.md)
 - [Native engine acceptance](docs/native-engine-acceptance.md)
 - [Native failures](docs/native-failure-verification.md)
+- [Final-route profiles](docs/native-profile-plan.md)

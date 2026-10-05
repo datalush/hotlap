@@ -8,9 +8,11 @@ bucket**, not an atomic cross-bucket snapshot.
 
 Active scope is native Rust plus validation of DataFusion in this repository.
 FFI/Python packages and experimental host integration have been removed; their
-historical checks do not constitute current acceptance. Final permissions/failover,
-sustained profiles, clean-checkout reproduction and engine lifecycle/recovery gates
-remain open even though the scoped provider milestones below are verified.
+historical checks do not constitute current acceptance. Native permission/fault,
+engine lifecycle and sustained-profile evidence is recorded in
+`native-failure-verification.md`, `native-engine-acceptance.md` and
+`native-profile-plan.md`. Clean Git reproduction of the versioned series remains
+the final gate; deployment guarantees stay scoped to the recorded server profile.
 
 ## Verified in the isolated native-sni laboratory
 
@@ -242,6 +244,9 @@ backport. Do not substitute a bounded preview for a complete SQL table scan.
 ## Verification commands
 
 Functional compilation uses `CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0`.
+The complete native engine coverage and caller runtime/planner/UDF checks are
+mapped in [native engine acceptance](native-engine-acceptance.md).
+
 ```bash
 cargo fmt --all --check
 cargo fmt --manifest-path clients/rust/Cargo.toml --all --check
@@ -322,6 +327,11 @@ budget was **checked by RSS/high-water mark**, not imposed as a cgroup limit;
 the temporary-file limit covers the client scanner, not all process disk use.
 The two RSS measurements are separate kernel observations and are rounded to
 MiB; do not treat a one-MiB difference as an exact ordering of peaks.
+
+Those measurements are the historical DEBUG baseline. Final-route performance
+acceptance uses RELEASE; [the native profile plan](native-profile-plan.md) fixes
+the new measured workload and limits before running it. Do not compare build modes
+as if only the connector implementation changed.
 
 Run the long profile alone, with four CPU IDs allowed by the host affinity:
 

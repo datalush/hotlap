@@ -13,6 +13,11 @@ Working-tree evidence on 2026-10-05, based on
 backport and original archive checksum are documented in [vendor provenance](../vendor/README.md).
 The root and client Cargo locks pin the active native graphs.
 
+Caller-session/operator/example coverage is versioned in `1a4556b`, following
+retirement `2a85deb` and failure hardening `043a346`. Profile harnesses and the
+ScanKv instrumentation are versioned in `4b78eca`. The recorded working-tree runs
+below precede those commits; clean Git verification is reported separately.
+
 Clean-checkout reproduction remains `rm21`, after authorized commits include
 the source/test changes and `e38t` removal. Running this working tree is not
 evidence that the current HEAD alone reproduces the new tests.
@@ -57,5 +62,17 @@ The failover test restarts only the active coordinator in the isolated native-sn
 namespace. Table fixtures use unique names and remove their own tables. Lab
 credentials stay in the ignored environment file.
 
-Clean Git reproduction and measured final-route profiles remain separate gates.
-ACK/offered offsets do not establish durable engine checkpoints or exactly-once recovery.
+The [short final-route RELEASE read profile](native-profile-plan.md) also passed:
+four concurrent log/KV SELECTs over a log dataset larger than the pool, slow
+consumers, repeated waves/cancellation and explicit resource cleanup. It measured
+128 scans in 120.3s, process VmHWM 118 MiB and reservation peak 32 MiB. This adds
+measured runtime evidence; it does not replace sustained/write-route profiles.
+
+Final-route profiles now pass: the 60s/300s four-case continuous writer matrix and
+5+30-minute reader, with latency/resource/data/cleanup checks and direct allocation
+controls. The final isolated-source example also executes native log/KV SQL with
+separate host/runtime policy; see [source evidence](native-cleanup-audit.md).
+
+`ydvk` awaits clean Git reproduction of the now-versioned series;
+profile-specific guarantees stay scoped to the recorded setup. ACK/offered offsets
+remain observations, not durable engine checkpoints or exactly-once recovery.

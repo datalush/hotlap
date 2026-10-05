@@ -4,6 +4,10 @@ Working-tree verification on 2026-10-05, after `adc4f70`. Functional builds use
 DEBUG and `CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0`. These results exercise
 the native Fluss client and DataFusion providers/planner/runtime.
 
+The implementation and tests are versioned in `043a346`; the original run results
+below are retained as pre-commit evidence. Clean-checkout results will identify
+the final tested series separately.
+
 ## Real permissions and preserved causes
 
 `tests/authorization.rs` creates a uniquely named, owned SASL/ACL Docker fixture
@@ -80,8 +84,9 @@ server profile; this fixture does not establish those stronger guarantees.
 - [Production readiness](production-readiness.md) retains the real S3 transient/
   permanent HTTP, retention and STS expiry/renewal evidence. This pass did not
   repeat the historical 900-second STS run or sustained resource profile.
-- `cf5y` remains open for review/authorized commit and profile-scope assessment.
-  `pc5n`, `ydvk` and clean reproduction remain distinct `dqar` gates.
+- `cf5y` scope is this recorded native matrix, with the explicit crash-durability
+  boundary above. Profiles, engine coverage and clean Git reproduction retain
+  their own evidence rather than expanding ACK semantics.
 
 ## Verification
 
