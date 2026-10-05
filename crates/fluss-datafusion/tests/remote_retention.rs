@@ -2,6 +2,8 @@
 //! Isolated Docker profiles: tiny segments, filesystem or RustFS S3 tiering, short TTL.
 //! Run alone with FLUSS_IMAGE and FLUSS_VERSION set to a matching Fluss server.
 
+#[path = "support/profile.rs"]
+mod profile;
 #[path = "support/s3_fault_proxy.rs"]
 mod s3_fault_proxy;
 
@@ -27,7 +29,7 @@ use fluss::row::GenericRow;
 use fluss::rpc::message::OffsetSpec;
 use fluss_datafusion::{FlussLogTable, LogReadOptions};
 use fluss_test_cluster::FlussTestingClusterBuilder;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use s3_fault_proxy::S3FaultProxy;
 
@@ -859,15 +861,29 @@ fn datafusion_resource_pressure_rustfs() -> TestResult<()> {
             .enable_all()
             .build()?
             .block_on(async {
-                let mut builder =
-                    FlussTestingClusterBuilder::new_with_cluster_conf("datafusion-pressure", &conf)
-                        .with_port(9523);
+                let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+                let mut builder = FlussTestingClusterBuilder::new_with_cluster_conf(
+                    format!("datafusion-pressure-{suffix}"),
+                    &conf,
+                )
+                .with_port(9523);
                 let cluster = builder.build().await;
-                let result = check_resource_pressure(&cluster, profile, &snapshotter).await;
-                drop(cluster);
+                let result = std::panic::AssertUnwindSafe(check_resource_pressure(
+                    &cluster,
+                    profile,
+                    &snapshotter,
+                ))
+                .catch_unwind()
+                .await;
+                cluster.stop();
                 let cleanup = test_objects.cleanup();
-                result?;
-                cleanup
+                match result {
+                    Ok(result) => {
+                        result?;
+                        cleanup
+                    }
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
             })
     })
 }
@@ -1253,10 +1269,11 @@ async fn run_pressure_profile(
         let high_water_rss = process_memory_bytes("VmHWM:")?;
         let downloaded = remote_bytes(snapshotter);
         eprintln!(
-            "DataFusion pressure profile full={} rows={} warmup_scans={} measured_scans={} measured_seconds={:.1} warmup_rss_mib={} sampled_peak_rss_mib={} process_hwm_rss_mib={} final_rss_mib={} peak_pool_mib={} sampled_peak_remote_temp_bytes={} remote_download_bytes={}",
-            profile.full, profile.rows, warmup_runs, measured_runs, elapsed.as_secs_f64(),
+            "DataFusion pressure profile full={} rows={} warmup_scans={} measured_scans={} measured_seconds={:.1} warmup_rss_mib={} sampled_peak_rss_mib={} process_hwm_rss_mib={} final_rss_mib={} peak_pool_mib={} sampled_peak_remote_temp_bytes={} remote_download_bytes={} query_p50_ms={} query_p95_ms={} query_p99_ms={} latency_overflow={}",
+            profile.full, profile.rows, warmup_runs.count(), measured_runs.count(), elapsed.as_secs_f64(),
             warm_rss / (1024 * 1024), state.peak_rss / (1024 * 1024), high_water_rss / (1024 * 1024),
-            final_rss / (1024 * 1024), state.peak_pool / (1024 * 1024), state.peak_temp, downloaded
+            final_rss / (1024 * 1024), state.peak_pool / (1024 * 1024), state.peak_temp, downloaded,
+            measured_runs.percentile(50), measured_runs.percentile(95), measured_runs.percentile(99), measured_runs.overflow
         );
         if high_water_rss > PRESSURE_RSS_LIMIT {
             return Err(format!("process RSS high-water mark exceeded budget: {high_water_rss}").into());
@@ -1277,9 +1294,9 @@ async fn run_pressure_stage(
     samples: &Arc<Mutex<PressureSamples>>,
     log_rows: usize,
     duration: Duration,
-) -> TestResult<usize> {
+) -> TestResult<profile::Latencies> {
     let until = Instant::now() + duration;
-    let mut scans = 0;
+    let mut latencies = profile::Latencies::new(180_000);
     loop {
         let reads = (0..4).map(|index| {
             let (table, expected) = if index % 2 == 0 {
@@ -1287,10 +1304,15 @@ async fn run_pressure_stage(
             } else {
                 ("pressure_kv", 64)
             };
-            pressure_read(ctx, table, expected, samples)
+            async move {
+                let started = Instant::now();
+                pressure_read(ctx, table, expected, samples).await?;
+                Ok::<_, Box<dyn std::error::Error>>(started.elapsed())
+            }
         });
-        futures::future::try_join_all(reads).await?;
-        scans += 4;
+        for elapsed in futures::future::try_join_all(reads).await? {
+            latencies.record(elapsed);
+        }
         wait_for(Duration::from_secs(5), || async {
             Ok::<bool, std::convert::Infallible>(pool.reserved() == 0)
         })
@@ -1324,7 +1346,7 @@ async fn run_pressure_stage(
             break;
         }
     }
-    Ok(scans)
+    Ok(latencies)
 }
 
 async fn pressure_read(

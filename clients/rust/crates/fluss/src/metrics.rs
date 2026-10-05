@@ -393,14 +393,15 @@ impl WriterMetrics {
 
 /// Returns a label value for reportable API keys, matching Java's
 /// `ConnectionMetrics.REPORT_API_KEYS` filter (`ProduceLog`, `FetchLog`,
-/// `PutKv`, `Lookup`). Returns `None` for admin/metadata/auth calls to
-/// avoid metric cardinality bloat.
+/// `PutKv`, `Lookup`), plus the native paginated `ScanKv` API. Returns `None` for
+/// admin/metadata/auth calls to avoid metric cardinality bloat.
 pub(crate) fn api_key_label(api_key: ApiKey) -> Option<&'static str> {
     match api_key {
         ApiKey::ProduceLog => Some("produce_log"),
         ApiKey::FetchLog => Some("fetch_log"),
         ApiKey::PutKv => Some("put_kv"),
         ApiKey::Lookup => Some("lookup"),
+        ApiKey::ScanKv => Some("scan_kv"),
         _ => None,
     }
 }
@@ -464,6 +465,7 @@ mod tests {
         assert_eq!(api_key_label(ApiKey::FetchLog), Some("fetch_log"));
         assert_eq!(api_key_label(ApiKey::PutKv), Some("put_kv"));
         assert_eq!(api_key_label(ApiKey::Lookup), Some("lookup"));
+        assert_eq!(api_key_label(ApiKey::ScanKv), Some("scan_kv"));
     }
 
     #[test]
