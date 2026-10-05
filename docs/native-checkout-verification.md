@@ -1,5 +1,11 @@
 # Native clean Git checkout verification
 
+History was selectively rewritten after this verification. Original test-run
+SHA identifiers below are preserved as evidence; their current Rust-history
+equivalents are in [the commit map](history-commit-map.tsv). For example,
+`e12c2f7` maps to `7ba969b`, and `6f9749f` to `7f2cafa`. This does not change the
+native source tested or erase the recorded initial failure/recovery.
+
 ## Versioned source
 
 Verified detached checkout **`e12c2f79fd639f9ced67af9e97c5c9ee33ead64a`**, whose

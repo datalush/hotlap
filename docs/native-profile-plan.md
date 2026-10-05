@@ -1,5 +1,10 @@
 # Final-route native profiles — pc5n
 
+Measurement SHA identifiers/artifact names retain their original identity. After
+selective history cleanup, their Rust-history equivalents are available in
+[the commit map](history-commit-map.tsv); `4b78eca` maps to `19dca49`. This is a
+traceability change, not a new benchmark or a source-policy change.
+
 Acceptance criteria fixed before the new measurements, 2026-10-05. Profiles use
 RELEASE with eight compilation jobs; correctness suites use DEBUG/eight jobs.
 The runs below used the working tree based on `adc4f70`; that is their historical

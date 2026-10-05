@@ -1,5 +1,9 @@
 # Native DataFusion engine acceptance — ydvk
 
+Original verification SHA identifiers are preserved below. Resolve them in the
+current cleaned Git history using [the old→new map](history-commit-map.tsv);
+upstream DataFusion/provenance identifiers are unaffected.
+
 The engine is this repository's DataFusion SessionContext/SessionState and
 RuntimeEnv, executing the real Fluss Rust providers. No external application or
 new scheduler/checkpoint implementation is required for this gate.

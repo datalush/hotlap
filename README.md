@@ -18,6 +18,8 @@ Its Apache licenses/notices remain intact. Java/reference and non-Rust bindings
 are removed from the current tree; their provenance remains in Git history.
 The client includes the protocol schema needed for regeneration without Java.
 See [Hotlap layout and migration](docs/hotlap-layout.md).
+The repository history is also [selectively cleaned](docs/history-cleanup.md);
+older evidence SHA identifiers resolve through the preserved old→new commit map.
 
 ## Native API and semantics
 

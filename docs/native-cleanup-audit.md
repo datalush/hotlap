@@ -1,5 +1,9 @@
 # Native source/cleanup inventory — rm21, prad, 7yt8
 
+For original SHA identifiers in this audit, see [the history commit map](history-commit-map.tsv).
+The later filtering removes retired paths from reachable history while preserving
+this native implementation, its licensing and the original evidence identity.
+
 This records the verified native-acceptance cycle before the Hotlap layout change.
 Current source disposition is in [Hotlap layout](hotlap-layout.md): the formerly
 excluded imported bindings and Java/reference tree are now removed from the
