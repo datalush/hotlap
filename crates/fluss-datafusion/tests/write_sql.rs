@@ -31,7 +31,7 @@ use fluss_datafusion::{
     FlussInsertCapability, FlussKvTable, FlussLogTable, FlussReadCapability, LogReadMode,
     LogReadOptions,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -87,6 +87,211 @@ async fn connect() -> TestResult<Arc<FlussConnection>> {
         .create_database("datafusion_tests", None, true)
         .await?;
     Ok(connection)
+}
+
+#[tokio::test]
+#[ignore = "requires native-sni and FLUSS_* credentials; isolated DELETE policy tables"]
+async fn delete_policy_matches_effective_server_behavior() -> TestResult<()> {
+    let connection = connect().await?;
+    let admin = connection.get_admin()?;
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let paths = ["default", "allow", "ignore", "disable", "first_row"]
+        .map(|name| TablePath::new("datafusion_tests", format!("delete_policy_{name}_{suffix}")));
+    let result = std::panic::AssertUnwindSafe(async {
+        for (mode, path) in ["default", "allow", "ignore", "disable", "first_row"]
+            .into_iter()
+            .zip(&paths)
+        {
+            let descriptor = TableDescriptor::builder()
+                .schema(
+                    Schema::builder()
+                        .column("id", DataTypes::int())
+                        .column("value", DataTypes::string())
+                        .primary_key(vec!["id"])?
+                        .build()?,
+                )
+                .distributed_by(Some(1), vec!["id".into()]);
+            let descriptor = match mode {
+                "default" => descriptor,
+                "first_row" => descriptor.property("table.merge-engine", "first_row"),
+                policy => descriptor.property("table.delete.behavior", policy),
+            };
+            admin
+                .create_table(path, &descriptor.build()?, false)
+                .await?;
+            let ctx = SessionContext::new();
+            let provider = FlussKvTable::open(
+                Arc::clone(&connection),
+                path.clone(),
+                Duration::from_secs(30),
+            )
+            .await?;
+            let allowed = mode == "default" || mode == "allow";
+            assert_eq!(provider.capabilities().delete, allowed);
+            let mut writes = provider.subscribe_writes();
+            ctx.register_table("state", Arc::new(provider))?;
+            assert_eq!(
+                rows_written(
+                    &ctx.sql("INSERT INTO state VALUES (1, 'seed')")
+                        .await?
+                        .collect()
+                        .await?
+                ),
+                1
+            );
+            while writes.try_recv().is_ok() {}
+            if allowed {
+                assert_eq!(
+                    rows_written(
+                        &ctx.sql("DELETE FROM state WHERE id = 1")
+                            .await?
+                            .collect()
+                            .await?
+                    ),
+                    1
+                );
+                let terminal = loop {
+                    if let fluss_datafusion::FlussWriteProgress::Terminated(summary) =
+                        writes.try_recv()?
+                    {
+                        break summary;
+                    }
+                };
+                assert_eq!(
+                    terminal.operation,
+                    fluss_datafusion::FlussWriteOperation::Delete
+                );
+                assert_eq!(
+                    terminal.status,
+                    fluss_datafusion::FlussWriteTermination::Completed
+                );
+                assert_eq!(terminal.counts.confirmed, 1);
+                assert_eq!(terminal.counts.uncertain, 0);
+                assert_eq!(
+                    rows_written(
+                        &ctx.sql("DELETE FROM state WHERE id = 1")
+                            .await?
+                            .collect()
+                            .await?
+                    ),
+                    0
+                );
+                let native = connection
+                    .get_table(path)
+                    .await?
+                    .new_upsert()?
+                    .create_writer()?;
+                let mut missing = GenericRow::new(2);
+                missing.set_field(0, 999_i32);
+                native.delete(&missing)?.await?;
+                native.flush().await?;
+            } else {
+                let error = match ctx.sql("DELETE FROM state WHERE id = 1").await {
+                    Ok(query) => query
+                        .collect()
+                        .await
+                        .expect_err("ignore/disable cannot be counted as deletion"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.to_string().contains("table.delete.behavior"),
+                    "{error}"
+                );
+                // An ignored native delete ACK is deliberately not a SQL delete success.
+                if mode == "ignore" || mode == "first_row" {
+                    let native = connection
+                        .get_table(path)
+                        .await?
+                        .new_upsert()?
+                        .create_writer()?;
+                    let mut row = GenericRow::new(2);
+                    row.set_field(0, 1_i32);
+                    native.delete(&row)?.await?;
+                    native.flush().await?;
+                }
+            }
+            let remaining = ctx.sql("SELECT id FROM state").await?.collect().await?;
+            assert_eq!(
+                remaining.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                usize::from(!allowed)
+            );
+        }
+
+        // The pinned server does not support changing delete policy in place.
+        // Verify its explicit rejection and that the original allow plan/policy
+        // remains in force, rather than assuming a supported live transition.
+        let path = &paths[1];
+        let ctx = SessionContext::new();
+        let provider = FlussKvTable::open(
+            Arc::clone(&connection),
+            path.clone(),
+            Duration::from_secs(30),
+        )
+        .await?;
+        let mut writes = provider.subscribe_writes();
+        ctx.register_table("state", Arc::new(provider))?;
+        ctx.sql("INSERT INTO state VALUES (2, 'retained')")
+            .await?
+            .collect()
+            .await?;
+        while writes.try_recv().is_ok() {}
+        let query = ctx.sql("DELETE FROM state WHERE id = 2").await?;
+        let plan = query.create_physical_plan().await?;
+        let unsupported = admin
+            .alter_table(
+                path,
+                false,
+                AlterTableChanges {
+                    config_changes: vec![fluss::metadata::AlterConfig::new(
+                        "table.delete.behavior",
+                        Some("ignore".into()),
+                        fluss::metadata::AlterConfigOpType::Set,
+                    )],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("pinned server rejects live delete policy changes");
+        assert!(
+            unsupported.to_string().contains("not supported to alter"),
+            "{unsupported}"
+        );
+        assert_eq!(
+            rows_written(&collect_plan(plan, Arc::new(query.task_ctx())).await?),
+            1
+        );
+        let terminal = loop {
+            if let fluss_datafusion::FlussWriteProgress::Terminated(summary) = writes.try_recv()? {
+                break summary;
+            }
+        };
+        assert_eq!(
+            terminal.status,
+            fluss_datafusion::FlussWriteTermination::Completed
+        );
+        assert_eq!(terminal.counts.confirmed, 1);
+        assert_eq!(terminal.counts.uncertain, 0);
+        let remaining = ctx
+            .sql("SELECT id FROM state WHERE id = 2")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            remaining.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            0
+        );
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .catch_unwind()
+    .await;
+    for path in &paths {
+        admin.drop_table(path, true).await?;
+    }
+    connection.close(Duration::from_secs(3)).await?;
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 #[tokio::test]
@@ -258,6 +463,25 @@ async fn insert_log_and_upsert_kv_from_sql() -> TestResult<()> {
                 .value(0),
             0
         );
+        ctx.sql("INSERT INTO state (id, value) VALUES (1, NULL), (2, 'two'), (3, 'keep')").await?.collect().await?;
+        assert_eq!(rows_written(&ctx.sql("DELETE FROM state WHERE value = NULL").await?.collect().await?), 0, "SQL unknown is not true");
+        for predicate in ["FALSE", "1 = 2", "value IS NULL AND value IS NOT NULL"] {
+            assert_eq!(rows_written(&ctx.sql(&format!("DELETE FROM state WHERE {predicate}")).await?.collect().await?), 0, "empty optimized DELETE keeps all rows: {predicate}");
+        }
+        for sql in ["DELETE FROM state WHERE id IN (SELECT id FROM state WHERE id = 2)", "DELETE FROM state LIMIT 1"] {
+            let error = match ctx.sql(sql).await { Ok(query) => query.collect().await.expect_err("unsupported row restrictions must not become unfiltered DELETE"), Err(error) => error };
+            assert!(error.to_string().contains("not supported"), "{error}");
+        }
+        assert_eq!(rows_written(&ctx.sql("DELETE FROM state AS selected WHERE is_two(id) OR value IS NULL").await?.collect().await?), 2, "unqualified alias/UDF and exact OR/null predicate");
+        let retained = ctx.sql("SELECT id FROM state").await?.collect().await?;
+        assert_eq!(retained.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(retained[0].column(0).as_any().downcast_ref::<Int32Array>().unwrap().value(0), 3);
+        assert_eq!(rows_written(&ctx.sql("DELETE FROM state").await?.collect().await?), 1);
+        let delete_log = match ctx.sql("DELETE FROM events WHERE id = 1").await {
+            Ok(query) => query.collect().await.expect_err("append-only logs cannot delete individual records"),
+            Err(error) => error,
+        };
+        assert!(delete_log.to_string().contains("DELETE not supported"), "{delete_log}");
         ctx.sql("INSERT INTO state (id, value) VALUES (1, 'before'), (2, 'delete')").await?.collect().await?;
         let merge_source = RecordBatch::try_from_iter(vec![
             ("id", Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef),
@@ -830,6 +1054,10 @@ async fn sql_insert_routes_mixed_partitions_after_rescale() -> TestResult<()> {
         let updated = ctx.sql("SELECT value FROM state WHERE id = 1 AND region = 'north'").await?.collect().await?;
         assert_eq!(updated[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "merged");
         assert_eq!(rows_written(&ctx.sql("DELETE FROM state WHERE region = 'west'").await?.collect().await?), 2);
+        ctx.sql("INSERT INTO state (id, region, value) VALUES (10, 'south', 'same-id-different-partition')").await?.collect().await?;
+        assert_eq!(rows_written(&ctx.sql("DELETE FROM state WHERE id = 10 AND region = 'north'").await?.collect().await?), 1, "composite PK delete routes to old2 north layout");
+        let distinct_key = ctx.sql("SELECT value FROM state WHERE id = 10 AND region = 'south'").await?.collect().await?;
+        assert_eq!(distinct_key[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "same-id-different-partition");
         let result = ctx.sql("SELECT COUNT(*) FROM state WHERE region = 'west'").await?.collect().await?;
         assert_eq!(result[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0), 0);
         Ok(())

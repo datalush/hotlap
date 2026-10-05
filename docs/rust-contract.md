@@ -314,9 +314,17 @@ DataFusion 55.1 rejects predicates qualified by a DELETE target alias (for
 example `DELETE FROM state AS s WHERE s.id = 2`) during SQL resolution. Use the
 table-name qualifier or unqualified columns; the connector does not add a SQL
 alias-rewriting workaround. MERGE target/source aliases remain supported.
+Unqualified DELETE alias predicates work. The native core now backports upstream
+empty-input/restriction protection: optimized FALSE/NULL returns zero; subquery
+join plans and DELETE LIMIT reject before invoking the provider. Proven-empty
+plans do not run a sink or emit Fluss write observations. See
+[delete-contract.md](delete-contract.md) and [vendor/README.md](../vendor/README.md)
+for provenance and verified selection/count/concurrency boundaries.
 Reject `ignore`/`disable` and implicit ignore for merge-engine policies where
 applicable. Concurrent changes may invalidate the user's intended selection;
 there is no compare-and-delete/global isolation (`jwyv`).
+The pinned server rejects in-place ALTER of `table.delete.behavior`; tests verify
+that explicit failure rather than assuming supported live policy mutation.
 
 MERGE uses DataFusion join/filter/CASE semantics and SQL null logic, with first
 eligible clause precedence. Supported modifying actions are matched UPDATE/DELETE,

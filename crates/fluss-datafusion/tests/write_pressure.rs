@@ -28,7 +28,7 @@ use fluss_datafusion::{
 };
 use fluss_test_cluster::{FlussTestingCluster, FlussTestingClusterBuilder};
 use futures::FutureExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -42,6 +42,7 @@ type Feed = mpsc::Sender<Result<RecordBatch>>;
 #[derive(Debug)]
 struct EncodingGate {
     armed: AtomicBool,
+    skip: AtomicUsize,
     entered: tokio::sync::Notify,
     released: Mutex<bool>,
     wake: std::sync::Condvar,
@@ -50,13 +51,18 @@ impl EncodingGate {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             armed: AtomicBool::new(false),
+            skip: AtomicUsize::new(0),
             entered: tokio::sync::Notify::new(),
             released: Mutex::new(true),
             wake: std::sync::Condvar::new(),
         })
     }
     fn arm(self: &Arc<Self>) -> ReleaseGate {
+        self.arm_after(0)
+    }
+    fn arm_after(self: &Arc<Self>, skip: usize) -> ReleaseGate {
         *self.released.lock().unwrap() = false;
+        self.skip.store(skip, Ordering::Release);
         self.armed.store(true, Ordering::Release);
         ReleaseGate(Arc::clone(self))
     }
@@ -65,6 +71,17 @@ impl EncodingGate {
         self.wake.notify_all();
     }
     fn observe(&self, reservation: &MemoryReservation) {
+        if reservation.consumer().name() == "FlussWriteEncoded"
+            && self.armed.load(Ordering::Acquire)
+            && self
+                .skip
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |skip| {
+                    skip.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return;
+        }
         if reservation.consumer().name() == "FlussWriteEncoded"
             && self.armed.swap(false, Ordering::AcqRel)
         {
@@ -938,7 +955,173 @@ async fn cases(
         assert_eq!(checked.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
         eprintln!("kv={kv}: live schema invalidation passed");
     }
+    delete_cases(&connection, cluster).await?;
     connection.close(Duration::from_secs(2)).await?;
+    Ok(())
+}
+
+async fn delete_cases(
+    connection: &Arc<FlussConnection>,
+    cluster: &FlussTestingCluster,
+) -> TestResult<()> {
+    let path = TablePath::new("writer_pressure", "delete_contract");
+    let admin = connection.get_admin()?;
+    admin
+        .create_table(
+            &path,
+            &TableDescriptor::builder()
+                .schema(
+                    FlussSchema::builder()
+                        .column("id", DataTypes::int())
+                        .column("value", DataTypes::string())
+                        .primary_key(vec!["id"])?
+                        .build()?,
+                )
+                .distributed_by(Some(2), vec!["id".into()])
+                .build()?,
+            false,
+        )
+        .await?;
+    let gate = EncodingGate::new();
+    let pool: Arc<dyn MemoryPool> = Arc::new(ObservedPool {
+        inner: GreedyMemoryPool::new(16 * 1024 * 1024),
+        gate: Arc::clone(&gate),
+    });
+    let ctx = SessionContext::new_with_config_rt(
+        SessionConfig::new()
+            .with_target_partitions(1)
+            .with_batch_size(1),
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build()?,
+        ),
+    );
+    let provider = FlussKvTable::open(
+        Arc::clone(connection),
+        path.clone(),
+        Duration::from_secs(20),
+    )
+    .await?
+    .with_write_options(FlussWriteOptions {
+        ack_timeout: Duration::from_millis(800),
+        ..Default::default()
+    })?;
+    ctx.register_table("sink", Arc::new(provider))?;
+    ctx.sql("INSERT INTO sink VALUES (1, 'old'), (2, 'gone')")
+        .await?
+        .collect()
+        .await?;
+
+    // The selected snapshot matches 'old'. A concurrent upsert is not a
+    // predicate-CAS: native key deletion removes the replacement value too.
+    let release = gate.arm();
+    let query = ctx
+        .sql("DELETE FROM sink WHERE id = 1 AND value = 'old'")
+        .await?;
+    let selected = tokio::spawn(async move { query.collect().await });
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified()).await?;
+    ctx.sql("INSERT INTO sink VALUES (1, 'replacement')")
+        .await?
+        .collect()
+        .await?;
+    drop(release);
+    let result = tokio::time::timeout(Duration::from_secs(3), selected).await???;
+    assert_eq!(
+        result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+    let absent = ctx
+        .sql("SELECT id FROM sink WHERE id = 1")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(absent.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    drop(absent);
+
+    // Count includes a selected key already deleted by a concurrent statement.
+    let release = gate.arm();
+    let query = ctx.sql("DELETE FROM sink WHERE id = 2").await?;
+    let selected = tokio::spawn(async move { query.collect().await });
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified()).await?;
+    ctx.sql("DELETE FROM sink WHERE id = 2")
+        .await?
+        .collect()
+        .await?;
+    drop(release);
+    let result = tokio::time::timeout(Duration::from_secs(3), selected).await???;
+    assert_eq!(
+        result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+    released(&pool).await?;
+
+    // Two native snapshot bucket batches: the first ACK is known before a
+    // blocked subsequent delete. No successful partial SQL count is emitted.
+    let values = (100..164)
+        .map(|id| format!("({id}, 'delete')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    ctx.sql(&format!("INSERT INTO sink VALUES {values}"))
+        .await?
+        .collect()
+        .await?;
+    let offsets = admin
+        .list_offsets(&path, &[0, 1], OffsetSpec::Latest)
+        .await?;
+    assert!(
+        offsets[&0] > 0 && offsets[&1] > 0,
+        "exercise both snapshot buckets"
+    );
+    let mut writes = observe(&ctx, true).await?;
+    let release = gate.arm_after(1);
+    let query = ctx.sql("DELETE FROM sink WHERE id >= 100").await?;
+    let deleting = tokio::spawn(async move { query.collect().await });
+    tokio::time::timeout(Duration::from_secs(3), gate.entered.notified()).await?;
+    let confirmed = loop {
+        if let FlussWriteProgress::BatchOutcome {
+            outcome: FlussWriteBatchOutcome::Confirmed,
+            counts,
+            ..
+        } = writes.try_recv()?
+        {
+            break counts.confirmed;
+        }
+    };
+    assert!(confirmed > 0 && confirmed < 64);
+    cluster.pause_tablet_server(0).await?;
+    drop(release);
+    let error = tokio::time::timeout(Duration::from_secs(3), deleting)
+        .await??
+        .unwrap_err();
+    assert_timeout(error, FlussWritePhase::EnqueueAndAck);
+    let partial = summary(&mut writes).await?;
+    assert_eq!(
+        partial.operation,
+        fluss_datafusion::FlussWriteOperation::Delete
+    );
+    assert_eq!(partial.status, FlussWriteTermination::Failed);
+    assert_eq!(partial.counts.confirmed, confirmed);
+    assert!(partial.counts.uncertain > 0);
+    assert_eq!(
+        partial.counts.received,
+        partial.counts.confirmed + partial.counts.uncertain
+    );
+    released(&pool).await?;
+    cluster.resume_tablet_server(0).await?;
+    let remaining = ctx.sql("SELECT id FROM sink").await?.collect().await?;
+    assert!(remaining.iter().map(RecordBatch::num_rows).sum::<usize>() <= 64 - confirmed as usize);
+    eprintln!("DELETE selection/update/delete races and partial ACK failure passed");
     Ok(())
 }
 

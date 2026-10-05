@@ -42,6 +42,9 @@ Failed/cancelled **execution status** is separate from operation knowledge:
 - Cleanup failure after EOF/ACK keeps confirmed operations and `input_exhausted=true`.
 - Cancellation before any input can report zero received operations.
 - Planning failures happen before sink execution and therefore produce no initialization.
+- Proven-empty optimized DELETE/UPDATE plans return SQL count zero without invoking
+  a sink, so they also emit no Fluss sink observations; no missing sink execution
+  is inferred from that upstream no-op.
 
 ACK policy is `FlussWriteAck::{All, Leader}`. Leader corresponds to `writer_acks=1`
 and is not the same replication guarantee as all/-1. Unsupported modes remain
