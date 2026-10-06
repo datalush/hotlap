@@ -3,8 +3,8 @@
 - Fecha: 2026-10-06
 - Estado: decisión validada por spike (crate throwaway, fuera del repo)
 - Alcance: núcleo de SP1 y forma de la frontera `IncrementalCore`
-- Plan ejecutado: `~/.opencode/plan/2026-10-06-hotlap-core-spike.md`
-- Spec: `~/.opencode/plan/2026-10-06-hotlap-streaming-engine-design.md` §7.8
+- Plan ejecutado: `2026-10-06-hotlap-core-spike.md` (local, fuera del repo)
+- Spec: `2026-10-06-hotlap-streaming-engine-design.md` §7.8 (local, fuera del repo)
 
 ## 1. Decisión
 
@@ -37,7 +37,11 @@ timely 0.31.0 MIT
 
 Dependencias directas del spike: `differential-dataflow@0.25.1` y `timely@0.31.0`.
 Rust del árbol: 1.97.1, edition 2024. Build en frío del crate (dev, sin optimizar):
-**15.22 s** (ver `notes/build.txt`).
+**15.22 s**.
+
+> **Pendiente (MSRV):** el repo fija `rust-version = "1.94"` (`Cargo.toml:9`) pero el spike se
+> compiló con **1.97.1**. La compatibilidad de DD/timely con **1.94** no está verificada;
+> comprobarla antes de comprometer el núcleo en el workspace real.
 
 ## 3. Ausencia de Arrow (evidencia verbatim)
 
@@ -115,8 +119,8 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 El "time" del circuito (los timestamps que avanzan con `advance_to`) es **lógico**: versiona
 los Z-sets para que DD incrementalice y consolide por epoch/batch. **No** es event-time.
 Event-time es un **atributo del registro** (p. ej. `ScanRecord.timestamp()` de Fluss) y se
-trata con watermarks/ventanas como operador relacional normal (spec §7.6). Verificado en el
-spike: los resultados son función del changelog, no del reloj wall-clock.
+trata con watermarks/ventanas como operador relacional normal (spec §7.6). El test del spike es
+determinista (mismo changelog ⇒ mismo resultado) y usa "time" lógico, no wall-clock.
 
 ## 6. Frontera `IncrementalCore`
 
@@ -139,6 +143,11 @@ pub struct DdCore;
 `DdCore` es un adaptador: convierte `RowChange` a su tipo interno y delega en el circuito DD.
 El core es **intercambiable** (igual que `StateBackend`), lo que evita hipotecarse a un
 núcleo concreto.
+
+> **Alcance de lo validado:** este trait es el *mínimo* que demuestra que DD queda detrás de una
+> frontera propia; **no** es todavía la frontera de SP1. El `apply` de arriba devuelve un
+> *snapshot* (`Vec<(i64,i64)>`) y es stateless (ver abajo). La frontera real debe (a) ser
+> stateful y (b) devolver un **changelog** (diffs), no un snapshot, para servir pipelines y vistas.
 
 ### Hallazgo de sesión con estado (Task 4 Step 5)
 
@@ -199,10 +208,13 @@ traducción plan→circuito (filtros, joins, aggregates, ventanas) es nuestra.
 - **Kaskada:** encaje ideal sobre el papel (embebido, Arrow nativo, incremental) pero
   **archivado** (`datastax-archive/kaskada`) → no es dependencia viable. Su caso motiva
   **no hipotecarse a un core concreto**, de ahí la frontera `IncrementalCore`.
-- No hay una tercera opción embebible y mantenida.
+- Según la revisión hecha (2026-10), no se identificó una tercera opción embebible y mantenida.
 
 ## 10. Artefactos
 
-- Crate throwaway del spike: `/tmp/opencode/hotlap-core-spike/` (no versionado; conservado
-  para verificación independiente). Evidencia cruda en sus `notes/`.
+- Crate throwaway del spike: `/tmp/opencode/hotlap-core-spike/` (no versionado). Se creó para el
+  spike y **se eliminó tras la verificación independiente**; `notes/*.txt` ya no existen y la
+  evidencia relevante está incrustada en §2–§4.
 - Este documento es lo único versionado del spike.
+- Verificación independiente: re-ejecución de `cargo test` (3/3 PASS), `cargo tree -i arrow`
+  vacío y licencias MIT. Commit: `9ac129bd5544174c58c6b82dff8fcf550ae60996`. Issue kata: `58jn`.
