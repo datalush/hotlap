@@ -80,3 +80,25 @@ fn independent_views_group_by_different_columns() {
     assert_eq!(pairs(&mut h, "by_value"), vec![(10, 3), (20, 1), (30, 1)]);
     h.shutdown().unwrap();
 }
+
+#[test]
+fn key_retracted_to_zero_disappears() {
+    let mut h = Hotlap::open().unwrap();
+    h.create_view(
+        "c",
+        Plan::GroupCount {
+            input: Box::new(Plan::Scan),
+            key: vec![0],
+        },
+    )
+    .unwrap();
+
+    let mut b = ChangeBatch::default();
+    b.push(Row(vec![Scalar::I64(1), Scalar::I64(1)]), 1);
+    b.push(Row(vec![Scalar::I64(1), Scalar::I64(1)]), -1);
+    h.push("c", &b).unwrap();
+
+    let got = h.snapshot("c").unwrap();
+    assert!(got.is_empty(), "key retracted to zero must disappear, got {got:?}");
+    h.shutdown().unwrap();
+}
