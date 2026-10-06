@@ -11,9 +11,11 @@ mod circuit;
 #[cfg(test)]
 mod tests;
 
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, mpsc};
+use std::rc::Rc;
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 use differential_dataflow::input::{Input, InputSession};
@@ -25,7 +27,8 @@ use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row};
 
 /// Consolidated output Z-set of a view, accumulated from the output stream.
-type State = Arc<Mutex<BTreeMap<Row, i64>>>;
+/// Single-threaded: only the worker thread touches it, so `Rc`/`RefCell` suffice.
+type State = Rc<RefCell<BTreeMap<Row, i64>>>;
 
 /// Upper bound on `worker.step()` calls while draining one push before giving up.
 /// The frontier must advance by at least one step per batch in normal operation; this
@@ -178,12 +181,12 @@ fn handle_build(
         Entry::Vacant(slot) => {
             let (input, probe, state) = worker.dataflow::<u64, _, _>(|scope| {
                 let (input, coll) = scope.new_collection::<Row, isize>();
-                let state: State = Arc::new(Mutex::new(BTreeMap::new()));
+                let state: State = Rc::new(RefCell::new(BTreeMap::new()));
                 let sink = state.clone();
                 let (probe, _out) = circuit::compile(coll, &plan)
                     .inspect(move |update| {
                         let (row, _time, diff) = update;
-                        let mut store = sink.lock().unwrap();
+                        let mut store = sink.borrow_mut();
                         *store.entry(row.clone()).or_insert(0) += *diff as i64;
                     })
                     .probe();
@@ -222,7 +225,7 @@ fn handle_snapshot(
     match views.get(&view) {
         None => Err(CoreError::Unsupported(format!("unknown view {view:?}"))),
         Some(vs) => {
-            let store = vs.state.lock().unwrap();
+            let store = vs.state.borrow();
             Ok(store
                 .iter()
                 .filter(|(_, diff)| **diff != 0)
