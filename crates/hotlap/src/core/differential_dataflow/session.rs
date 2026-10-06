@@ -14,6 +14,12 @@ use crate::core::{CoreError, InputId, ViewId, WatermarkSpec};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row, Scalar};
 
+/// Factor between the logical event-time watermark (unscaled, batch-independent)
+/// and the DD frontier time. Each kept push advances the fed input's frontier by
+/// at least one scaled step, so records inserted at the current logical time are
+/// always strictly below the new frontier and visible in the same push.
+pub(super) const TIME_SCALE: u64 = 1 << 20;
+
 /// Consolidated output Z-set of a view, accumulated from the output stream.
 /// Single-threaded: only the worker thread touches it, so `Rc`/`RefCell` suffice.
 pub(super) type State = Rc<RefCell<BTreeMap<Row, i64>>>;
@@ -37,7 +43,11 @@ pub(super) struct Running {
     pub(super) arities: HashMap<InputId, usize>,
     pub(super) event_time: bool,
     pub(super) watermarks: HashMap<InputId, WatermarkSpec>,
+    /// Logical, batch-independent watermark per input (unscaled event time).
     pub(super) watermarks_now: HashMap<InputId, u64>,
+    /// Actual DD frontier per input, scaled by [`TIME_SCALE`]; advances on every
+    /// non-empty push so same-push records are visible, independent of the watermark.
+    pub(super) frontier_now: HashMap<InputId, u64>,
     pub(super) late: HashMap<InputId, u64>,
 }
 
@@ -88,11 +98,11 @@ impl Running {
     }
 
     /// En modo event-time, separa las filas no tardías (devueltas) y avanza el
-    /// watermark de `input`. Si no se conserva ninguna fila, la frontera no cambia.
-    /// Si se conserva alguna, la frontera avanza estrictamente más allá de la actual
-    /// (`max(max_ts - lag, current + 1)`), para que una fila insertada en el tiempo
-    /// lógico actual quede por debajo de la frontera y sea visible en el mismo push.
-    /// El descarte de tardíos sigue comparando contra `current`. En modo epoch no toca nada.
+    /// watermark lógico de `input` de forma monótona y **independiente del batching**:
+    /// `next = current.max((max_ts - lag).max(0))` si se conserva alguna fila, o
+    /// `current` si no. El descarte de tardíos compara contra el `current` previo.
+    /// La frontera DD (visibilidad) se gestiona aparte en `frontier_now`. En modo
+    /// epoch no toca nada.
     pub(super) fn filter_late(&mut self, input: InputId, batch: &ChangeBatch) -> (ChangeBatch, u64) {
         let current = *self.watermarks_now.get(&input).unwrap_or(&0);
         if !self.event_time {
@@ -113,8 +123,7 @@ impl Running {
         let next = if kept.rows.is_empty() {
             current
         } else {
-            let candidate = (max_ts - spec.lag).max(0) as u64;
-            candidate.max(current + 1)
+            current.max((max_ts - spec.lag).max(0) as u64)
         };
         self.watermarks_now.insert(input, next);
         (kept, next)

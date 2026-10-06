@@ -33,8 +33,13 @@ pub(super) fn run_push(
     }
     let (kept, wm) = running.filter_late(input, batch);
     let epoch = if running.event_time {
-        circuit::feed_event_time(&mut running.inputs, input, &kept, wm);
-        wm
+        circuit::feed_event_time(
+            &mut running.inputs,
+            &mut running.frontier_now,
+            input,
+            &kept,
+            wm,
+        )
     } else {
         circuit::feed(&mut running.inputs, input, &kept)
     };
@@ -43,7 +48,7 @@ pub(super) fn run_push(
 }
 
 /// Objetivo de drenaje por consumidor: en epoch, `epoch`; en event-time, el mínimo
-/// de los watermarks de las fuentes del plan de la vista.
+/// de las fronteras DD de las fuentes del plan de la vista.
 fn targets_for(running: &Running, consumers: &[ViewId], epoch: u64) -> HashMap<ViewId, u64> {
     consumers
         .iter()
@@ -51,7 +56,7 @@ fn targets_for(running: &Running, consumers: &[ViewId], epoch: u64) -> HashMap<V
             let target = if running.event_time {
                 circuit::sources(&running.views[view].plan)
                     .iter()
-                    .map(|src| *running.watermarks_now.get(src).unwrap_or(&0))
+                    .map(|src| *running.frontier_now.get(src).unwrap_or(&0))
                     .min()
                     .unwrap_or(0)
             } else {

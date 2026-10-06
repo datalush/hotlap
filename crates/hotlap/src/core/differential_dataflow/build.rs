@@ -45,6 +45,7 @@ pub(super) fn build_dataflow(
             event_time,
             watermarks: watermarks.clone(),
             watermarks_now: inputs.iter().map(|&i| (i, 0u64)).collect(),
+            frontier_now: inputs.iter().map(|&i| (i, 0u64)).collect(),
             late: HashMap::new(),
         }
     }))

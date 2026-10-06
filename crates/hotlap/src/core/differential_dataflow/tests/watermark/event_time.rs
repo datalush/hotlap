@@ -74,7 +74,7 @@ fn event_time_empty_batch_does_not_move_watermark() {
 }
 
 #[test]
-fn event_time_same_ts_second_push_is_visible() {
+fn event_time_same_ts_repeat_pushes_are_visible() {
     let mut core = DifferentialCore::new().unwrap();
     core.register_input(InputId(0)).unwrap();
     core.declare_watermark(InputId(0), WatermarkSpec { time_col: 0, lag: 0 })
@@ -85,18 +85,16 @@ fn event_time_same_ts_second_push_is_visible() {
     })
     .unwrap();
 
-    let mut first = ChangeBatch::default();
-    first.push(Row(vec![Scalar::I64(100), Scalar::I64(1)]), 1);
-    core.push(InputId(0), &first).unwrap();
-    assert_eq!(snapshot_pairs(&mut core, ViewId(0)), vec![(1, 1)]);
-
-    // Same event-time as the current watermark: the watermark must still advance
-    // so this row (inserted at the current logical time) is visible this push.
-    let mut second = ChangeBatch::default();
-    second.push(Row(vec![Scalar::I64(100), Scalar::I64(1)]), 1);
-    core.push(InputId(0), &second).unwrap();
+    // Same event-time three times: the logical watermark is batch-independent, so
+    // none of these boundary repeats may be classified late, and all must be
+    // visible to the same-push snapshot (DD frontier decoupled from the watermark).
+    for _ in 0..3 {
+        let mut b = ChangeBatch::default();
+        b.push(Row(vec![Scalar::I64(100), Scalar::I64(1)]), 1);
+        core.push(InputId(0), &b).unwrap();
+    }
     assert_eq!(core.late_dropped(InputId(0)).unwrap(), 0);
-    assert_eq!(snapshot_pairs(&mut core, ViewId(0)), vec![(1, 2)]);
+    assert_eq!(snapshot_pairs(&mut core, ViewId(0)), vec![(1, 3)]);
 }
 
 #[test]

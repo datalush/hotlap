@@ -8,7 +8,7 @@ use timely::worker::Worker;
 
 use super::MAX_DRAIN_STEPS;
 use super::join;
-use super::session::ViewState;
+use super::session::{TIME_SCALE, ViewState};
 use crate::core::{CoreError, InputId, ViewId};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row, Scalar};
@@ -61,21 +61,27 @@ pub(super) fn feed(
     next
 }
 
-/// Inserta el lote en el tiempo actual de `input` y avanza SOLO su frontera a
-/// `new_wm` (modo event-time). Otros inputs conservan su watermark; los operadores
-/// binarios propagan el mínimo.
+/// Inserta el lote en el tiempo actual de `input` y avanza su **frontera DD** a
+/// `target = max(logical_next * TIME_SCALE, frontier_actual + 1)`, devolviéndolo.
+/// Otros inputs conservan su frontera; los operadores binarios propagan el mínimo.
+/// El `+1` garantiza visibilidad en el mismo push sin tocar el watermark lógico.
 pub(super) fn feed_event_time(
     sessions: &mut HashMap<InputId, InputSession<u64, Row, isize>>,
+    frontier_now: &mut HashMap<InputId, u64>,
     input: InputId,
     batch: &ChangeBatch,
-    new_wm: u64,
-) {
+    logical_next: u64,
+) -> u64 {
+    let current_frontier = *frontier_now.get(&input).unwrap_or(&0);
+    let target = (logical_next * TIME_SCALE).max(current_frontier + 1);
     let session = sessions.get_mut(&input).expect("caller checked the input");
     for (row, diff) in &batch.rows {
         session.update(row.clone(), *diff as isize);
     }
-    session.advance_to(new_wm);
+    session.advance_to(target);
     session.flush();
+    frontier_now.insert(input, target);
+    target
 }
 
 /// Fail if draining has consumed the step budget without the output frontier
