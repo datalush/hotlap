@@ -18,7 +18,9 @@ pub struct ChangeBatch {
 }
 
 impl ChangeBatch {
-    pub fn push(&mut self, row: Row, diff: i64) { self.rows.push((row, diff)); }
+    pub fn push(&mut self, row: Row, diff: i64) {
+        self.rows.push((row, diff));
+    }
 }
 
 #[cfg(test)]

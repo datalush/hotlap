@@ -1,11 +1,11 @@
 //! Public [`Hotlap`] facade over the stateful [`IncrementalCore`].
 //!
-//! `Hotlap` owns a boxed [`IncrementalCore`] (today a [`DdCore`]) plus a name ->
+//! `Hotlap` owns a boxed [`IncrementalCore`] (today a [`DifferentialCore`]) plus a name ->
 //! [`ViewId`] registry, so callers speak in view names and engine types instead
 //! of core handles. View ids are assigned
 //! monotonically from a counter; the counter only advances after a build succeeds.
 
-use crate::core::dd::DdCore;
+use crate::core::differential_dataflow::DifferentialCore;
 use crate::core::{IncrementalCore, ViewId};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row};
@@ -25,7 +25,7 @@ impl Hotlap {
     /// Open an engine and start its backing worker.
     pub fn open() -> Result<Self, HotlapError> {
         Ok(Self {
-            core: Box::new(DdCore::new().map_err(|e| HotlapError(format!("{e:?}")))?),
+            core: Box::new(DifferentialCore::new().map_err(|e| HotlapError(format!("{e:?}")))?),
             next: 0,
             views: Default::default(),
         })
@@ -135,6 +135,9 @@ mod tests {
         let mut b = ChangeBatch::default();
         b.push(Row(vec![Scalar::I64(7), Scalar::I64(1)]), 1);
         h.push("v", &b).unwrap();
-        assert_eq!(h.snapshot("v").unwrap(), vec![Row(vec![Scalar::I64(7), Scalar::I64(1)])]);
+        assert_eq!(
+            h.snapshot("v").unwrap(),
+            vec![Row(vec![Scalar::I64(7), Scalar::I64(1)])]
+        );
     }
 }

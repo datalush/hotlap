@@ -29,7 +29,9 @@ pub enum Plan {
 mod tests {
     use super::*;
 
-    fn row(v: i64) -> Row { Row(vec![Scalar::I64(v)]) }
+    fn row(v: i64) -> Row {
+        Row(vec![Scalar::I64(v)])
+    }
 
     #[test]
     fn predicate_eq_and_gt() {

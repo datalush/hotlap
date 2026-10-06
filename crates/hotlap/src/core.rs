@@ -2,9 +2,9 @@
 //!
 //! No `differential-dataflow` type crosses this boundary: the trait speaks only in
 //! engine types (`Plan`, `ChangeBatch`, `Row`). The DD-backed implementation lives
-//! behind [`dd::DdCore`].
+//! behind [`differential_dataflow::DifferentialCore`].
 
-pub mod dd;
+pub mod differential_dataflow;
 
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row};

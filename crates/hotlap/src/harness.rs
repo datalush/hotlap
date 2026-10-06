@@ -9,13 +9,41 @@ pub struct Fixture {
 
 pub fn fixture() -> Vec<Fixture> {
     vec![
-        Fixture { key: 1, value: 10, diff: 1 },
-        Fixture { key: 1, value: 20, diff: 1 },
-        Fixture { key: 2, value: 30, diff: 1 },
-        Fixture { key: 1, value: 10, diff: -1 },
-        Fixture { key: 3, value: 30, diff: 1 },
-        Fixture { key: 2, value: 30, diff: -1 },
-        Fixture { key: 1, value: 20, diff: 1 },
+        Fixture {
+            key: 1,
+            value: 10,
+            diff: 1,
+        },
+        Fixture {
+            key: 1,
+            value: 20,
+            diff: 1,
+        },
+        Fixture {
+            key: 2,
+            value: 30,
+            diff: 1,
+        },
+        Fixture {
+            key: 1,
+            value: 10,
+            diff: -1,
+        },
+        Fixture {
+            key: 3,
+            value: 30,
+            diff: 1,
+        },
+        Fixture {
+            key: 2,
+            value: 30,
+            diff: -1,
+        },
+        Fixture {
+            key: 1,
+            value: 20,
+            diff: 1,
+        },
     ]
 }
 
