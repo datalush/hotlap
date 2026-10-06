@@ -47,4 +47,6 @@ pub trait IncrementalCore {
     fn push(&mut self, input: InputId, batch: &ChangeBatch) -> Result<(), CoreError>;
     /// Current consolidated output of a view as rows.
     fn snapshot(&mut self, view: ViewId) -> Result<Vec<Row>, CoreError>;
+    /// Número de eventos descartados por tardíos en `input`.
+    fn late_dropped(&self, input: InputId) -> Result<u64, CoreError>;
 }

@@ -11,6 +11,8 @@ mod circuit;
 
 mod join;
 
+mod push;
+
 mod session;
 
 #[cfg(test)]
@@ -55,6 +57,10 @@ enum Command {
     Snapshot {
         view: ViewId,
         reply: mpsc::Sender<Result<Vec<Row>, CoreError>>,
+    },
+    LateDropped {
+        input: InputId,
+        reply: mpsc::Sender<Result<u64, CoreError>>,
     },
     Shutdown {
         reply: mpsc::Sender<()>,
@@ -147,6 +153,13 @@ impl IncrementalCore for DifferentialCore {
         self.request(
             |reply| Command::Snapshot { view, reply },
             "core worker dropped snapshot request",
+        )
+    }
+
+    fn late_dropped(&self, input: InputId) -> Result<u64, CoreError> {
+        self.request(
+            |reply| Command::LateDropped { input, reply },
+            "core worker dropped late_dropped request",
         )
     }
 }

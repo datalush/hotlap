@@ -61,6 +61,23 @@ pub(super) fn feed(
     next
 }
 
+/// Inserta el lote en el tiempo actual de `input` y avanza SOLO su frontera a
+/// `new_wm` (modo event-time). Otros inputs conservan su watermark; los operadores
+/// binarios propagan el mínimo.
+pub(super) fn feed_event_time(
+    sessions: &mut HashMap<InputId, InputSession<u64, Row, isize>>,
+    input: InputId,
+    batch: &ChangeBatch,
+    new_wm: u64,
+) {
+    let session = sessions.get_mut(&input).expect("caller checked the input");
+    for (row, diff) in &batch.rows {
+        session.update(row.clone(), *diff as isize);
+    }
+    session.advance_to(new_wm);
+    session.flush();
+}
+
 /// Fail if draining has consumed the step budget without the output frontier
 /// advancing, turning a stuck dataflow into an error instead of a hang.
 fn ensure_drain_budget(steps: usize) -> Result<(), CoreError> {
@@ -74,14 +91,17 @@ fn ensure_drain_budget(steps: usize) -> Result<(), CoreError> {
 
 /// Step until every consuming view's probe is at or past `target`, ensuring all
 /// output updates at that time are observed before a snapshot reads the Z-set.
-pub(super) fn drain(
+pub(super) fn drain_targets(
     worker: &mut Worker,
     views: &HashMap<ViewId, ViewState>,
     consumers: &[ViewId],
-    target: u64,
+    targets: &HashMap<ViewId, u64>,
 ) -> Result<(), CoreError> {
     let mut steps = 0;
-    while consumers.iter().any(|v| views[v].probe.less_than(&target)) {
+    while consumers
+        .iter()
+        .any(|v| targets.get(v).is_some_and(|t| views[v].probe.less_than(t)))
+    {
         ensure_drain_budget(steps)?;
         worker.step();
         steps += 1;

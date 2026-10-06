@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use timely::worker::Worker;
 
-use super::session::{Phase, Running};
-use super::{Command, build, circuit, validate};
+use super::session::Phase;
+use super::{Command, build, push, validate};
 use crate::core::{CoreError, InputId, ViewId, WatermarkSpec};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row};
@@ -45,6 +45,13 @@ pub(super) fn run_worker(rx: mpsc::Receiver<Command>) {
                 }
                 Ok(Command::Snapshot { view, reply }) => {
                     let _ = reply.send(handle_snapshot(&phase, view));
+                }
+                Ok(Command::LateDropped { input, reply }) => {
+                    let v = match &phase {
+                        Phase::Running(r) => Ok(*r.late.get(&input).unwrap_or(&0)),
+                        Phase::Building { .. } => Ok(0),
+                    };
+                    let _ = reply.send(v);
                 }
                 Ok(Command::Shutdown { reply }) => {
                     let _ = reply.send(());
@@ -139,32 +146,9 @@ fn handle_push(
         *phase = Phase::Running(running);
     }
     match phase {
-        Phase::Running(running) => run_push(worker, running, input, &batch),
+        Phase::Running(running) => push::run_push(worker, running, input, &batch),
         Phase::Building { .. } => unreachable!("build occurred above"),
     }
-}
-
-/// Validate the batch against every consuming view, then feed and drain the input.
-fn run_push(
-    worker: &mut Worker,
-    running: &mut Running,
-    input: InputId,
-    batch: &ChangeBatch,
-) -> Result<(), CoreError> {
-    if !running.inputs.contains_key(&input) {
-        return Err(CoreError::Unsupported(format!("unknown input {input:?}")));
-    }
-    let consumers = running.consumers.get(&input).cloned().unwrap_or_default();
-    running.learn_arity(input, batch)?;
-    for view in &consumers {
-        validate::validate(
-            &running.views[view].plan,
-            &running.arities,
-            &running.registered,
-        )?;
-    }
-    let target = circuit::feed(&mut running.inputs, input, batch);
-    circuit::drain(worker, &running.views, &consumers, target)
 }
 
 /// Read the non-zero consolidated Z-set of an existing view.

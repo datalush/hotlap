@@ -12,7 +12,7 @@ use timely::dataflow::operators::probe::Handle;
 
 use crate::core::{CoreError, InputId, ViewId, WatermarkSpec};
 use crate::plan::Plan;
-use crate::row::{ChangeBatch, Row};
+use crate::row::{ChangeBatch, Row, Scalar};
 
 /// Consolidated output Z-set of a view, accumulated from the output stream.
 /// Single-threaded: only the worker thread touches it, so `Rc`/`RefCell` suffice.
@@ -85,5 +85,43 @@ impl Running {
             .filter(|(_, diff)| **diff != 0)
             .map(|(row, _)| row.clone())
             .collect())
+    }
+
+    /// En modo event-time, separa las filas no tardías (devueltas) y avanza el
+    /// watermark de `input` a `max(actual, max_ts - lag)`. En modo epoch no toca nada.
+    pub(super) fn filter_late(&mut self, input: InputId, batch: &ChangeBatch) -> (ChangeBatch, u64) {
+        let current = *self.watermarks_now.get(&input).unwrap_or(&0);
+        if !self.event_time {
+            return (batch.clone(), current);
+        }
+        let spec = self.watermarks[&input];
+        let mut kept = ChangeBatch::default();
+        let mut max_ts = i64::MIN;
+        for (row, diff) in &batch.rows {
+            let ts = time_of(row, spec.time_col);
+            max_ts = max_ts.max(ts);
+            if (ts as u64) < current {
+                *self.late.entry(input).or_insert(0) += 1;
+            } else {
+                kept.push(row.clone(), *diff);
+            }
+        }
+        let candidate = if max_ts == i64::MIN {
+            current
+        } else {
+            (max_ts - spec.lag).max(0) as u64
+        };
+        let next = current.max(candidate);
+        self.watermarks_now.insert(input, next);
+        (kept, next)
+    }
+}
+
+/// Lee la columna de event-time como `i64` no negativo; `Null`/otro tipo y los
+/// negativos se tratan como 0.
+fn time_of(row: &Row, col: usize) -> i64 {
+    match row.col(col) {
+        Scalar::I64(v) => v.max(0),
+        _ => 0,
     }
 }
