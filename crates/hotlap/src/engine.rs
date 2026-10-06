@@ -32,6 +32,11 @@ impl Hotlap {
 
     /// Compile `plan` into a new view registered under `name`.
     pub fn create_view(&mut self, name: &str, plan: Plan) -> Result<(), HotlapError> {
+        // Reject duplicate names up front: overwriting the mapping would orphan
+        // the previously-built view (still alive in the core, unreachable here).
+        if self.views.contains_key(name) {
+            return Err(HotlapError(format!("view already exists: {name}")));
+        }
         let id = ViewId(self.next);
         // Only claim the id once the core accepts the plan; a failed build must
         // not burn an id or shadow an existing name with a dangling mapping.
@@ -113,5 +118,22 @@ mod tests {
         let batch = ChangeBatch::default();
         assert!(matches!(h.push("nope", &batch), Err(HotlapError(_))));
         assert!(matches!(h.snapshot("nope"), Err(HotlapError(_))));
+    }
+
+    #[test]
+    fn duplicate_view_name_rejected_and_original_survives() {
+        let mut h = Hotlap::open().unwrap();
+        let plan = || Plan::GroupCount {
+            input: Box::new(Plan::Scan),
+            key: vec![0],
+        };
+        h.create_view("v", plan()).unwrap();
+        assert!(matches!(h.create_view("v", plan()), Err(HotlapError(_))));
+
+        // The first view is still operable.
+        let mut b = ChangeBatch::default();
+        b.push(Row(vec![Scalar::I64(7), Scalar::I64(1)]), 1);
+        h.push("v", &b).unwrap();
+        assert_eq!(h.snapshot("v").unwrap(), vec![Row(vec![Scalar::I64(7), Scalar::I64(1)])]);
     }
 }
