@@ -58,7 +58,7 @@ pub(super) enum Phase {
         views: Vec<(ViewId, Plan)>,
         watermarks: HashMap<InputId, WatermarkSpec>,
     },
-    Running(Running),
+    Running(Box<Running>),
 }
 
 impl Running {

@@ -143,7 +143,7 @@ fn handle_push(
             } => build::build_dataflow(worker, inputs, views, watermarks)?,
             Phase::Running(_) => unreachable!("matched Building above"),
         };
-        *phase = Phase::Running(running);
+        *phase = Phase::Running(Box::new(running));
     }
     match phase {
         Phase::Running(running) => push::run_push(worker, running, input, &batch),
