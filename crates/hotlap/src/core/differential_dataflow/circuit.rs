@@ -78,7 +78,7 @@ fn drain(worker: &mut Worker, vs: &mut ViewState) -> Result<(), CoreError> {
     let mut steps = 0;
     while vs.probe.less_than(vs.input.time()) {
         if steps >= MAX_DRAIN_STEPS {
-            return Err(CoreError::Unsupported(format!(
+            return Err(CoreError::Infrastructure(format!(
                 "output frontier did not advance after {MAX_DRAIN_STEPS} steps"
             )));
         }

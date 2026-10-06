@@ -80,7 +80,7 @@ impl DifferentialCore {
     fn send(&self, cmd: Command) -> Result<(), CoreError> {
         self.tx
             .send(cmd)
-            .map_err(|_| CoreError::Unsupported("core worker is not running".into()))
+            .map_err(|_| CoreError::Infrastructure("core worker is not running".into()))
     }
 }
 
@@ -99,7 +99,7 @@ impl IncrementalCore for DifferentialCore {
             reply,
         })?;
         rx.recv()
-            .map_err(|_| CoreError::Unsupported("core worker dropped build request".into()))?
+            .map_err(|_| CoreError::Infrastructure("core worker dropped build request".into()))?
     }
 
     fn push(&mut self, view_input: ViewId, batch: &ChangeBatch) -> Result<(), CoreError> {
@@ -110,14 +110,14 @@ impl IncrementalCore for DifferentialCore {
             reply,
         })?;
         rx.recv()
-            .map_err(|_| CoreError::Unsupported("core worker dropped push request".into()))?
+            .map_err(|_| CoreError::Infrastructure("core worker dropped push request".into()))?
     }
 
     fn snapshot(&mut self, view: ViewId) -> Result<Vec<Row>, CoreError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::Snapshot { view, reply })?;
         rx.recv()
-            .map_err(|_| CoreError::Unsupported("core worker dropped snapshot request".into()))?
+            .map_err(|_| CoreError::Infrastructure("core worker dropped snapshot request".into()))?
     }
 }
 

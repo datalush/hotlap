@@ -14,7 +14,12 @@ pub struct ViewId(pub u32);
 
 #[derive(Debug)]
 pub enum CoreError {
+    /// The caller's plan or usage is not supported (bad plan, unknown view,
+    /// out-of-range index, duplicate build).
     Unsupported(String),
+    /// The backing worker failed: it is not running, its channel broke, or the
+    /// dataflow stopped making progress.
+    Infrastructure(String),
 }
 
 pub trait IncrementalCore {
