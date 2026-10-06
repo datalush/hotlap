@@ -34,6 +34,18 @@ pub enum Plan {
         input: Box<Plan>,
         key: Vec<usize>,
     },
+    /// Inner equi-join of two plans on `left_key`/`right_key`.
+    ///
+    /// Only key pairs where `left_key` and `right_key` select equal values produce
+    /// output. The output row is **every column of the joined left row followed by
+    /// every column of the joined right row** (`arity(left) + arity(right)`);
+    /// multiplicities multiply, so retracting one side retracts its joined tuples.
+    Join {
+        left: Box<Plan>,
+        right: Box<Plan>,
+        left_key: Vec<usize>,
+        right_key: Vec<usize>,
+    },
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use differential_dataflow::input::{Input, InputSession};
 use timely::worker::Worker;
 
 use super::session::{Phase, Running, State, ViewState};
-use super::{Command, circuit};
+use super::{Command, circuit, validate};
 use crate::core::{CoreError, InputId, ViewId};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row};
@@ -86,7 +86,7 @@ fn handle_build(phase: &mut Phase, view: ViewId, plan: Plan) -> Result<(), CoreE
                 )));
             }
             let registered: HashSet<InputId> = inputs.iter().copied().collect();
-            circuit::validate(&plan, None, &registered)?;
+            validate::validate(&plan, None, &registered)?;
             views.push((view, plan));
             Ok(())
         }
@@ -173,13 +173,9 @@ fn run_push(
     }
     let consumers = running.consumers.get(&input).cloned().unwrap_or_default();
     for view in &consumers {
-        circuit::validate_rows(&running.views[view].plan, batch, &running.registered)?;
+        validate::validate_rows(&running.views[view].plan, batch, &running.registered)?;
     }
-    let target = {
-        let session = running.inputs.get_mut(&input).expect("checked above");
-        circuit::feed(session, batch);
-        *session.time()
-    };
+    let target = circuit::feed(&mut running.inputs, input, batch);
     circuit::drain(worker, &running.views, &consumers, target)
 }
 

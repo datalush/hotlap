@@ -1,80 +1,17 @@
 //! Plan validation, compilation, and batch feeding for the differential core.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use differential_dataflow::VecCollection;
 use differential_dataflow::input::InputSession;
 use timely::worker::Worker;
 
 use super::MAX_DRAIN_STEPS;
+use super::join;
 use super::session::ViewState;
 use crate::core::{CoreError, InputId, ViewId};
-use crate::plan::{Plan, Predicate};
+use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row, Scalar};
-
-/// Validate that `col` is in range for a child row of length `arity`.
-fn check_col(col: usize, arity: Option<usize>, what: &str) -> Result<(), CoreError> {
-    if let Some(n) = arity
-        && col >= n
-    {
-        return Err(CoreError::Unsupported(format!(
-            "{what} column {col} out of range (arity {n})"
-        )));
-    }
-    Ok(())
-}
-
-/// Validate that every index referenced by `plan` is in range for a child row of
-/// length `arity`, and that every `Source` is a registered input. `arity` is
-/// `None` while validating a plan detached from data.
-pub(super) fn validate(
-    plan: &Plan,
-    arity: Option<usize>,
-    inputs: &HashSet<InputId>,
-) -> Result<Option<usize>, CoreError> {
-    match plan {
-        Plan::Source(id) => {
-            if !inputs.contains(id) {
-                return Err(CoreError::Unsupported(format!("unknown input {id:?}")));
-            }
-            Ok(arity)
-        }
-        Plan::Filter { input, pred } => {
-            let arity = validate(input, arity, inputs)?;
-            let col = match pred {
-                Predicate::Eq(col, _) | Predicate::Gt(col, _) => *col,
-            };
-            check_col(col, arity, "filter")?;
-            Ok(arity)
-        }
-        Plan::Project { input, cols } => {
-            let arity = validate(input, arity, inputs)?;
-            for &col in cols {
-                check_col(col, arity, "project")?;
-            }
-            Ok(Some(cols.len()))
-        }
-        Plan::GroupCount { input, key } => {
-            let arity = validate(input, arity, inputs)?;
-            for &col in key {
-                check_col(col, arity, "group key")?;
-            }
-            Ok(Some(key.len() + 1))
-        }
-    }
-}
-
-/// Validate every row in `batch` against `plan`.
-pub(super) fn validate_rows(
-    plan: &Plan,
-    batch: &ChangeBatch,
-    inputs: &HashSet<InputId>,
-) -> Result<(), CoreError> {
-    for (row, _) in &batch.rows {
-        validate(plan, Some(row.0.len()), inputs)?;
-    }
-    Ok(())
-}
 
 /// Collect the input ids a plan reads from, in traversal order.
 pub(super) fn sources(plan: &Plan) -> Vec<InputId> {
@@ -88,19 +25,36 @@ fn collect_sources(plan: &Plan, out: &mut Vec<InputId>) {
         Plan::Source(id) => out.push(*id),
         Plan::Filter { input, .. } | Plan::Project { input, .. } => collect_sources(input, out),
         Plan::GroupCount { input, .. } => collect_sources(input, out),
+        Plan::Join { left, right, .. } => {
+            collect_sources(left, out);
+            collect_sources(right, out);
+        }
     }
 }
 
-/// Advance logical time monotonically and feed the batch into an input session.
-pub(super) fn feed(session: &mut InputSession<u64, Row, isize>, batch: &ChangeBatch) {
-    let time = *session.time();
-    session.advance_to(time);
-    for (row, diff) in &batch.rows {
-        session.update(row.clone(), *diff as isize);
+/// Apply `batch` to `input`, then advance *every* input one logical step and
+/// return the new step. All inputs share one logical clock, so a binary operator's
+/// output frontier (the minimum of its inputs' frontiers) can always reach the
+/// step we drain to, even when only one side received updates. Without this, a
+/// join's frontier would stay pinned to the un-fed side and drain would time out.
+pub(super) fn feed(
+    sessions: &mut HashMap<InputId, InputSession<u64, Row, isize>>,
+    input: InputId,
+    batch: &ChangeBatch,
+) -> u64 {
+    let time = {
+        let session = sessions.get_mut(&input).expect("caller checked the input");
+        for (row, diff) in &batch.rows {
+            session.update(row.clone(), *diff as isize);
+        }
+        *session.time()
+    };
+    let next = time + 1;
+    for session in sessions.values_mut() {
+        session.advance_to(next);
+        session.flush();
     }
-    // Advance past the batch so DD consolidates and the output frontier moves.
-    session.advance_to(time + 1);
-    session.flush();
+    next
 }
 
 /// Fail if draining has consumed the step budget without the output frontier
@@ -160,5 +114,16 @@ pub(super) fn compile<'scope>(
                     Row(out)
                 })
         }
+        Plan::Join {
+            left,
+            right,
+            left_key,
+            right_key,
+        } => join::equijoin(
+            compile(collections, left),
+            compile(collections, right),
+            left_key,
+            right_key,
+        ),
     }
 }

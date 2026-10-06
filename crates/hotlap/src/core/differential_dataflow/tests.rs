@@ -1,7 +1,9 @@
+mod join;
+
 use std::collections::HashSet;
 
 use super::DifferentialCore;
-use super::circuit::validate;
+use super::validate::validate;
 use crate::core::{CoreError, IncrementalCore, InputId, ViewId};
 use crate::harness::fixture;
 use crate::plan::{Plan, Predicate};

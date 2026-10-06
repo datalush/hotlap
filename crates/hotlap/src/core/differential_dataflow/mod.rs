@@ -7,10 +7,14 @@
 
 mod circuit;
 
+mod join;
+
 mod session;
 
 #[cfg(test)]
 mod tests;
+
+mod validate;
 
 mod worker;
 
