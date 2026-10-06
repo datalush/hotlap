@@ -7,7 +7,7 @@ use std::time::Duration;
 use timely::worker::Worker;
 
 use super::session::{Phase, Running};
-use super::{Command, circuit, validate};
+use super::{Command, build, circuit, validate};
 use crate::core::{CoreError, InputId, ViewId, WatermarkSpec};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row};
@@ -133,7 +133,7 @@ fn handle_push(
                 inputs,
                 views,
                 watermarks,
-            } => circuit::build_dataflow(worker, inputs, views, watermarks)?,
+            } => build::build_dataflow(worker, inputs, views, watermarks)?,
             Phase::Running(_) => unreachable!("matched Building above"),
         };
         *phase = Phase::Running(running);

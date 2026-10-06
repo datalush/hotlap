@@ -54,3 +54,23 @@ fn declare_watermark_duplicate_errors() {
         Err(CoreError::Unsupported(_))
     ));
 }
+
+#[test]
+fn declare_watermark_subset_rejected_at_build() {
+    let mut core = DifferentialCore::new().unwrap();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    core.build_view(ViewId(0), &group_by(0)).unwrap();
+    let spec = WatermarkSpec {
+        time_col: 1,
+        lag: 0,
+    };
+    core.declare_watermark(InputId(0), spec).unwrap();
+
+    // Only one of two inputs has a watermark: the build must refuse the mix.
+    let batch = ChangeBatch::default();
+    assert!(matches!(
+        core.push(InputId(0), &batch),
+        Err(CoreError::Unsupported(_))
+    ));
+}

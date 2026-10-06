@@ -5,6 +5,8 @@
 //! channel. One dataflow holds every input and view in the same scope; it is built
 //! once, on the first push, because DD cannot add operators to a live `dataflow`.
 
+mod build;
+
 mod circuit;
 
 mod join;
