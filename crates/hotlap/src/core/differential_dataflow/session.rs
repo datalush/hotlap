@@ -103,7 +103,11 @@ impl Running {
     /// `current` si no. El descarte de tardíos compara contra el `current` previo.
     /// La frontera DD (visibilidad) se gestiona aparte en `frontier_now`. En modo
     /// epoch no toca nada.
-    pub(super) fn filter_late(&mut self, input: InputId, batch: &ChangeBatch) -> (ChangeBatch, u64) {
+    pub(super) fn filter_late(
+        &mut self,
+        input: InputId,
+        batch: &ChangeBatch,
+    ) -> (ChangeBatch, u64) {
         let current = *self.watermarks_now.get(&input).unwrap_or(&0);
         if !self.event_time {
             return (batch.clone(), current);

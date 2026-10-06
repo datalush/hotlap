@@ -74,7 +74,10 @@ fn bucket(row: &Row, key: &[usize], time_col: usize, size: u64) -> (Row, u64) {
         Scalar::I64(v) => v.max(0) as u64,
         _ => 0,
     };
-    (Row(key.iter().map(|&c| row.col(c)).collect()), (event_ts / size) * size)
+    (
+        Row(key.iter().map(|&c| row.col(c)).collect()),
+        (event_ts / size) * size,
+    )
 }
 
 /// The DD time at which the window starting at `window_start` closes. Saturating:

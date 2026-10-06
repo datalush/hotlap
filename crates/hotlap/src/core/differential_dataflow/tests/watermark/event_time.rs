@@ -10,12 +10,21 @@ use crate::row::{ChangeBatch, Row, Scalar};
 fn event_time_drops_late_and_advances_watermark() {
     let mut core = DifferentialCore::new().unwrap();
     core.register_input(InputId(0)).unwrap();
-    core.declare_watermark(InputId(0), WatermarkSpec { time_col: 0, lag: 0 })
-        .unwrap();
-    core.build_view(ViewId(0), &Plan::GroupCount {
-        input: Box::new(source()),
-        key: vec![1],
-    })
+    core.declare_watermark(
+        InputId(0),
+        WatermarkSpec {
+            time_col: 0,
+            lag: 0,
+        },
+    )
+    .unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::GroupCount {
+            input: Box::new(source()),
+            key: vec![1],
+        },
+    )
     .unwrap();
 
     let mut first = ChangeBatch::default();
@@ -34,12 +43,21 @@ fn event_time_drops_late_and_advances_watermark() {
 fn event_time_boundary_is_not_late() {
     let mut core = DifferentialCore::new().unwrap();
     core.register_input(InputId(0)).unwrap();
-    core.declare_watermark(InputId(0), WatermarkSpec { time_col: 0, lag: 0 })
-        .unwrap();
-    core.build_view(ViewId(0), &Plan::GroupCount {
-        input: Box::new(source()),
-        key: vec![1],
-    })
+    core.declare_watermark(
+        InputId(0),
+        WatermarkSpec {
+            time_col: 0,
+            lag: 0,
+        },
+    )
+    .unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::GroupCount {
+            input: Box::new(source()),
+            key: vec![1],
+        },
+    )
     .unwrap();
     let mut first = ChangeBatch::default();
     first.push(Row(vec![Scalar::I64(100), Scalar::I64(1)]), 1);
@@ -55,12 +73,21 @@ fn event_time_boundary_is_not_late() {
 fn event_time_empty_batch_does_not_move_watermark() {
     let mut core = DifferentialCore::new().unwrap();
     core.register_input(InputId(0)).unwrap();
-    core.declare_watermark(InputId(0), WatermarkSpec { time_col: 0, lag: 0 })
-        .unwrap();
-    core.build_view(ViewId(0), &Plan::GroupCount {
-        input: Box::new(source()),
-        key: vec![1],
-    })
+    core.declare_watermark(
+        InputId(0),
+        WatermarkSpec {
+            time_col: 0,
+            lag: 0,
+        },
+    )
+    .unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::GroupCount {
+            input: Box::new(source()),
+            key: vec![1],
+        },
+    )
     .unwrap();
     let mut first = ChangeBatch::default();
     first.push(Row(vec![Scalar::I64(50), Scalar::I64(1)]), 1);
@@ -77,12 +104,21 @@ fn event_time_empty_batch_does_not_move_watermark() {
 fn event_time_same_ts_repeat_pushes_are_visible() {
     let mut core = DifferentialCore::new().unwrap();
     core.register_input(InputId(0)).unwrap();
-    core.declare_watermark(InputId(0), WatermarkSpec { time_col: 0, lag: 0 })
-        .unwrap();
-    core.build_view(ViewId(0), &Plan::GroupCount {
-        input: Box::new(source()),
-        key: vec![1],
-    })
+    core.declare_watermark(
+        InputId(0),
+        WatermarkSpec {
+            time_col: 0,
+            lag: 0,
+        },
+    )
+    .unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::GroupCount {
+            input: Box::new(source()),
+            key: vec![1],
+        },
+    )
     .unwrap();
 
     // Same event-time three times: the logical watermark is batch-independent, so
@@ -101,12 +137,21 @@ fn event_time_same_ts_repeat_pushes_are_visible() {
 fn event_time_large_timestamp_does_not_panic() {
     let mut core = DifferentialCore::new().unwrap();
     core.register_input(InputId(0)).unwrap();
-    core.declare_watermark(InputId(0), WatermarkSpec { time_col: 0, lag: 0 })
-        .unwrap();
-    core.build_view(ViewId(0), &Plan::GroupCount {
-        input: Box::new(source()),
-        key: vec![1],
-    })
+    core.declare_watermark(
+        InputId(0),
+        WatermarkSpec {
+            time_col: 0,
+            lag: 0,
+        },
+    )
+    .unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::GroupCount {
+            input: Box::new(source()),
+            key: vec![1],
+        },
+    )
     .unwrap();
 
     // `i64::MAX` scaled by TIME_SCALE overflows u64; the guard must saturate, not
@@ -123,12 +168,21 @@ fn event_time_large_timestamp_does_not_panic() {
 fn rejected_push_does_not_advance_clock_or_count_late() {
     let mut core = DifferentialCore::new().unwrap();
     core.register_input(InputId(0)).unwrap();
-    core.declare_watermark(InputId(0), WatermarkSpec { time_col: 0, lag: 0 })
-        .unwrap();
-    core.build_view(ViewId(0), &Plan::GroupCount {
-        input: Box::new(source()),
-        key: vec![1],
-    })
+    core.declare_watermark(
+        InputId(0),
+        WatermarkSpec {
+            time_col: 0,
+            lag: 0,
+        },
+    )
+    .unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::GroupCount {
+            input: Box::new(source()),
+            key: vec![1],
+        },
+    )
     .unwrap();
 
     let mut first = ChangeBatch::default();
@@ -138,7 +192,10 @@ fn rejected_push_does_not_advance_clock_or_count_late() {
 
     // Arity 3 vs the learned 2: rejected before the clock or late metric is touched.
     let mut bad = ChangeBatch::default();
-    bad.push(Row(vec![Scalar::I64(1000), Scalar::I64(1), Scalar::I64(0)]), 1);
+    bad.push(
+        Row(vec![Scalar::I64(1000), Scalar::I64(1), Scalar::I64(0)]),
+        1,
+    );
     assert!(matches!(
         core.push(InputId(0), &bad),
         Err(CoreError::Unsupported(_))

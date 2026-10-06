@@ -12,8 +12,14 @@ use crate::row::{ChangeBatch, Row, Scalar};
 fn window_core() -> DifferentialCore {
     let mut core = DifferentialCore::new().unwrap();
     core.register_input(InputId(0)).unwrap();
-    core.declare_watermark(InputId(0), WatermarkSpec { time_col: 0, lag: 0 })
-        .unwrap();
+    core.declare_watermark(
+        InputId(0),
+        WatermarkSpec {
+            time_col: 0,
+            lag: 0,
+        },
+    )
+    .unwrap();
     core.build_view(
         ViewId(0),
         &Plan::TumbleCount {
@@ -63,7 +69,10 @@ fn tumbling_window_emits_on_close_and_frees_state() {
     b.push(Row(vec![Scalar::I64(3), Scalar::I64(5)]), 1);
     b.push(Row(vec![Scalar::I64(7), Scalar::I64(5)]), 1);
     core.push(InputId(0), &b).unwrap();
-    assert!(core.snapshot(ViewId(0)).unwrap().is_empty(), "ventana aún abierta");
+    assert!(
+        core.snapshot(ViewId(0)).unwrap().is_empty(),
+        "ventana aún abierta"
+    );
 
     let mut c = ChangeBatch::default();
     c.push(Row(vec![Scalar::I64(12), Scalar::I64(5)]), 1);

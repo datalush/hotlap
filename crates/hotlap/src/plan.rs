@@ -61,9 +61,9 @@ pub enum Plan {
 pub(crate) fn has_window(plan: &Plan) -> bool {
     match plan {
         Plan::TumbleCount { .. } => true,
-        Plan::Filter { input, .. } | Plan::Project { input, .. } | Plan::GroupCount { input, .. } => {
-            has_window(input)
-        }
+        Plan::Filter { input, .. }
+        | Plan::Project { input, .. }
+        | Plan::GroupCount { input, .. } => has_window(input),
         Plan::Join { left, right, .. } => has_window(left) || has_window(right),
         Plan::Source(_) => false,
     }

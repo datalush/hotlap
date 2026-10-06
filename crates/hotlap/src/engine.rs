@@ -125,4 +125,3 @@ impl Hotlap {
 
 #[cfg(test)]
 mod tests;
-
