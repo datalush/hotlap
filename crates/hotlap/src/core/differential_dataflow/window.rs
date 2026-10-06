@@ -1,4 +1,4 @@
-//! Operador de ventana tumbling: estado por cubo, emisión al cerrar y GC.
+//! Tumbling-window operator: per-bucket state, emit on close and GC.
 
 use std::collections::HashMap;
 
@@ -12,11 +12,11 @@ use crate::row::{Row, Scalar};
 
 type Container = Vec<(Row, u64, isize)>;
 
-/// Agrega por `key` y ventana tumbling de `size` sobre `time_col`. Emite
-/// `key ++ [window_start, count]` una vez por ventana cerrada; libera el cubo.
-/// El tiempo de DD está escalado: `t = wm_lógico * TIME_SCALE + tick`; el cierre
-/// se registra en `(window_start + size) * TIME_SCALE - 1`, que dispara cuando la
-/// frontera alcanza ese punto, i.e. `wm_lógico >= window_end`.
+/// Aggregate by `key` and a `size`-wide tumbling window over `time_col`. Emits
+/// `key ++ [window_start, count]` once per closed window; frees the bucket.
+/// DD time is scaled: `t = logical_wm * TIME_SCALE + tick`; the close is
+/// scheduled at `(window_start + size) * TIME_SCALE - 1`, which fires when the
+/// frontier reaches that point, i.e. `logical_wm >= window_end`.
 pub(super) fn tumble_count<'scope>(
     input: &Collection<'scope, u64, Container>,
     key: &[usize],

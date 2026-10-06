@@ -23,7 +23,7 @@ fn declare_watermark_before_push_and_reject_after() {
     b.push(Row(vec![Scalar::I64(0), Scalar::I64(100)]), 1);
     core.push(InputId(0), &b).unwrap();
 
-    // Ya arrancado: declarar tarde debe fallar.
+    // Already running: declaring late must fail.
     assert!(matches!(
         core.declare_watermark(InputId(0), spec),
         Err(CoreError::Unsupported(_))

@@ -73,7 +73,7 @@ fn tumbling_window_emits_on_close_and_frees_state() {
     core.push(InputId(0), &b).unwrap();
     assert!(
         core.snapshot(ViewId(0)).unwrap().is_empty(),
-        "ventana aún abierta"
+        "window still open"
     );
 
     let mut c = ChangeBatch::default();
@@ -99,7 +99,7 @@ fn window_rejected_without_event_time() {
         },
     )
     .unwrap();
-    // Sin watermark (modo epoch), el build debe rechazar un plan con ventana.
+    // Without a watermark (epoch mode), build must reject a plan with a window.
     let mut b = ChangeBatch::default();
     b.push(Row(vec![Scalar::I64(0), Scalar::I64(1)]), 1);
     assert!(matches!(

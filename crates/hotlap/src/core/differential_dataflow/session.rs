@@ -97,12 +97,12 @@ impl Running {
             .collect())
     }
 
-    /// En modo event-time, separa las filas no tardías (devueltas) y avanza el
-    /// watermark lógico de `input` de forma monótona y **independiente del batching**:
-    /// `next = current.max((max_ts - lag).max(0))` si se conserva alguna fila, o
-    /// `current` si no. El descarte de tardíos compara contra el `current` previo.
-    /// La frontera DD (visibilidad) se gestiona aparte en `frontier_now`. En modo
-    /// epoch no toca nada.
+    /// In event-time mode, split out the non-late rows (returned) and advance
+    /// `input`'s logical watermark monotonically and **independent of batching**:
+    /// `next = current.max((max_ts - lag).max(0))` if any row is kept, or
+    /// `current` otherwise. Late dropping compares against the previous `current`.
+    /// The DD frontier (visibility) is managed separately in `frontier_now`. In
+    /// epoch mode this touches nothing.
     pub(super) fn filter_late(
         &mut self,
         input: InputId,
@@ -136,8 +136,8 @@ impl Running {
     }
 }
 
-/// Lee la columna de event-time como `i64` no negativo; `Null`/otro tipo y los
-/// negativos se tratan como 0.
+/// Read the event-time column as a non-negative `i64`; `Null`/any other type and
+/// negative values are treated as 0.
 fn time_of(row: &Row, col: usize) -> i64 {
     match row.col(col) {
         Scalar::I64(v) => v.max(0),

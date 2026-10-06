@@ -47,8 +47,8 @@ pub(super) fn run_push(
     circuit::drain_targets(worker, &running.views, &consumers, &targets)
 }
 
-/// Objetivo de drenaje por consumidor: en epoch, `epoch`; en event-time, el mínimo
-/// de las fronteras DD de las fuentes del plan de la vista.
+/// Drain target per consumer: in epoch mode, `epoch`; in event-time mode, the
+/// minimum of the DD frontiers of the view plan's sources.
 fn targets_for(running: &Running, consumers: &[ViewId], epoch: u64) -> HashMap<ViewId, u64> {
     consumers
         .iter()

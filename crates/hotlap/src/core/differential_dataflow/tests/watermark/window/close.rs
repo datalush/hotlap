@@ -17,7 +17,7 @@ fn window_closes_exactly_at_watermark_end() {
     assert_eq!(
         rows,
         vec![Row(vec![Scalar::I64(5), Scalar::I64(0), Scalar::I64(1)])],
-        "ventana [0,10) debe cerrar con count 1"
+        "window [0,10) must close with count 1"
     );
 }
 
@@ -60,7 +60,7 @@ fn closed_window_is_not_reemitted_and_state_freed() {
     b.push(Row(vec![Scalar::I64(3), Scalar::I64(5)]), 1);
     b.push(Row(vec![Scalar::I64(7), Scalar::I64(5)]), 1);
     core.push(InputId(0), &b).unwrap();
-    // Cierra [0,10) (count 3) y abre [10,20) con el ts=12.
+    // Closes [0,10) (count 3) and opens [10,20) with ts=12.
     let mut c = ChangeBatch::default();
     c.push(Row(vec![Scalar::I64(12), Scalar::I64(5)]), 1);
     core.push(InputId(0), &c).unwrap();
@@ -69,8 +69,8 @@ fn closed_window_is_not_reemitted_and_state_freed() {
         vec![Row(vec![Scalar::I64(5), Scalar::I64(0), Scalar::I64(3)])]
     );
 
-    // Avanza el watermark muy por encima de [0,10): la notificación de [10,20)
-    // dispara `closed_buckets`; si [0,10) no se hubiera liberado, se re-emitiría.
+    // Advance the watermark well past [0,10): the [10,20) notification
+    // fires `closed_buckets`; if [0,10) had not been freed it would be re-emitted.
     let mut d = ChangeBatch::default();
     d.push(Row(vec![Scalar::I64(25), Scalar::I64(5)]), 1);
     core.push(InputId(0), &d).unwrap();
@@ -87,12 +87,12 @@ fn closed_window_is_not_reemitted_and_state_freed() {
 fn retraction_before_close_emits_nothing() {
     let mut core = window_core();
 
-    // +1 seguido de -1 de la misma fila antes del cierre: el cubo de [0,10) consolida a 0.
+    // +1 followed by -1 of the same row before close: the [0,10) bucket consolidates to 0.
     let mut b = ChangeBatch::default();
     b.push(Row(vec![Scalar::I64(1), Scalar::I64(5)]), 1);
     b.push(Row(vec![Scalar::I64(1), Scalar::I64(5)]), -1);
     core.push(InputId(0), &b).unwrap();
-    // Cierra [0,10) y abre [10,20) (aún abierta): nada debe emitirse.
+    // Closes [0,10) and opens [10,20) (still open): nothing must be emitted.
     let mut c = ChangeBatch::default();
     c.push(Row(vec![Scalar::I64(12), Scalar::I64(5)]), 1);
     core.push(InputId(0), &c).unwrap();

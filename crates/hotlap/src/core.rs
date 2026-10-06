@@ -16,7 +16,7 @@ pub struct InputId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ViewId(pub u32);
 
-/// Declaración de watermark de una fuente: columna de event-time y retraso (lag).
+/// Watermark declaration for a source: event-time column and lag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WatermarkSpec {
     pub time_col: usize,
@@ -40,13 +40,13 @@ pub trait IncrementalCore {
     /// Compile a `Source`-rooted plan into a live view. Also pre-freeze only.
     /// The inputs named by the plan must already be registered.
     fn build_view(&mut self, view: ViewId, plan: &Plan) -> Result<(), CoreError>;
-    /// Declara el watermark de una fuente. Solo antes del primer `push`, y tras
-    /// `register_input` de esa fuente.
+    /// Declare a source's watermark. Only before the first `push`, and after
+    /// `register_input` of that source.
     fn declare_watermark(&mut self, input: InputId, spec: WatermarkSpec) -> Result<(), CoreError>;
     /// Feed a batch to the given source, consolidating every consuming view.
     fn push(&mut self, input: InputId, batch: &ChangeBatch) -> Result<(), CoreError>;
     /// Current consolidated output of a view as rows.
     fn snapshot(&mut self, view: ViewId) -> Result<Vec<Row>, CoreError>;
-    /// Número de eventos descartados por tardíos en `input`.
+    /// Number of events dropped as late in `input`.
     fn late_dropped(&self, input: InputId) -> Result<u64, CoreError>;
 }

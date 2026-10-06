@@ -46,9 +46,9 @@ pub enum Plan {
         left_key: Vec<usize>,
         right_key: Vec<usize>,
     },
-    /// Agregado por ventana tumbling de `size` sobre `time_col`, agrupado por `key`.
-    /// Salida: columnas de `key`, `window_start`, `count`. Emite cada ventana una vez
-    /// al cerrarse (append-only).
+    /// Tumbling-window aggregate of `size` over `time_col`, grouped by `key`.
+    /// Output: columns of `key`, `window_start`, `count`. Emits each window once
+    /// when it closes (append-only).
     TumbleCount {
         input: Box<Plan>,
         key: Vec<usize>,
@@ -57,7 +57,7 @@ pub enum Plan {
     },
 }
 
-/// ¿El plan contiene alguna ventana?
+/// Does the plan contain any window?
 pub(crate) fn has_window(plan: &Plan) -> bool {
     match plan {
         Plan::TumbleCount { .. } => true,

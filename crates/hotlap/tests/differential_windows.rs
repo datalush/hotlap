@@ -13,8 +13,8 @@ fn tumble(key: usize, time_col: usize, size: i64) -> Plan {
     }
 }
 
-/// Oráculo de recomputación completa para `tumble(key, size)` con lag dado.
-/// `batches` son los lotes en el mismo orden/agrupación que el motor recibe.
+/// Full-recomputation oracle for `tumble(key, size)` with the given lag.
+/// `batches` are the batches in the same order/grouping the engine receives.
 fn recompute_tumble(batches: &[Vec<(i64, i64)>], size: i64, lag: i64) -> Vec<Row> {
     use std::collections::BTreeMap;
     let mut counts: BTreeMap<(i64, i64), i64> = BTreeMap::new();
@@ -24,7 +24,7 @@ fn recompute_tumble(batches: &[Vec<(i64, i64)>], size: i64, lag: i64) -> Vec<Row
         for (ts, key) in batch {
             max_ts = max_ts.max(*ts);
             if *ts < wm {
-                continue; // tardío
+                continue; // late
             }
             let ws = (ts / size) * size;
             *counts.entry((*key, ws)).or_default() += 1;
@@ -50,8 +50,8 @@ fn tumble_incremental_equals_recompute_across_batches() {
     let batches: Vec<Vec<(i64, i64)>> = vec![
         vec![(1, 5), (3, 5)],
         vec![(7, 5)],
-        vec![(4, 7), (15, 7)], // 4 < wm(5) -> tardío
-        vec![(25, 7)],         // wm 23 -> cierra [10,20)
+        vec![(4, 7), (15, 7)], // 4 < wm(5) -> late
+        vec![(25, 7)],         // wm 23 -> closes [10,20)
     ];
     for batch in &batches {
         let mut b = ChangeBatch::default();

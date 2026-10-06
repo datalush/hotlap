@@ -50,7 +50,7 @@ impl Hotlap {
         Ok(())
     }
 
-    /// Declara el watermark de `input` (columna de event-time y retardo `lag`).
+    /// Declare `input`'s watermark (event-time column and lag `lag`).
     pub fn declare_watermark(
         &mut self,
         input: &str,
@@ -106,7 +106,7 @@ impl Hotlap {
             .map_err(|e| HotlapError(format!("{e:?}")))
     }
 
-    /// Eventos descartados por tardíos en `input` (modo event-time).
+    /// Events dropped as late in `input` (event-time mode).
     pub fn late_dropped(&self, input: &str) -> Result<u64, HotlapError> {
         let id = *self
             .inputs

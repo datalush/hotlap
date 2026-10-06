@@ -101,8 +101,8 @@ fn handle_build(phase: &mut Phase, view: ViewId, plan: Plan) -> Result<(), CoreE
     }
 }
 
-/// Declara el watermark de una fuente antes del build. Rechaza input desconocido,
-/// duplicado y llamadas tras el primer push.
+/// Declare a source's watermark before the build. Rejects an unknown input,
+/// a duplicate, and calls after the first push.
 fn handle_declare(phase: &mut Phase, input: InputId, spec: WatermarkSpec) -> Result<(), CoreError> {
     match phase {
         Phase::Building {

@@ -65,7 +65,7 @@ fn event_time_boundary_is_not_late() {
     let mut first = ChangeBatch::default();
     first.push(Row(vec![Scalar::I64(100), Scalar::I64(1)]), 1);
     core.push(InputId(0), &first).unwrap();
-    // ts == wm (100) no es tardío.
+    // ts == wm (100) is not late.
     let mut edge = ChangeBatch::default();
     edge.push(Row(vec![Scalar::I64(100), Scalar::I64(1)]), 1);
     core.push(InputId(0), &edge).unwrap();

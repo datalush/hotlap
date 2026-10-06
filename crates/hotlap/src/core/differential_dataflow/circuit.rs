@@ -63,10 +63,10 @@ pub(super) fn feed(
     next
 }
 
-/// Inserta el lote en el tiempo actual de `input` y avanza su **frontera DD** a
-/// `target = max(logical_next * TIME_SCALE, frontier_actual + 1)`, devolviéndolo.
-/// Otros inputs conservan su frontera; los operadores binarios propagan el mínimo.
-/// El `+1` garantiza visibilidad en el mismo push sin tocar el watermark lógico.
+/// Insert the batch at `input`'s current time and advance its **DD frontier** to
+/// `target = max(logical_next * TIME_SCALE, current_frontier + 1)`, returning it.
+/// Other inputs keep their frontier; binary operators propagate the minimum.
+/// The `+1` guarantees same-push visibility without touching the logical watermark.
 pub(super) fn feed_event_time(
     sessions: &mut HashMap<InputId, InputSession<u64, Row, isize>>,
     frontier_now: &mut HashMap<InputId, u64>,
