@@ -1,7 +1,8 @@
 //! Public [`Hotlap`] facade over the stateful [`IncrementalCore`].
 //!
-//! `Hotlap` owns a [`DdCore`] plus a name -> [`ViewId`] registry, so callers speak
-//! in view names and engine types instead of core handles. View ids are assigned
+//! `Hotlap` owns a boxed [`IncrementalCore`] (today a [`DdCore`]) plus a name ->
+//! [`ViewId`] registry, so callers speak in view names and engine types instead
+//! of core handles. View ids are assigned
 //! monotonically from a counter; the counter only advances after a build succeeds.
 
 use crate::core::dd::DdCore;
@@ -15,7 +16,7 @@ pub struct HotlapError(pub String);
 
 /// Stateful engine facade: one live core, many named views.
 pub struct Hotlap {
-    core: DdCore,
+    core: Box<dyn IncrementalCore>,
     next: u32,
     views: std::collections::HashMap<String, ViewId>,
 }
@@ -24,7 +25,7 @@ impl Hotlap {
     /// Open an engine and start its backing worker.
     pub fn open() -> Result<Self, HotlapError> {
         Ok(Self {
-            core: DdCore::new().map_err(|e| HotlapError(format!("{e:?}")))?,
+            core: Box::new(DdCore::new().map_err(|e| HotlapError(format!("{e:?}")))?),
             next: 0,
             views: Default::default(),
         })
