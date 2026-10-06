@@ -88,7 +88,11 @@ impl Running {
     }
 
     /// En modo event-time, separa las filas no tardías (devueltas) y avanza el
-    /// watermark de `input` a `max(actual, max_ts - lag)`. En modo epoch no toca nada.
+    /// watermark de `input`. Si no se conserva ninguna fila, la frontera no cambia.
+    /// Si se conserva alguna, la frontera avanza estrictamente más allá de la actual
+    /// (`max(max_ts - lag, current + 1)`), para que una fila insertada en el tiempo
+    /// lógico actual quede por debajo de la frontera y sea visible en el mismo push.
+    /// El descarte de tardíos sigue comparando contra `current`. En modo epoch no toca nada.
     pub(super) fn filter_late(&mut self, input: InputId, batch: &ChangeBatch) -> (ChangeBatch, u64) {
         let current = *self.watermarks_now.get(&input).unwrap_or(&0);
         if !self.event_time {
@@ -106,12 +110,12 @@ impl Running {
                 kept.push(row.clone(), *diff);
             }
         }
-        let candidate = if max_ts == i64::MIN {
+        let next = if kept.rows.is_empty() {
             current
         } else {
-            (max_ts - spec.lag).max(0) as u64
+            let candidate = (max_ts - spec.lag).max(0) as u64;
+            candidate.max(current + 1)
         };
-        let next = current.max(candidate);
         self.watermarks_now.insert(input, next);
         (kept, next)
     }

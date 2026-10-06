@@ -20,9 +20,10 @@ pub(super) fn run_push(
     if !running.inputs.contains_key(&input) {
         return Err(CoreError::Unsupported(format!("unknown input {input:?}")));
     }
-    let (kept, wm) = running.filter_late(input, batch);
     let consumers = running.consumers.get(&input).cloned().unwrap_or_default();
-    running.learn_arity(input, &kept)?;
+    // Validate against the RAW batch first: arity is invariant to dropping late
+    // rows, and a rejected push must not advance the clock or bump the late metric.
+    running.learn_arity(input, batch)?;
     for view in &consumers {
         validate::validate(
             &running.views[view].plan,
@@ -30,6 +31,7 @@ pub(super) fn run_push(
             &running.registered,
         )?;
     }
+    let (kept, wm) = running.filter_late(input, batch);
     let epoch = if running.event_time {
         circuit::feed_event_time(&mut running.inputs, input, &kept, wm);
         wm
