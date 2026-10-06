@@ -73,7 +73,11 @@ pub(super) fn feed_event_time(
     logical_next: u64,
 ) -> u64 {
     let current_frontier = *frontier_now.get(&input).unwrap_or(&0);
-    let target = (logical_next * TIME_SCALE).max(current_frontier + 1);
+    // Event-times are assumed ms-scale; the saturating ops are guards so out-of-spec
+    // µs/ns timestamps cannot overflow and panic in debug builds.
+    let target = logical_next
+        .saturating_mul(TIME_SCALE)
+        .max(current_frontier.saturating_add(1));
     let session = sessions.get_mut(&input).expect("caller checked the input");
     for (row, diff) in &batch.rows {
         session.update(row.clone(), *diff as isize);

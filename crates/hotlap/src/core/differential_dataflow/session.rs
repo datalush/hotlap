@@ -46,7 +46,7 @@ pub(super) struct Running {
     /// Logical, batch-independent watermark per input (unscaled event time).
     pub(super) watermarks_now: HashMap<InputId, u64>,
     /// Actual DD frontier per input, scaled by [`TIME_SCALE`]; advances on every
-    /// non-empty push so same-push records are visible, independent of the watermark.
+    /// push so same-push records are visible, independent of the logical watermark.
     pub(super) frontier_now: HashMap<InputId, u64>,
     pub(super) late: HashMap<InputId, u64>,
 }

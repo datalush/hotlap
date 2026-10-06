@@ -98,6 +98,28 @@ fn event_time_same_ts_repeat_pushes_are_visible() {
 }
 
 #[test]
+fn event_time_large_timestamp_does_not_panic() {
+    let mut core = DifferentialCore::new().unwrap();
+    core.register_input(InputId(0)).unwrap();
+    core.declare_watermark(InputId(0), WatermarkSpec { time_col: 0, lag: 0 })
+        .unwrap();
+    core.build_view(ViewId(0), &Plan::GroupCount {
+        input: Box::new(source()),
+        key: vec![1],
+    })
+    .unwrap();
+
+    // `i64::MAX` scaled by TIME_SCALE overflows u64; the guard must saturate, not
+    // panic, and push must still return. A second push exercises the `+1` guard too.
+    for _ in 0..2 {
+        let mut b = ChangeBatch::default();
+        b.push(Row(vec![Scalar::I64(i64::MAX), Scalar::I64(1)]), 1);
+        core.push(InputId(0), &b).unwrap();
+    }
+    assert_eq!(core.late_dropped(InputId(0)).unwrap(), 0);
+}
+
+#[test]
 fn rejected_push_does_not_advance_clock_or_count_late() {
     let mut core = DifferentialCore::new().unwrap();
     core.register_input(InputId(0)).unwrap();
