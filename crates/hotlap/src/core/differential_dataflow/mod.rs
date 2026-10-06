@@ -86,6 +86,21 @@ impl DifferentialCore {
     }
 }
 
+#[cfg(test)]
+impl DifferentialCore {
+    /// Test-only: stop the worker but keep `self.tx` alive, so the next command
+    /// fails at the channel boundary and yields `CoreError::Infrastructure`.
+    pub(crate) fn stop_worker_for_test(&mut self) {
+        let (reply, rx) = std::sync::mpsc::channel();
+        if self.tx.send(Command::Shutdown { reply }).is_ok() {
+            let _ = rx.recv();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 impl IncrementalCore for DifferentialCore {
     fn build_view(&mut self, view: ViewId, plan: &Plan) -> Result<(), CoreError> {
         // SP1a compiles only linear pipelines rooted at GroupCount; SP1b adds joins.

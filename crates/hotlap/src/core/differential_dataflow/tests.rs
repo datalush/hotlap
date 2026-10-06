@@ -115,6 +115,21 @@ fn unknown_view_errors_on_push_and_snapshot() {
 }
 
 #[test]
+fn commands_after_worker_stop_report_infrastructure_error() {
+    let mut core = DifferentialCore::new().unwrap();
+    core.stop_worker_for_test();
+    let batch = ChangeBatch::default();
+    assert!(matches!(
+        core.push(ViewId(0), &batch),
+        Err(CoreError::Infrastructure(_))
+    ));
+    assert!(matches!(
+        core.snapshot(ViewId(0)),
+        Err(CoreError::Infrastructure(_))
+    ));
+}
+
+#[test]
 fn project_then_group_count_snapshot() {
     let mut core = DifferentialCore::new().unwrap();
     // Group by the projected value column: `[k, v] -> [v] -> [v, count]`.
