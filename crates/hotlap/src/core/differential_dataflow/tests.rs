@@ -1,4 +1,5 @@
 mod join;
+mod watermark;
 
 use std::collections::{HashMap, HashSet};
 

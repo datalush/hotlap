@@ -1,18 +1,14 @@
 //! Worker-thread loop and command handlers for the differential core.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
-use differential_dataflow::VecCollection;
-use differential_dataflow::input::{Input, InputSession};
 use timely::worker::Worker;
 
-use super::session::{Phase, Running, State, ViewState};
+use super::session::{Phase, Running};
 use super::{Command, circuit, validate};
-use crate::core::{CoreError, InputId, ViewId};
+use crate::core::{CoreError, InputId, ViewId, WatermarkSpec};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row};
 
@@ -25,6 +21,7 @@ pub(super) fn run_worker(rx: mpsc::Receiver<Command>) {
         let mut phase = Phase::Building {
             inputs: Vec::new(),
             views: Vec::new(),
+            watermarks: HashMap::new(),
         };
         loop {
             worker.step();
@@ -35,6 +32,9 @@ pub(super) fn run_worker(rx: mpsc::Receiver<Command>) {
                 }
                 Ok(Command::Build { view, plan, reply }) => {
                     let _ = reply.send(handle_build(&mut phase, view, plan));
+                }
+                Ok(Command::DeclareWatermark { input, spec, reply }) => {
+                    let _ = reply.send(handle_declare(&mut phase, input, spec));
                 }
                 Ok(Command::Push {
                     input,
@@ -79,7 +79,7 @@ fn handle_register(phase: &mut Phase, input: InputId) -> Result<(), CoreError> {
 /// bounds are deferred to the push, since the schema is unknown until data arrives.
 fn handle_build(phase: &mut Phase, view: ViewId, plan: Plan) -> Result<(), CoreError> {
     match phase {
-        Phase::Building { inputs, views } => {
+        Phase::Building { inputs, views, .. } => {
             if views.iter().any(|(built, _)| *built == view) {
                 return Err(CoreError::Unsupported(format!(
                     "view {view:?} already built"
@@ -88,6 +88,27 @@ fn handle_build(phase: &mut Phase, view: ViewId, plan: Plan) -> Result<(), CoreE
             let registered: HashSet<InputId> = inputs.iter().copied().collect();
             validate::validate(&plan, &HashMap::new(), &registered)?;
             views.push((view, plan));
+            Ok(())
+        }
+        Phase::Running(_) => Err(CoreError::Unsupported("engine already running".into())),
+    }
+}
+
+/// Declara el watermark de una fuente antes del build. Rechaza input desconocido,
+/// duplicado y llamadas tras el primer push.
+fn handle_declare(phase: &mut Phase, input: InputId, spec: WatermarkSpec) -> Result<(), CoreError> {
+    match phase {
+        Phase::Building {
+            inputs, watermarks, ..
+        } => {
+            if !inputs.contains(&input) {
+                return Err(CoreError::Unsupported(format!("unknown input {input:?}")));
+            }
+            if watermarks.insert(input, spec).is_some() {
+                return Err(CoreError::Unsupported(format!(
+                    "watermark already declared for {input:?}"
+                )));
+            }
             Ok(())
         }
         Phase::Running(_) => Err(CoreError::Unsupported("engine already running".into())),
@@ -108,7 +129,11 @@ fn handle_push(
     }
     if matches!(phase, Phase::Building { .. }) {
         let running = match phase {
-            Phase::Building { inputs, views } => build_dataflow(worker, inputs, views),
+            Phase::Building {
+                inputs,
+                views,
+                watermarks,
+            } => circuit::build_dataflow(worker, inputs, views, watermarks)?,
             Phase::Running(_) => unreachable!("matched Building above"),
         };
         *phase = Phase::Running(running);
@@ -117,49 +142,6 @@ fn handle_push(
         Phase::Running(running) => run_push(worker, running, input, &batch),
         Phase::Building { .. } => unreachable!("build occurred above"),
     }
-}
-
-/// Build the single scope holding every declared input and view.
-fn build_dataflow(worker: &mut Worker, inputs: &[InputId], views: &[(ViewId, Plan)]) -> Running {
-    worker.dataflow::<u64, _, _>(|scope| {
-        let mut sessions: HashMap<InputId, InputSession<u64, Row, isize>> = HashMap::new();
-        let mut collections: HashMap<InputId, VecCollection<'_, u64, Row, isize>> = HashMap::new();
-        for &id in inputs {
-            let (session, coll) = scope.new_collection::<Row, isize>();
-            sessions.insert(id, session);
-            collections.insert(id, coll);
-        }
-        let mut view_states: HashMap<ViewId, ViewState> = HashMap::new();
-        let mut consumers: HashMap<InputId, Vec<ViewId>> = HashMap::new();
-        for (view, plan) in views {
-            let state: State = Rc::new(RefCell::new(BTreeMap::new()));
-            let sink = state.clone();
-            let (probe, _out) = circuit::compile(&collections, plan)
-                .inspect(move |update| {
-                    let (row, _time, diff) = update;
-                    *sink.borrow_mut().entry(row.clone()).or_insert(0) += *diff as i64;
-                })
-                .probe();
-            for src in circuit::sources(plan) {
-                consumers.entry(src).or_default().push(*view);
-            }
-            view_states.insert(
-                *view,
-                ViewState {
-                    probe,
-                    state,
-                    plan: plan.clone(),
-                },
-            );
-        }
-        Running {
-            inputs: sessions,
-            views: view_states,
-            consumers,
-            registered: inputs.iter().copied().collect(),
-            arities: HashMap::new(),
-        }
-    })
 }
 
 /// Validate the batch against every consuming view, then feed and drain the input.

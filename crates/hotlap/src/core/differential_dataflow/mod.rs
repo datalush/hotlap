@@ -20,7 +20,7 @@ mod worker;
 
 use std::sync::mpsc;
 
-use crate::core::{CoreError, IncrementalCore, InputId, ViewId};
+use crate::core::{CoreError, IncrementalCore, InputId, ViewId, WatermarkSpec};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row};
 
@@ -38,6 +38,11 @@ enum Command {
     Build {
         view: ViewId,
         plan: Plan,
+        reply: mpsc::Sender<Result<(), CoreError>>,
+    },
+    DeclareWatermark {
+        input: InputId,
+        spec: WatermarkSpec,
         reply: mpsc::Sender<Result<(), CoreError>>,
     },
     Push {
@@ -115,6 +120,13 @@ impl IncrementalCore for DifferentialCore {
                 reply,
             },
             "core worker dropped build request",
+        )
+    }
+
+    fn declare_watermark(&mut self, input: InputId, spec: WatermarkSpec) -> Result<(), CoreError> {
+        self.request(
+            |reply| Command::DeclareWatermark { input, spec, reply },
+            "core worker dropped declare_watermark request",
         )
     }
 

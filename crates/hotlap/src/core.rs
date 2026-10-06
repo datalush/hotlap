@@ -16,6 +16,13 @@ pub struct InputId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ViewId(pub u32);
 
+/// Declaración de watermark de una fuente: columna de event-time y retraso (lag).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WatermarkSpec {
+    pub time_col: usize,
+    pub lag: i64,
+}
+
 #[derive(Debug)]
 pub enum CoreError {
     /// The caller's plan or usage is not supported (bad plan, unknown view/input,
@@ -33,6 +40,9 @@ pub trait IncrementalCore {
     /// Compile a `Source`-rooted plan into a live view. Also pre-freeze only.
     /// The inputs named by the plan must already be registered.
     fn build_view(&mut self, view: ViewId, plan: &Plan) -> Result<(), CoreError>;
+    /// Declara el watermark de una fuente. Solo antes del primer `push`, y tras
+    /// `register_input` de esa fuente.
+    fn declare_watermark(&mut self, input: InputId, spec: WatermarkSpec) -> Result<(), CoreError>;
     /// Feed a batch to the given source, consolidating every consuming view.
     fn push(&mut self, input: InputId, batch: &ChangeBatch) -> Result<(), CoreError>;
     /// Current consolidated output of a view as rows.

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use differential_dataflow::input::InputSession;
 use timely::dataflow::operators::probe::Handle;
 
-use crate::core::{CoreError, InputId, ViewId};
+use crate::core::{CoreError, InputId, ViewId, WatermarkSpec};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row};
 
@@ -35,6 +35,10 @@ pub(super) struct Running {
     /// Row length observed for each input, learned on its first push. Used to
     /// validate plan indices (including above joins) as data arrives.
     pub(super) arities: HashMap<InputId, usize>,
+    pub(super) event_time: bool,
+    pub(super) watermarks: HashMap<InputId, WatermarkSpec>,
+    pub(super) watermarks_now: HashMap<InputId, u64>,
+    pub(super) late: HashMap<InputId, u64>,
 }
 
 /// Schema state: declarations accumulate, then freeze on the first push.
@@ -42,6 +46,7 @@ pub(super) enum Phase {
     Building {
         inputs: Vec<InputId>,
         views: Vec<(ViewId, Plan)>,
+        watermarks: HashMap<InputId, WatermarkSpec>,
     },
     Running(Running),
 }

@@ -50,6 +50,22 @@ impl Hotlap {
         Ok(())
     }
 
+    /// Declara el watermark de `input` (columna de event-time y retardo `lag`).
+    pub fn declare_watermark(
+        &mut self,
+        input: &str,
+        time_col: usize,
+        lag: i64,
+    ) -> Result<(), HotlapError> {
+        let id = *self
+            .inputs
+            .get(input)
+            .ok_or_else(|| HotlapError("no such input".into()))?;
+        self.core
+            .declare_watermark(id, crate::core::WatermarkSpec { time_col, lag })
+            .map_err(|e| HotlapError(format!("{e:?}")))
+    }
+
     /// Compile `plan` into a new view registered under `name`.
     pub fn create_view(&mut self, name: &str, plan: Plan) -> Result<(), HotlapError> {
         // Reject duplicate names up front: overwriting the mapping would orphan
