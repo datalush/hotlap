@@ -80,6 +80,49 @@ fn one_input_feeds_two_views() {
 }
 
 #[test]
+fn one_input_feeds_two_views_via_api() {
+    let mut h = Hotlap::open().unwrap();
+    h.register_input("events").unwrap();
+    h.create_view(
+        "by_a",
+        Plan::GroupCount {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![0],
+        },
+    )
+    .unwrap();
+    h.create_view(
+        "by_b",
+        Plan::GroupCount {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![1],
+        },
+    )
+    .unwrap();
+
+    let mut b = ChangeBatch::default();
+    b.push(Row(vec![Scalar::I64(1), Scalar::I64(10)]), 1);
+    b.push(Row(vec![Scalar::I64(1), Scalar::I64(20)]), 1);
+    h.push("events", &b).unwrap();
+
+    assert_eq!(pairs(&mut h, "by_a"), vec![(1, 2)]);
+    assert_eq!(pairs(&mut h, "by_b"), vec![(10, 1), (20, 1)]);
+
+    // Freeze: after the first push the schema is fixed.
+    assert!(h.register_input("late").is_err());
+    assert!(
+        h.create_view(
+            "late_view",
+            Plan::GroupCount {
+                input: Box::new(Plan::Source(InputId(0))),
+                key: vec![0],
+            },
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn key_retracted_to_zero_disappears() {
     let mut h = Hotlap::open().unwrap();
     h.register_input("events").unwrap();
