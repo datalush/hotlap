@@ -1,33 +1,24 @@
 //! Stateful `differential-dataflow` implementation of [`IncrementalCore`].
 //!
 //! This is the only module that may name `differential-dataflow`/`timely` types. It
-//! owns a live timely worker on its own thread (so DD operators retain their
-//! arrangements between pushes) and speaks to it through a command channel. Logical
-//! time is advanced monotonically by one tick per push; a probe on the output tells
-//! us when the push has settled before we read the consolidated Z-set.
+//! owns a live timely worker on its own thread and speaks to it through a command
+//! channel. One dataflow holds every input and view in the same scope; it is built
+//! once, on the first push, because DD cannot add operators to a live `dataflow`.
 
 mod circuit;
+
+mod session;
 
 #[cfg(test)]
 mod tests;
 
 mod worker;
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::rc::Rc;
 use std::sync::mpsc;
 
-use differential_dataflow::input::InputSession;
-use timely::dataflow::operators::probe::Handle;
-
-use crate::core::{CoreError, IncrementalCore, ViewId};
+use crate::core::{CoreError, IncrementalCore, InputId, ViewId};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row};
-
-/// Consolidated output Z-set of a view, accumulated from the output stream.
-/// Single-threaded: only the worker thread touches it, so `Rc`/`RefCell` suffice.
-type State = Rc<RefCell<BTreeMap<Row, i64>>>;
 
 /// Upper bound on `worker.step()` calls while draining one push before giving up.
 /// The frontier must advance by at least one step per batch in normal operation; this
@@ -35,22 +26,18 @@ type State = Rc<RefCell<BTreeMap<Row, i64>>>;
 /// (and, transitively, `push` and `Drop`).
 const MAX_DRAIN_STEPS: usize = 1_000_000;
 
-struct ViewState {
-    input: InputSession<u64, Row, isize>,
-    probe: Handle<u64>,
-    state: State,
-    next_time: u64,
-    plan: Plan,
-}
-
 enum Command {
+    RegisterInput {
+        input: InputId,
+        reply: mpsc::Sender<Result<(), CoreError>>,
+    },
     Build {
         view: ViewId,
         plan: Plan,
         reply: mpsc::Sender<Result<(), CoreError>>,
     },
     Push {
-        view: ViewId,
+        input: InputId,
         batch: ChangeBatch,
         reply: mpsc::Sender<Result<(), CoreError>>,
     },
@@ -79,10 +66,17 @@ impl DifferentialCore {
         })
     }
 
-    fn send(&self, cmd: Command) -> Result<(), CoreError> {
+    fn request<T>(
+        &self,
+        make: impl FnOnce(mpsc::Sender<Result<T, CoreError>>) -> Command,
+        dropped: &str,
+    ) -> Result<T, CoreError> {
+        let (reply, rx) = mpsc::channel();
         self.tx
-            .send(cmd)
-            .map_err(|_| CoreError::Infrastructure("core worker is not running".into()))
+            .send(make(reply))
+            .map_err(|_| CoreError::Infrastructure("core worker is not running".into()))?;
+        rx.recv()
+            .map_err(|_| CoreError::Infrastructure(dropped.to_string()))?
     }
 }
 
@@ -102,39 +96,40 @@ impl DifferentialCore {
 }
 
 impl IncrementalCore for DifferentialCore {
-    fn build_view(&mut self, view: ViewId, plan: &Plan) -> Result<(), CoreError> {
-        // SP1a compiles only linear pipelines rooted at GroupCount; SP1b adds joins.
-        if !matches!(plan, Plan::GroupCount { .. }) {
-            return Err(CoreError::Unsupported(
-                "SP1a supports only pipelines rooted at GroupCount".into(),
-            ));
-        }
-        let (reply, rx) = mpsc::channel();
-        self.send(Command::Build {
-            view,
-            plan: plan.clone(),
-            reply,
-        })?;
-        rx.recv()
-            .map_err(|_| CoreError::Infrastructure("core worker dropped build request".into()))?
+    fn register_input(&mut self, input: InputId) -> Result<(), CoreError> {
+        self.request(
+            |reply| Command::RegisterInput { input, reply },
+            "core worker dropped register request",
+        )
     }
 
-    fn push(&mut self, view_input: ViewId, batch: &ChangeBatch) -> Result<(), CoreError> {
-        let (reply, rx) = mpsc::channel();
-        self.send(Command::Push {
-            view: view_input,
-            batch: batch.clone(),
-            reply,
-        })?;
-        rx.recv()
-            .map_err(|_| CoreError::Infrastructure("core worker dropped push request".into()))?
+    fn build_view(&mut self, view: ViewId, plan: &Plan) -> Result<(), CoreError> {
+        self.request(
+            |reply| Command::Build {
+                view,
+                plan: plan.clone(),
+                reply,
+            },
+            "core worker dropped build request",
+        )
+    }
+
+    fn push(&mut self, input: InputId, batch: &ChangeBatch) -> Result<(), CoreError> {
+        self.request(
+            |reply| Command::Push {
+                input,
+                batch: batch.clone(),
+                reply,
+            },
+            "core worker dropped push request",
+        )
     }
 
     fn snapshot(&mut self, view: ViewId) -> Result<Vec<Row>, CoreError> {
-        let (reply, rx) = mpsc::channel();
-        self.send(Command::Snapshot { view, reply })?;
-        rx.recv()
-            .map_err(|_| CoreError::Infrastructure("core worker dropped snapshot request".into()))?
+        self.request(
+            |reply| Command::Snapshot { view, reply },
+            "core worker dropped snapshot request",
+        )
     }
 }
 

@@ -1,5 +1,6 @@
 //! Minimal plan IR: the operators the incremental core will compile to.
 
+use crate::core::InputId;
 use crate::row::{Row, Scalar};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,10 +20,20 @@ impl Predicate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Plan {
-    Scan,
-    Filter { input: Box<Plan>, pred: Predicate },
-    Project { input: Box<Plan>, cols: Vec<usize> },
-    GroupCount { input: Box<Plan>, key: Vec<usize> },
+    /// Leaf: the shared source registered under this id.
+    Source(InputId),
+    Filter {
+        input: Box<Plan>,
+        pred: Predicate,
+    },
+    Project {
+        input: Box<Plan>,
+        cols: Vec<usize>,
+    },
+    GroupCount {
+        input: Box<Plan>,
+        key: Vec<usize>,
+    },
 }
 
 #[cfg(test)]

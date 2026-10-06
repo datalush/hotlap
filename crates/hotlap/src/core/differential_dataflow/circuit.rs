@@ -1,9 +1,14 @@
 //! Plan validation, compilation, and batch feeding for the differential core.
 
+use std::collections::{HashMap, HashSet};
+
 use differential_dataflow::VecCollection;
+use differential_dataflow::input::InputSession;
 use timely::worker::Worker;
 
-use super::{CoreError, MAX_DRAIN_STEPS, ViewState};
+use super::MAX_DRAIN_STEPS;
+use super::session::ViewState;
+use crate::core::{CoreError, InputId, ViewId};
 use crate::plan::{Plan, Predicate};
 use crate::row::{ChangeBatch, Row, Scalar};
 
@@ -20,12 +25,22 @@ fn check_col(col: usize, arity: Option<usize>, what: &str) -> Result<(), CoreErr
 }
 
 /// Validate that every index referenced by `plan` is in range for a child row of
-/// length `arity`. `arity` is `None` only while scanning a plan detached from data.
-pub(super) fn validate(plan: &Plan, arity: Option<usize>) -> Result<Option<usize>, CoreError> {
+/// length `arity`, and that every `Source` is a registered input. `arity` is
+/// `None` while validating a plan detached from data.
+pub(super) fn validate(
+    plan: &Plan,
+    arity: Option<usize>,
+    inputs: &HashSet<InputId>,
+) -> Result<Option<usize>, CoreError> {
     match plan {
-        Plan::Scan => Ok(arity),
+        Plan::Source(id) => {
+            if !inputs.contains(id) {
+                return Err(CoreError::Unsupported(format!("unregistered input {id:?}")));
+            }
+            Ok(arity)
+        }
         Plan::Filter { input, pred } => {
-            let arity = validate(input, arity)?;
+            let arity = validate(input, arity, inputs)?;
             let col = match pred {
                 Predicate::Eq(col, _) | Predicate::Gt(col, _) => *col,
             };
@@ -33,14 +48,14 @@ pub(super) fn validate(plan: &Plan, arity: Option<usize>) -> Result<Option<usize
             Ok(arity)
         }
         Plan::Project { input, cols } => {
-            let arity = validate(input, arity)?;
+            let arity = validate(input, arity, inputs)?;
             for &col in cols {
                 check_col(col, arity, "project")?;
             }
             Ok(Some(cols.len()))
         }
         Plan::GroupCount { input, key } => {
-            let arity = validate(input, arity)?;
+            let arity = validate(input, arity, inputs)?;
             for &col in key {
                 check_col(col, arity, "group key")?;
             }
@@ -49,27 +64,43 @@ pub(super) fn validate(plan: &Plan, arity: Option<usize>) -> Result<Option<usize
     }
 }
 
-/// Validate that every row in `batch` is in range for `plan` (schemas are
-/// row-shaped, not declared in SP1a).
-fn validate_rows(plan: &Plan, batch: &ChangeBatch) -> Result<(), CoreError> {
+/// Validate every row in `batch` against `plan`.
+pub(super) fn validate_rows(
+    plan: &Plan,
+    batch: &ChangeBatch,
+    inputs: &HashSet<InputId>,
+) -> Result<(), CoreError> {
     for (row, _) in &batch.rows {
-        validate(plan, Some(row.0.len()))?;
+        validate(plan, Some(row.0.len()), inputs)?;
     }
     Ok(())
 }
 
-/// Advance logical time monotonically and feed the batch into the view's input.
-fn feed(vs: &mut ViewState, batch: &ChangeBatch) {
-    let time = vs.next_time;
-    vs.next_time += 1;
+/// Collect the input ids a plan reads from, in traversal order.
+pub(super) fn sources(plan: &Plan) -> Vec<InputId> {
+    let mut out = Vec::new();
+    collect_sources(plan, &mut out);
+    out
+}
 
-    vs.input.advance_to(time);
+fn collect_sources(plan: &Plan, out: &mut Vec<InputId>) {
+    match plan {
+        Plan::Source(id) => out.push(*id),
+        Plan::Filter { input, .. } | Plan::Project { input, .. } => collect_sources(input, out),
+        Plan::GroupCount { input, .. } => collect_sources(input, out),
+    }
+}
+
+/// Advance logical time monotonically and feed the batch into an input session.
+pub(super) fn feed(session: &mut InputSession<u64, Row, isize>, batch: &ChangeBatch) {
+    let time = *session.time();
+    session.advance_to(time);
     for (row, diff) in &batch.rows {
-        vs.input.update(row.clone(), *diff as isize);
+        session.update(row.clone(), *diff as isize);
     }
     // Advance past the batch so DD consolidates and the output frontier moves.
-    vs.input.advance_to(time + 1);
-    vs.input.flush();
+    session.advance_to(time + 1);
+    session.flush();
 }
 
 /// Fail if draining has consumed the step budget without the output frontier
@@ -83,11 +114,16 @@ fn ensure_drain_budget(steps: usize) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Drain until the output probe is past the batch time, ensuring every output
-/// update at that time has been observed before a snapshot reads the Z-set.
-fn drain(worker: &mut Worker, vs: &mut ViewState) -> Result<(), CoreError> {
+/// Step until every consuming view's probe is at or past `target`, ensuring all
+/// output updates at that time are observed before a snapshot reads the Z-set.
+pub(super) fn drain(
+    worker: &mut Worker,
+    views: &HashMap<ViewId, ViewState>,
+    consumers: &[ViewId],
+    target: u64,
+) -> Result<(), CoreError> {
     let mut steps = 0;
-    while vs.probe.less_than(vs.input.time()) {
+    while consumers.iter().any(|v| views[v].probe.less_than(&target)) {
         ensure_drain_budget(steps)?;
         worker.step();
         steps += 1;
@@ -95,38 +131,27 @@ fn drain(worker: &mut Worker, vs: &mut ViewState) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Validate, feed and drain a single batch into the view's live session.
-pub(super) fn push_batch(
-    worker: &mut Worker,
-    vs: &mut ViewState,
-    batch: &ChangeBatch,
-) -> Result<(), CoreError> {
-    validate_rows(&vs.plan, batch)?;
-    feed(vs, batch);
-    drain(worker, vs)
-}
-
-/// Compile a linear plan over a collection of rows. Infallible: bounds are checked
-/// by [`validate`] when batches are pushed, and unsupported roots are rejected by
-/// `build_view`.
+/// Compile a plan over the shared collections. Infallible: bounds are checked by
+/// [`validate`] when batches are pushed, and unsupported plans are rejected when
+/// a view is built.
 pub(super) fn compile<'scope>(
-    coll: VecCollection<'scope, u64, Row, isize>,
+    collections: &HashMap<InputId, VecCollection<'scope, u64, Row, isize>>,
     plan: &Plan,
 ) -> VecCollection<'scope, u64, Row, isize> {
     match plan {
-        Plan::Scan => coll,
+        Plan::Source(id) => collections[id].clone(),
         Plan::Filter { input, pred } => {
             let pred = pred.clone();
-            compile(coll, input).filter(move |row| pred.eval(row))
+            compile(collections, input).filter(move |row| pred.eval(row))
         }
         Plan::Project { input, cols } => {
             let cols = cols.clone();
-            compile(coll, input)
+            compile(collections, input)
                 .map(move |row| Row(cols.iter().map(|&col| row.0[col].clone()).collect()))
         }
         Plan::GroupCount { input, key } => {
             let key = key.clone();
-            compile(coll, input)
+            compile(collections, input)
                 .map(move |row| Row(key.iter().map(|&col| row.0[col].clone()).collect()))
                 .count()
                 .map(|(k, count)| {

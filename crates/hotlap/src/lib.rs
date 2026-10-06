@@ -7,6 +7,7 @@ pub mod plan;
 pub mod row;
 pub mod state;
 
+pub use core::InputId;
 pub use engine::{Hotlap, HotlapError};
 pub use plan::Plan;
 pub use row::{ChangeBatch, Row, Scalar};
