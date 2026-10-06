@@ -72,16 +72,23 @@ fn feed(vs: &mut ViewState, batch: &ChangeBatch) {
     vs.input.flush();
 }
 
+/// Fail if draining has consumed the step budget without the output frontier
+/// advancing, turning a stuck dataflow into an error instead of a hang.
+fn ensure_drain_budget(steps: usize) -> Result<(), CoreError> {
+    if steps >= MAX_DRAIN_STEPS {
+        return Err(CoreError::Infrastructure(format!(
+            "output frontier did not advance after {MAX_DRAIN_STEPS} steps"
+        )));
+    }
+    Ok(())
+}
+
 /// Drain until the output probe is past the batch time, ensuring every output
 /// update at that time has been observed before a snapshot reads the Z-set.
 fn drain(worker: &mut Worker, vs: &mut ViewState) -> Result<(), CoreError> {
     let mut steps = 0;
     while vs.probe.less_than(vs.input.time()) {
-        if steps >= MAX_DRAIN_STEPS {
-            return Err(CoreError::Infrastructure(format!(
-                "output frontier did not advance after {MAX_DRAIN_STEPS} steps"
-            )));
-        }
+        ensure_drain_budget(steps)?;
         worker.step();
         steps += 1;
     }
