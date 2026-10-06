@@ -14,7 +14,7 @@ use crate::row::Row;
 
 /// Re-key `row` to `(selected key columns, full row)`.
 fn keyed(row: Row, key: &[usize]) -> (Row, Row) {
-    let fields = Row(key.iter().map(|&col| row.0[col].clone()).collect());
+    let fields = Row(key.iter().map(|&col| row.col(col)).collect());
     (fields, row)
 }
 

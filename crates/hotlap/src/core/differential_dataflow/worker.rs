@@ -86,7 +86,7 @@ fn handle_build(phase: &mut Phase, view: ViewId, plan: Plan) -> Result<(), CoreE
                 )));
             }
             let registered: HashSet<InputId> = inputs.iter().copied().collect();
-            validate::validate(&plan, None, &registered, None)?;
+            validate::validate(&plan, &HashMap::new(), &registered)?;
             views.push((view, plan));
             Ok(())
         }
@@ -157,6 +157,7 @@ fn build_dataflow(worker: &mut Worker, inputs: &[InputId], views: &[(ViewId, Pla
             views: view_states,
             consumers,
             registered: inputs.iter().copied().collect(),
+            arities: HashMap::new(),
         }
     })
 }
@@ -172,8 +173,13 @@ fn run_push(
         return Err(CoreError::Unsupported(format!("unknown input {input:?}")));
     }
     let consumers = running.consumers.get(&input).cloned().unwrap_or_default();
+    running.learn_arity(input, batch)?;
     for view in &consumers {
-        validate::validate_rows(&running.views[view].plan, batch, &running.registered, input)?;
+        validate::validate(
+            &running.views[view].plan,
+            &running.arities,
+            &running.registered,
+        )?;
     }
     let target = circuit::feed(&mut running.inputs, input, batch);
     circuit::drain(worker, &running.views, &consumers, target)

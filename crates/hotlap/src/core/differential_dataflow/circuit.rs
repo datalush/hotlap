@@ -105,12 +105,12 @@ pub(super) fn compile<'scope>(
         Plan::Project { input, cols } => {
             let cols = cols.clone();
             compile(collections, input)
-                .map(move |row| Row(cols.iter().map(|&col| row.0[col].clone()).collect()))
+                .map(move |row| Row(cols.iter().map(|&col| row.col(col)).collect()))
         }
         Plan::GroupCount { input, key } => {
             let key = key.clone();
             compile(collections, input)
-                .map(move |row| Row(key.iter().map(|&col| row.0[col].clone()).collect()))
+                .map(move |row| Row(key.iter().map(|&col| row.col(col)).collect()))
                 .count()
                 .map(|(k, count)| {
                     let mut out = k.0;

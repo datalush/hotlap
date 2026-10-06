@@ -1,6 +1,6 @@
 mod join;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::DifferentialCore;
 use super::validate::validate;
@@ -125,18 +125,19 @@ fn stateful_retraction_without_rebuild() {
 #[test]
 fn validate_rejects_out_of_range_columns() {
     let inputs: HashSet<InputId> = HashSet::from([InputId(0)]);
+    let arities = HashMap::from([(InputId(0), 2usize)]);
 
     let project = Plan::Project {
         input: Box::new(source()),
         cols: vec![5],
     };
-    assert!(validate(&project, Some(2), &inputs, None).is_err());
+    assert!(validate(&project, &arities, &inputs).is_err());
 
     let group = Plan::GroupCount {
         input: Box::new(source()),
         key: vec![9],
     };
-    assert!(validate(&group, Some(2), &inputs, None).is_err());
+    assert!(validate(&group, &arities, &inputs).is_err());
 }
 
 #[test]

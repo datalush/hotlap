@@ -1,10 +1,9 @@
 //! Plan validation: index bounds, source registration, and per-batch row checks.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::core::{CoreError, InputId};
 use crate::plan::{Plan, Predicate};
-use crate::row::ChangeBatch;
 
 /// Validate that `col` is in range for a child row of length `arity`.
 fn check_col(col: usize, arity: Option<usize>, what: &str) -> Result<(), CoreError> {
@@ -26,41 +25,30 @@ fn check_cols(cols: &[usize], arity: Option<usize>, what: &str) -> Result<(), Co
     Ok(())
 }
 
-/// Arity at a `Source`: known only for the input actually being pushed (`pushed`),
-/// or when validating detached from data (`pushed` is `None`, all sources assumed
-/// to have `arity`). Other sources report an unknown arity, so their branches are
-/// not checked against a row they do not read.
-fn source_arity(arity: Option<usize>, id: InputId, pushed: Option<InputId>) -> Option<usize> {
-    if pushed.is_none() || pushed == Some(id) {
-        arity
-    } else {
-        None
-    }
-}
-
-/// Validate that every index referenced by `plan` is in range, and that every
-/// `Source` is a registered input.
+/// Validate that every index referenced by `plan` is in range and that every
+/// `Source` is a registered input, using the arity learned for each input.
 ///
-/// `arity` is the length of the row fed to `plan` and `pushed` the input that row
-/// came from; both are `None` when validating a plan detached from data. With a
-/// join, only the branch reading `pushed` sees a known arity, so indices of one
-/// side are never compared against the other side's arity. The returned arity is
-/// the output arity of `plan`, and is `None` unless it is grounded in `pushed`.
+/// `arities` maps each input that has received data to the row length observed
+/// for it; a source whose arity is still unknown reports `None`, so indices that
+/// depend on it are skipped until its data arrives. This includes indices *above*
+/// a join: the join's output arity is unknown until both sides' arities are
+/// known, at which point it becomes `left + right` and the indices beyond it are
+/// checked. The returned arity is `plan`'s output arity, or `None` when it depends
+/// on an input whose arity is not yet known.
 pub(super) fn validate(
     plan: &Plan,
-    arity: Option<usize>,
+    arities: &HashMap<InputId, usize>,
     inputs: &HashSet<InputId>,
-    pushed: Option<InputId>,
 ) -> Result<Option<usize>, CoreError> {
     match plan {
         Plan::Source(id) => {
             if !inputs.contains(id) {
                 return Err(CoreError::Unsupported(format!("unknown input {id:?}")));
             }
-            Ok(source_arity(arity, *id, pushed))
+            Ok(arities.get(id).copied())
         }
         Plan::Filter { input, pred } => {
-            let arity = validate(input, arity, inputs, pushed)?;
+            let arity = validate(input, arities, inputs)?;
             let col = match pred {
                 Predicate::Eq(col, _) | Predicate::Gt(col, _) => *col,
             };
@@ -68,12 +56,12 @@ pub(super) fn validate(
             Ok(arity)
         }
         Plan::Project { input, cols } => {
-            let arity = validate(input, arity, inputs, pushed)?;
+            let arity = validate(input, arities, inputs)?;
             check_cols(cols, arity, "project")?;
             Ok(arity.map(|_| cols.len()))
         }
         Plan::GroupCount { input, key } => {
-            let arity = validate(input, arity, inputs, pushed)?;
+            let arity = validate(input, arities, inputs)?;
             check_cols(key, arity, "group key")?;
             Ok(arity.map(|_| key.len() + 1))
         }
@@ -86,24 +74,11 @@ pub(super) fn validate(
             if left_key.len() != right_key.len() {
                 return Err(CoreError::Unsupported("join key arity mismatch".into()));
             }
-            let left_arity = validate(left, arity, inputs, pushed)?;
-            let right_arity = validate(right, arity, inputs, pushed)?;
+            let left_arity = validate(left, arities, inputs)?;
+            let right_arity = validate(right, arities, inputs)?;
             check_cols(left_key, left_arity, "join left key")?;
             check_cols(right_key, right_arity, "join right key")?;
             Ok(left_arity.zip(right_arity).map(|(l, r)| l + r))
         }
     }
-}
-
-/// Validate every row in `batch`, which is a batch for `input`, against `plan`.
-pub(super) fn validate_rows(
-    plan: &Plan,
-    batch: &ChangeBatch,
-    inputs: &HashSet<InputId>,
-    input: InputId,
-) -> Result<(), CoreError> {
-    for (row, _) in &batch.rows {
-        validate(plan, Some(row.0.len()), inputs, Some(input))?;
-    }
-    Ok(())
 }

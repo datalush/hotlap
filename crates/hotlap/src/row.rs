@@ -11,6 +11,16 @@ pub enum Scalar {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Row(pub Vec<Scalar>);
 
+impl Row {
+    /// Checked column access: an out-of-range `index` yields [`Scalar::Null`]
+    /// instead of panicking. Plan validation rejects such indices before data
+    /// flows; this is a last-resort safeguard so one bad index can never kill the
+    /// worker thread (and degrade every later push to `Infrastructure`).
+    pub fn col(&self, index: usize) -> Scalar {
+        self.0.get(index).cloned().unwrap_or(Scalar::Null)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChangeBatch {
     /// (row, signed multiplicity): +1 insert, -1 retraction.

@@ -12,7 +12,7 @@ use timely::dataflow::operators::probe::Handle;
 
 use crate::core::{CoreError, InputId, ViewId};
 use crate::plan::Plan;
-use crate::row::Row;
+use crate::row::{ChangeBatch, Row};
 
 /// Consolidated output Z-set of a view, accumulated from the output stream.
 /// Single-threaded: only the worker thread touches it, so `Rc`/`RefCell` suffice.
@@ -32,6 +32,9 @@ pub(super) struct Running {
     /// Views that read each input, used to wait on the right probes per push.
     pub(super) consumers: HashMap<InputId, Vec<ViewId>>,
     pub(super) registered: HashSet<InputId>,
+    /// Row length observed for each input, learned on its first push. Used to
+    /// validate plan indices (including above joins) as data arrives.
+    pub(super) arities: HashMap<InputId, usize>,
 }
 
 /// Schema state: declarations accumulate, then freeze on the first push.
@@ -44,6 +47,27 @@ pub(super) enum Phase {
 }
 
 impl Running {
+    /// Learn `input`'s row arity from `batch`, rejecting a batch inconsistent with
+    /// a previously observed arity. Empty batches learn nothing.
+    pub(super) fn learn_arity(
+        &mut self,
+        input: InputId,
+        batch: &ChangeBatch,
+    ) -> Result<(), CoreError> {
+        for (row, _) in &batch.rows {
+            let arity = row.0.len();
+            if let Some(&known) = self.arities.get(&input)
+                && known != arity
+            {
+                return Err(CoreError::Unsupported(format!(
+                    "input {input:?} row arity {arity} inconsistent with known arity {known}"
+                )));
+            }
+            self.arities.insert(input, arity);
+        }
+        Ok(())
+    }
+
     /// Read the non-zero consolidated Z-set of an existing view.
     pub(super) fn snapshot(&self, view: ViewId) -> Result<Vec<Row>, CoreError> {
         let vs = self
