@@ -99,7 +99,10 @@ fn key_retracted_to_zero_disappears() {
     h.push("c", &b).unwrap();
 
     let got = h.snapshot("c").unwrap();
-    assert!(got.is_empty(), "key retracted to zero must disappear, got {got:?}");
+    assert!(
+        got.is_empty(),
+        "key retracted to zero must disappear, got {got:?}"
+    );
     h.shutdown().unwrap();
 }
 
