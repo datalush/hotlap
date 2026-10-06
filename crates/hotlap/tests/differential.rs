@@ -102,3 +102,37 @@ fn key_retracted_to_zero_disappears() {
     assert!(got.is_empty(), "key retracted to zero must disappear, got {got:?}");
     h.shutdown().unwrap();
 }
+
+#[test]
+fn filter_project_group_count_via_api() {
+    let mut h = Hotlap::open().unwrap();
+    // keep only key>1, project [key], group by key -> [(3,1)]
+    let plan = Plan::GroupCount {
+        input: Box::new(Plan::Project {
+            input: Box::new(Plan::Filter {
+                input: Box::new(Plan::Scan),
+                pred: hotlap::plan::Predicate::Gt(0, 1),
+            }),
+            cols: vec![0],
+        }),
+        key: vec![0],
+    };
+    h.create_view("v", plan).unwrap();
+    let mut b = ChangeBatch::default();
+    for (k, v) in [(1i64, 10i64), (1, 20), (2, 30), (3, 30)] {
+        b.push(Row(vec![Scalar::I64(k), Scalar::I64(v)]), 1);
+    }
+    h.push("v", &b).unwrap();
+    let mut got: Vec<(i64, i64)> = h
+        .snapshot("v")
+        .unwrap()
+        .into_iter()
+        .map(|r| match (&r.0[0], &r.0[1]) {
+            (Scalar::I64(k), Scalar::I64(c)) => (*k, *c),
+            _ => panic!("shape"),
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![(2, 1), (3, 1)]); // key1 filtered out (key>1)
+    h.shutdown().unwrap();
+}
