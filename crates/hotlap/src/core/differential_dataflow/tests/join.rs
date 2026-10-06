@@ -2,7 +2,7 @@
 
 use super::super::DifferentialCore;
 use super::super::validate::validate;
-use crate::core::{IncrementalCore, InputId, ViewId};
+use crate::core::{CoreError, IncrementalCore, InputId, ViewId};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row, Scalar};
 use std::collections::HashSet;
@@ -67,6 +67,53 @@ fn validate_rejects_out_of_range_join_key() {
         left_key: vec![9],
         right_key: vec![0],
     };
-    assert!(validate(&join, Some(2), &inputs).is_err());
-    assert_eq!(validate(&join, None, &inputs).unwrap(), None);
+    assert!(validate(&join, Some(2), &inputs, None).is_err());
+    assert_eq!(validate(&join, None, &inputs, None).unwrap(), None);
+}
+
+#[test]
+fn join_accepts_sides_with_different_arities() {
+    let mut core = DifferentialCore::new().unwrap();
+    core.register_input(InputId(0)).unwrap(); // [id, name]          aridad 2
+    core.register_input(InputId(1)).unwrap(); // [user_id, amt, tag] aridad 3
+    let plan = Plan::Join {
+        left: Box::new(Plan::Source(InputId(0))),
+        right: Box::new(Plan::Source(InputId(1))),
+        left_key: vec![0],
+        right_key: vec![0],
+    };
+    core.build_view(ViewId(0), &plan).unwrap();
+    let mut l = ChangeBatch::default();
+    l.push(Row(vec![Scalar::I64(1), Scalar::I64(100)]), 1);
+    core.push(InputId(0), &l).unwrap();
+    let mut r = ChangeBatch::default();
+    r.push(Row(vec![Scalar::I64(1), Scalar::I64(7), Scalar::I64(0)]), 1);
+    core.push(InputId(1), &r).unwrap();
+    assert_eq!(
+        snapshot_rows(&mut core, ViewId(0)),
+        vec![vec![
+            Scalar::I64(1),
+            Scalar::I64(100),
+            Scalar::I64(1),
+            Scalar::I64(7),
+            Scalar::I64(0)
+        ]]
+    );
+}
+
+#[test]
+fn join_rejects_mismatched_key_lengths() {
+    let mut core = DifferentialCore::new().unwrap();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    let plan = Plan::Join {
+        left: Box::new(Plan::Source(InputId(0))),
+        right: Box::new(Plan::Source(InputId(1))),
+        left_key: vec![0, 1],
+        right_key: vec![0],
+    };
+    assert!(matches!(
+        core.build_view(ViewId(0), &plan),
+        Err(CoreError::Unsupported(_))
+    ));
 }

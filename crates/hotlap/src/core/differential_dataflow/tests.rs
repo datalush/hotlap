@@ -130,13 +130,13 @@ fn validate_rejects_out_of_range_columns() {
         input: Box::new(source()),
         cols: vec![5],
     };
-    assert!(validate(&project, Some(2), &inputs).is_err());
+    assert!(validate(&project, Some(2), &inputs, None).is_err());
 
     let group = Plan::GroupCount {
         input: Box::new(source()),
         key: vec![9],
     };
-    assert!(validate(&group, Some(2), &inputs).is_err());
+    assert!(validate(&group, Some(2), &inputs, None).is_err());
 }
 
 #[test]

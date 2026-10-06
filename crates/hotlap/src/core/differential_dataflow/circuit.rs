@@ -37,6 +37,10 @@ fn collect_sources(plan: &Plan, out: &mut Vec<InputId>) {
 /// output frontier (the minimum of its inputs' frontiers) can always reach the
 /// step we drain to, even when only one side received updates. Without this, a
 /// join's frontier would stay pinned to the un-fed side and drain would time out.
+///
+/// The shared clock is a deliberate simplification: it makes a `push` a global
+/// barrier over every input. Per-input event-time/window semantics and the GC that
+/// depends on them are deferred to the windowing phase and will revisit this.
 pub(super) fn feed(
     sessions: &mut HashMap<InputId, InputSession<u64, Row, isize>>,
     input: InputId,
