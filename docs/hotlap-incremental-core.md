@@ -39,9 +39,10 @@ Dependencias directas del spike: `differential-dataflow@0.25.1` y `timely@0.31.0
 Rust del árbol: 1.97.1, edition 2024. Build en frío del crate (dev, sin optimizar):
 **15.22 s**.
 
-> **Pendiente (MSRV):** el repo fija `rust-version = "1.94"` (`Cargo.toml:9`) pero el spike se
-> compiló con **1.97.1**. La compatibilidad de DD/timely con **1.94** no está verificada;
-> comprobarla antes de comprometer el núcleo en el workspace real.
+> **MSRV verificado:** DD/timely declaran `rust_version = 1.86` y **compilan con 1.94.0** del
+> repo (`rustc 1.94.0`, edition 2024; deps resueltas `differential-dataflow 0.25.1` /
+> `timely 0.31.0`). Comprobado en un crate aparte con `rust-version = "1.94"`; sin errores de
+> MSRV ni de edición.
 
 ## 3. Ausencia de Arrow (evidencia verbatim)
 
