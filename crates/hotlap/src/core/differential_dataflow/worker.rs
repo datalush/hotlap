@@ -111,11 +111,15 @@ fn handle_declare(phase: &mut Phase, input: InputId, spec: WatermarkSpec) -> Res
             if !inputs.contains(&input) {
                 return Err(CoreError::Unsupported(format!("unknown input {input:?}")));
             }
-            if watermarks.insert(input, spec).is_some() {
+            if spec.lag < 0 {
+                return Err(CoreError::Unsupported("watermark lag must be >= 0".into()));
+            }
+            if watermarks.contains_key(&input) {
                 return Err(CoreError::Unsupported(format!(
                     "watermark already declared for {input:?}"
                 )));
             }
+            watermarks.insert(input, spec);
             Ok(())
         }
         Phase::Running(_) => Err(CoreError::Unsupported("engine already running".into())),

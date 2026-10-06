@@ -73,3 +73,17 @@ fn duplicate_view_name_rejected_and_original_survives() {
         vec![Row(vec![Scalar::I64(7), Scalar::I64(1)])]
     );
 }
+
+#[test]
+fn declare_watermark_facade_validates() {
+    let mut h = Hotlap::open().unwrap();
+    h.register_input("in").unwrap();
+    h.create_view("v", count_by(0)).unwrap();
+
+    h.declare_watermark("in", 0, 2).unwrap();
+    assert!(h.declare_watermark("nope", 0, 0).is_err());
+
+    // Declaring after the first push is rejected: the schema is frozen.
+    h.push("in", &ChangeBatch::default()).unwrap();
+    assert!(h.declare_watermark("in", 0, 0).is_err());
+}

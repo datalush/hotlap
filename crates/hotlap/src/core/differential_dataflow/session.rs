@@ -118,7 +118,9 @@ impl Running {
         for (row, diff) in &batch.rows {
             let ts = time_of(row, spec.time_col);
             max_ts = max_ts.max(ts);
-            if (ts as u64) < current {
+            // Only late insertions are dropped and counted: a retraction (diff <= 0)
+            // must always be applied, or dropping it would corrupt downstream state.
+            if *diff > 0 && (ts as u64) < current {
                 *self.late.entry(input).or_insert(0) += 1;
             } else {
                 kept.push(row.clone(), *diff);
