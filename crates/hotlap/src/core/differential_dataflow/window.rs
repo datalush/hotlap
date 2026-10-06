@@ -51,10 +51,11 @@ pub(super) fn tumble_count<'scope>(
                     let t = *cap.time();
                     let wm = (t + 1) / TIME_SCALE;
                     let mut session = output.session(&cap);
-                    for (group, ws) in closed_buckets(&windows, wm, size) {
-                        if let Some(count) = windows.remove(&(group.clone(), ws))
+                    for bucket in closed_buckets(&windows, wm, size) {
+                        if let Some(count) = windows.remove(&bucket)
                             && count != 0
                         {
+                            let (group, ws) = bucket;
                             let mut row = group.0;
                             row.push(Scalar::I64(ws as i64));
                             row.push(Scalar::I64(count));
@@ -76,16 +77,21 @@ fn bucket(row: &Row, key: &[usize], time_col: usize, size: u64) -> (Row, u64) {
     (Row(key.iter().map(|&c| row.col(c)).collect()), (event_ts / size) * size)
 }
 
-/// The DD time at which the window starting at `window_start` closes.
+/// The DD time at which the window starting at `window_start` closes. Saturating:
+/// an event-time near `u64::MAX` must not wrap the scaled frontier (a wrapped
+/// `t` below the input capability would make `cap.delayed` panic).
 fn close_time(window_start: u64, size: u64) -> u64 {
-    (window_start + size) * TIME_SCALE - 1
+    window_start
+        .saturating_add(size)
+        .saturating_mul(TIME_SCALE)
+        .saturating_sub(1)
 }
 
 /// `(key_row, window_start)` pairs whose end the watermark `wm` has reached.
 fn closed_buckets(windows: &HashMap<(Row, u64), i64>, wm: u64, size: u64) -> Vec<(Row, u64)> {
     windows
         .keys()
-        .filter(|(_, ws)| ws + size <= wm)
+        .filter(|(_, ws)| ws.saturating_add(size) <= wm)
         .cloned()
         .collect()
 }
