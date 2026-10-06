@@ -20,6 +20,8 @@ mod tests;
 
 mod validate;
 
+mod window;
+
 mod worker;
 
 use std::sync::mpsc;

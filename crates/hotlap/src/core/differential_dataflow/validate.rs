@@ -80,5 +80,19 @@ pub(super) fn validate(
             check_cols(right_key, right_arity, "join right key")?;
             Ok(left_arity.zip(right_arity).map(|(l, r)| l + r))
         }
+        Plan::TumbleCount {
+            input,
+            key,
+            time_col,
+            size,
+        } => {
+            if *size <= 0 {
+                return Err(CoreError::Unsupported("window size must be > 0".into()));
+            }
+            let arity = validate(input, arities, inputs)?;
+            check_cols(key, arity, "window key")?;
+            check_col(*time_col, arity, "window time")?;
+            Ok(arity.map(|_| key.len() + 2))
+        }
     }
 }

@@ -46,6 +46,27 @@ pub enum Plan {
         left_key: Vec<usize>,
         right_key: Vec<usize>,
     },
+    /// Agregado por ventana tumbling de `size` sobre `time_col`, agrupado por `key`.
+    /// Salida: columnas de `key`, `window_start`, `count`. Emite cada ventana una vez
+    /// al cerrarse (append-only).
+    TumbleCount {
+        input: Box<Plan>,
+        key: Vec<usize>,
+        time_col: usize,
+        size: i64,
+    },
+}
+
+/// ¿El plan contiene alguna ventana?
+pub(crate) fn has_window(plan: &Plan) -> bool {
+    match plan {
+        Plan::TumbleCount { .. } => true,
+        Plan::Filter { input, .. } | Plan::Project { input, .. } | Plan::GroupCount { input, .. } => {
+            has_window(input)
+        }
+        Plan::Join { left, right, .. } => has_window(left) || has_window(right),
+        Plan::Source(_) => false,
+    }
 }
 
 #[cfg(test)]

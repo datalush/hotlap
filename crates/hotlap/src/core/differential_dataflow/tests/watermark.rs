@@ -1,6 +1,7 @@
 //! Watermark-declaration core tests.
 
 mod event_time;
+mod window;
 
 use super::super::DifferentialCore;
 use super::group_by;

@@ -9,6 +9,7 @@ use timely::worker::Worker;
 use super::MAX_DRAIN_STEPS;
 use super::join;
 use super::session::{TIME_SCALE, ViewState};
+use super::window;
 use crate::core::{CoreError, InputId, ViewId};
 use crate::plan::Plan;
 use crate::row::{ChangeBatch, Row, Scalar};
@@ -25,6 +26,7 @@ fn collect_sources(plan: &Plan, out: &mut Vec<InputId>) {
         Plan::Source(id) => out.push(*id),
         Plan::Filter { input, .. } | Plan::Project { input, .. } => collect_sources(input, out),
         Plan::GroupCount { input, .. } => collect_sources(input, out),
+        Plan::TumbleCount { input, .. } => collect_sources(input, out),
         Plan::Join { left, right, .. } => {
             collect_sources(left, out);
             collect_sources(right, out);
@@ -159,5 +161,11 @@ pub(super) fn compile<'scope>(
             left_key,
             right_key,
         ),
+        Plan::TumbleCount {
+            input,
+            key,
+            time_col,
+            size,
+        } => window::tumble_count(&compile(collections, input), key, *time_col, *size as u64),
     }
 }

@@ -27,6 +27,11 @@ pub(super) fn build_dataflow(
         ));
     }
     let event_time = !watermarks.is_empty();
+    if !event_time && views.iter().any(|(_, plan)| crate::plan::has_window(plan)) {
+        return Err(CoreError::Unsupported(
+            "tumbling windows require event-time inputs (declare_watermark)".into(),
+        ));
+    }
     Ok(worker.dataflow::<u64, _, _>(|scope| {
         let mut sessions: HashMap<InputId, InputSession<u64, Row, isize>> = HashMap::new();
         let mut collections: HashMap<InputId, VecCollection<'_, u64, Row, isize>> = HashMap::new();
