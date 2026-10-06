@@ -49,17 +49,17 @@ pub(super) fn validate(plan: &Plan, arity: Option<usize>) -> Result<Option<usize
     }
 }
 
-/// Advance logical time monotonically and feed the batch into the view's input.
-pub(super) fn push_batch(
-    worker: &mut Worker,
-    vs: &mut ViewState,
-    batch: &ChangeBatch,
-) -> Result<(), CoreError> {
-    // Validate bounds per row (schemas are row-shaped, not declared in SP1a).
+/// Validate that every row in `batch` is in range for `plan` (schemas are
+/// row-shaped, not declared in SP1a).
+fn validate_rows(plan: &Plan, batch: &ChangeBatch) -> Result<(), CoreError> {
     for (row, _) in &batch.rows {
-        validate(&vs.plan, Some(row.0.len()))?;
+        validate(plan, Some(row.0.len()))?;
     }
+    Ok(())
+}
 
+/// Advance logical time monotonically and feed the batch into the view's input.
+fn feed(vs: &mut ViewState, batch: &ChangeBatch) {
     let time = vs.next_time;
     vs.next_time += 1;
 
@@ -70,9 +70,11 @@ pub(super) fn push_batch(
     // Advance past the batch so DD consolidates and the output frontier moves.
     vs.input.advance_to(time + 1);
     vs.input.flush();
+}
 
-    // Drain until the output probe is past the batch time, ensuring every output
-    // update at `time` has been observed before a snapshot can read the Z-set.
+/// Drain until the output probe is past the batch time, ensuring every output
+/// update at that time has been observed before a snapshot reads the Z-set.
+fn drain(worker: &mut Worker, vs: &mut ViewState) -> Result<(), CoreError> {
     let mut steps = 0;
     while vs.probe.less_than(vs.input.time()) {
         if steps >= MAX_DRAIN_STEPS {
@@ -84,6 +86,17 @@ pub(super) fn push_batch(
         steps += 1;
     }
     Ok(())
+}
+
+/// Validate, feed and drain a single batch into the view's live session.
+pub(super) fn push_batch(
+    worker: &mut Worker,
+    vs: &mut ViewState,
+    batch: &ChangeBatch,
+) -> Result<(), CoreError> {
+    validate_rows(&vs.plan, batch)?;
+    feed(vs, batch);
+    drain(worker, vs)
 }
 
 /// Compile a linear plan over a collection of rows. Infallible: bounds are checked
