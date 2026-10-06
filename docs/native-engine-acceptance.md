@@ -8,6 +8,12 @@ The engine is this repository's DataFusion SessionContext/SessionState and
 RuntimeEnv, executing the real Fluss Rust providers. No external application or
 new scheduler/checkpoint implementation is required for this gate.
 
+> **Superseded framing (2026-10-06):** for the `ydvk` gate the engine was the
+> in-repo DataFusion session. A later decision makes Hotlap an explicit engine
+> built on DataFusion, with `differential-dataflow` as its incremental core;
+> `ydvk`'s scope and evidence are unchanged. See
+> [incremental core decision and boundary](hotlap-incremental-core.md).
+
 ## Stack and reproducibility boundary
 
 Working-tree evidence on 2026-10-05, based on

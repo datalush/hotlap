@@ -3,8 +3,14 @@
 Hotlap is the project/engine identity. DataFusion is the SQL/planning/operator/
 runtime foundation; `fluss-datafusion` is its Fluss provider integration and
 `fluss-rs` is the native protocol/client implementation. Component names and
-public API versions remain stable; no placeholder engine crate or new scheduler
-is introduced for this rename.
+public API versions remained stable across the Rust-only migration; at that time
+no placeholder engine crate was introduced.
+
+> **Superseded (2026-10-06):** Hotlap is now an explicit **engine** layer built on
+> DataFusion. The incremental core is `differential-dataflow` behind an
+> `IncrementalCore` boundary, and the provider crate is to be renamed
+> `connector-datafusion`. See
+> [incremental core decision and boundary](hotlap-incremental-core.md).
 
 ## Current tree
 
