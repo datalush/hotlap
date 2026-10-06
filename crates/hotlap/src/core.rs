@@ -27,9 +27,11 @@ pub enum CoreError {
 }
 
 pub trait IncrementalCore {
-    /// Declare a source. Must happen before the first [`push`](Self::push).
+    /// Declare a source. Must happen before the first [`push`](Self::push), and
+    /// before any [`build_view`](Self::build_view) that references it.
     fn register_input(&mut self, input: InputId) -> Result<(), CoreError>;
     /// Compile a `Source`-rooted plan into a live view. Also pre-freeze only.
+    /// The inputs named by the plan must already be registered.
     fn build_view(&mut self, view: ViewId, plan: &Plan) -> Result<(), CoreError>;
     /// Feed a batch to the given source, consolidating every consuming view.
     fn push(&mut self, input: InputId, batch: &ChangeBatch) -> Result<(), CoreError>;

@@ -12,6 +12,14 @@ fn source() -> Plan {
     Plan::Source(InputId(0))
 }
 
+/// `GROUP BY key` over the usual source.
+fn group_by(key: usize) -> Plan {
+    Plan::GroupCount {
+        input: Box::new(source()),
+        key: vec![key],
+    }
+}
+
 /// Snapshot `view` as `(key, count)` pairs, asserting the `[key, count]` row shape.
 fn snapshot_pairs(core: &mut DifferentialCore, view: ViewId) -> Vec<(i64, i64)> {
     core.snapshot(view)
@@ -28,22 +36,8 @@ fn snapshot_pairs(core: &mut DifferentialCore, view: ViewId) -> Vec<(i64, i64)> 
 fn two_views_share_one_input() {
     let mut core = DifferentialCore::new().unwrap();
     core.register_input(InputId(0)).unwrap();
-    core.build_view(
-        ViewId(0),
-        &Plan::GroupCount {
-            input: Box::new(source()),
-            key: vec![0],
-        },
-    )
-    .unwrap();
-    core.build_view(
-        ViewId(1),
-        &Plan::GroupCount {
-            input: Box::new(source()),
-            key: vec![1],
-        },
-    )
-    .unwrap();
+    core.build_view(ViewId(0), &group_by(0)).unwrap();
+    core.build_view(ViewId(1), &group_by(1)).unwrap();
 
     let mut b = ChangeBatch::default();
     b.push(Row(vec![Scalar::I64(1), Scalar::I64(10)]), 1);
@@ -52,6 +46,38 @@ fn two_views_share_one_input() {
 
     assert_eq!(snapshot_pairs(&mut core, ViewId(0)), vec![(1, 2)]);
     assert_eq!(snapshot_pairs(&mut core, ViewId(1)), vec![(10, 1), (20, 1)]);
+}
+
+#[test]
+fn schema_freezes_after_first_push_at_core_level() {
+    let mut core = DifferentialCore::new().unwrap();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_by(0)).unwrap();
+    let mut b = ChangeBatch::default();
+    b.push(Row(vec![Scalar::I64(1), Scalar::I64(1)]), 1);
+    core.push(InputId(0), &b).unwrap();
+
+    assert!(matches!(
+        core.register_input(InputId(1)),
+        Err(CoreError::Unsupported(_))
+    ));
+    assert!(matches!(
+        core.build_view(ViewId(1), &group_by(0)),
+        Err(CoreError::Unsupported(_))
+    ));
+}
+
+#[test]
+fn build_view_rejects_unregistered_source() {
+    let mut core = DifferentialCore::new().unwrap();
+    let missing = Plan::GroupCount {
+        input: Box::new(Plan::Source(InputId(9))),
+        key: vec![0],
+    };
+    assert!(matches!(
+        core.build_view(ViewId(0), &missing),
+        Err(CoreError::Unsupported(_))
+    ));
 }
 
 #[test]
@@ -79,11 +105,7 @@ fn filtered_group_count_matches_recompute() {
 fn stateful_retraction_without_rebuild() {
     let mut core = DifferentialCore::new().unwrap();
     core.register_input(InputId(0)).unwrap();
-    let plan = Plan::GroupCount {
-        input: Box::new(source()),
-        key: vec![0],
-    };
-    core.build_view(ViewId(0), &plan).unwrap();
+    core.build_view(ViewId(0), &group_by(0)).unwrap();
 
     let mut first = ChangeBatch::default();
     first.push(Row(vec![Scalar::I64(1), Scalar::I64(10)]), 1);
@@ -99,60 +121,39 @@ fn stateful_retraction_without_rebuild() {
 }
 
 #[test]
-fn validate_rejects_out_of_range_columns_and_unregistered_sources() {
+fn validate_rejects_out_of_range_columns() {
     let inputs: HashSet<InputId> = HashSet::from([InputId(0)]);
 
     let project = Plan::Project {
         input: Box::new(source()),
         cols: vec![5],
     };
-    assert!(matches!(
-        validate(&project, Some(2), &inputs),
-        Err(CoreError::Unsupported(_))
-    ));
+    assert!(validate(&project, Some(2), &inputs).is_err());
 
     let group = Plan::GroupCount {
         input: Box::new(source()),
         key: vec![9],
     };
-    assert!(matches!(
-        validate(&group, Some(2), &inputs),
-        Err(CoreError::Unsupported(_))
-    ));
-
-    // A plan naming an input that was never registered is rejected.
-    let unregistered = Plan::GroupCount {
-        input: Box::new(Plan::Source(InputId(7))),
-        key: vec![0],
-    };
-    assert!(matches!(
-        validate(&unregistered, Some(2), &inputs),
-        Err(CoreError::Unsupported(_))
-    ));
-
-    // In-range chains are accepted; `Project` narrows the arity seen downstream.
-    let ok = Plan::GroupCount {
-        input: Box::new(Plan::Project {
-            input: Box::new(source()),
-            cols: vec![1, 0],
-        }),
-        key: vec![0, 1],
-    };
-    assert!(validate(&ok, Some(2), &inputs).is_ok());
+    assert!(validate(&group, Some(2), &inputs).is_err());
 }
 
 #[test]
 fn unknown_input_and_view_error() {
     let mut core = DifferentialCore::new().unwrap();
     let batch = ChangeBatch::default();
-    assert!(matches!(
-        core.push(InputId(7), &batch),
-        Err(CoreError::Unsupported(_))
-    ));
-    assert!(matches!(
-        core.snapshot(ViewId(7)),
-        Err(CoreError::Unsupported(_))
-    ));
+    assert!(core.push(InputId(7), &batch).is_err());
+    assert!(core.snapshot(ViewId(7)).is_err());
+}
+
+#[test]
+fn declared_but_unbuilt_view_reports_specific_error() {
+    let mut core = DifferentialCore::new().unwrap();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_by(0)).unwrap();
+    match core.snapshot(ViewId(0)) {
+        Err(CoreError::Unsupported(msg)) => assert_eq!(msg, "view not built yet"),
+        other => panic!("expected 'view not built yet', got {other:?}"),
+    }
 }
 
 #[test]

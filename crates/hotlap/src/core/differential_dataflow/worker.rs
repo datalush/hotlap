@@ -74,29 +74,24 @@ fn handle_register(phase: &mut Phase, input: InputId) -> Result<(), CoreError> {
 }
 
 /// Record a view before the dataflow is built; reject duplicates and late calls.
-/// Source references are checked at build time, so forward references are allowed.
+/// Inputs must already be registered: `Plan::Source` is checked here so an unknown
+/// source fails fast at declaration rather than at the first push. Column/arity
+/// bounds are deferred to the push, since the schema is unknown until data arrives.
 fn handle_build(phase: &mut Phase, view: ViewId, plan: Plan) -> Result<(), CoreError> {
     match phase {
-        Phase::Building { views, .. } => {
+        Phase::Building { inputs, views } => {
             if views.iter().any(|(built, _)| *built == view) {
                 return Err(CoreError::Unsupported(format!(
                     "view {view:?} already built"
                 )));
             }
+            let registered: HashSet<InputId> = inputs.iter().copied().collect();
+            circuit::validate(&plan, None, &registered)?;
             views.push((view, plan));
             Ok(())
         }
         Phase::Running(_) => Err(CoreError::Unsupported("engine already running".into())),
     }
-}
-
-/// Reject plans whose `Source` ids were never registered, before building.
-fn validate_schema(inputs: &[InputId], views: &[(ViewId, Plan)]) -> Result<(), CoreError> {
-    let registered: HashSet<InputId> = inputs.iter().copied().collect();
-    for (_, plan) in views {
-        circuit::validate(plan, None, &registered)?;
-    }
-    Ok(())
 }
 
 /// Build the dataflow on first push, then feed the batch to the requested input.
@@ -106,11 +101,10 @@ fn handle_push(
     input: InputId,
     batch: ChangeBatch,
 ) -> Result<(), CoreError> {
-    if let Phase::Building { inputs, views } = phase {
-        if !inputs.contains(&input) {
-            return Err(CoreError::Unsupported(format!("unknown input {input:?}")));
-        }
-        validate_schema(inputs, views)?;
+    if let Phase::Building { inputs, .. } = phase
+        && !inputs.contains(&input)
+    {
+        return Err(CoreError::Unsupported(format!("unknown input {input:?}")));
     }
     if matches!(phase, Phase::Building { .. }) {
         let running = match phase {
@@ -193,6 +187,11 @@ fn run_push(
 fn handle_snapshot(phase: &Phase, view: ViewId) -> Result<Vec<Row>, CoreError> {
     match phase {
         Phase::Running(running) => running.snapshot(view),
-        Phase::Building { .. } => Err(CoreError::Unsupported(format!("unknown view {view:?}"))),
+        Phase::Building { views, .. } => {
+            if views.iter().any(|(declared, _)| *declared == view) {
+                return Err(CoreError::Unsupported("view not built yet".into()));
+            }
+            Err(CoreError::Unsupported(format!("unknown view {view:?}")))
+        }
     }
 }

@@ -35,7 +35,7 @@ pub(super) fn validate(
     match plan {
         Plan::Source(id) => {
             if !inputs.contains(id) {
-                return Err(CoreError::Unsupported(format!("unregistered input {id:?}")));
+                return Err(CoreError::Unsupported(format!("unknown input {id:?}")));
             }
             Ok(arity)
         }
