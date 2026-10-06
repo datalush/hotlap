@@ -106,7 +106,7 @@ fn key_retracted_to_zero_disappears() {
 #[test]
 fn filter_project_group_count_via_api() {
     let mut h = Hotlap::open().unwrap();
-    // keep only key>1, project [key], group by key -> [(3,1)]
+    // keep only key>1, project [key], group by key -> [(2,1),(3,1)]
     let plan = Plan::GroupCount {
         input: Box::new(Plan::Project {
             input: Box::new(Plan::Filter {
