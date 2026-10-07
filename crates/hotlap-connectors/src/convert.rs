@@ -1,7 +1,7 @@
 //! Arrow -> kernel conversion. The kernel's scalar model is Null/I64/Str/Bool.
 
-use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Schema};
+use arrow::array::{Array, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray};
+use arrow::datatypes::{DataType, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use hotlap::{ChangeBatch, Row, Scalar};
 
@@ -12,6 +12,9 @@ pub fn ensure_supported(schema: &Schema) -> Result<(), ConnectorError> {
     for field in schema.fields() {
         match field.data_type() {
             DataType::Int64 | DataType::Utf8 | DataType::Boolean => {}
+            // Only millisecond timestamps are representable as epoch milliseconds;
+            // any other unit is rejected explicitly rather than coerced.
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {}
             other => {
                 return Err(ConnectorError::Unsupported(format!(
                     "column `{}` has unsupported type {other:?}",
@@ -47,6 +50,11 @@ fn scalar_at(array: &dyn Array, row: usize) -> Result<Scalar, ConnectorError> {
             downcast::<StringArray>(array)?.value(row).to_string(),
         )),
         DataType::Boolean => Ok(Scalar::Bool(downcast::<BooleanArray>(array)?.value(row))),
+        // Millisecond timestamps map to `I64` holding milliseconds since the
+        // epoch; the timezone, if any, does not change the underlying value.
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(Scalar::I64(
+            downcast::<TimestampMillisecondArray>(array)?.value(row),
+        )),
         other => Err(ConnectorError::Unsupported(format!(
             "unsupported column type {other:?}"
         ))),
@@ -112,6 +120,30 @@ mod tests {
     #[test]
     fn rejects_unsupported_type() {
         let schema = Schema::new(vec![Field::new("f", DataType::Float64, true)]);
+        let err = ensure_supported(&schema).unwrap_err();
+        assert!(matches!(err, ConnectorError::Unsupported(_)));
+    }
+
+    #[test]
+    fn maps_millisecond_timestamp_to_i64() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]));
+        let cols: Vec<ArrayRef> = vec![Arc::new(TimestampMillisecondArray::from(vec![1000, 2000]))];
+        let cb = to_change_batch(&batch(schema, cols)).unwrap();
+        assert_eq!(cb.rows[0], (Row(vec![Scalar::I64(1000)]), 1));
+        assert_eq!(cb.rows[1], (Row(vec![Scalar::I64(2000)]), 1));
+    }
+
+    #[test]
+    fn rejects_non_millisecond_timestamp() {
+        let schema = Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        )]);
         let err = ensure_supported(&schema).unwrap_err();
         assert!(matches!(err, ConnectorError::Unsupported(_)));
     }
