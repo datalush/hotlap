@@ -107,7 +107,7 @@ impl KeyedArrangement {
         let payload_arrays = decode(&self.payload_converter, &payloads)?;
         let batch = self.assemble(&key_arrays, &payload_arrays)?;
         let diffs: Vec<i64> = entries.iter().map(|entry| entry.2).collect();
-        ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs)))
+        Ok(ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs)))?)
     }
 
     /// Adds `sign * diff` for every row of `batch` to the state.
@@ -183,7 +183,10 @@ impl KeyedArrangement {
             .map(|field| new_empty_array(field.data_type()))
             .collect();
         let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
-        ZSetBatch::new(batch, Arc::new(Int64Array::from(Vec::<i64>::new())))
+        Ok(ZSetBatch::new(
+            batch,
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+        )?)
     }
 }
 

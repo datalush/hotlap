@@ -2145,10 +2145,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotlap-core"
+version = "0.0.0"
+dependencies = [
+ "arrow",
+ "serde",
+]
+
+[[package]]
 name = "hotlap-engine"
 version = "0.0.0"
 dependencies = [
  "arrow",
+ "hotlap-core",
  "serde",
  "serde_json",
 ]

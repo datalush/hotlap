@@ -36,7 +36,7 @@ pub fn consolidate(zset: &ZSetBatch) -> Result<ZSetBatch, EngineError> {
     let indices = UInt32Array::from(positions);
     let batch = take_batch(&zset.batch, &indices)?;
     let diff: ArrayRef = Arc::new(Int64Array::from(sums));
-    ZSetBatch::new(batch, diff)
+    Ok(ZSetBatch::new(batch, diff)?)
 }
 
 /// Encodes every column of `batch` into byte-comparable rows.
@@ -106,7 +106,7 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch,
 fn take_zset(zset: &ZSetBatch, indices: &UInt32Array) -> Result<ZSetBatch, EngineError> {
     let batch = take_batch(&zset.batch, indices)?;
     let diff = take(zset.diff.as_ref(), indices, None)?;
-    ZSetBatch::new(batch, diff)
+    Ok(ZSetBatch::new(batch, diff)?)
 }
 
 #[cfg(test)]

@@ -1,0 +1,18 @@
+//! Shared, differential-dataflow-free contract for the hotlap engine.
+//!
+//! Defines the plan IR, ids, watermark spec, Z-set batch and the
+//! [`IncrementalCore`] trait implemented by concrete engine kernels.
+
+pub mod batch;
+pub mod core;
+pub mod error;
+pub mod ids;
+pub mod plan;
+pub mod watermark;
+
+pub use batch::ZSetBatch;
+pub use core::IncrementalCore;
+pub use error::CoreError;
+pub use ids::{InputId, ViewId};
+pub use plan::{Plan, Predicate, Scalar};
+pub use watermark::WatermarkSpec;

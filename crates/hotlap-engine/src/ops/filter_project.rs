@@ -22,7 +22,7 @@ pub fn filter(zset: &ZSetBatch, predicate: &BooleanArray) -> Result<ZSetBatch, E
     }
     let batch = filter_record_batch(&zset.batch, predicate)?;
     let diff = arrow_filter(zset.diff.as_ref(), predicate)?;
-    ZSetBatch::new(batch, diff)
+    Ok(ZSetBatch::new(batch, diff)?)
 }
 
 /// Selects the columns named by `cols`, keeping the `diff` column unchanged.
@@ -46,5 +46,5 @@ pub fn project(zset: &ZSetBatch, cols: &[usize]) -> Result<ZSetBatch, EngineErro
         .map(|&index| zset.batch.column(index).clone())
         .collect();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-    ZSetBatch::new(batch, zset.diff.clone())
+    Ok(ZSetBatch::new(batch, zset.diff.clone())?)
 }

@@ -158,7 +158,10 @@ impl TumbleCount {
             columns.push(Arc::new(Int64Array::from(Vec::<i64>::new())));
             columns.push(Arc::new(Int64Array::from(Vec::<i64>::new())));
             let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-            return ZSetBatch::new(batch, Arc::new(Int64Array::from(Vec::<i64>::new())));
+            return Ok(ZSetBatch::new(
+                batch,
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
+            )?);
         }
 
         let converter = self.converter.as_ref().expect("converter initialized");
@@ -172,7 +175,7 @@ impl TumbleCount {
         )));
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
         let diff: ArrayRef = Arc::new(Int64Array::from(vec![1i64; closed.len()]));
-        ZSetBatch::new(batch, diff)
+        Ok(ZSetBatch::new(batch, diff)?)
     }
 }
 

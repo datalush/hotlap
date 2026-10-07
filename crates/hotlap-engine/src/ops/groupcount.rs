@@ -105,5 +105,5 @@ fn build_counts(
 
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
     let diff: ArrayRef = Arc::new(Int64Array::from(vec![1i64; groups.len()]));
-    ZSetBatch::new(batch, diff)
+    Ok(ZSetBatch::new(batch, diff)?)
 }
