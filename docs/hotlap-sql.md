@@ -191,8 +191,26 @@ pendiente.
 
 ## 11. Límites conocidos (v1, low priority)
 
-- La proyección que DataFusion coloca sobre un `Aggregate` se desenvuelve
-  comprobando solo que cada expresión sea una columna resoluble; no se valida
-  que sea una identidad exacta (orden/subconjunto de columnas).
-- El escáner DDL (`ddl_scan.rs`) es minimalista (reconoce `k='v'` separados por
-  comas); no cubre comillas escapadas ni comas dentro de literales.
+Residuos de la implementación de SP3, no bloqueantes (parkeados con ruling). Los
+más sustantivos tienen issue de kata para repararse; el resto queda aquí:
+
+- **Proyección identidad laxa:** la proyección que DataFusion coloca sobre un
+  `Aggregate` se desenvuelve comprobando solo que cada expresión sea una columna
+  resoluble; no se valida que sea una identidad exacta (orden/subconjunto de
+  columnas). `SELECT count(*), k ...` o `SELECT count(*) ...` se aceptan y su
+  orden/subconjunto se descarta en favor del orden normalizado del kernel.
+  (Issue kata pendiente.)
+- **`built==false` enmascara errores:** el snapshot de una MV usa
+  `SnapshotHandle::is_built` (flag de motor, global) y, si el dataflow aún no se
+  ha construido, sirve **vacío** en vez de propagar un error del engine anterior
+  al primer push. Tolerable para el motor single-source de v1; un motor
+  multi-source necesitaría una señal por input. (Issue kata pendiente.)
+- **Escáner DDL minimalista** (`ddl_scan.rs`): reconoce `k='v'` separados por
+  comas; no cubre comillas escapadas ni comas dentro de literales. El anclaje de
+  `WITH` no es estricto (busca la primera aparición) y la normalización de
+  `tumble(...)` es textual (podría casar dentro de un literal).
+- **Opción `table` engañosa:** en `CREATE SOURCE`, `table` es una ruta
+  `<db>/<table>` (la esperada por `FlussSource::open_from_bootstrap`); el nombre
+  del source no se usa. El nombre de la opción sugiere lo contrario.
+- **`session/mod.rs` en 199/200 líneas:** la próxima adición a la sesión debe
+  extraer una unidad antes de crecer.
