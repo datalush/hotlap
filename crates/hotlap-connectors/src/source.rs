@@ -23,6 +23,10 @@ pub struct Split {
 }
 
 /// Resumable per-split offsets (serializable for future checkpoints).
+///
+/// The offsets reflect the **read position** of each split: the offset of the
+/// next record to be read. They do not track what has been fully consumed by
+/// downstream views.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceState {
     pub offsets: BTreeMap<SplitId, Offset>,
@@ -32,6 +36,8 @@ pub struct SourceState {
 #[derive(Clone, Debug)]
 pub struct SourceBatch {
     pub batch: RecordBatch,
+    /// Offset of the **first** record of `batch`; the records are ordered but
+    /// their offsets are not assumed to be contiguous.
     pub base_offset: Offset,
 }
 
@@ -46,7 +52,8 @@ pub trait Source: Send + Sync {
     fn splits(&self) -> Result<Vec<Split>, ConnectorError>;
     /// Read `split` as an ordered stream of batches.
     fn read(&self, split: &Split) -> Result<SourceStream, ConnectorError>;
-    /// Current resumable state.
+    /// Current resumable state, reflecting the **read position** (not the
+    /// consumption position) of each split.
     fn state(&self) -> SourceState;
     /// Column index of the event-time column (ms), if the source has one.
     fn event_time_column(&self) -> Option<usize>;

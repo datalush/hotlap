@@ -70,6 +70,9 @@ impl EngineHandle {
     }
 
     /// Read the consolidated output of a view.
+    ///
+    /// Blocks on `blocking_recv`, so it must not be called from within an async
+    /// runtime (it would panic or stall the executor).
     pub fn snapshot(&self, view: &str) -> Result<Vec<Row>, ConnectorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -82,6 +85,9 @@ impl EngineHandle {
     }
 
     /// Events dropped as late in `input`.
+    ///
+    /// Blocks on `blocking_recv`, so it must not be called from within an async
+    /// runtime (it would panic or stall the executor).
     pub fn late_dropped(&self, input: &str) -> Result<u64, ConnectorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
