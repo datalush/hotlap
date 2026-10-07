@@ -167,6 +167,9 @@ impl SqlSession {
             },
         )?;
         let schema = mv_schema(&plan, source_schema.as_ref())?;
+        // Reject unrepresentable output types here so the view fails at DDL
+        // time rather than later, when a `SELECT` reads the consolidated rows.
+        crate::convert::ensure_kernel_types(&schema)?;
         self.mv_schemas.insert(cv.name.clone(), schema);
         self.views.push((cv.name, plan));
         Ok(QueryResult::Ack("CREATE MATERIALIZED VIEW".into()))

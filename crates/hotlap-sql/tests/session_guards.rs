@@ -73,3 +73,18 @@ async fn second_source_rejected() {
         Err(SqlError::Unsupported(_))
     ));
 }
+
+#[tokio::test]
+async fn unrepresentable_mv_output_rejected() {
+    let float = Arc::new(Schema::new(vec![
+        Field::new("f", DataType::Float64, false),
+        Field::new("_event_time", DataType::Int64, false),
+    ]));
+    let mut session = session(float);
+    session.sql(SOURCE).await.unwrap();
+    let view = "CREATE MATERIALIZED VIEW mv AS SELECT f FROM src;";
+    assert!(matches!(
+        session.sql(view).await,
+        Err(SqlError::Unsupported(_))
+    ));
+}
