@@ -35,13 +35,23 @@ pub type ChangelogSender = mpsc::Sender<Result<ChangeBatch, ConnectorError>>;
 /// Spawn the sink task; returns the bounded sender the engine pumps into.
 ///
 /// Dropping the returned sender ends the changelog and lets the task finish,
-/// which is what makes shutdown deliver the last batches.
+/// which is what makes shutdown deliver the last batches. The task drives the
+/// full sink lifecycle: `write` until the stream ends, then `commit` on success
+/// (delivery for fire-and-forget sinks such as Fluss) or `abort` on failure.
 pub fn spawn_sink(
     sink: Arc<dyn Sink>,
     capacity: usize,
 ) -> (ChangelogSender, JoinHandle<Result<(), ConnectorError>>) {
     let (tx, rx) = mpsc::channel(capacity);
-    let handle = tokio::spawn(async move { sink.write(Box::pin(ChangelogStream { rx })).await });
+    let handle = tokio::spawn(async move {
+        match sink.write(Box::pin(ChangelogStream { rx })).await {
+            Ok(()) => sink.commit().await,
+            Err(error) => {
+                let _ = sink.abort().await;
+                Err(error)
+            }
+        }
+    });
     (tx, handle)
 }
 

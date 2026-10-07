@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,10 +44,13 @@ impl Source for FakeSource {
 }
 
 /// Collects written change batches; `delay` forces engine backpressure.
+/// The commit/abort flags record whether the task drove the sink lifecycle.
 #[derive(Clone)]
 struct FakeSink {
     batches: Arc<Mutex<Vec<ChangeBatch>>>,
     delay: Option<Duration>,
+    committed: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
 }
 
 impl FakeSink {
@@ -54,6 +58,8 @@ impl FakeSink {
         Self {
             batches: Arc::new(Mutex::new(Vec::new())),
             delay,
+            committed: Arc::new(AtomicBool::new(false)),
+            aborted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -63,6 +69,14 @@ impl FakeSink {
 
     fn len(&self) -> usize {
         self.batches.lock().unwrap().len()
+    }
+
+    fn committed(&self) -> bool {
+        self.committed.load(Ordering::SeqCst)
+    }
+
+    fn aborted(&self) -> bool {
+        self.aborted.load(Ordering::SeqCst)
     }
 }
 
@@ -79,9 +93,11 @@ impl Sink for FakeSink {
         Ok(())
     }
     async fn commit(&self) -> Result<(), ConnectorError> {
+        self.committed.store(true, Ordering::SeqCst);
         Ok(())
     }
     async fn abort(&self) -> Result<(), ConnectorError> {
+        self.aborted.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -194,4 +210,16 @@ fn shutdown_delivers_the_last_changelog() {
     wait_converged(&handle, &sink);
     handle.shutdown().unwrap();
     assert_eq!(sink.len(), 3, "the sink missed a changelog batch");
+}
+
+#[test]
+fn commit_runs_after_the_stream_ends() {
+    let batches = vec![batch(&[1], &[10]), batch(&[999], &[99])];
+    let (handle, sink) = start(batches, FakeSink::new(None));
+    wait_converged(&handle, &sink);
+    assert!(!sink.committed(), "commit must wait for the stream to end");
+    assert!(!sink.aborted(), "a healthy run must not abort");
+    handle.shutdown().unwrap();
+    assert!(sink.committed(), "commit must run once the stream ends");
+    assert!(!sink.aborted(), "a healthy run must not abort");
 }
