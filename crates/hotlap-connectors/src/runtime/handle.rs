@@ -1,5 +1,6 @@
 //! Thread-safe handle to a running engine, and the command protocol.
 
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use hotlap::Row;
@@ -28,17 +29,29 @@ pub enum Command {
 pub struct EngineHandle {
     tx: mpsc::UnboundedSender<Command>,
     join: Option<JoinHandle<()>>,
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl EngineHandle {
     /// Spawn the engine thread and start the pipeline.
     pub fn start(pipeline: Pipeline) -> Result<Self, ConnectorError> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let join = std::thread::spawn(move || engine::run(pipeline, rx));
+        let last_error = Arc::new(Mutex::new(None));
+        let engine_error = Arc::clone(&last_error);
+        let join = std::thread::spawn(move || engine::run(pipeline, rx, engine_error));
         Ok(Self {
             tx,
             join: Some(join),
+            last_error,
         })
+    }
+
+    /// First source/ingestion error that stopped the source branch, if any.
+    pub fn last_error(&self) -> Result<Option<String>, ConnectorError> {
+        self.last_error
+            .lock()
+            .map(|slot| slot.clone())
+            .map_err(|_| ConnectorError::Infrastructure("engine error state poisoned".into()))
     }
 
     /// Read the consolidated output of a view.
