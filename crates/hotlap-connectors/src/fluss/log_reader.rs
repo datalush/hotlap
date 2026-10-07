@@ -1,7 +1,6 @@
 //! Seam over `fluss-rs`: open a log scanner and poll ordered records.
 //! This is the A1 boundary: the future shared-layer extraction cuts here.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
@@ -23,18 +22,20 @@ pub struct Rec {
     pub row: ColumnarRow,
 }
 
-/// A live per-record log scanner over a Fluss table.
+/// A live per-record log scanner over a single Fluss bucket.
 pub struct FlussLogReader {
     scanner: LogScanner,
     schema: SchemaRef,
+    bucket: i32,
 }
 
 impl FlussLogReader {
-    /// Open a reader over `table_path`, subscribing `buckets` at their offsets.
+    /// Open a reader over `table_path`, subscribed to `bucket` at `start`.
     pub async fn open(
         connection: &FlussConnection,
         table_path: &TablePath,
-        buckets: &[(i32, i64)],
+        bucket: i32,
+        start: i64,
     ) -> Result<Self, ConnectorError> {
         let table = connection.get_table(table_path).await.map_err(fluss_err)?;
         let schema = table
@@ -43,12 +44,12 @@ impl FlussLogReader {
             .map_err(fluss_err)?
             .schema();
         let scanner = table.new_scan().create_log_scanner().map_err(fluss_err)?;
-        let offsets: HashMap<i32, i64> = buckets.iter().copied().collect();
-        scanner
-            .subscribe_buckets(&offsets)
-            .await
-            .map_err(fluss_err)?;
-        Ok(Self { scanner, schema })
+        scanner.subscribe(bucket, start).await.map_err(fluss_err)?;
+        Ok(Self {
+            scanner,
+            schema,
+            bucket,
+        })
     }
 
     /// Arrow schema of the records (without `_event_time`).
@@ -56,16 +57,21 @@ impl FlussLogReader {
         self.schema.clone()
     }
 
-    /// Poll at most one batch of records within `timeout`.
+    /// Poll this bucket's records within `timeout`, ordered by log offset.
     pub async fn poll(&mut self, timeout: Duration) -> Result<Vec<Rec>, ConnectorError> {
         let records = self.scanner.poll(timeout).await.map_err(fluss_err)?;
-        Ok(records
-            .into_iter()
-            .map(|record| Rec {
+        let mut polled = Vec::new();
+        for (table_bucket, bucket_records) in records.into_records_by_buckets() {
+            if table_bucket.bucket_id() != self.bucket {
+                continue;
+            }
+            polled.extend(bucket_records.into_iter().map(|record| Rec {
                 timestamp: record.timestamp(),
                 offset: record.offset(),
                 row: record.row().clone(),
-            })
-            .collect())
+            }));
+        }
+        polled.sort_by_key(|record| record.offset);
+        Ok(polled)
     }
 }
