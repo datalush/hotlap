@@ -3,6 +3,7 @@
 
 pub mod catalog;
 pub mod error;
+pub mod watermark;
 
 pub use catalog::{Catalog, MvDef, SourceDef};
 pub use error::SqlError;
