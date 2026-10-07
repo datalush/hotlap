@@ -6,7 +6,11 @@
 pub mod batch;
 pub mod error;
 pub mod keys;
+pub mod time;
+pub mod zset;
 
 pub use batch::ZSetBatch;
 pub use error::EngineError;
 pub use keys::KeyConverter;
+pub use time::Frontier;
+pub use zset::{consolidate, sort_rows};
