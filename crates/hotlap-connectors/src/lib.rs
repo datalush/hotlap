@@ -3,6 +3,7 @@
 
 pub mod convert;
 pub mod error;
+pub mod fluss;
 pub mod runtime;
 pub mod sink;
 pub mod source;
