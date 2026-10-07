@@ -12,7 +12,8 @@ use hotlap::{InputId, Plan};
 
 use crate::error::SqlError;
 use crate::translate_expr::{
-    column_index, ensure_count_only, is_tumble, parse_tumble, predicate, projection_indices,
+    column_index, ensure_count_only, ensure_identity_projection, is_tumble, parse_tumble,
+    predicate, projection_indices,
 };
 
 /// Register the planning-only `tumble(ts, size)` scalar function.
@@ -48,9 +49,12 @@ pub fn to_kernel_plan(plan: &LogicalPlan, source: InputId) -> Result<Plan, SqlEr
 }
 
 /// DataFusion wraps every `SELECT` over an aggregate in a projection; the
-/// kernel normalizes aggregate output itself, so that wrapper is unwrapped.
+/// kernel normalizes aggregate output itself. Unwrap that wrapper only when it
+/// is an identity selection, so lossy transforms are rejected rather than
+/// silently dropped.
 fn project(p: &Projection, source: InputId) -> Result<Plan, SqlError> {
-    if matches!(p.input.as_ref(), LogicalPlan::Aggregate(_)) {
+    if let LogicalPlan::Aggregate(a) = p.input.as_ref() {
+        ensure_identity_projection(&p.expr, &a.schema)?;
         return to_kernel_plan(&p.input, source);
     }
     let input = to_kernel_plan(&p.input, source)?;
@@ -103,6 +107,12 @@ fn translate_join(j: &Join, source: InputId) -> Result<Plan, SqlError> {
             "only inner equi-joins are supported".into(),
         ));
     }
+    let left_tables = base_tables(&j.left)?;
+    if left_tables.is_empty() || left_tables != base_tables(&j.right)? {
+        return Err(SqlError::Unsupported(
+            "both join sides must read the same single source".into(),
+        ));
+    }
     let left = to_kernel_plan(&j.left, source)?;
     let right = to_kernel_plan(&j.right, source)?;
     let mut left_key = Vec::new();
@@ -119,62 +129,19 @@ fn translate_join(j: &Join, source: InputId) -> Result<Plan, SqlError> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use datafusion::datasource::memory::MemTable;
-    use datafusion::prelude::SessionContext;
-    use hotlap::{InputId, Plan};
-
-    use super::*;
-
-    fn register_empty_table(ctx: &SessionContext, name: &str, schema: Arc<Schema>) {
-        let batch = RecordBatch::new_empty(schema.clone());
-        let mem = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-        ctx.register_table(name, Arc::new(mem)).unwrap();
-    }
-
-    fn ctx_with_src() -> SessionContext {
-        let ctx = SessionContext::new();
-        register_tumble_udf(&ctx);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("ts", DataType::Int64, false),
-        ]));
-        register_empty_table(&ctx, "src", schema);
-        ctx
-    }
-
-    #[tokio::test]
-    async fn translates_tumble_count() {
-        let ctx = ctx_with_src();
-        let df = ctx
-            .sql("SELECT k, count(*) FROM src GROUP BY k, tumble(ts, 10000)")
-            .await
-            .unwrap();
-        let plan = to_kernel_plan(df.logical_plan(), InputId(0)).unwrap();
-        match plan {
-            Plan::TumbleCount {
-                key,
-                time_col,
-                size,
-                ..
-            } => {
-                assert_eq!(key, vec![0]);
-                assert_eq!(time_col, 1);
-                assert_eq!(size, 10000);
-            }
-            other => panic!("expected TumbleCount, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_unsupported() {
-        let ctx = ctx_with_src();
-        let df = ctx.sql("SELECT sum(k) FROM src").await.unwrap();
-        assert!(to_kernel_plan(df.logical_plan(), InputId(0)).is_err());
+/// Collect the base-table names under `plan`, rejecting non-scan leaves. The
+/// current `to_kernel_plan` interface has a single `InputId`, so both join
+/// sides must be the same table; otherwise two tables would collapse silently.
+fn base_tables(plan: &LogicalPlan) -> Result<Vec<String>, SqlError> {
+    match plan {
+        LogicalPlan::TableScan(t) => Ok(vec![t.table_name.to_string()]),
+        LogicalPlan::Projection(p) => base_tables(&p.input),
+        LogicalPlan::Filter(f) => base_tables(&f.input),
+        other => Err(SqlError::Unsupported(format!(
+            "unsupported join input: {other:?}"
+        ))),
     }
 }
+
+#[cfg(test)]
+mod tests;

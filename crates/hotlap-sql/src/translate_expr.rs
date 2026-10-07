@@ -3,8 +3,8 @@
 use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::logical_expr::expr::{BinaryExpr, ScalarFunction};
 use datafusion::logical_expr::{Expr, Operator};
-use hotlap::plan::Predicate;
 use hotlap::Scalar;
+use hotlap::plan::Predicate;
 
 use crate::error::SqlError;
 
@@ -26,6 +26,29 @@ pub(crate) fn projection_indices(
     schema: &DFSchema,
 ) -> Result<Vec<usize>, SqlError> {
     exprs.iter().map(|e| column_index(e, schema)).collect()
+}
+
+/// Require an identity selection: every expression is a bare column (or an
+/// `Alias` of one) that resolves in `schema`. Used to unwrap the projection
+/// DataFusion puts over an `Aggregate` without losing transforms.
+pub(crate) fn ensure_identity_projection(
+    exprs: &[Expr],
+    schema: &DFSchema,
+) -> Result<(), SqlError> {
+    for expr in exprs {
+        let col = match expr {
+            Expr::Column(c) => c,
+            Expr::Alias(a) => match a.expr.as_ref() {
+                Expr::Column(c) => c,
+                other => return Err(unsupported("identity projection", other)),
+            },
+            other => return Err(unsupported("identity projection", other)),
+        };
+        schema
+            .index_of_column(col)
+            .map_err(|e| SqlError::Unsupported(format!("unknown column `{col}`: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Translate a filter expression into an IR predicate (`Eq`/`Gt` only).
@@ -71,7 +94,7 @@ pub(crate) fn parse_tumble(
     Ok((column_index(ts, schema)?, int_literal(size)?))
 }
 
-/// Require the aggregate list to be a single, non-distinct `count`.
+/// Require the aggregate list to be a single, non-distinct `count(*)`.
 pub(crate) fn ensure_count_only(aggr: &[Expr]) -> Result<(), SqlError> {
     let [expr] = aggr else {
         return Err(SqlError::Unsupported(format!(
@@ -81,7 +104,9 @@ pub(crate) fn ensure_count_only(aggr: &[Expr]) -> Result<(), SqlError> {
     };
     match expr {
         Expr::AggregateFunction(af)
-            if af.func.name().eq_ignore_ascii_case("count") && !af.params.distinct =>
+            if af.func.name().eq_ignore_ascii_case("count")
+                && !af.params.distinct
+                && is_count_star(&af.params.args) =>
         {
             Ok(())
         }
@@ -89,6 +114,11 @@ pub(crate) fn ensure_count_only(aggr: &[Expr]) -> Result<(), SqlError> {
             "only `count(*)` is supported, got `{other}`"
         ))),
     }
+}
+
+/// `count(*)` is normalized to `count(1)`; bare `count()` is also accepted.
+fn is_count_star(args: &[Expr]) -> bool {
+    matches!(args, [] | [Expr::Literal(ScalarValue::Int64(Some(1)), _)])
 }
 
 fn column_literal(b: &BinaryExpr, swap_ok: bool) -> Result<(&Expr, &Expr), SqlError> {
@@ -118,9 +148,7 @@ fn scalar(expr: &Expr) -> Result<Scalar, SqlError> {
     };
     match value {
         ScalarValue::Int64(Some(v)) => Ok(Scalar::I64(*v)),
-        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
-            Ok(Scalar::Str(v.clone()))
-        }
+        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => Ok(Scalar::Str(v.clone())),
         ScalarValue::Boolean(Some(v)) => Ok(Scalar::Bool(*v)),
         ScalarValue::Int64(None) => Ok(Scalar::Null),
         other => Err(SqlError::Unsupported(format!(
