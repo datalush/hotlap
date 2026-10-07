@@ -67,7 +67,8 @@ En `hotlap-connectors/src/runtime/sink.rs`:
 - Por sink, un canal **`tokio::sync::mpsc` acotado** (`CHANNEL_CAPACITY = 64`).
 - `ChangelogStream` es el extremo receptor adaptado a `futures::Stream`
   (`Item = Result<ChangeBatch, ConnectorError>`); es lo que recibe `Sink::write`.
-- Un **task** por sink ejecuta `sink.write(ChangelogStream).await` hasta el cierre.
+- Un **task** por sink ejecuta `sink.write(ChangelogStream).await` hasta el cierre
+  del canal y, al terminar, `commit` (o `abort` si `write` falló).
 - `SinkPump::pump` corre **tras cada `ingest`**: por cada vista suscrita toma sus
   deltas y hace `sender.send(...).await`. Si el canal está lleno, el `await`
   **bloquea el bucle del engine**, que pausa la lectura del source: un sink lento
@@ -94,9 +95,10 @@ pub trait Sink: Send + Sync {
 - `commit` = confirmar lo escrito desde el último commit.
 - `abort` = descartar lo escrito desde el último commit.
 
-En v1 la forma 2PC es **nominal**: el ciclo de vida del engine solo dirige
-`write`; `commit`/`abort` forman parte del contrato y los ejercita el test live,
-pero el bucle de runtime aún no los invoca (ver §10).
+El task del runtime dirige el ciclo de vida completo: `write` hasta el cierre del
+canal y, al terminar, `commit` (que entrega lo fire-and-forget del sink Fluss) o
+`abort` si `write` falló. La forma sigue siendo nominal (sin transacción ni
+exactly-once), pero el runtime ya invoca el contrato, no solo el test live.
 
 ## 6. `FlussSink` (append-only)
 
@@ -155,27 +157,42 @@ START;
 3. En `shutdown` (o cuando el canal de comandos se cierra), `SinkPump::close`
    **suelta los senders** (cierra los canales), **espera** a cada task y devuelve
    el primer error. Soltar el sender termina el changelog, de modo que el **último
-   lote se entrega** antes de que el task termine.
+   lote se entrega** antes de que el task termine; al aceptar el stream, el task
+   llama a `commit` (o a `abort` si `write` falló). El join de cada task está
+   acotado por un **timeout** de 5 s para que un sink colgado no bloquee
+   `shutdown` indefinidamente; el timeout se reporta como error del sink.
 
 ## 9. No-goals
 
 - `upsert`/`delete` sobre tablas con PK — v1 solo **append**.
 - **2PC real / exactly-once**: `commit`/`abort` son forma nominal (SP4).
-- **N sinks / fan-out**: v1 un sink por vista (ver §10).
+- **N sinks / fan-out**: v1 un sink por vista; un segundo `CREATE SINK` sobre la
+  misma vista se **rechaza** con `SqlError::Unsupported` (ver §10).
 - `CREATE SINK` tras `START`.
 - Persistencia de estado / recuperación desde checkpoint.
-- **Proyección explícita**: solo `AS SELECT * FROM <mv>` (toda la MV).
+- **Proyección explícita**: solo `AS SELECT * FROM <mv>`; cualquier otra
+  proyección (`SELECT k ...`) se **rechaza** con `SqlError::Unsupported`.
 
 ## 10. Límites y residuos v1
 
-- **`commit` no está cableado en el bucle del engine.** Solo se dirige `write`
-  hasta el cierre del canal; `commit`/`abort` los ejercita el test live
-  (`fluss_sink_live.rs`). Consecuencia: en un run vivo, el `flush` de Fluss
-  depende del cierre o del flush periódico del writer, no de un commit periódico.
-  Cablear commit por ciclo (o al cerrar) queda como follow-up de SP4.
+- **`commit` cableado al cierre del stream.** El task del sink llama a `commit`
+  al aceptar el changelog (o a `abort` si `write` falló), de modo que el `flush`
+  de Fluss ya no depende solo del cierre del writer. Falta el **commit
+  periódico** por ciclo y la semántica 2PC real (SP4).
 - **Un sink por vista.** `take_changes` **drena** el buffer, así que dos sinks
-  sobre la misma vista se pisarían (el segundo recibiría vacío). Sinks sobre
-  vistas **distintas** funcionan, pero el fan-out no es un objetivo v1.
+  sobre la misma vista se pisarían; el segundo `CREATE SINK` sobre una vista ya
+  suscrita se **rechaza** en la capa SQL (`SqlError::Unsupported`). Sinks sobre
+  vistas **distintas** funcionan; el fan-out no es un objetivo v1.
+- **`SinkPump::close` con timeout.** El join de cada task está acotado a 5 s;
+  superarlo reporta un error de infraestructura en vez de colgar `shutdown`.
+- **Parkeado (LOW) — sin drenado final antes de `close`.** `close` no hace un
+  último `pump` defensivo: se confía en que el bucle del engine drena tras cada
+  `ingest`. Un `close` sin drenado previo podría perder los deltas pendientes;
+  queda como endurecimiento defensivo si el orden cambia.
+- **Parkeado (LOW) — materialización de multiplicidad en el hilo del engine.**
+  `rows_to_batch` expande `diff` repitiendo filas en el hilo del engine (no hay
+  límite de `diff`), por lo que un multiplicidad grande consume CPU/memoria del
+  engine. Se acepta mientras la ventana v1 no genere multiplicidades grandes.
 - **Schema mismatch:** la tabla Fluss destino debe coincidir con el schema de la
   MV; si no, el error aflora en el writer.
 - **Tipos:** solo `Int64`/`Timestamp(ms)`/`Utf8`/`Boolean`; otros son
@@ -194,8 +211,10 @@ cargo test -p hotlap-sql
 Cobertura: `hotlap::changes` (`changelog_reconstructs_snapshot`,
 `tap_after_first_push_rejected`); `hotlap-connectors::sink_e2e`
 (`sink_consolidated_state_matches_snapshot`, `backpressure_loses_no_batch`,
-`shutdown_delivers_the_last_changelog`) y `fluss/sink.rs` unit
-(`rejects_retraction`, `expands_multiplicity_into_rows`,
-`builds_timestamp_column`, `rejects_unsupported_type`); `hotlap-sql::sink_e2e`
-(wiring completo, sink tras `START` rechazado, vista desconocida rechazada).
+`shutdown_delivers_the_last_changelog`, `commit_runs_after_the_stream_ends`) y
+`fluss/sink.rs` unit (`rejects_retraction`, `expands_multiplicity_into_rows`,
+`builds_timestamp_column`, `rejects_unsupported_type`); `hotlap-sql::ddl::sink`
+(`parses_create_sink`, `rejects_non_star_projection`); `hotlap-sql::sink_e2e`
+(wiring completo, sink tras `START` rechazado, vista desconocida rechazada,
+segundo sink sobre la misma vista rechazado).
 `fluss_sink_live.rs` es un test **ignored** (requiere un cluster Fluss vivo).
