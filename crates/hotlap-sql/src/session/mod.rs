@@ -126,9 +126,8 @@ impl SqlSession {
 
     async fn create_source(&mut self, cs: CreateSource) -> Result<QueryResult, SqlError> {
         self.reject_after_start("CREATE SOURCE")?;
-        // v1 owns a single source: a second declaration would overwrite the
-        // runtime source/watermark while leaving the first still registered,
-        // so a view over the first name could silently read the second's data.
+        // v1 owns a single source; a second declaration would overwrite the live
+        // source/watermark while the first name stays registered.
         if self.source.is_some() {
             return Err(SqlError::Unsupported(
                 "only one source is supported in v1".into(),
@@ -160,16 +159,17 @@ impl SqlSession {
         let query = normalize_tumble_intervals(&cv.query)?;
         let df = self.ctx.sql(&query).await.map_err(to_engine)?;
         let plan = to_kernel_plan(df.logical_plan(), InputId(0))?;
+        let schema = mv_schema(&plan, source_schema.as_ref())?;
+        // Reject unrepresentable output types here so the view fails at DDL
+        // time rather than later, when a `SELECT` reads the consolidated rows.
+        crate::convert::ensure_kernel_types(&schema)?;
+        // Register after validation; a rejected view must not poison its name.
         self.catalog.add_view(
             &cv.name,
             MvDef {
                 query: cv.query.clone(),
             },
         )?;
-        let schema = mv_schema(&plan, source_schema.as_ref())?;
-        // Reject unrepresentable output types here so the view fails at DDL
-        // time rather than later, when a `SELECT` reads the consolidated rows.
-        crate::convert::ensure_kernel_types(&schema)?;
         self.mv_schemas.insert(cv.name.clone(), schema);
         self.views.push((cv.name, plan));
         Ok(QueryResult::Ack("CREATE MATERIALIZED VIEW".into()))

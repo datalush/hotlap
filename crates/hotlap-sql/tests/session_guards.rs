@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use futures::stream;
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
-use hotlap_sql::{SourceFactory, SqlError, SqlSession};
+use hotlap_sql::{QueryResult, SourceFactory, SqlError, SqlSession};
 
 const SOURCE: &str = "CREATE SOURCE src WITH (connector='inmem') WATERMARK FOR \
      _event_time AS _event_time - INTERVAL '1 s';";
@@ -62,6 +62,13 @@ fn kv_schema() -> SchemaRef {
     ]))
 }
 
+fn float_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("f", DataType::Float64, false),
+        Field::new("_event_time", DataType::Int64, false),
+    ]))
+}
+
 #[tokio::test]
 async fn second_source_rejected() {
     let mut session = session(kv_schema());
@@ -76,15 +83,26 @@ async fn second_source_rejected() {
 
 #[tokio::test]
 async fn unrepresentable_mv_output_rejected() {
-    let float = Arc::new(Schema::new(vec![
-        Field::new("f", DataType::Float64, false),
-        Field::new("_event_time", DataType::Int64, false),
-    ]));
-    let mut session = session(float);
+    let mut session = session(float_schema());
     session.sql(SOURCE).await.unwrap();
     let view = "CREATE MATERIALIZED VIEW mv AS SELECT f FROM src;";
     assert!(matches!(
         session.sql(view).await,
         Err(SqlError::Unsupported(_))
     ));
+}
+
+#[tokio::test]
+async fn rejected_view_does_not_poison_its_name() {
+    let mut session = session(float_schema());
+    session.sql(SOURCE).await.unwrap();
+    let bad = "CREATE MATERIALIZED VIEW mv AS SELECT f FROM src;";
+    assert!(matches!(
+        session.sql(bad).await,
+        Err(SqlError::Unsupported(_))
+    ));
+    // The failed attempt must not have registered `mv`; the same name is free.
+    let good = "CREATE MATERIALIZED VIEW mv AS SELECT _event_time, count(*) \
+         FROM src GROUP BY _event_time;";
+    assert!(matches!(session.sql(good).await, Ok(QueryResult::Ack(_))));
 }

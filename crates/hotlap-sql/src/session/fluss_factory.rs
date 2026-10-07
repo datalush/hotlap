@@ -20,7 +20,9 @@ impl SourceFactory for FlussSourceFactory {
         options: &BTreeMap<String, String>,
     ) -> Result<Box<dyn Source>, SqlError> {
         require_connector(options)?;
+        // The source name is unused: the Fluss table path identifies the data.
         let bootstrap = required(options, "bootstrap")?;
+        // `table` is a `<database>/<table>` path, per `open_from_bootstrap`.
         let table = required(options, "table")?;
         let source = FlussSource::open_from_bootstrap(bootstrap, table)
             .await

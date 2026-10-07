@@ -113,12 +113,15 @@ planifica como una tabla normal:
 1. `CREATE SOURCE` construye el `Source` vía el `SourceFactory` inyectado
    (`SqlSession::open()` usa `FlussSourceFactory`, que mapea
    `connector='fluss'` + `bootstrap` + `table` a
-   `FlussSource::open_from_bootstrap`; los tests inyectan un factory propio con
-   `SqlSession::open_with_factory(...)`), valida la columna de watermark y
-   registra una tabla de planificación.
-2. `CREATE MATERIALIZED VIEW` planifica el `SELECT`, lo traduce y guarda la
-   definición, el `Plan` y el esquema (validando que sus tipos sean
-   representables).
+   `FlussSource::open_from_bootstrap`, donde `table` es una ruta
+   `<db>/<table>` y el nombre del source no se usa; los tests inyectan un
+   factory propio con `SqlSession::open_with_factory(...)`), valida la columna
+   de watermark y registra una tabla de planificación.
+2. `CREATE MATERIALIZED VIEW` planifica el `SELECT`, lo traduce, valida que los
+   tipos de salida sean representables y **solo entonces** registra la
+   definición, el `Plan` y el esquema; una vista rechazada no deja su nombre en
+   el catálogo, así que un reintento con el mismo nombre no falla con un
+   `view already exists` engañoso.
 3. `START` construye el `Pipeline` (source + watermark + vistas), arranca el
    `EngineHandle` y registra los `MvTableProvider`.
 4. Los `SELECT` se ejecutan con DataFusion; las consultas a MVs leen el
@@ -177,8 +180,9 @@ Cobertura: unit (`ddl`, `watermark`, `convert`, `translate`, `mv_schema`,
 `catalog`) e integración (`tests/e2e.rs` — paridad del resultado SQL con una
 recomputación completa de las ventanas tumbling, MV vacía → 0 filas, DDL tras
 `START` rechazado, y drop de la sesión sin pánico en el executor;
-`tests/session_guards.rs` — segundo `CREATE SOURCE` rechazado y tipo de salida
-de MV no representable rechazado en DDL).
+`tests/session_guards.rs` — segundo `CREATE SOURCE` rechazado, tipo de salida
+de MV no representable rechazado en DDL, y nombre de vista no envenenado por un
+`CREATE MATERIALIZED VIEW` fallido).
 
 La ruta Fluss por defecto (`FlussSourceFactory`) requiere un clúster vivo; en
 este entorno **no** hay uno, así que se verifica en compilación y los tests
