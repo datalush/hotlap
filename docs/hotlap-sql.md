@@ -22,7 +22,7 @@ kernel.
 
 | Módulo | Rol |
 | --- | --- |
-| `session/` (`mod.rs`, `runtime.rs`) | `SqlSession`: dispatch de sentencias, ciclo de vida del motor, registro de MVs |
+| `session/` (`mod.rs`, `runtime.rs`, `fluss_factory.rs`) | `SqlSession`: dispatch de sentencias, ciclo de vida del motor, registro de MVs, y `FlussSourceFactory` (fuente por defecto) |
 | `ddl.rs` (+ `ddl_scan.rs`) | parser mínimo de `CREATE SOURCE` / `CREATE MATERIALIZED VIEW` / `START` |
 | `translate.rs` (+ `translate_expr.rs`, `tumble.rs`) | `LogicalPlan` de DataFusion → `Plan` del kernel |
 | `convert.rs` | filas del kernel (`Row`/`Scalar`) → `RecordBatch` Arrow |
@@ -32,7 +32,8 @@ kernel.
 | `error.rs` | `SqlError` (`Parse` / `Unsupported` / `Catalog` / `Engine`) |
 
 Tipos re-exportados en `lib.rs`: `Catalog`, `MvDef`, `SourceDef`, `SqlError`,
-`MvTableProvider`, `SqlSession`, `QueryResult`, `Snapshotter`, `SourceFactory`.
+`MvTableProvider`, `SqlSession`, `QueryResult`, `Snapshotter`, `SourceFactory`,
+`FlussSourceFactory`.
 
 ## 3. Gramática DDL mínima
 
@@ -83,8 +84,10 @@ con una traducción parcial o silenciosa: agregados distintos de `count(*)`
 (`sum`, `avg`, `count(DISTINCT ...)`, `FILTER`, `ORDER BY`), operadores de
 predicado fuera de `Eq`/`Gt`, más de un `tumble`, o un join entre sources
 distintos. Los tipos de columna que el kernel no representa
-(`Int64`/`Utf8`/`Boolean` son los admitidos) también se rechazan en
-`convert::ensure_kernel_types`.
+(`Int64`/`Utf8`/`Boolean` son los admitidos) también se rechazan: el esquema de
+salida de la MV se valida con `convert::ensure_kernel_types` en el propio
+`CREATE MATERIALIZED VIEW`, de modo que un tipo no representable falla en DDL y
+no más tarde en el `SELECT`.
 
 ## 5. MV como `TableProvider`
 
@@ -107,10 +110,15 @@ planifica como una tabla normal:
 
 ## 6. Ciclo de vida
 
-1. `CREATE SOURCE` construye el `Source` vía el `SourceFactory` inyectado,
-   valida la columna de watermark y registra una tabla de planificación.
+1. `CREATE SOURCE` construye el `Source` vía el `SourceFactory` inyectado
+   (`SqlSession::open()` usa `FlussSourceFactory`, que mapea
+   `connector='fluss'` + `bootstrap` + `table` a
+   `FlussSource::open_from_bootstrap`; los tests inyectan un factory propio con
+   `SqlSession::open_with_factory(...)`), valida la columna de watermark y
+   registra una tabla de planificación.
 2. `CREATE MATERIALIZED VIEW` planifica el `SELECT`, lo traduce y guarda la
-   definición, el `Plan` y el esquema.
+   definición, el `Plan` y el esquema (validando que sus tipos sean
+   representables).
 3. `START` construye el `Pipeline` (source + watermark + vistas), arranca el
    `EngineHandle` y registra los `MvTableProvider`.
 4. Los `SELECT` se ejecutan con DataFusion; las consultas a MVs leen el
@@ -118,7 +126,10 @@ planifica como una tabla normal:
 
 El **DDL se declara antes de `START`** (ventana DDL). Crear un source o una MV
 después de `START` se **rechaza** con `SqlError::Unsupported` (no se ignora ni
-se aplica parcialmente).
+se aplica parcialmente). Un **segundo `CREATE SOURCE`** también se rechaza con
+`SqlError::Unsupported("only one source is supported in v1")`: v1 admite una
+única fuente por sesión, y aceptarla sobrescribiría la fuente/watermark vivos
+dejando el primer nombre registrado apuntando a los datos del segundo.
 
 ## 7. Nota sobre `_event_time`
 
@@ -165,4 +176,19 @@ cargo test -p hotlap-connectors
 Cobertura: unit (`ddl`, `watermark`, `convert`, `translate`, `mv_schema`,
 `catalog`) e integración (`tests/e2e.rs` — paridad del resultado SQL con una
 recomputación completa de las ventanas tumbling, MV vacía → 0 filas, DDL tras
-`START` rechazado, y drop de la sesión sin pánico en el executor).
+`START` rechazado, y drop de la sesión sin pánico en el executor;
+`tests/session_guards.rs` — segundo `CREATE SOURCE` rechazado y tipo de salida
+de MV no representable rechazado en DDL).
+
+La ruta Fluss por defecto (`FlussSourceFactory`) requiere un clúster vivo; en
+este entorno **no** hay uno, así que se verifica en compilación y los tests
+ejercitan el factory inyectado. La integración contra un clúster real queda
+pendiente.
+
+## 11. Límites conocidos (v1, low priority)
+
+- La proyección que DataFusion coloca sobre un `Aggregate` se desenvuelve
+  comprobando solo que cada expresión sea una columna resoluble; no se valida
+  que sea una identidad exacta (orden/subconjunto de columnas).
+- El escáner DDL (`ddl_scan.rs`) es minimalista (reconoce `k='v'` separados por
+  comas); no cubre comillas escapadas ni comas dentro de literales.
