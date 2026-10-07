@@ -110,16 +110,23 @@ impl SinkPump {
     /// Close every channel and wait for its task, surfacing the first failure.
     ///
     /// Each join is bounded by [`CLOSE_TIMEOUT`] so a stalled sink cannot hang
-    /// shutdown forever; a timeout is reported like any other sink failure.
+    /// shutdown forever; a timeout is reported like any other sink failure. The
+    /// task is aborted and reaped so it cannot outlive `shutdown`.
     pub async fn close(self) -> Result<(), ConnectorError> {
         let mut failure = None;
-        for entry in self.entries {
+        for mut entry in self.entries {
             drop(entry.tx);
-            match tokio::time::timeout(CLOSE_TIMEOUT, entry.handle).await {
+            match tokio::time::timeout(CLOSE_TIMEOUT, &mut entry.handle).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(error))) => record(&mut failure, error),
                 Ok(Err(_)) => record(&mut failure, stopped()),
-                Err(_) => record(&mut failure, timed_out()),
+                Err(_) => {
+                    // The join handle is still ours; abort the stalled task and
+                    // wait for it to unwind before reporting the timeout.
+                    entry.handle.abort();
+                    let _ = entry.handle.await;
+                    record(&mut failure, timed_out());
+                }
             }
         }
         match failure {
