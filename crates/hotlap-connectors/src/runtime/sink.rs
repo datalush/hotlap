@@ -3,6 +3,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures::Stream;
 use hotlap::{ChangeBatch, Hotlap, HotlapError};
@@ -15,6 +16,9 @@ use crate::sink::Sink;
 
 /// Bound on how far a sink may lag the engine before backpressure bites.
 const CHANNEL_CAPACITY: usize = 64;
+
+/// How long `SinkPump::close` waits for one sink task before giving up.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Receiver end of a sink's bounded changelog channel.
 pub struct ChangelogStream {
@@ -104,14 +108,18 @@ impl SinkPump {
     }
 
     /// Close every channel and wait for its task, surfacing the first failure.
+    ///
+    /// Each join is bounded by [`CLOSE_TIMEOUT`] so a stalled sink cannot hang
+    /// shutdown forever; a timeout is reported like any other sink failure.
     pub async fn close(self) -> Result<(), ConnectorError> {
         let mut failure = None;
         for entry in self.entries {
             drop(entry.tx);
-            match entry.handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => record(&mut failure, error),
-                Err(_) => record(&mut failure, stopped()),
+            match tokio::time::timeout(CLOSE_TIMEOUT, entry.handle).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => record(&mut failure, error),
+                Ok(Err(_)) => record(&mut failure, stopped()),
+                Err(_) => record(&mut failure, timed_out()),
             }
         }
         match failure {
@@ -127,6 +135,10 @@ fn record(slot: &mut Option<ConnectorError>, error: ConnectorError) {
 
 fn stopped() -> ConnectorError {
     ConnectorError::Infrastructure("sink task stopped".into())
+}
+
+fn timed_out() -> ConnectorError {
+    ConnectorError::Infrastructure("sink task timed out during close".into())
 }
 
 fn hotlap_err(error: HotlapError) -> ConnectorError {
