@@ -60,3 +60,17 @@ async fn create_sink_unknown_view_rejected() {
     let bad = "CREATE SINK out WITH (connector='inmem') AS SELECT * FROM nope;";
     assert!(matches!(session.sql(bad).await, Err(SqlError::Catalog(_))));
 }
+
+#[tokio::test]
+async fn second_sink_on_same_view_rejected() {
+    let sink_batches = Arc::new(Mutex::new(Vec::new()));
+    let mut session = session(vec![source_batch(&[1], &[1000])], &sink_batches);
+    session.sql(SOURCE).await.unwrap();
+    session.sql(VIEW).await.unwrap();
+    session.sql(SINK).await.unwrap();
+    let dup = "CREATE SINK out2 WITH (connector='inmem') AS SELECT * FROM mv;";
+    assert!(matches!(
+        session.sql(dup).await,
+        Err(SqlError::Unsupported(_))
+    ));
+}

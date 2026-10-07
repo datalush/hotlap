@@ -30,7 +30,11 @@ pub(super) fn parse(sql: &str) -> Result<CreateSink, SqlError> {
     })
 }
 
-/// Extract the source view name from the `AS SELECT ... FROM <view>` tail.
+/// Extract the source view name from the `AS SELECT * FROM <view>` tail.
+///
+/// v1 supports only the identity projection of a whole materialized view, so
+/// any `SELECT` other than `*` (or a missing `SELECT`) is rejected up front
+/// rather than silently ignored.
 fn parse_view(sql: &str, upper: &str) -> Result<String, SqlError> {
     let as_pos = upper
         .find(" AS ")
@@ -40,6 +44,11 @@ fn parse_view(sql: &str, upper: &str) -> Result<String, SqlError> {
     let from_pos = upper_after
         .find(" FROM ")
         .ok_or_else(|| SqlError::Parse("missing ` FROM ` in CREATE SINK".into()))?;
+    if !after[..from_pos].trim().eq_ignore_ascii_case("SELECT *") {
+        return Err(SqlError::Unsupported(
+            "CREATE SINK supports only `AS SELECT * FROM <view>`".into(),
+        ));
+    }
     let view = after[from_pos + " FROM ".len()..]
         .split_whitespace()
         .next()
@@ -63,5 +72,12 @@ mod tests {
         assert_eq!(s.name, "out");
         assert_eq!(s.options.get("connector").unwrap(), "fluss");
         assert_eq!(s.view, "mv");
+    }
+
+    #[test]
+    fn rejects_non_star_projection() {
+        let err = parse("CREATE SINK out WITH (connector='fluss') AS SELECT k FROM mv;")
+            .expect_err("projection must be rejected");
+        assert!(matches!(err, SqlError::Unsupported(_)), "{err:?}");
     }
 }

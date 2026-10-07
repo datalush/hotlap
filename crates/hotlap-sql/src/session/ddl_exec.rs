@@ -82,6 +82,14 @@ impl SqlSession {
                 cs.name
             )));
         }
+        // A view's changelog is drained per `take_changes`, so a second sink on
+        // the same view would silently receive nothing; reject it in v1.
+        if let Some(existing) = self.sinks.iter().find(|s| s.view == cs.view) {
+            return Err(SqlError::Unsupported(format!(
+                "view `{}` already has sink `{}`; v1 supports one sink per view",
+                cs.view, existing.name
+            )));
+        }
         // The sink is opened at START so the factory can be async and the view
         // schema is already validated.
         self.sinks.push(SinkDef {
