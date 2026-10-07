@@ -72,7 +72,14 @@ impl TableProvider for SourceTableProvider {
                 }) as Arc<dyn PartitionStream>
             })
             .collect();
-        let exec = StreamingTableExec::try_new(schema, partitions, None, [], false, None)?;
+        let exec = StreamingTableExec::try_new(
+            schema,
+            partitions,
+            None,
+            [],
+            self.source.is_unbounded(),
+            None,
+        )?;
         Ok(Arc::new(exec))
     }
 }
@@ -117,7 +124,7 @@ fn project_result(
     result: Result<crate::source::SourceBatch, ConnectorError>,
     projection: Option<&[usize]>,
 ) -> Result<arrow::record_batch::RecordBatch> {
-    let batch = result.map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let batch = result.map_err(to_df)?;
     match projection {
         Some(indices) => Ok(batch.batch.project(indices)?),
         None => Ok(batch.batch),

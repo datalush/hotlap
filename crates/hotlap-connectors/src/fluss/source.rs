@@ -129,4 +129,8 @@ impl Source for FlussSource {
     fn event_time_column(&self) -> Option<usize> {
         Some(self.event_time_idx)
     }
+
+    fn is_unbounded(&self) -> bool {
+        true
+    }
 }

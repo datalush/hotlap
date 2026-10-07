@@ -50,6 +50,10 @@ pub trait Source: Send + Sync {
     fn state(&self) -> SourceState;
     /// Column index of the event-time column (ms), if the source has one.
     fn event_time_column(&self) -> Option<usize>;
+    /// Whether this source never ends (default: bounded).
+    fn is_unbounded(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
