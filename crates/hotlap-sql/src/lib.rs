@@ -16,6 +16,10 @@ mod tumble;
 pub mod watermark;
 
 pub use catalog::{Catalog, MvDef, SourceDef};
+pub use ddl::CreateSink;
 pub use error::SqlError;
 pub use mv_provider::MvTableProvider;
-pub use session::{FlussSourceFactory, QueryResult, Snapshotter, SourceFactory, SqlSession};
+pub use session::{
+    FlussSinkFactory, FlussSourceFactory, QueryResult, SinkFactory, Snapshotter, SourceFactory,
+    SqlSession,
+};

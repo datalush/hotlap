@@ -1,4 +1,8 @@
-//! Minimal DDL parser for CREATE SOURCE / CREATE MATERIALIZED VIEW / START.
+//! Minimal DDL parser for CREATE SOURCE / CREATE SINK / CREATE MATERIALIZED VIEW / START.
+
+mod sink;
+
+pub use sink::CreateSink;
 
 use std::collections::BTreeMap;
 
@@ -8,12 +12,14 @@ use crate::watermark::parse_interval_ms;
 
 const SOURCE_PREFIX: &str = "CREATE SOURCE ";
 const VIEW_PREFIX: &str = "CREATE MATERIALIZED VIEW ";
+const SINK_PREFIX: &str = "CREATE SINK ";
 
 /// A parsed DDL statement.
 #[derive(Debug)]
 pub enum Statement {
     CreateSource(CreateSource),
     CreateView(CreateView),
+    CreateSink(CreateSink),
     Start,
 }
 
@@ -45,6 +51,9 @@ pub fn parse(sql: &str) -> Result<Statement, SqlError> {
     }
     if upper.starts_with(VIEW_PREFIX) {
         return parse_create_view(trimmed);
+    }
+    if upper.starts_with(SINK_PREFIX) {
+        return sink::parse(trimmed).map(Statement::CreateSink);
     }
     Err(SqlError::Parse(format!(
         "unrecognized statement: {trimmed}"

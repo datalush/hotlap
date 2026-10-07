@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use hotlap_connectors::runtime::handle::EngineHandle;
-use hotlap_connectors::runtime::pipeline::Pipeline;
+use hotlap_connectors::runtime::pipeline::{Pipeline, SinkSpec};
 
 use super::{
     MvTableProvider, QueryResult, SharedSource, Snapshotter, SqlError, SqlSession, to_engine,
@@ -18,7 +18,7 @@ impl SqlSession {
         if self.started {
             return Err(SqlError::Unsupported("session already started".into()));
         }
-        let pipeline = self.build_pipeline()?;
+        let pipeline = self.build_pipeline().await?;
         let engine = tokio::task::spawn_blocking(move || EngineHandle::start(pipeline))
             .await
             .map_err(to_engine)?
@@ -40,7 +40,8 @@ impl SqlSession {
         Ok(())
     }
 
-    fn build_pipeline(&self) -> Result<Pipeline, SqlError> {
+    /// Build the pipeline, opening each declared sink against its view schema.
+    async fn build_pipeline(&self) -> Result<Pipeline, SqlError> {
         let name = self
             .source_name
             .clone()
@@ -49,13 +50,35 @@ impl SqlSession {
             .source
             .clone()
             .ok_or_else(|| SqlError::Catalog("START before CREATE SOURCE".into()))?;
+        let sinks = self.build_sinks().await?;
         Ok(Pipeline {
             input: name,
             source: Box::new(SharedSource(source)),
             watermark: self.watermark,
             views: self.views.clone(),
-            sinks: vec![],
+            sinks,
         })
+    }
+
+    /// Open every declared sink via the factory, resolving its view schema.
+    async fn build_sinks(&self) -> Result<Vec<SinkSpec>, SqlError> {
+        let mut sinks = Vec::with_capacity(self.sinks.len());
+        for def in &self.sinks {
+            let schema = self
+                .mv_schemas
+                .get(&def.view)
+                .cloned()
+                .ok_or_else(|| SqlError::Catalog(format!("unknown view: {}", def.view)))?;
+            let sink = self
+                .sink_factory
+                .create(&def.name, &def.options, schema)
+                .await?;
+            sinks.push(SinkSpec {
+                view: def.view.clone(),
+                sink,
+            });
+        }
+        Ok(sinks)
     }
 
     fn register_mv_providers(&self, engine: &EngineHandle) -> Result<(), SqlError> {

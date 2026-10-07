@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use futures::stream;
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
-use hotlap_sql::{QueryResult, SourceFactory, SqlError, SqlSession};
+use hotlap_sql::{FlussSinkFactory, QueryResult, SourceFactory, SqlError, SqlSession};
 
 const SOURCE: &str = "CREATE SOURCE src WITH (connector='inmem') WATERMARK FOR \
      _event_time AS _event_time - INTERVAL '1 s';";
@@ -52,7 +52,10 @@ impl SourceFactory for FixedFactory {
 }
 
 fn session(schema: SchemaRef) -> SqlSession {
-    SqlSession::open_with_factory(Arc::new(FixedFactory { schema }))
+    SqlSession::open_with_factories(
+        Arc::new(FixedFactory { schema }),
+        Arc::new(FlussSinkFactory),
+    )
 }
 
 fn kv_schema() -> SchemaRef {

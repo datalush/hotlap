@@ -10,7 +10,7 @@ use arrow::record_batch::RecordBatch;
 use futures::stream;
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
-use hotlap_sql::{QueryResult, SourceFactory, SqlError, SqlSession};
+use hotlap_sql::{FlussSinkFactory, QueryResult, SourceFactory, SqlError, SqlSession};
 
 const SOURCE: &str = "CREATE SOURCE src WITH (connector='inmem') WATERMARK FOR \
      _event_time AS _event_time - INTERVAL '1 s';";
@@ -132,7 +132,7 @@ fn recompute(batches: &[SourceBatch], size: i64, lag: i64) -> Vec<(i64, i64, i64
 }
 
 async fn started(batches: Vec<SourceBatch>) -> SqlSession {
-    let mut session = SqlSession::open_with_factory(factory(batches));
+    let mut session = SqlSession::open_with_factories(factory(batches), Arc::new(FlussSinkFactory));
     session.sql(SOURCE).await.unwrap();
     session.sql(VIEW).await.unwrap();
     session.sql("START;").await.unwrap();

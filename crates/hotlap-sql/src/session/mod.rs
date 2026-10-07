@@ -1,9 +1,12 @@
 //! Embedded SQL session: DDL, START and materialized-view queries.
 
+mod ddl_exec;
 mod fluss_factory;
 mod runtime;
+mod sink_factory;
 
 pub use fluss_factory::FlussSourceFactory;
+pub use sink_factory::{FlussSinkFactory, SinkFactory};
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -11,20 +14,17 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
-use hotlap::{InputId, Plan, Row};
-use hotlap_connectors::datafusion::provider::SourceTableProvider;
+use hotlap::{Plan, Row};
 use hotlap_connectors::runtime::handle::{EngineHandle, SnapshotHandle};
 use hotlap_connectors::runtime::pipeline::Watermark;
 use hotlap_connectors::source::Source;
 
-use crate::catalog::{Catalog, MvDef, SourceDef};
-use crate::ddl::{self, CreateSource, CreateView, Statement};
+use crate::catalog::Catalog;
+use crate::ddl::{self, Statement};
 use crate::error::SqlError;
 use crate::mv_provider::MvTableProvider;
-use crate::mv_schema::mv_schema;
 use crate::session_source::SharedSource;
-use crate::translate::{register_tumble_udf, to_kernel_plan};
-use crate::tumble::normalize_tumble_intervals;
+use crate::translate::register_tumble_udf;
 
 /// Builds engine sources from `CREATE SOURCE` options.
 #[async_trait::async_trait]
@@ -64,41 +64,55 @@ impl Snapshotter for SnapshotHandle {
     }
 }
 
+/// A declared sink, opened against its view when the engine starts.
+struct SinkDef {
+    name: String,
+    options: BTreeMap<String, String>,
+    view: String,
+}
+
 /// A single embedded session over one source and its materialized views.
 pub struct SqlSession {
     ctx: SessionContext,
     catalog: Catalog,
     factory: Arc<dyn SourceFactory>,
+    sink_factory: Arc<dyn SinkFactory>,
     source: Option<Arc<dyn Source>>,
     source_name: Option<String>,
     watermark: Option<Watermark>,
     views: Vec<(String, Plan)>,
     mv_schemas: HashMap<String, SchemaRef>,
+    sinks: Vec<SinkDef>,
     engine: Option<EngineHandle>,
     started: bool,
 }
 
 impl SqlSession {
-    /// Open an empty session using the default [`FlussSourceFactory`].
+    /// Open an empty session using the default Fluss factories.
     pub fn open() -> Self {
-        Self::open_with_factory(Arc::new(FlussSourceFactory))
+        Self::open_with_factories(Arc::new(FlussSourceFactory), Arc::new(FlussSinkFactory))
     }
 
-    /// Open an empty session with a caller-supplied source factory.
+    /// Open an empty session with caller-supplied source and sink factories.
     ///
     /// The `tumble` planning function is registered on the fresh context.
-    pub fn open_with_factory(factory: Arc<dyn SourceFactory>) -> Self {
+    pub fn open_with_factories(
+        source_factory: Arc<dyn SourceFactory>,
+        sink_factory: Arc<dyn SinkFactory>,
+    ) -> Self {
         let ctx = SessionContext::new();
         register_tumble_udf(&ctx);
         Self {
             ctx,
             catalog: Catalog::default(),
-            factory,
+            factory: source_factory,
+            sink_factory,
             source: None,
             source_name: None,
             watermark: None,
             views: Vec::new(),
             mv_schemas: HashMap::new(),
+            sinks: Vec::new(),
             engine: None,
             started: false,
         }
@@ -120,59 +134,9 @@ impl SqlSession {
         match stmt {
             Statement::CreateSource(cs) => self.create_source(cs).await,
             Statement::CreateView(cv) => self.create_view(cv).await,
+            Statement::CreateSink(cs) => self.create_sink(cs).await,
             Statement::Start => self.start().await,
         }
-    }
-
-    async fn create_source(&mut self, cs: CreateSource) -> Result<QueryResult, SqlError> {
-        self.reject_after_start("CREATE SOURCE")?;
-        // v1 owns a single source; a second declaration would overwrite the live
-        // source/watermark while the first name stays registered.
-        if self.source.is_some() {
-            return Err(SqlError::Unsupported(
-                "only one source is supported in v1".into(),
-            ));
-        }
-        let source: Arc<dyn Source> = self.factory.create(&cs.name, &cs.options).await?.into();
-        crate::watermark::column_index(&source.schema(), &cs.time_col)?;
-        let connector = cs.options.get("connector").cloned().unwrap_or_default();
-        self.catalog.add_source(&cs.name, SourceDef { connector })?;
-        self.ctx
-            .register_table(
-                &cs.name,
-                Arc::new(SourceTableProvider::new(Arc::clone(&source))),
-            )
-            .map_err(to_engine)?;
-        self.source = Some(source);
-        self.source_name = Some(cs.name);
-        self.watermark = Some(Watermark { lag: cs.lag_ms });
-        Ok(QueryResult::Ack("CREATE SOURCE".into()))
-    }
-
-    async fn create_view(&mut self, cv: CreateView) -> Result<QueryResult, SqlError> {
-        self.reject_after_start("CREATE MATERIALIZED VIEW")?;
-        let source_schema = self
-            .source
-            .as_ref()
-            .ok_or_else(|| SqlError::Catalog("view declared before its source".into()))?
-            .schema();
-        let query = normalize_tumble_intervals(&cv.query)?;
-        let df = self.ctx.sql(&query).await.map_err(to_engine)?;
-        let plan = to_kernel_plan(df.logical_plan(), InputId(0))?;
-        let schema = mv_schema(&plan, source_schema.as_ref())?;
-        // Reject unrepresentable output types here so the view fails at DDL
-        // time rather than later, when a `SELECT` reads the consolidated rows.
-        crate::convert::ensure_kernel_types(&schema)?;
-        // Register after validation; a rejected view must not poison its name.
-        self.catalog.add_view(
-            &cv.name,
-            MvDef {
-                query: cv.query.clone(),
-            },
-        )?;
-        self.mv_schemas.insert(cv.name.clone(), schema);
-        self.views.push((cv.name, plan));
-        Ok(QueryResult::Ack("CREATE MATERIALIZED VIEW".into()))
     }
 
     async fn query(&mut self, sql: &str) -> Result<QueryResult, SqlError> {
