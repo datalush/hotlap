@@ -16,4 +16,5 @@ pub use batch::ZSetBatch;
 pub use error::EngineError;
 pub use keys::KeyConverter;
 pub use time::Frontier;
+pub use time::Watermark;
 pub use zset::{consolidate, sort_rows};

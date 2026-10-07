@@ -35,6 +35,38 @@ pub fn settle(frontier: &Frontier, time: u64) -> bool {
     frontier.settle(time)
 }
 
+/// Monotonic event-time watermark computed as `max(event_ts) - lag`.
+///
+/// Mirrors the SP1c clock: every observation advances the watermark to at least
+/// `max_ts - lag` (clamped at zero) and it never moves backwards.
+#[derive(Debug, Clone, Copy)]
+pub struct Watermark {
+    lag: i64,
+    value: i64,
+}
+
+impl Watermark {
+    /// Creates a watermark at zero with the given lag (negatives clamp to zero).
+    pub fn new(lag: i64) -> Self {
+        Self {
+            lag: lag.max(0),
+            value: 0,
+        }
+    }
+
+    /// Advances on the greatest timestamp of a batch and returns the watermark.
+    pub fn observe(&mut self, max_ts: i64) -> i64 {
+        let next = (max_ts - self.lag).max(0);
+        self.value = self.value.max(next);
+        self.value
+    }
+
+    /// Current watermark value.
+    pub fn value(&self) -> i64 {
+        self.value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Frontier;
