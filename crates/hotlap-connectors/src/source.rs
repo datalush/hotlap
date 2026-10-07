@@ -36,8 +36,7 @@ pub struct SourceBatch {
 }
 
 /// A source's stream of batches.
-pub type SourceStream =
-    Pin<Box<dyn Stream<Item = Result<SourceBatch, ConnectorError>> + Send>>;
+pub type SourceStream = Pin<Box<dyn Stream<Item = Result<SourceBatch, ConnectorError>> + Send>>;
 
 /// A source of Arrow batches with resumable offsets and optional event-time.
 pub trait Source: Send + Sync {

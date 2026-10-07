@@ -43,7 +43,9 @@ fn scalar_at(array: &dyn Array, row: usize) -> Result<Scalar, ConnectorError> {
     }
     match array.data_type() {
         DataType::Int64 => Ok(Scalar::I64(downcast::<Int64Array>(array)?.value(row))),
-        DataType::Utf8 => Ok(Scalar::Str(downcast::<StringArray>(array)?.value(row).to_string())),
+        DataType::Utf8 => Ok(Scalar::Str(
+            downcast::<StringArray>(array)?.value(row).to_string(),
+        )),
         DataType::Boolean => Ok(Scalar::Bool(downcast::<BooleanArray>(array)?.value(row))),
         other => Err(ConnectorError::Unsupported(format!(
             "unsupported column type {other:?}"
@@ -90,7 +92,11 @@ mod tests {
         assert_eq!(
             cb.rows[0],
             (
-                Row(vec![Scalar::I64(1), Scalar::Str("x".into()), Scalar::Bool(true)]),
+                Row(vec![
+                    Scalar::I64(1),
+                    Scalar::Str("x".into()),
+                    Scalar::Bool(true)
+                ]),
                 1
             )
         );

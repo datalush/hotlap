@@ -8,8 +8,7 @@ use hotlap::ChangeBatch;
 use crate::error::ConnectorError;
 
 /// A stream of change batches (Z-sets) to write.
-pub type ChangeStream =
-    Pin<Box<dyn Stream<Item = Result<ChangeBatch, ConnectorError>> + Send>>;
+pub type ChangeStream = Pin<Box<dyn Stream<Item = Result<ChangeBatch, ConnectorError>> + Send>>;
 
 /// A sink of change batches with 2PC shape (real 2PC lands in SP4).
 pub trait Sink: Send + Sync {

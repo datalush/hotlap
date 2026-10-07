@@ -35,14 +35,20 @@ impl EngineHandle {
     pub fn start(pipeline: Pipeline) -> Result<Self, ConnectorError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let join = std::thread::spawn(move || engine::run(pipeline, rx));
-        Ok(Self { tx, join: Some(join) })
+        Ok(Self {
+            tx,
+            join: Some(join),
+        })
     }
 
     /// Read the consolidated output of a view.
     pub fn snapshot(&self, view: &str) -> Result<Vec<Row>, ConnectorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Command::Snapshot { view: view.to_string(), reply })
+            .send(Command::Snapshot {
+                view: view.to_string(),
+                reply,
+            })
             .map_err(|_| stopped())?;
         rx.blocking_recv().map_err(|_| stopped())?
     }
@@ -51,7 +57,10 @@ impl EngineHandle {
     pub fn late_dropped(&self, input: &str) -> Result<u64, ConnectorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Command::LateDropped { input: input.to_string(), reply })
+            .send(Command::LateDropped {
+                input: input.to_string(),
+                reply,
+            })
             .map_err(|_| stopped())?;
         rx.blocking_recv().map_err(|_| stopped())?
     }
