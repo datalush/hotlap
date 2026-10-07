@@ -7,7 +7,7 @@ use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use hotlap::{Hotlap, InputId, Plan};
 
-use hotlap_connectors::runtime::pipeline::{self, Pipeline};
+use hotlap_connectors::runtime::pipeline::{self, Pipeline, Watermark};
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
 
 struct FakeSource {
@@ -196,4 +196,51 @@ async fn window_without_watermark_is_rejected_at_push() {
     let mut stream = pipeline::merged_stream(pipeline.source.as_ref()).unwrap();
     let sb = stream.next().await.unwrap().unwrap();
     assert!(pipeline::ingest(&mut hotlap, "in", &sb).is_err());
+}
+
+#[tokio::test]
+async fn watermark_uses_the_source_event_time_column() {
+    let source = batch(&[1], &[10]);
+    let (mut hotlap, mut pipeline) = group_count(source.batch.schema(), vec![source]);
+    pipeline.watermark = Some(Watermark { lag: 0 });
+    pipeline::setup(&mut hotlap, &pipeline).unwrap();
+}
+
+#[tokio::test]
+async fn watermark_without_source_event_time_errors() {
+    struct NoEventTime {
+        schema: SchemaRef,
+    }
+    impl Source for NoEventTime {
+        fn schema(&self) -> SchemaRef {
+            self.schema.clone()
+        }
+        fn splits(&self) -> Result<Vec<Split>, hotlap_connectors::ConnectorError> {
+            Ok(vec![Split { id: 0, start: 0 }])
+        }
+        fn read(&self, _split: &Split) -> Result<SourceStream, hotlap_connectors::ConnectorError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn state(&self) -> SourceState {
+            SourceState::default()
+        }
+        fn event_time_column(&self) -> Option<usize> {
+            None
+        }
+    }
+    let schema = batch(&[1], &[10]).batch.schema();
+    let pipeline = Pipeline {
+        input: "in".into(),
+        source: Box::new(NoEventTime {
+            schema: schema.clone(),
+        }),
+        watermark: Some(Watermark { lag: 0 }),
+        views: vec![],
+    };
+    let mut hotlap = Hotlap::open().unwrap();
+    let error = pipeline::setup(&mut hotlap, &pipeline).unwrap_err();
+    assert!(matches!(
+        error,
+        hotlap_connectors::ConnectorError::Unsupported(_)
+    ));
 }

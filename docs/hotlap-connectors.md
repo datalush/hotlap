@@ -73,8 +73,10 @@ implementaciones (no antes).
 El source Fluss añade la columna **`_event_time`** (`Int64`, milisegundos),
 tomada del `timestamp` que el broker adjunta a cada registro. La columna se
 agrega en `assemble.rs` (`with_event_time`) y su índice se reporta por
-`Source::event_time_column()`. El pipeline usa ese índice para
-`declare_watermark` (`runtime/pipeline.rs`).
+`Source::event_time_column()`. El `Watermark` de `Pipeline` solo declara la
+`lag`; en `setup` el índice `time_col` se **deriva del source**
+(`event_time_column()`), y si el source no tiene event-time se rechaza con
+`Unsupported` en lugar de asumir una columna.
 
 ## 6. Runtime
 

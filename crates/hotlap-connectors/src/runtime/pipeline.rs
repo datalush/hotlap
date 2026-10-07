@@ -9,7 +9,6 @@ use crate::source::{Source, SourceBatch, SourceStream};
 /// Event-time declaration for the pipeline's input.
 #[derive(Clone, Copy, Debug)]
 pub struct Watermark {
-    pub time_col: usize,
     pub lag: i64,
 }
 
@@ -22,11 +21,18 @@ pub struct Pipeline {
 }
 
 /// Register the input, optional watermark and views on `hotlap`.
+///
+/// The event-time column index is owned by the source, so it is derived from
+/// `Source::event_time_column` rather than supplied by the caller.
 pub fn setup(hotlap: &mut Hotlap, pipeline: &Pipeline) -> Result<(), ConnectorError> {
     hotlap.register_input(&pipeline.input).map_err(hotlap_err)?;
     if let Some(w) = pipeline.watermark {
+        let time_col = pipeline
+            .source
+            .event_time_column()
+            .ok_or_else(|| ConnectorError::Unsupported("source has no event-time column".into()))?;
         hotlap
-            .declare_watermark(&pipeline.input, w.time_col, w.lag)
+            .declare_watermark(&pipeline.input, time_col, w.lag)
             .map_err(hotlap_err)?;
     }
     for (name, plan) in &pipeline.views {
