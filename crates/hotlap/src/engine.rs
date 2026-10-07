@@ -84,6 +84,30 @@ impl Hotlap {
         Ok(())
     }
 
+    /// Subscribe the view registered as `name` to its output changelog. Only
+    /// before the first push; read the buffered deltas with [`take_changes`].
+    pub fn tap_view(&mut self, name: &str) -> Result<(), HotlapError> {
+        let id = *self
+            .views
+            .get(name)
+            .ok_or_else(|| HotlapError("no such view".into()))?;
+        self.core
+            .tap_view(id)
+            .map_err(|e| HotlapError(format!("{e:?}")))
+    }
+
+    /// Drain `(row, diff)` changes of the tapped view registered as `name`,
+    /// accumulated by the last push. Empty for an untapped view.
+    pub fn take_changes(&mut self, name: &str) -> Result<Vec<(Row, i64)>, HotlapError> {
+        let id = *self
+            .views
+            .get(name)
+            .ok_or_else(|| HotlapError("no such view".into()))?;
+        self.core
+            .take_changes(id)
+            .map_err(|e| HotlapError(format!("{e:?}")))
+    }
+
     /// Feed `batch` into the input registered as `name`.
     pub fn push(&mut self, input: &str, batch: &ChangeBatch) -> Result<(), HotlapError> {
         let id = *self

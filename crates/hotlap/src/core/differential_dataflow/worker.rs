@@ -22,6 +22,7 @@ pub(super) fn run_worker(rx: mpsc::Receiver<Command>) {
             inputs: Vec::new(),
             views: Vec::new(),
             watermarks: HashMap::new(),
+            tapped: HashSet::new(),
         };
         loop {
             worker.step();
@@ -32,6 +33,12 @@ pub(super) fn run_worker(rx: mpsc::Receiver<Command>) {
                 }
                 Ok(Command::Build { view, plan, reply }) => {
                     let _ = reply.send(handle_build(&mut phase, view, plan));
+                }
+                Ok(Command::Tap { view, reply }) => {
+                    let _ = reply.send(handle_tap(&mut phase, view));
+                }
+                Ok(Command::TakeChanges { view, reply }) => {
+                    let _ = reply.send(handle_take_changes(&mut phase, view));
                 }
                 Ok(Command::DeclareWatermark { input, spec, reply }) => {
                     let _ = reply.send(handle_declare(&mut phase, input, spec));
@@ -144,7 +151,8 @@ fn handle_push(
                 inputs,
                 views,
                 watermarks,
-            } => build::build_dataflow(worker, inputs, views, watermarks)?,
+                tapped,
+            } => build::build_dataflow(worker, inputs, views, watermarks, tapped)?,
             Phase::Running(_) => unreachable!("matched Building above"),
         };
         *phase = Phase::Running(Box::new(running));
@@ -165,5 +173,25 @@ fn handle_snapshot(phase: &Phase, view: ViewId) -> Result<Vec<Row>, CoreError> {
             }
             Err(CoreError::Unsupported(format!("unknown view {view:?}")))
         }
+    }
+}
+
+/// Subscribe a declared view's changes; pre-freeze only, like `build_view`.
+fn handle_tap(phase: &mut Phase, view: ViewId) -> Result<(), CoreError> {
+    let Phase::Building { views, tapped, .. } = phase else {
+        return Err(CoreError::Unsupported("engine already running".into()));
+    };
+    if !views.iter().any(|(declared, _)| *declared == view) {
+        return Err(CoreError::Unsupported(format!("unknown view {view:?}")));
+    }
+    tapped.insert(view);
+    Ok(())
+}
+
+/// Drain the change deltas buffered by the last push for `view`.
+fn handle_take_changes(phase: &mut Phase, view: ViewId) -> Result<Vec<(Row, i64)>, CoreError> {
+    match phase {
+        Phase::Running(running) => running.take_changes(view),
+        Phase::Building { .. } => Err(CoreError::Unsupported("view not built yet".into())),
     }
 }

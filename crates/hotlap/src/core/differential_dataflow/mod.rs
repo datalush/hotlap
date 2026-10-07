@@ -46,6 +46,14 @@ enum Command {
         plan: Plan,
         reply: mpsc::Sender<Result<(), CoreError>>,
     },
+    Tap {
+        view: ViewId,
+        reply: mpsc::Sender<Result<(), CoreError>>,
+    },
+    TakeChanges {
+        view: ViewId,
+        reply: mpsc::Sender<Result<Vec<(Row, i64)>, CoreError>>,
+    },
     DeclareWatermark {
         input: InputId,
         spec: WatermarkSpec,
@@ -130,6 +138,17 @@ impl IncrementalCore for DifferentialCore {
                 reply,
             },
             "core worker dropped build request",
+        )
+    }
+
+    fn tap_view(&mut self, view: ViewId) -> Result<(), CoreError> {
+        self.request(|reply| Command::Tap { view, reply }, "tap request dropped")
+    }
+
+    fn take_changes(&mut self, view: ViewId) -> Result<Vec<(Row, i64)>, CoreError> {
+        self.request(
+            |reply| Command::TakeChanges { view, reply },
+            "core worker dropped take_changes request",
         )
     }
 

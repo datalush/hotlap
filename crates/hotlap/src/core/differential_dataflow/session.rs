@@ -24,10 +24,16 @@ pub(super) const TIME_SCALE: u64 = 1 << 20;
 /// Single-threaded: only the worker thread touches it, so `Rc`/`RefCell` suffice.
 pub(super) type State = Rc<RefCell<BTreeMap<Row, i64>>>;
 
+/// A tap buffer: output deltas `(row, diff)` accumulated since the last drain.
+/// Single-threaded, like [`State`].
+pub(super) type Changes = Rc<RefCell<Vec<(Row, i64)>>>;
+
 /// A compiled view: its output probe, accumulated state and plan (for validation).
 pub(super) struct ViewState {
     pub(super) probe: Handle<u64>,
     pub(super) state: State,
+    /// Deltas pushed by the tap, or empty when the view is not tapped.
+    pub(super) changes: Changes,
     pub(super) plan: Plan,
 }
 
@@ -57,6 +63,8 @@ pub(super) enum Phase {
         inputs: Vec<InputId>,
         views: Vec<(ViewId, Plan)>,
         watermarks: HashMap<InputId, WatermarkSpec>,
+        /// Views whose output deltas are buffered for [`IncrementalCore::take_changes`].
+        tapped: HashSet<ViewId>,
     },
     Running(Box<Running>),
 }
@@ -95,6 +103,15 @@ impl Running {
             .filter(|(_, diff)| **diff != 0)
             .map(|(row, _)| row.clone())
             .collect())
+    }
+
+    /// Drain the change deltas buffered for `view` since the last drain.
+    pub(super) fn take_changes(&mut self, view: ViewId) -> Result<Vec<(Row, i64)>, CoreError> {
+        let vs = self
+            .views
+            .get(&view)
+            .ok_or_else(|| CoreError::Unsupported(format!("unknown view {view:?}")))?;
+        Ok(std::mem::take(&mut *vs.changes.borrow_mut()))
     }
 
     /// In event-time mode, split out the non-late rows (returned) and advance

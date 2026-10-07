@@ -40,6 +40,11 @@ pub trait IncrementalCore {
     /// Compile a `Source`-rooted plan into a live view. Also pre-freeze only.
     /// The inputs named by the plan must already be registered.
     fn build_view(&mut self, view: ViewId, plan: &Plan) -> Result<(), CoreError>;
+    /// Subscribe `view`'s output changes (`tap`). Pre-freeze: after `build_view`
+    /// and before the first `push`.
+    fn tap_view(&mut self, view: ViewId) -> Result<(), CoreError>;
+    /// Drain the change deltas `(row, diff)` produced by the last push for `view`.
+    fn take_changes(&mut self, view: ViewId) -> Result<Vec<(Row, i64)>, CoreError>;
     /// Declare a source's watermark. Only before the first `push`, and after
     /// `register_input` of that source.
     fn declare_watermark(&mut self, input: InputId, spec: WatermarkSpec) -> Result<(), CoreError>;

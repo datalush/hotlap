@@ -1,7 +1,7 @@
 //! Dataflow construction: wire declared inputs and views into one timely scope.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use differential_dataflow::VecCollection;
@@ -9,7 +9,7 @@ use differential_dataflow::input::{Input, InputSession};
 use timely::worker::Worker;
 
 use super::circuit::{compile, sources};
-use super::session::{Running, State, ViewState};
+use super::session::{Changes, Running, State, ViewState};
 use crate::core::{CoreError, InputId, ViewId, WatermarkSpec};
 use crate::plan::Plan;
 use crate::row::Row;
@@ -20,6 +20,7 @@ pub(super) fn build_dataflow(
     inputs: &[InputId],
     views: &[(ViewId, Plan)],
     watermarks: &HashMap<InputId, WatermarkSpec>,
+    tapped: &HashSet<ViewId>,
 ) -> Result<Running, CoreError> {
     if !watermarks.is_empty() && watermarks.len() != inputs.len() {
         return Err(CoreError::Unsupported(
@@ -40,7 +41,7 @@ pub(super) fn build_dataflow(
             sessions.insert(id, session);
             collections.insert(id, coll);
         }
-        let (view_states, consumers) = assemble_views(&collections, views);
+        let (view_states, consumers) = assemble_views(&collections, views, tapped);
         Running {
             inputs: sessions,
             views: view_states,
@@ -60,16 +61,23 @@ pub(super) fn build_dataflow(
 fn assemble_views<'scope>(
     collections: &HashMap<InputId, VecCollection<'scope, u64, Row, isize>>,
     views: &[(ViewId, Plan)],
+    tapped: &HashSet<ViewId>,
 ) -> (HashMap<ViewId, ViewState>, HashMap<InputId, Vec<ViewId>>) {
     let mut view_states: HashMap<ViewId, ViewState> = HashMap::new();
     let mut consumers: HashMap<InputId, Vec<ViewId>> = HashMap::new();
     for (view, plan) in views {
         let state: State = Rc::new(RefCell::new(BTreeMap::new()));
+        let changes: Changes = Rc::new(RefCell::new(Vec::new()));
         let sink = state.clone();
+        let delta_sink = changes.clone();
+        let is_tapped = tapped.contains(view);
         let (probe, _out) = compile(collections, plan)
             .inspect(move |update| {
                 let (row, _time, diff) = update;
                 *sink.borrow_mut().entry(row.clone()).or_insert(0) += *diff as i64;
+                if is_tapped {
+                    delta_sink.borrow_mut().push((row.clone(), *diff as i64));
+                }
             })
             .probe();
         for src in sources(plan) {
@@ -80,6 +88,7 @@ fn assemble_views<'scope>(
             ViewState {
                 probe,
                 state,
+                changes,
                 plan: plan.clone(),
             },
         );
