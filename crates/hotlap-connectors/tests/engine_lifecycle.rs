@@ -44,6 +44,10 @@ fn start_snapshot_shutdown() {
     .unwrap();
     // No view registered: snapshot of an unknown view errors, but the handle must respond.
     assert!(handle.snapshot("nope").is_err());
+    // The derived handle can read snapshots too, without owning the engine.
+    let snap = handle.snapshot_handle();
+    assert!(snap.snapshot("nope").is_err());
+    assert!(snap.last_error().unwrap().is_none());
     handle.shutdown().unwrap();
 }
 

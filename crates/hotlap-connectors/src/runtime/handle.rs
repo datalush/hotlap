@@ -63,10 +63,7 @@ impl EngineHandle {
 
     /// First source/ingestion error that stopped the source branch, if any.
     pub fn last_error(&self) -> Result<Option<String>, ConnectorError> {
-        self.last_error
-            .lock()
-            .map(|slot| slot.clone())
-            .map_err(|_| ConnectorError::Infrastructure("engine error state poisoned".into()))
+        self.snapshot_handle().last_error()
     }
 
     /// Read the consolidated output of a view.
@@ -74,14 +71,16 @@ impl EngineHandle {
     /// Blocks on `blocking_recv`, so it must not be called from within an async
     /// runtime (it would panic or stall the executor).
     pub fn snapshot(&self, view: &str) -> Result<Vec<Row>, ConnectorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Snapshot {
-                view: view.to_string(),
-                reply,
-            })
-            .map_err(|_| stopped())?;
-        rx.blocking_recv().map_err(|_| stopped())?
+        self.snapshot_handle().snapshot(view)
+    }
+
+    /// Derive a cloneable handle that can read snapshots without owning the
+    /// engine thread.
+    pub fn snapshot_handle(&self) -> SnapshotHandle {
+        SnapshotHandle {
+            tx: self.tx.clone(),
+            last_error: Arc::clone(&self.last_error),
+        }
     }
 
     /// Events dropped as late in `input`.
@@ -119,6 +118,42 @@ impl EngineHandle {
 impl Drop for EngineHandle {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Cloneable, thread-safe handle to a running engine.
+///
+/// Shares the command channel and error slot with [`EngineHandle`] but neither
+/// owns the engine thread nor stops it on drop, so multiple table providers can
+/// read snapshots concurrently with the owner.
+#[derive(Clone)]
+pub struct SnapshotHandle {
+    tx: mpsc::UnboundedSender<Command>,
+    last_error: Arc<Mutex<Option<String>>>,
+}
+
+impl SnapshotHandle {
+    /// First source/ingestion error that stopped the source branch, if any.
+    pub fn last_error(&self) -> Result<Option<String>, ConnectorError> {
+        self.last_error
+            .lock()
+            .map(|slot| slot.clone())
+            .map_err(|_| ConnectorError::Infrastructure("engine error state poisoned".into()))
+    }
+
+    /// Read the consolidated output of a view.
+    ///
+    /// Blocks on `blocking_recv`, so it must not be called from within an async
+    /// runtime; callers in async code should offload it to a blocking thread.
+    pub fn snapshot(&self, view: &str) -> Result<Vec<Row>, ConnectorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Snapshot {
+                view: view.to_string(),
+                reply,
+            })
+            .map_err(|_| stopped())?;
+        rx.blocking_recv().map_err(|_| stopped())?
     }
 }
 

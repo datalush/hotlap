@@ -2149,6 +2149,7 @@ name = "hotlap-sql"
 version = "0.0.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "datafusion",
  "futures",
  "hotlap",

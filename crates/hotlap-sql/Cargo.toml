@@ -7,6 +7,7 @@ edition = "2024"
 hotlap = { path = "../hotlap" }
 hotlap-connectors = { path = "../hotlap-connectors" }
 arrow = "59.2"
+async-trait = "0.1"
 datafusion = { version = "55.1", default-features = false, features = ["sql"] }
 futures = "0.3"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
