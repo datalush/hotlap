@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 
 pub mod catalog;
+pub mod ddl;
+mod ddl_scan;
 pub mod error;
 pub mod watermark;
 
