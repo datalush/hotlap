@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 
-use hotlap_core::plan::sources;
+use hotlap_core::plan::has_window;
 use hotlap_core::{CoreError, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
 
+use super::graph::ViewGraph;
 use super::{EngineCore, ViewState};
-use crate::core_eval::{delta, merge};
 use crate::zset::consolidate;
 
 impl IncrementalCore for EngineCore {
@@ -31,18 +31,20 @@ impl IncrementalCore for EngineCore {
         if self.views.contains_key(&view) {
             return Err(CoreError::Unsupported(format!("view {view:?} already built")));
         }
-        for src in sources(plan) {
-            if !self.registered.contains(&src) {
+        let graph = ViewGraph::build(plan);
+        for src in graph.sources() {
+            if !self.registered.contains(src) {
                 return Err(CoreError::Unsupported(format!("unknown input {src:?}")));
             }
         }
         self.views.insert(
             view,
             ViewState {
-                plan: plan.clone(),
+                graph,
+                windowed: has_window(plan),
                 tapped: false,
-                current: None,
-                drained: None,
+                output: None,
+                pending: None,
             },
         );
         Ok(())
@@ -74,15 +76,18 @@ impl IncrementalCore for EngineCore {
         if !self.frozen {
             self.freeze()?;
         }
+        self.schemas.insert(input, batch.schema());
         let kept = self.filter_late(input, batch).map_err(CoreError::from)?;
-        let merged = match self.inputs.get(&input) {
-            Some(previous) => merge(previous, &kept),
-            None => Ok(kept),
+        let targets: Vec<ViewId> = self
+            .views
+            .iter()
+            .filter(|(_, view)| view.graph.sources().contains(&input))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in targets {
+            self.push_view(id, input, &kept)?;
         }
-        .map_err(CoreError::from)?;
-        let accumulated = consolidate(&merged).map_err(CoreError::from)?;
-        self.inputs.insert(input, accumulated);
-        self.refresh_views()
+        Ok(())
     }
 
     fn snapshot(&mut self, view: ViewId) -> Result<ZSetBatch, CoreError> {
@@ -90,8 +95,8 @@ impl IncrementalCore for EngineCore {
             .views
             .get(&view)
             .ok_or_else(|| CoreError::Unsupported(format!("unknown view {view:?}")))?;
-        match &state.current {
-            Some(current) => Ok(current.clone()),
+        match &state.output {
+            Some(output) => consolidate(output).map_err(CoreError::from),
             None => Ok(ZSetBatch::empty(Arc::new(Schema::empty()))),
         }
     }
@@ -108,11 +113,8 @@ impl IncrementalCore for EngineCore {
         if !state.tapped {
             return Ok(ZSetBatch::empty(Arc::new(Schema::empty())));
         }
-        let changes =
-            delta(state.current.as_ref(), state.drained.as_ref()).map_err(CoreError::from)?;
-        state.drained = state.current.clone();
-        match changes {
-            Some(changes) => Ok(changes),
+        match state.pending.take() {
+            Some(pending) => consolidate(&pending).map_err(CoreError::from),
             None => Ok(ZSetBatch::empty(Arc::new(Schema::empty()))),
         }
     }

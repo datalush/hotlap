@@ -1,39 +1,44 @@
-//! Arrow-native [`IncrementalCore`]: recompute each view from accumulated inputs.
+//! Arrow-native [`IncrementalCore`]: persistent per-view operator graphs.
 
+mod graph;
 mod traits;
 
 use std::collections::{HashMap, HashSet};
 
 use arrow::array::BooleanArray;
+use arrow::datatypes::SchemaRef;
 
-use hotlap_core::plan::has_window;
-use hotlap_core::{CoreError, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
+use hotlap_core::{CoreError, InputId, ViewId, WatermarkSpec, ZSetBatch};
 
-use crate::core_eval::{eval_plan, time_values};
 use crate::error::EngineError;
 use crate::ops::filter;
 use crate::zset::int64_diffs;
 
-/// A view's compiled plan plus its last output and last drained output.
+use graph::ViewGraph;
+
+/// A view's persistent graph plus its accumulated output and pending changes.
 pub(super) struct ViewState {
-    pub(super) plan: Plan,
+    pub(super) graph: ViewGraph,
+    pub(super) windowed: bool,
     pub(super) tapped: bool,
-    pub(super) current: Option<ZSetBatch>,
-    pub(super) drained: Option<ZSetBatch>,
+    pub(super) output: Option<ZSetBatch>,
+    pub(super) pending: Option<ZSetBatch>,
 }
 
 /// Differential-dataflow-free engine kernel.
 ///
-/// Inputs accumulate consolidated Z-sets. On every push each view is recomputed
-/// from the accumulated inputs, so its output is the full relation for the
-/// current inputs; changelogs are derived by diffing successive relations.
+/// Each view compiles to a persistent [`ViewGraph`] at `build_view`. A push
+/// propagates only the pushed delta through the graphs that read the input;
+/// stateful operators retain their state, so per-push work does not grow with
+/// accumulated history. Snapshots consolidate the accumulated output deltas.
 pub struct EngineCore {
-    pub(super) inputs: HashMap<InputId, ZSetBatch>,
     pub(super) views: HashMap<ViewId, ViewState>,
     pub(super) registered: HashSet<InputId>,
     pub(super) specs: HashMap<InputId, WatermarkSpec>,
     pub(super) watermarks: HashMap<InputId, i64>,
+    pub(super) schemas: HashMap<InputId, SchemaRef>,
     pub(super) late: HashMap<InputId, u64>,
+    pub(super) rows_processed: u64,
     pub(super) frozen: bool,
 }
 
@@ -41,14 +46,20 @@ impl EngineCore {
     /// Creates an empty core with no inputs, views or watermarks.
     pub fn new() -> Self {
         Self {
-            inputs: HashMap::new(),
             views: HashMap::new(),
             registered: HashSet::new(),
             specs: HashMap::new(),
             watermarks: HashMap::new(),
+            schemas: HashMap::new(),
             late: HashMap::new(),
+            rows_processed: 0,
             frozen: false,
         }
+    }
+
+    /// Cumulative rows fed to view operators since construction.
+    pub fn rows_processed(&self) -> u64 {
+        self.rows_processed
     }
 
     /// Freezes the schema: rejects mixed watermark declarations and windowed
@@ -60,7 +71,7 @@ impl EngineCore {
             ));
         }
         let event_time = !self.specs.is_empty();
-        if !event_time && self.views.values().any(|view| has_window(&view.plan)) {
+        if !event_time && self.views.values().any(|view| view.windowed) {
             return Err(CoreError::Unsupported(
                 "tumbling windows require event-time inputs (declare_watermark)".into(),
             ));
@@ -108,17 +119,44 @@ impl EngineCore {
         Ok(kept)
     }
 
-    /// Recomputes every view from the accumulated inputs.
-    pub(super) fn refresh_views(&mut self) -> Result<(), CoreError> {
-        let ids: Vec<ViewId> = self.views.keys().copied().collect();
-        for id in ids {
-            let plan = self.views[&id].plan.clone();
-            let current = eval_plan(&plan, &self.inputs, &self.watermarks)?;
-            if let Some(view) = self.views.get_mut(&id) {
-                view.current = current;
+    /// Propagates one input's delta through the graph of view `id`.
+    pub(super) fn push_view(
+        &mut self,
+        id: ViewId,
+        input: InputId,
+        delta: &ZSetBatch,
+    ) -> Result<(), CoreError> {
+        let watermark = self.view_watermark(id);
+        let view = self
+            .views
+            .get_mut(&id)
+            .ok_or_else(|| CoreError::Unsupported(format!("unknown view {id:?}")))?;
+        let (output, rows) = view
+            .graph
+            .eval(input, delta, &self.schemas, watermark)
+            .map_err(CoreError::from)?;
+        if let Some(output) = output {
+            view.output = graph::accumulate(view.output.take(), &output).map_err(CoreError::from)?;
+            if view.tapped {
+                view.pending =
+                    graph::accumulate(view.pending.take(), &output).map_err(CoreError::from)?;
             }
         }
+        self.rows_processed += rows;
         Ok(())
+    }
+
+    /// Watermark a view's window closes against: the minimum of its sources'.
+    fn view_watermark(&self, id: ViewId) -> i64 {
+        let Some(view) = self.views.get(&id) else {
+            return 0;
+        };
+        view.graph
+            .sources()
+            .iter()
+            .map(|source| self.watermarks.get(source).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0)
     }
 }
 
@@ -126,4 +164,27 @@ impl Default for EngineCore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Reads an event-time column as non-negative `i64`; nulls map to zero.
+fn time_values(
+    batch: &arrow::record_batch::RecordBatch,
+    col: usize,
+) -> Result<arrow::array::Int64Array, EngineError> {
+    use arrow::compute::cast;
+    use arrow::datatypes::DataType;
+
+    let column = batch.columns().get(col).ok_or_else(|| {
+        EngineError::Unsupported(format!("time column {col} out of range"))
+    })?;
+    let casted = cast(column.as_ref(), &DataType::Int64)?;
+    let ints = casted
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .ok_or_else(|| EngineError::Infrastructure("int64 cast produced wrong type".to_string()))?;
+    Ok(arrow::array::Int64Array::from(
+        ints.iter()
+            .map(|value| value.unwrap_or(0).max(0))
+            .collect::<Vec<_>>(),
+    ))
 }

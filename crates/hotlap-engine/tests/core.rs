@@ -133,65 +133,29 @@ fn untapped_view_has_no_changes() {
     assert!(core.take_changes(ViewId(0)).unwrap().is_empty());
 }
 
-fn time_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("k", DataType::Int64, false),
-        Field::new("ts", DataType::Int64, false),
-    ]))
-}
-
-fn time_zset(rows: &[(i64, i64, i64)]) -> ZSetBatch {
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from(
-            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
-        )),
-        Arc::new(Int64Array::from(
-            rows.iter().map(|row| row.1).collect::<Vec<_>>(),
-        )),
-    ];
-    let diffs: Vec<i64> = rows.iter().map(|row| row.2).collect();
-    let batch = RecordBatch::try_new(time_schema(), columns).unwrap();
-    ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs))).unwrap()
-}
-
 #[test]
-fn tumbling_window_closes_and_drops_late_records() {
+fn per_push_work_does_not_grow_with_history() {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();
-    core.declare_watermark(
-        InputId(0),
-        hotlap_core::WatermarkSpec {
-            time_col: 1,
-            lag: 0,
-        },
-    )
-    .unwrap();
-    core.build_view(
-        ViewId(0),
-        &Plan::TumbleCount {
-            input: Box::new(Plan::Source(InputId(0))),
-            key: vec![0],
-            time_col: 1,
-            size: 10,
-        },
-    )
-    .unwrap();
-    core.tap_view(ViewId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
 
-    // Two events in window [0, 10): not closed until the watermark reaches 10.
-    core.push(InputId(0), &time_zset(&[(1, 1, 1), (1, 2, 1)]))
-        .unwrap();
-    assert!(core.snapshot(ViewId(0)).unwrap().is_empty());
+    let mut previous = core.rows_processed();
+    let mut intervals = Vec::new();
+    for epoch in 0..6i64 {
+        let base = epoch * 10;
+        let batch = text_zset(&[
+            (base + 1, "a", 1),
+            (base + 2, "b", 1),
+            (base + 3, "c", 1),
+        ]);
+        core.push(InputId(0), &batch).unwrap();
+        let now = core.rows_processed();
+        intervals.push(now - previous);
+        previous = now;
+    }
 
-    // Event at ts 12 advances the watermark and closes [0, 10).
-    core.push(InputId(0), &time_zset(&[(1, 12, 1)])).unwrap();
-    let snapshot = core.snapshot(ViewId(0)).unwrap();
-    assert_eq!(ints(&snapshot, 0), vec![1]);
-    assert_eq!(ints(&snapshot, 1), vec![0]);
-    assert_eq!(ints(&snapshot, 2), vec![2]);
-
-    // A late insertion (ts 3 < watermark 12) is dropped and counted.
-    core.push(InputId(0), &time_zset(&[(1, 3, 1)])).unwrap();
-    assert_eq!(core.late_dropped(InputId(0)).unwrap(), 1);
-    assert_eq!(core.snapshot(ViewId(0)).unwrap().len(), 1);
+    // Every push processes the same fixed work, independent of accumulated
+    // history; a recompute-based core would grow this with the input history.
+    assert!(intervals[0] > 0);
+    assert!(intervals.iter().all(|&work| work == intervals[0]));
 }

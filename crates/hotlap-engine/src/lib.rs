@@ -8,7 +8,6 @@
 pub mod arrange;
 pub mod batch;
 pub mod core;
-mod core_eval;
 pub mod error;
 pub mod keys;
 pub mod ops;
