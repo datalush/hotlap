@@ -7,6 +7,7 @@ pub mod arrange;
 pub mod batch;
 pub mod error;
 pub mod keys;
+pub mod ops;
 pub mod time;
 pub mod zset;
 

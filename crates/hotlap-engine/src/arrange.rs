@@ -80,6 +80,11 @@ impl KeyedArrangement {
         self.state.is_empty()
     }
 
+    /// Schema column indices treated as keys by this arrangement.
+    pub fn key_indices(&self) -> &[usize] {
+        &self.key_indices
+    }
+
     /// Iterates `(key bytes, payload bytes, diff)` in deterministic order.
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>, i64)> + '_ {
         self.state
