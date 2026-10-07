@@ -8,6 +8,7 @@ use crate::error::EngineError;
 ///
 /// Each row of `batch` carries the multiplicity stored at the same position
 /// in `diff`. The `diff` column must have as many rows as `batch`.
+#[derive(Clone)]
 pub struct ZSetBatch {
     /// The data rows of the Z-set.
     pub batch: RecordBatch,

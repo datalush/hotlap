@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, UInt32Array};
-use arrow::compute::take;
+use arrow::compute::{concat, concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -9,15 +9,42 @@ use crate::arrange::KeyedArrangement;
 use crate::batch::ZSetBatch;
 use crate::error::EngineError;
 use crate::keys::KeyConverter;
-use crate::zset::int64_diffs;
+use crate::zset::{consolidate, int64_diffs};
 
-/// Reduces an arrangement to per-key counts as a Z-set of `(key..., count)`.
+/// Stateful incremental `groupcount` over a keyed arrangement.
 ///
-/// A key's count is the sum of the diffs of every `(key, payload)` entry it
-/// owns, so retractions lower it and a key that crosses to zero disappears.
-/// Each surviving key emits one row with a `+1` diff; incremental callers diff
-/// consecutive outputs to recover the retraction/insertion deltas.
-pub fn group_count(arrangement: &KeyedArrangement) -> Result<ZSetBatch, EngineError> {
+/// The reducer sums the diffs of every `(key, payload)` entry per key and turns
+/// that relation into a per-epoch changelog. Each `apply` emits one row per key
+/// whose count changed: `(key..., count)` with a signed diff. A key that leaves
+/// the arrangement (crosses to zero) emits its old count with a `-1` diff only;
+/// a new key emits its count with a `+1`; a changed key emits the old count with
+/// `-1` and the new count with `+1`.
+#[derive(Default)]
+pub struct GroupCount {
+    previous: Option<ZSetBatch>,
+}
+
+impl GroupCount {
+    /// Creates a reducer with no prior state; the first `apply` emits the full
+    /// snapshot of the current relation.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reduces `arrangement` and returns the changelog since the previous call.
+    pub fn apply(&mut self, arrangement: &KeyedArrangement) -> Result<ZSetBatch, EngineError> {
+        let current = snapshot(arrangement)?;
+        let delta = match &self.previous {
+            None => current.clone(),
+            Some(previous) => subtract(&current, previous)?,
+        };
+        self.previous = Some(current);
+        Ok(delta)
+    }
+}
+
+/// Reduces the arrangement's current state to one `(key..., count)` row per key.
+fn snapshot(arrangement: &KeyedArrangement) -> Result<ZSetBatch, EngineError> {
     let materialized = arrangement.to_zset()?;
     let key_indices = arrangement.key_indices();
     let converter = KeyConverter::new(materialized.schema().as_ref(), key_indices)?;
@@ -36,6 +63,21 @@ pub fn group_count(arrangement: &KeyedArrangement) -> Result<ZSetBatch, EngineEr
     }
     groups.retain(|(_, sum)| *sum != 0);
     build_counts(&materialized, key_indices, &groups)
+}
+
+/// Returns `current - previous` as a consolidated Z-set of `(key, count)` rows.
+fn subtract(current: &ZSetBatch, previous: &ZSetBatch) -> Result<ZSetBatch, EngineError> {
+    let batch = concat_batches(&current.schema(), [&current.batch, &previous.batch])?;
+    let retracted = negate(previous.diff())?;
+    let diff = concat(&[current.diff().as_ref(), retracted.as_ref()])?;
+    consolidate(&ZSetBatch::new(batch, diff)?)
+}
+
+/// Negates an integer diff column, preserving its length.
+fn negate(diff: &ArrayRef) -> Result<ArrayRef, EngineError> {
+    let ints = int64_diffs(diff)?;
+    let negated: Int64Array = ints.iter().map(|value| value.map(|v| -v)).collect();
+    Ok(Arc::new(negated))
 }
 
 /// Builds `(key columns, count)` rows plus a `+1` diff for every kept group.

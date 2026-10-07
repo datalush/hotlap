@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, UInt32Array};
-use arrow::compute::{filter as arrow_filter, filter_record_batch, take};
+use arrow::array::BooleanArray;
+use arrow::compute::{filter as arrow_filter, filter_record_batch};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
@@ -28,7 +28,8 @@ pub fn filter(zset: &ZSetBatch, predicate: &BooleanArray) -> Result<ZSetBatch, E
 /// Selects the columns named by `cols`, keeping the `diff` column unchanged.
 ///
 /// Columns may be reordered (and repeated) freely; row count and row identity
-/// are preserved, so the output is the projected Z-set.
+/// are preserved, so the output is the projected Z-set. Columns are shared by
+/// `ArrayRef::clone`, so projection is O(number of selected columns).
 pub fn project(zset: &ZSetBatch, cols: &[usize]) -> Result<ZSetBatch, EngineError> {
     let width = zset.schema().fields().len();
     if let Some(&bad) = cols.iter().find(|&&index| index >= width) {
@@ -36,15 +37,14 @@ pub fn project(zset: &ZSetBatch, cols: &[usize]) -> Result<ZSetBatch, EngineErro
             "project column index {bad} out of bounds for width {width}"
         )));
     }
-    let rows = UInt32Array::from((0..zset.len() as u32).collect::<Vec<u32>>());
     let fields: Vec<_> = cols
         .iter()
         .map(|&index| zset.schema().field(index).clone())
         .collect();
     let columns = cols
         .iter()
-        .map(|&index| take(zset.batch.column(index).as_ref(), &rows, None))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|&index| zset.batch.column(index).clone())
+        .collect();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
     ZSetBatch::new(batch, zset.diff.clone())
 }

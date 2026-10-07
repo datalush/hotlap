@@ -4,4 +4,4 @@ pub mod filter_project;
 pub mod groupcount;
 
 pub use filter_project::{filter, project};
-pub use groupcount::group_count;
+pub use groupcount::GroupCount;
