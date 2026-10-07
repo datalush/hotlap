@@ -4,24 +4,23 @@ use arrow::array::{Array, ArrayRef, Int64Array, UInt32Array};
 use arrow::compute::{cast, sort_to_indices, take};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use arrow::row::Rows;
+use arrow::row::{RowConverter, Rows, SortField};
 
 use crate::batch::ZSetBatch;
 use crate::error::EngineError;
-use crate::keys::KeyConverter;
 
-/// Sorts the rows of `zset` by the key columns encoded by `keys`.
-pub fn sort_rows(zset: &ZSetBatch, keys: &KeyConverter) -> Result<ZSetBatch, EngineError> {
-    let order = order_rows(zset, keys)?;
+/// Sorts the rows of `zset` by every column, treating the whole row as identity.
+pub fn sort_rows(zset: &ZSetBatch) -> Result<ZSetBatch, EngineError> {
+    let order = order_rows(&zset.batch)?;
     take_zset(zset, &order)
 }
 
-/// Sums the diffs of identical key rows, dropping rows whose sum is zero.
+/// Sums the diffs of identical full rows, dropping rows whose sum is zero.
 ///
-/// The output is ordered by the encoded key rows, which makes the result
-/// deterministic for a given input and converter.
-pub fn consolidate(zset: &ZSetBatch, keys: &KeyConverter) -> Result<ZSetBatch, EngineError> {
-    let rows = keys.convert(zset.batch.columns())?;
+/// A Z-set's identity is the whole row, so all columns participate in grouping.
+/// The output is sorted by the encoded rows, which makes it deterministic.
+pub fn consolidate(zset: &ZSetBatch) -> Result<ZSetBatch, EngineError> {
+    let rows = full_rows(&zset.batch)?;
     let order = order_rows_from(&rows)?;
     let diffs = int64_diffs(&zset.diff)?;
 
@@ -40,9 +39,21 @@ pub fn consolidate(zset: &ZSetBatch, keys: &KeyConverter) -> Result<ZSetBatch, E
     ZSetBatch::new(batch, diff)
 }
 
-/// Encodes key rows and returns the order that sorts them ascending.
-fn order_rows(zset: &ZSetBatch, keys: &KeyConverter) -> Result<UInt32Array, EngineError> {
-    let rows = keys.convert(zset.batch.columns())?;
+/// Encodes every column of `batch` into byte-comparable rows.
+fn full_rows(batch: &RecordBatch) -> Result<Rows, EngineError> {
+    let fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| SortField::new(field.data_type().clone()))
+        .collect();
+    let converter = RowConverter::new(fields)?;
+    Ok(converter.convert_columns(batch.columns())?)
+}
+
+/// Returns the order that sorts the full encoded rows ascending.
+fn order_rows(batch: &RecordBatch) -> Result<UInt32Array, EngineError> {
+    let rows = full_rows(batch)?;
     order_rows_from(&rows)
 }
 
@@ -108,7 +119,6 @@ mod tests {
 
     use super::{consolidate, sort_rows};
     use crate::batch::ZSetBatch;
-    use crate::keys::KeyConverter;
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -124,10 +134,6 @@ mod tests {
         ];
         let batch = RecordBatch::try_new(schema(), columns).unwrap();
         ZSetBatch::new(batch, Arc::new(Int64Array::from(diff))).unwrap()
-    }
-
-    fn key_converter() -> KeyConverter {
-        KeyConverter::new(schema().as_ref(), &[0]).unwrap()
     }
 
     fn diffs(zset: &ZSetBatch) -> Vec<i64> {
@@ -151,23 +157,33 @@ mod tests {
 
     #[test]
     fn consolidate_sums_duplicates_and_drops_zeros() {
-        // +1 +1 -1 for a repeated key leaves +1; a zero-sum key disappears.
+        // +1 +1 -1 for a repeated full row leaves +1; a zero-sum row disappears.
         let input = zset(
             vec![1, 1, 1, 2, 2],
             vec!["a", "a", "a", "b", "b"],
             vec![1, 1, -1, 1, -1],
         );
-        let out = consolidate(&input, &key_converter()).unwrap();
+        let out = consolidate(&input).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(key_values(&out), vec![1]);
         assert_eq!(diffs(&out), vec![1]);
     }
 
     #[test]
+    fn consolidate_keeps_same_key_with_different_payload() {
+        // Same key, different payload means different full rows: both survive.
+        let input = zset(vec![1, 1], vec!["a", "b"], vec![1, 1]);
+        let out = consolidate(&input).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(key_values(&out), vec![1, 1]);
+        assert_eq!(diffs(&out), vec![1, 1]);
+    }
+
+    #[test]
     fn consolidate_is_deterministic() {
         let input = zset(vec![2, 1, 2], vec!["b", "a", "b"], vec![1, 1, 1]);
-        let first = consolidate(&input, &key_converter()).unwrap();
-        let second = consolidate(&input, &key_converter()).unwrap();
+        let first = consolidate(&input).unwrap();
+        let second = consolidate(&input).unwrap();
         assert_eq!(key_values(&first), key_values(&second));
         assert_eq!(diffs(&first), diffs(&second));
     }
@@ -175,7 +191,7 @@ mod tests {
     #[test]
     fn sort_rows_orders_by_key() {
         let input = zset(vec![3, 1, 2], vec!["c", "a", "b"], vec![1, 2, 3]);
-        let out = sort_rows(&input, &key_converter()).unwrap();
+        let out = sort_rows(&input).unwrap();
         assert_eq!(key_values(&out), vec![1, 2, 3]);
         assert_eq!(diffs(&out), vec![2, 3, 1]);
     }
