@@ -47,8 +47,9 @@ struct FakeFactory {
     batches: Vec<SourceBatch>,
 }
 
+#[async_trait::async_trait]
 impl SourceFactory for FakeFactory {
-    fn create(
+    async fn create(
         &self,
         _name: &str,
         _options: &BTreeMap<String, String>,
@@ -131,7 +132,7 @@ fn recompute(batches: &[SourceBatch], size: i64, lag: i64) -> Vec<(i64, i64, i64
 }
 
 async fn started(batches: Vec<SourceBatch>) -> SqlSession {
-    let mut session = SqlSession::open(factory(batches));
+    let mut session = SqlSession::open_with_factory(factory(batches));
     session.sql(SOURCE).await.unwrap();
     session.sql(VIEW).await.unwrap();
     session.sql("START;").await.unwrap();

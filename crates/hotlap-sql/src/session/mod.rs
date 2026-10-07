@@ -1,6 +1,9 @@
 //! Embedded SQL session: DDL, START and materialized-view queries.
 
+mod fluss_factory;
 mod runtime;
+
+pub use fluss_factory::FlussSourceFactory;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -24,9 +27,10 @@ use crate::translate::{register_tumble_udf, to_kernel_plan};
 use crate::tumble::normalize_tumble_intervals;
 
 /// Builds engine sources from `CREATE SOURCE` options.
+#[async_trait::async_trait]
 pub trait SourceFactory: Send + Sync {
     /// Create the source named `name` from its DDL `options`.
-    fn create(
+    async fn create(
         &self,
         name: &str,
         options: &BTreeMap<String, String>,
@@ -75,8 +79,15 @@ pub struct SqlSession {
 }
 
 impl SqlSession {
-    /// Open an empty session with the planning-only `tumble` function registered.
-    pub fn open(factory: Arc<dyn SourceFactory>) -> Self {
+    /// Open an empty session using the default [`FlussSourceFactory`].
+    pub fn open() -> Self {
+        Self::open_with_factory(Arc::new(FlussSourceFactory))
+    }
+
+    /// Open an empty session with a caller-supplied source factory.
+    ///
+    /// The `tumble` planning function is registered on the fresh context.
+    pub fn open_with_factory(factory: Arc<dyn SourceFactory>) -> Self {
         let ctx = SessionContext::new();
         register_tumble_udf(&ctx);
         Self {
@@ -107,15 +118,15 @@ impl SqlSession {
 
     async fn run_ddl(&mut self, stmt: Statement) -> Result<QueryResult, SqlError> {
         match stmt {
-            Statement::CreateSource(cs) => self.create_source(cs),
+            Statement::CreateSource(cs) => self.create_source(cs).await,
             Statement::CreateView(cv) => self.create_view(cv).await,
             Statement::Start => self.start().await,
         }
     }
 
-    fn create_source(&mut self, cs: CreateSource) -> Result<QueryResult, SqlError> {
+    async fn create_source(&mut self, cs: CreateSource) -> Result<QueryResult, SqlError> {
         self.reject_after_start("CREATE SOURCE")?;
-        let source: Arc<dyn Source> = self.factory.create(&cs.name, &cs.options)?.into();
+        let source: Arc<dyn Source> = self.factory.create(&cs.name, &cs.options).await?.into();
         crate::watermark::column_index(&source.schema(), &cs.time_col)?;
         let connector = cs.options.get("connector").cloned().unwrap_or_default();
         self.catalog.add_source(&cs.name, SourceDef { connector })?;
@@ -147,8 +158,8 @@ impl SqlSession {
                 query: cv.query.clone(),
             },
         )?;
-        self.mv_schemas
-            .insert(cv.name.clone(), mv_schema(&plan, source_schema.as_ref())?);
+        let schema = mv_schema(&plan, source_schema.as_ref())?;
+        self.mv_schemas.insert(cv.name.clone(), schema);
         self.views.push((cv.name, plan));
         Ok(QueryResult::Ack("CREATE MATERIALIZED VIEW".into()))
     }
