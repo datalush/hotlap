@@ -54,6 +54,7 @@ impl SqlSession {
             source: Box::new(SharedSource(source)),
             watermark: self.watermark,
             views: self.views.clone(),
+            sinks: vec![],
         })
     }
 

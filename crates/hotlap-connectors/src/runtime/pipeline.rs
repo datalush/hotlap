@@ -1,9 +1,12 @@
 //! Source -> kernel pipeline: setup, stream merging and batch ingestion.
 
+use std::sync::Arc;
+
 use hotlap::{ChangeBatch, Hotlap, HotlapError, Plan};
 
 use crate::convert;
 use crate::error::ConnectorError;
+use crate::sink::Sink;
 use crate::source::{Source, SourceBatch, SourceStream};
 
 /// Event-time declaration for the pipeline's input.
@@ -12,12 +15,19 @@ pub struct Watermark {
     pub lag: i64,
 }
 
+/// A view tapped into a sink's changelog channel.
+pub struct SinkSpec {
+    pub view: String,
+    pub sink: Arc<dyn Sink>,
+}
+
 /// Everything needed to run a source into the kernel.
 pub struct Pipeline {
     pub input: String,
     pub source: Box<dyn Source>,
     pub watermark: Option<Watermark>,
     pub views: Vec<(String, Plan)>,
+    pub sinks: Vec<SinkSpec>,
 }
 
 /// Register the input, optional watermark and views on `hotlap`.
@@ -37,6 +47,10 @@ pub fn setup(hotlap: &mut Hotlap, pipeline: &Pipeline) -> Result<(), ConnectorEr
     }
     for (name, plan) in &pipeline.views {
         hotlap.create_view(name, plan.clone()).map_err(hotlap_err)?;
+    }
+    // Tapping must happen before the first push, so it belongs in setup.
+    for spec in &pipeline.sinks {
+        hotlap.tap_view(&spec.view).map_err(hotlap_err)?;
     }
     Ok(())
 }

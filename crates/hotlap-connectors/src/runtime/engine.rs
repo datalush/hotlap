@@ -10,6 +10,7 @@ use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 use crate::error::ConnectorError;
 use crate::runtime::handle::Command;
 use crate::runtime::pipeline::{self, Pipeline};
+use crate::runtime::sink::SinkPump;
 use crate::source::SourceBatch;
 
 /// Run the engine loop until shutdown or channel close.
@@ -62,12 +63,16 @@ async fn drive(
             return;
         }
     };
+    let sinks = SinkPump::start(&pipeline.sinks);
     let _ = ready.send(Ok(()));
     let mut source_done = false;
     loop {
         tokio::select! {
             maybe = source.next(), if !source_done => {
-                source_done = on_source_item(&mut hotlap, &pipeline, maybe, last_error, built);
+                source_done = feed_source(
+                    &mut hotlap, &pipeline, &sinks, maybe, last_error, built,
+                )
+                .await;
             }
             cmd = rx.recv() => match cmd {
                 Some(Command::Snapshot { view, reply }) => {
@@ -77,11 +82,46 @@ async fn drive(
                     let _ = reply.send(hotlap.late_dropped(&input).map_err(map_err));
                 }
                 Some(Command::Shutdown { reply }) => {
+                    close_sinks(sinks, last_error).await;
                     let _ = reply.send(());
                     return;
                 }
-                None => return,
+                None => {
+                    close_sinks(sinks, last_error).await;
+                    return;
+                }
             },
+        }
+    }
+}
+
+/// Drop the sink senders and wait for the tasks, so the last changelog lands.
+async fn close_sinks(sinks: SinkPump, last_error: &Mutex<Option<String>>) {
+    if let Err(error) = sinks.close().await {
+        record_error(last_error, error);
+    }
+}
+
+/// Ingest one source item and, if it succeeded, pump its deltas into the sinks.
+///
+/// Returns whether the source branch is finished (exhausted, errored or the
+/// sink channel broke), which disables that branch of the select loop.
+async fn feed_source(
+    hotlap: &mut Hotlap,
+    pipeline: &Pipeline,
+    sinks: &SinkPump,
+    item: Option<Result<SourceBatch, ConnectorError>>,
+    last_error: &Mutex<Option<String>>,
+    built: &AtomicBool,
+) -> bool {
+    if on_source_item(hotlap, pipeline, item, last_error, built) {
+        return true;
+    }
+    match sinks.pump(hotlap).await {
+        Ok(()) => false,
+        Err(error) => {
+            record_error(last_error, error);
+            true
         }
     }
 }

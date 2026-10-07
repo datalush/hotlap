@@ -42,6 +42,7 @@ fn start_snapshot_shutdown() {
         source: Box::new(PendingSource { schema }),
         watermark: None,
         views: vec![],
+        sinks: vec![],
     })
     .unwrap();
     // No view registered: snapshot of an unknown view errors, but the handle must respond.
@@ -125,6 +126,7 @@ fn snapshot_handle_reads_a_built_view() {
                 key: vec![0],
             },
         )],
+        sinks: vec![],
     })
     .unwrap();
     let snap = handle.snapshot_handle();
@@ -153,6 +155,7 @@ fn source_error_is_surfaced() {
         source: Box::new(FailingSource { schema }),
         watermark: None,
         views: vec![],
+        sinks: vec![],
     })
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -183,6 +186,7 @@ fn start_reports_setup_failure() {
                 key: vec![0],
             },
         )],
+        sinks: vec![],
     });
     assert!(result.is_err());
 }

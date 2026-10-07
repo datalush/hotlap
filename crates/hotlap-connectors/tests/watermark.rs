@@ -46,6 +46,7 @@ async fn watermark_uses_the_source_event_time_column() {
         }),
         watermark: Some(Watermark { lag: 0 }),
         views: vec![],
+        sinks: vec![],
     };
     let mut hotlap = Hotlap::open().unwrap();
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
@@ -61,6 +62,7 @@ async fn watermark_without_source_event_time_errors() {
         }),
         watermark: Some(Watermark { lag: 0 }),
         views: vec![],
+        sinks: vec![],
     };
     let mut hotlap = Hotlap::open().unwrap();
     let error = pipeline::setup(&mut hotlap, &pipeline).unwrap_err();

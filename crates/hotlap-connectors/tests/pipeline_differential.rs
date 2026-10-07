@@ -63,6 +63,7 @@ fn group_count(schema: SchemaRef, batches: Vec<SourceBatch>) -> (Hotlap, Pipelin
                 key: vec![0],
             },
         )],
+        sinks: vec![],
     };
     (Hotlap::open().unwrap(), pipeline)
 }
@@ -152,6 +153,7 @@ async fn two_splits_merge() {
                 key: vec![0],
             },
         )],
+        sinks: vec![],
     };
     let mut hotlap = Hotlap::open().unwrap();
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
@@ -190,6 +192,7 @@ async fn window_without_watermark_is_rejected_at_push() {
                 size: 10,
             },
         )],
+        sinks: vec![],
     };
     let mut hotlap = Hotlap::open().unwrap();
     pipeline::setup(&mut hotlap, &pipeline).unwrap();

@@ -11,8 +11,12 @@ use crate::error::ConnectorError;
 pub type ChangeStream = Pin<Box<dyn Stream<Item = Result<ChangeBatch, ConnectorError>> + Send>>;
 
 /// A sink of change batches with 2PC shape (real 2PC lands in SP4).
+#[async_trait::async_trait]
 pub trait Sink: Send + Sync {
-    fn write(&self, changes: ChangeStream) -> Result<(), ConnectorError>;
-    fn commit(&self) -> Result<(), ConnectorError>;
-    fn abort(&self) -> Result<(), ConnectorError>;
+    /// Consume the changelog until the stream ends, then return.
+    async fn write(&self, changes: ChangeStream) -> Result<(), ConnectorError>;
+    /// Commit the data written since the last commit.
+    async fn commit(&self) -> Result<(), ConnectorError>;
+    /// Drop uncommitted data written since the last commit.
+    async fn abort(&self) -> Result<(), ConnectorError>;
 }
