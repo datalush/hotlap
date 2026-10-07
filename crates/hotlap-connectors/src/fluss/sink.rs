@@ -1,17 +1,16 @@
 //! Fluss append sink: writes a view's changelog to a Fluss log table.
 
-use arrow::array::{ArrayRef, BooleanBuilder, Int64Builder, StringBuilder};
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use fluss::client::{AppendWriter, FlussConnection};
 use fluss::config::Config;
 use futures::StreamExt;
-use hotlap::{ChangeBatch, Row, Scalar};
+use hotlap::ChangeBatch;
 
 use crate::error::ConnectorError;
 use crate::sink::{ChangeStream, Sink};
 
+use super::sink_convert::rows_to_batch;
 use super::{fluss_err, parse_path};
 
 /// Append-only Fluss sink. Retractions (`diff < 0`) are rejected.
@@ -59,73 +58,6 @@ pub fn retraction_check(batch: &ChangeBatch) -> Result<(), ConnectorError> {
     Ok(())
 }
 
-/// Build one Arrow batch, repeating each row `diff` times (append multiplicity).
-fn rows_to_batch(schema: &SchemaRef, batch: &ChangeBatch) -> Result<RecordBatch, ConnectorError> {
-    retraction_check(batch)?;
-    let rows: Vec<&Row> = batch
-        .rows
-        .iter()
-        .flat_map(|(row, diff)| std::iter::repeat_n(row, usize::try_from(*diff).unwrap_or(0)))
-        .collect();
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    for (col, field) in schema.fields().iter().enumerate() {
-        arrays.push(build_column(field.data_type(), col, &rows)?);
-    }
-    RecordBatch::try_new(schema.clone(), arrays)
-        .map_err(|error| ConnectorError::Arrow(format!("record batch: {error}")))
-}
-
-fn build_column(
-    data_type: &DataType,
-    col: usize,
-    rows: &[&Row],
-) -> Result<ArrayRef, ConnectorError> {
-    match data_type {
-        DataType::Int64 | DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let mut builder = Int64Builder::with_capacity(rows.len());
-            for row in rows {
-                match row.0.get(col) {
-                    Some(Scalar::I64(value)) => builder.append_value(*value),
-                    Some(Scalar::Null) | None => builder.append_null(),
-                    other => return Err(mismatch(data_type, other)),
-                }
-            }
-            Ok(std::sync::Arc::new(builder.finish()))
-        }
-        DataType::Utf8 => {
-            let mut builder = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
-            for row in rows {
-                match row.0.get(col) {
-                    Some(Scalar::Str(value)) => builder.append_value(value),
-                    Some(Scalar::Null) | None => builder.append_null(),
-                    other => return Err(mismatch(data_type, other)),
-                }
-            }
-            Ok(std::sync::Arc::new(builder.finish()))
-        }
-        DataType::Boolean => {
-            let mut builder = BooleanBuilder::with_capacity(rows.len());
-            for row in rows {
-                match row.0.get(col) {
-                    Some(Scalar::Bool(value)) => builder.append_value(*value),
-                    Some(Scalar::Null) | None => builder.append_null(),
-                    other => return Err(mismatch(data_type, other)),
-                }
-            }
-            Ok(std::sync::Arc::new(builder.finish()))
-        }
-        other => Err(ConnectorError::Unsupported(format!(
-            "unsupported column type {other:?}"
-        ))),
-    }
-}
-
-fn mismatch(data_type: &DataType, scalar: Option<&Scalar>) -> ConnectorError {
-    ConnectorError::Arrow(format!(
-        "value {scalar:?} does not match column type {data_type:?}"
-    ))
-}
-
 #[async_trait]
 impl Sink for FlussSink {
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
@@ -159,7 +91,7 @@ impl Sink for FlussSink {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::{Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use hotlap::{ChangeBatch, Row, Scalar};
 
     use super::*;
@@ -182,6 +114,23 @@ mod tests {
         let batch = rows_to_batch(&schema, &b).unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 1);
+    }
+
+    #[test]
+    fn builds_timestamp_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]));
+        let mut b = ChangeBatch::default();
+        b.push(Row(vec![Scalar::I64(1000)]), 1);
+        let batch = rows_to_batch(&schema, &b).unwrap();
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            schema.field(0).data_type()
+        );
+        assert_eq!(batch.num_rows(), 1);
     }
 
     #[test]
