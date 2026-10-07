@@ -1,7 +1,7 @@
 //! Expression helpers for `translate`: predicates, columns, literals, `tumble`.
 
 use datafusion::common::{DFSchema, ScalarValue};
-use datafusion::logical_expr::expr::{BinaryExpr, ScalarFunction};
+use datafusion::logical_expr::expr::{AggregateFunction, BinaryExpr, ScalarFunction};
 use datafusion::logical_expr::{Expr, Operator};
 use hotlap::Scalar;
 use hotlap::plan::Predicate;
@@ -94,7 +94,8 @@ pub(crate) fn parse_tumble(
     Ok((column_index(ts, schema)?, int_literal(size)?))
 }
 
-/// Require the aggregate list to be a single, non-distinct `count(*)`.
+/// Require the aggregate list to be a single plain `count(*)`: no `DISTINCT`,
+/// `FILTER`, `ORDER BY`, `NULL TREATMENT`, or per-column argument.
 pub(crate) fn ensure_count_only(aggr: &[Expr]) -> Result<(), SqlError> {
     let [expr] = aggr else {
         return Err(SqlError::Unsupported(format!(
@@ -103,17 +104,21 @@ pub(crate) fn ensure_count_only(aggr: &[Expr]) -> Result<(), SqlError> {
         )));
     };
     match expr {
-        Expr::AggregateFunction(af)
-            if af.func.name().eq_ignore_ascii_case("count")
-                && !af.params.distinct
-                && is_count_star(&af.params.args) =>
-        {
-            Ok(())
-        }
+        Expr::AggregateFunction(af) if is_plain_count(af) => Ok(()),
         other => Err(SqlError::Unsupported(format!(
             "only `count(*)` is supported, got `{other}`"
         ))),
     }
+}
+
+/// A `count(*)` with no modifiers; anything else would be silently dropped.
+fn is_plain_count(af: &AggregateFunction) -> bool {
+    af.func.name().eq_ignore_ascii_case("count")
+        && !af.params.distinct
+        && af.params.filter.is_none()
+        && af.params.order_by.is_empty()
+        && af.params.null_treatment.is_none()
+        && is_count_star(&af.params.args)
 }
 
 /// `count(*)` is normalized to `count(1)`; bare `count()` is also accepted.

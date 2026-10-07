@@ -89,6 +89,20 @@ async fn rejects_count_of_column() {
 }
 
 #[tokio::test]
+async fn rejects_count_filter_clause() {
+    let ctx = ctx_with_src();
+    assert!(
+        plan_for(
+            &ctx,
+            "SELECT count(*) FILTER (WHERE k > 0) FROM src GROUP BY k, tumble(ts, 10000)",
+        )
+        .await
+        .is_err(),
+        "a FILTER clause would be silently dropped"
+    );
+}
+
+#[tokio::test]
 async fn rejects_join_of_distinct_sources() {
     let ctx = ctx_with_src();
     register_empty_table(&ctx, "other");

@@ -135,6 +135,7 @@ fn translate_join(j: &Join, source: InputId) -> Result<Plan, SqlError> {
 fn base_tables(plan: &LogicalPlan) -> Result<Vec<String>, SqlError> {
     match plan {
         LogicalPlan::TableScan(t) => Ok(vec![t.table_name.to_string()]),
+        LogicalPlan::SubqueryAlias(a) => base_tables(&a.input),
         LogicalPlan::Projection(p) => base_tables(&p.input),
         LogicalPlan::Filter(f) => base_tables(&f.input),
         other => Err(SqlError::Unsupported(format!(
