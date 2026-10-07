@@ -112,7 +112,7 @@ impl PartitionStream for SourcePartition {
                 .map(move |r| project_result(r, projection.as_deref()))
                 .boxed(),
             Err(e) => {
-                let error = DataFusionError::External(Box::new(e));
+                let error = to_df(e);
                 futures::stream::once(async move { Err(error) }).boxed()
             }
         };

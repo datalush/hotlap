@@ -3,6 +3,8 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion::catalog::TableProvider;
+use datafusion::physical_plan::execution_plan::Boundedness;
 use datafusion::prelude::SessionContext;
 
 use hotlap_connectors::datafusion::provider::SourceTableProvider;
@@ -78,4 +80,24 @@ async fn unbounded_source_limits_rows() {
     let out = df.collect().await.unwrap();
     let rows: usize = out.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn scan_boundedness_follows_source() {
+    let ctx = SessionContext::new();
+    let state = ctx.state();
+
+    let bounded = SourceTableProvider::new(one_batch_source(false));
+    let plan = bounded.scan(&state, None, &[], None).await.unwrap();
+    assert!(matches!(
+        plan.properties().boundedness,
+        Boundedness::Bounded
+    ));
+
+    let unbounded = SourceTableProvider::new(one_batch_source(true));
+    let plan = unbounded.scan(&state, None, &[], None).await.unwrap();
+    assert!(matches!(
+        plan.properties().boundedness,
+        Boundedness::Unbounded { .. }
+    ));
 }
