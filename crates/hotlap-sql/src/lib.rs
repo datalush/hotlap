@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod catalog;
+pub mod convert;
 pub mod ddl;
 mod ddl_scan;
 pub mod error;
