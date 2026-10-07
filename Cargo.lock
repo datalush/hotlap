@@ -2145,6 +2145,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotlap-engine"
+version = "0.0.0"
+dependencies = [
+ "arrow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hotlap-sql"
 version = "0.0.0"
 dependencies = [
