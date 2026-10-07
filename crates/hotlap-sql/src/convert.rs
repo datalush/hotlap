@@ -18,7 +18,7 @@ pub fn ensure_kernel_types(schema: &Schema) -> Result<(), SqlError> {
                 return Err(SqlError::Unsupported(format!(
                     "column `{}` has type {other:?}, not representable by the kernel",
                     f.name()
-                )))
+                )));
             }
         }
     }
@@ -78,7 +78,9 @@ fn build_column(dt: &DataType, col: usize, rows: &[Row]) -> Result<ArrayRef, Sql
 }
 
 fn mismatch(dt: &DataType, scalar: Option<&Scalar>) -> SqlError {
-    SqlError::Unsupported(format!("value {scalar:?} does not match column type {dt:?}"))
+    SqlError::Unsupported(format!(
+        "value {scalar:?} does not match column type {dt:?}"
+    ))
 }
 
 #[cfg(test)]

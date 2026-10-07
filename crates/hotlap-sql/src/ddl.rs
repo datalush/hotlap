@@ -46,7 +46,9 @@ pub fn parse(sql: &str) -> Result<Statement, SqlError> {
     if upper.starts_with(VIEW_PREFIX) {
         return parse_create_view(trimmed);
     }
-    Err(SqlError::Parse(format!("unrecognized statement: {trimmed}")))
+    Err(SqlError::Parse(format!(
+        "unrecognized statement: {trimmed}"
+    )))
 }
 
 fn parse_create_source(sql: &str) -> Result<Statement, SqlError> {

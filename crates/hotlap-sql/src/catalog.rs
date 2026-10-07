@@ -55,7 +55,21 @@ mod tests {
     #[test]
     fn catalog_registers_and_rejects_duplicates() {
         let mut c = Catalog::default();
-        c.add_source("s", SourceDef { connector: "fluss".into() }).unwrap();
-        assert!(c.add_source("s", SourceDef { connector: "fluss".into() }).is_err());
+        c.add_source(
+            "s",
+            SourceDef {
+                connector: "fluss".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            c.add_source(
+                "s",
+                SourceDef {
+                    connector: "fluss".into()
+                }
+            )
+            .is_err()
+        );
     }
 }
