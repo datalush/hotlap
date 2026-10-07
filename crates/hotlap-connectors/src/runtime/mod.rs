@@ -1,3 +1,5 @@
-//! Runtime: pipeline wiring and the engine/handle (Task 4).
+//! Runtime: pipeline wiring, engine thread and handle.
 
+pub mod engine;
+pub mod handle;
 pub mod pipeline;
