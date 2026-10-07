@@ -64,7 +64,7 @@ fn order_rows_from(rows: &Rows) -> Result<UInt32Array, EngineError> {
 }
 
 /// Coerces the diff column to signed 64-bit integers.
-fn int64_diffs(diff: &ArrayRef) -> Result<Int64Array, EngineError> {
+pub(crate) fn int64_diffs(diff: &ArrayRef) -> Result<Int64Array, EngineError> {
     if !diff.data_type().is_integer() {
         return Err(EngineError::Unsupported(format!(
             "diff column must be integer, found {:?}",

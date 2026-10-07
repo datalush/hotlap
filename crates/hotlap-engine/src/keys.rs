@@ -18,16 +18,8 @@ impl KeyConverter {
     ///
     /// Types are resolved from `schema`; indices must address existing fields.
     pub fn new(schema: &Schema, column_indices: &[usize]) -> Result<Self, EngineError> {
-        let mut fields = Vec::with_capacity(column_indices.len());
-        for &index in column_indices {
-            let field = schema.fields().get(index).ok_or_else(|| {
-                EngineError::Unsupported(format!("key column index {index} out of bounds"))
-            })?;
-            fields.push(SortField::new(field.data_type().clone()));
-        }
-        let inner = RowConverter::new(fields)?;
         Ok(Self {
-            inner,
+            inner: converter_for(schema, column_indices)?,
             column_indices: column_indices.to_vec(),
         })
     }
@@ -48,6 +40,23 @@ impl KeyConverter {
         }
         Ok(self.inner.convert_columns(&keys)?)
     }
+}
+
+/// Builds a `RowConverter` over the selected schema columns.
+///
+/// Returns `Unsupported` when an index does not address an existing field.
+pub(crate) fn converter_for(
+    schema: &Schema,
+    column_indices: &[usize],
+) -> Result<RowConverter, EngineError> {
+    let mut fields = Vec::with_capacity(column_indices.len());
+    for &index in column_indices {
+        let field = schema.fields().get(index).ok_or_else(|| {
+            EngineError::Unsupported(format!("key column index {index} out of bounds"))
+        })?;
+        fields.push(SortField::new(field.data_type().clone()));
+    }
+    Ok(RowConverter::new(fields)?)
 }
 
 #[cfg(test)]
