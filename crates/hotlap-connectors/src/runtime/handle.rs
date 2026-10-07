@@ -34,11 +34,26 @@ pub struct EngineHandle {
 
 impl EngineHandle {
     /// Spawn the engine thread and start the pipeline.
+    ///
+    /// Blocks until the engine reports startup success or failure, so setup
+    /// errors surface here instead of later as a stopped engine.
     pub fn start(pipeline: Pipeline) -> Result<Self, ConnectorError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let last_error = Arc::new(Mutex::new(None));
         let engine_error = Arc::clone(&last_error);
-        let join = std::thread::spawn(move || engine::run(pipeline, rx, engine_error));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let join = std::thread::spawn(move || engine::run(pipeline, rx, engine_error, ready_tx));
+        match ready_rx.blocking_recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = join.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = join.join();
+                return Err(stopped());
+            }
+        }
         Ok(Self {
             tx,
             join: Some(join),
@@ -80,13 +95,24 @@ impl EngineHandle {
 
     /// Stop the engine and join its thread.
     pub fn shutdown(mut self) -> Result<(), ConnectorError> {
-        let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(Command::Shutdown { reply });
-        let _ = rx.blocking_recv();
+        self.stop();
+        Ok(())
+    }
+
+    /// Send shutdown and join the engine thread, if still running.
+    fn stop(&mut self) {
         if let Some(join) = self.join.take() {
+            let (reply, rx) = oneshot::channel();
+            let _ = self.tx.send(Command::Shutdown { reply });
+            let _ = rx.blocking_recv();
             let _ = join.join();
         }
-        Ok(())
+    }
+}
+
+impl Drop for EngineHandle {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

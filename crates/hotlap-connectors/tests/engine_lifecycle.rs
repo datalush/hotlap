@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use futures::stream;
+use hotlap::{InputId, Plan};
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::runtime::handle::EngineHandle;
 use hotlap_connectors::runtime::pipeline::Pipeline;
@@ -91,4 +92,23 @@ fn source_error_is_surfaced() {
     }
     assert!(raised, "engine did not surface the source error");
     handle.shutdown().unwrap();
+}
+
+#[test]
+fn start_reports_setup_failure() {
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let result = EngineHandle::start(Pipeline {
+        input: "in".into(),
+        source: Box::new(PendingSource { schema }),
+        watermark: None,
+        // A view referencing an unknown input fails during setup.
+        views: vec![(
+            "c".into(),
+            Plan::GroupCount {
+                input: Box::new(Plan::Source(InputId(99))),
+                key: vec![0],
+            },
+        )],
+    });
+    assert!(result.is_err());
 }
