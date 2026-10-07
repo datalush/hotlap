@@ -126,6 +126,14 @@ impl SqlSession {
 
     async fn create_source(&mut self, cs: CreateSource) -> Result<QueryResult, SqlError> {
         self.reject_after_start("CREATE SOURCE")?;
+        // v1 owns a single source: a second declaration would overwrite the
+        // runtime source/watermark while leaving the first still registered,
+        // so a view over the first name could silently read the second's data.
+        if self.source.is_some() {
+            return Err(SqlError::Unsupported(
+                "only one source is supported in v1".into(),
+            ));
+        }
         let source: Arc<dyn Source> = self.factory.create(&cs.name, &cs.options).await?.into();
         crate::watermark::column_index(&source.schema(), &cs.time_col)?;
         let connector = cs.options.get("connector").cloned().unwrap_or_default();
