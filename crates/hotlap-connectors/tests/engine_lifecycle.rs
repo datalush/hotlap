@@ -1,9 +1,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
 use futures::stream;
-use hotlap::{InputId, Plan};
+use hotlap::{InputId, Plan, Row, Scalar};
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::runtime::handle::EngineHandle;
 use hotlap_connectors::runtime::pipeline::Pipeline;
@@ -73,6 +75,74 @@ impl Source for FailingSource {
     fn event_time_column(&self) -> Option<usize> {
         None
     }
+}
+
+struct OneBatchSource {
+    schema: SchemaRef,
+}
+
+impl Source for OneBatchSource {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn splits(&self) -> Result<Vec<Split>, ConnectorError> {
+        Ok(vec![Split { id: 0, start: 0 }])
+    }
+    fn read(&self, _split: &Split) -> Result<SourceStream, ConnectorError> {
+        let schema = self.schema.clone();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 1, 2]))],
+        )
+        .unwrap();
+        let item = Ok(SourceBatch {
+            batch,
+            base_offset: 0,
+        });
+        Ok(Box::pin(stream::iter(vec![item])))
+    }
+    fn state(&self) -> SourceState {
+        SourceState::default()
+    }
+    fn event_time_column(&self) -> Option<usize> {
+        None
+    }
+}
+
+#[test]
+fn snapshot_handle_reads_a_built_view() {
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let handle = EngineHandle::start(Pipeline {
+        input: "in".into(),
+        source: Box::new(OneBatchSource {
+            schema: schema.clone(),
+        }),
+        watermark: None,
+        views: vec![(
+            "c".into(),
+            Plan::GroupCount {
+                input: Box::new(Plan::Source(InputId(0))),
+                key: vec![0],
+            },
+        )],
+    })
+    .unwrap();
+    let snap = handle.snapshot_handle();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !snap.is_built() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(snap.is_built(), "engine never built the dataflow");
+    let mut rows = snap.snapshot("c").unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            Row(vec![Scalar::I64(1), Scalar::I64(2)]),
+            Row(vec![Scalar::I64(2), Scalar::I64(1)]),
+        ]
+    );
+    handle.shutdown().unwrap();
 }
 
 #[test]

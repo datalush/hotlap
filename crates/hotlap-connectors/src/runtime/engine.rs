@@ -1,5 +1,6 @@
 //! The dedicated engine thread: owns `Hotlap`, drives the source and commands.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
@@ -19,6 +20,7 @@ pub(crate) fn run(
     pipeline: Pipeline,
     mut rx: UnboundedReceiver<Command>,
     last_error: Arc<Mutex<Option<String>>>,
+    built: Arc<AtomicBool>,
     ready: oneshot::Sender<Result<(), ConnectorError>>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -31,7 +33,7 @@ pub(crate) fn run(
             return;
         }
     };
-    rt.block_on(drive(pipeline, &mut rx, &last_error, ready));
+    rt.block_on(drive(pipeline, &mut rx, &last_error, &built, ready));
 }
 
 /// Open the kernel, wire the pipeline and then serve source data and commands.
@@ -39,6 +41,7 @@ async fn drive(
     pipeline: Pipeline,
     rx: &mut UnboundedReceiver<Command>,
     last_error: &Mutex<Option<String>>,
+    built: &AtomicBool,
     ready: oneshot::Sender<Result<(), ConnectorError>>,
 ) {
     let mut hotlap = match Hotlap::open() {
@@ -64,7 +67,7 @@ async fn drive(
     loop {
         tokio::select! {
             maybe = source.next(), if !source_done => {
-                source_done = on_source_item(&mut hotlap, &pipeline, maybe, last_error);
+                source_done = on_source_item(&mut hotlap, &pipeline, maybe, last_error, built);
             }
             cmd = rx.recv() => match cmd {
                 Some(Command::Snapshot { view, reply }) => {
@@ -89,10 +92,16 @@ fn on_source_item(
     pipeline: &Pipeline,
     item: Option<Result<SourceBatch, ConnectorError>>,
     last_error: &Mutex<Option<String>>,
+    built: &AtomicBool,
 ) -> bool {
     match item {
         Some(Ok(sb)) => match pipeline::ingest(hotlap, &pipeline.input, &sb) {
-            Ok(()) => false,
+            Ok(()) => {
+                // The first successful push builds the dataflow, so views become
+                // readable even if later pushes add no rows.
+                built.store(true, Ordering::SeqCst);
+                false
+            }
             Err(error) => {
                 record_error(last_error, error);
                 true

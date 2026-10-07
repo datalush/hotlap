@@ -180,3 +180,10 @@ async fn ddl_after_start_rejected() {
     assert!(session.sql(VIEW).await.is_err(), "DDL after START");
     session.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn dropping_session_stops_engine() {
+    // Dropping without `shutdown().await` must not panic on the executor.
+    let session = started(vec![batch(&[1], &[1000])]).await;
+    drop(session);
+}

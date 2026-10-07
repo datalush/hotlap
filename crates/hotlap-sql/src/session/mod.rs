@@ -49,18 +49,15 @@ pub enum QueryResult {
 
 impl Snapshotter for SnapshotHandle {
     fn snapshot(&self, view: &str) -> Result<Vec<Row>, SqlError> {
-        match SnapshotHandle::snapshot(self, view) {
-            Ok(rows) => Ok(rows),
-            // A declared view whose dataflow has not been built yet (no row has
-            // reached the input) is empty, not an error.
-            Err(error) if is_unbuilt_view(&error) => Ok(Vec::new()),
-            Err(error) => Err(to_engine(error)),
+        // Before the first push the kernel has no built dataflow, so a declared
+        // view reads as empty rather than erroring. `is_built` is set by the
+        // engine after the first successful push, avoiding any dependence on
+        // the kernel's error text.
+        if !self.is_built() {
+            return Ok(Vec::new());
         }
+        SnapshotHandle::snapshot(self, view).map_err(to_engine)
     }
-}
-
-fn is_unbuilt_view(error: &hotlap_connectors::ConnectorError) -> bool {
-    error.to_string().contains("view not built yet")
 }
 
 /// A single embedded session over one source and its materialized views.

@@ -1,5 +1,6 @@
 //! Thread-safe handle to a running engine, and the command protocol.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -30,6 +31,7 @@ pub struct EngineHandle {
     tx: mpsc::UnboundedSender<Command>,
     join: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
+    built: Arc<AtomicBool>,
 }
 
 impl EngineHandle {
@@ -41,8 +43,12 @@ impl EngineHandle {
         let (tx, rx) = mpsc::unbounded_channel();
         let last_error = Arc::new(Mutex::new(None));
         let engine_error = Arc::clone(&last_error);
+        let built = Arc::new(AtomicBool::new(false));
+        let engine_built = Arc::clone(&built);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let join = std::thread::spawn(move || engine::run(pipeline, rx, engine_error, ready_tx));
+        let join = std::thread::spawn(move || {
+            engine::run(pipeline, rx, engine_error, engine_built, ready_tx)
+        });
         match ready_rx.blocking_recv() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -58,6 +64,7 @@ impl EngineHandle {
             tx,
             join: Some(join),
             last_error,
+            built,
         })
     }
 
@@ -80,6 +87,7 @@ impl EngineHandle {
         SnapshotHandle {
             tx: self.tx.clone(),
             last_error: Arc::clone(&self.last_error),
+            built: Arc::clone(&self.built),
         }
     }
 
@@ -104,12 +112,16 @@ impl EngineHandle {
         Ok(())
     }
 
-    /// Send shutdown and join the engine thread, if still running.
+    /// Ask the engine to stop and join its thread, if still running.
+    ///
+    /// The reply is deliberately not awaited: `blocking_recv` panics inside a
+    /// tokio executor, so `Drop` could not use it. Joining the engine thread
+    /// still blocks until the engine has processed the command and exited, and
+    /// `thread::join` is safe to call from within a runtime.
     fn stop(&mut self) {
         if let Some(join) = self.join.take() {
-            let (reply, rx) = oneshot::channel();
+            let (reply, _rx) = oneshot::channel();
             let _ = self.tx.send(Command::Shutdown { reply });
-            let _ = rx.blocking_recv();
             let _ = join.join();
         }
     }
@@ -130,9 +142,16 @@ impl Drop for EngineHandle {
 pub struct SnapshotHandle {
     tx: mpsc::UnboundedSender<Command>,
     last_error: Arc<Mutex<Option<String>>>,
+    built: Arc<AtomicBool>,
 }
 
 impl SnapshotHandle {
+    /// Whether at least one batch has been pushed, i.e. the dataflow has been
+    /// built. Before that, a declared view has no output to read.
+    pub fn is_built(&self) -> bool {
+        self.built.load(Ordering::SeqCst)
+    }
+
     /// First source/ingestion error that stopped the source branch, if any.
     pub fn last_error(&self) -> Result<Option<String>, ConnectorError> {
         self.last_error

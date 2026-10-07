@@ -61,3 +61,53 @@ fn field_at(fields: &[Field], index: usize) -> Result<Field, SqlError> {
 fn int_field(name: &str) -> Field {
     Field::new(name, DataType::Int64, true)
 }
+
+#[cfg(test)]
+mod tests {
+    use hotlap::InputId;
+
+    use super::*;
+
+    fn source() -> Schema {
+        Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("_event_time", DataType::Int64, true),
+        ])
+    }
+
+    fn names(schema: &Schema) -> Vec<&str> {
+        schema.fields().iter().map(|f| f.name().as_str()).collect()
+    }
+
+    #[test]
+    fn tumble_order_is_key_window_count() {
+        let plan = Plan::TumbleCount {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![0],
+            time_col: 1,
+            size: 10_000,
+        };
+        let schema = mv_schema(&plan, &source()).unwrap();
+        assert_eq!(names(&schema), vec!["k", "window_start", "count"]);
+    }
+
+    #[test]
+    fn group_order_is_key_count() {
+        let plan = Plan::GroupCount {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![0],
+        };
+        let schema = mv_schema(&plan, &source()).unwrap();
+        assert_eq!(names(&schema), vec!["k", "count"]);
+    }
+
+    #[test]
+    fn project_uses_source_column_names() {
+        let plan = Plan::Project {
+            input: Box::new(Plan::Source(InputId(0))),
+            cols: vec![1, 0],
+        };
+        let schema = mv_schema(&plan, &source()).unwrap();
+        assert_eq!(names(&schema), vec!["_event_time", "k"]);
+    }
+}
