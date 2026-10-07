@@ -1,0 +1,16 @@
+[package]
+name = "hotlap-sql"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+hotlap = { path = "../hotlap" }
+hotlap-connectors = { path = "../hotlap-connectors" }
+arrow = "59.2"
+datafusion = { version = "55.1", default-features = false, features = ["sql"] }
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
