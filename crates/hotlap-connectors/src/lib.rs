@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod convert;
+pub mod datafusion;
 pub mod error;
 pub mod fluss;
 pub mod runtime;
