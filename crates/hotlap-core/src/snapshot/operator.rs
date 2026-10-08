@@ -18,11 +18,12 @@ pub enum OperatorState {
 
 /// Accumulated value of one aggregate for one group.
 ///
-/// Floats are compared by `f64` equality. `PartialEq` is implemented manually:
-/// `min`/`max` compare by their current extreme rather than by their whole
-/// multiset, so two states that render the same output row are equal and no
-/// redundant upsert is emitted. `Eq` is implemented to keep the snapshot
-/// container usable as an `Eq` type, mirroring `Scalar`.
+/// Floats are compared with [`f64::total_cmp`], so equality is reflexive even
+/// for `NaN`. `PartialEq` is implemented manually: `min`/`max` compare by their
+/// current extreme rather than by their whole multiset, so two states that
+/// render the same output row are equal and no redundant upsert is emitted.
+/// `Eq` is implemented to keep the snapshot container usable as an `Eq` type,
+/// mirroring `Scalar`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AggValue {
     /// A `count` accumulator.
@@ -63,10 +64,10 @@ impl PartialEq for AggValue {
                 AggValue::SumInteger { sum: c, count: d },
             ) => a == c && b == d,
             (AggValue::SumFloat { sum: a, count: b }, AggValue::SumFloat { sum: c, count: d }) => {
-                a == c && b == d
+                a.total_cmp(c).is_eq() && b == d
             }
             (AggValue::Avg { sum: a, count: b }, AggValue::Avg { sum: c, count: d }) => {
-                a == c && b == d
+                a.total_cmp(c).is_eq() && b == d
             }
             (AggValue::Min(a), AggValue::Min(b)) => a.min() == b.min(),
             (AggValue::Max(a), AggValue::Max(b)) => a.max() == b.max(),
@@ -146,4 +147,23 @@ pub struct JoinState {
     pub left_pending: Option<SnapshotTable>,
     /// Right delta buffered until the left schema was known.
     pub right_pending: Option<SnapshotTable>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AggValue;
+
+    #[test]
+    fn float_equality_is_reflexive_for_nan() {
+        let sum = AggValue::SumFloat {
+            sum: f64::NAN,
+            count: 1,
+        };
+        assert_eq!(sum, sum.clone());
+        let avg = AggValue::Avg {
+            sum: f64::NAN,
+            count: 2,
+        };
+        assert_eq!(avg, avg.clone());
+    }
 }

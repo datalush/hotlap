@@ -11,9 +11,11 @@ mod eval;
 
 /// A scalar literal used by [`Predicate`].
 ///
-/// `Eq` is implemented manually because the `F64` payload is not `Eq`; the
-/// equality itself still follows `f64` semantics.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// `PartialEq` is implemented manually because the `F64` payload is not `Eq`.
+/// Floats compare with [`f64::total_cmp`], so equality is reflexive even for
+/// `NaN` and distinguishes `-0.0` from `0.0`. That keeps `Predicate`/`Plan`
+/// equality (and the change detection built on it) well defined.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Scalar {
     Null,
     I64(i64),
@@ -21,6 +23,20 @@ pub enum Scalar {
     F64(f64),
     Str(String),
     Bool(bool),
+}
+
+impl PartialEq for Scalar {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Scalar::Null, Scalar::Null) => true,
+            (Scalar::I64(a), Scalar::I64(b)) => a == b,
+            (Scalar::I32(a), Scalar::I32(b)) => a == b,
+            (Scalar::F64(a), Scalar::F64(b)) => a.total_cmp(b).is_eq(),
+            (Scalar::Str(a), Scalar::Str(b)) => a == b,
+            (Scalar::Bool(a), Scalar::Bool(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl Eq for Scalar {}
@@ -87,4 +103,16 @@ fn column(batch: &RecordBatch, col: usize) -> Result<&ArrayRef, CoreError> {
             batch.num_columns()
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Scalar;
+
+    #[test]
+    fn scalar_equality_is_reflexive_for_nan() {
+        let nan = Scalar::F64(f64::NAN);
+        assert_eq!(nan, nan.clone());
+        assert_ne!(Scalar::F64(-0.0), Scalar::F64(0.0));
+    }
 }
