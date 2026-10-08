@@ -13,7 +13,7 @@ mod sql_source;
 
 use std::sync::Arc;
 
-use hotlap_runtime::{FlussSinkFactory, SqlSession};
+use hotlap_runtime::{FlussSinkFactory, QueryResult, Session, SessionConfig, SqlSession};
 
 use factory::{CrossSourceFactory, SourceSpec};
 use session::{batch, ints, schema_a, schema_b, send, wait_acks, wait_pairs};
@@ -167,4 +167,30 @@ async fn inverted_declaration_order_keeps_the_same_assignment() {
         vec![(1, 2000)]
     );
     session.shutdown().await.unwrap();
+}
+
+/// A `START` before any push must read empty, not error or hang.
+#[test]
+fn fresh_start_reads_empty_before_the_first_push() {
+    let factory = CrossSourceFactory::new();
+    factory.declare("a", SourceSpec::new(schema_a(), 1));
+    factory.declare("b", SourceSpec::new(schema_b(), 2));
+    let mut session = Session::open(SessionConfig::new().with_source_factory(factory)).unwrap();
+    session.sql(CREATE_A).unwrap();
+    session.sql(CREATE_B).unwrap();
+    session
+        .sql("CREATE MATERIALIZED VIEW j AS SELECT a.k, b.value FROM a JOIN b ON a.k = b.k;")
+        .unwrap();
+    session.sql("START;").unwrap();
+
+    let rows = match session.sql("SELECT k, value FROM j").unwrap() {
+        QueryResult::Rows(batches) => batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        QueryResult::Ack(_) => panic!("expected a result set"),
+    };
+    assert_eq!(rows, 0, "a declared but unbuilt view must read empty");
+    assert!(
+        session.snapshot("j").unwrap().is_empty(),
+        "the raw snapshot must be empty before any push"
+    );
+    session.shutdown().unwrap();
 }

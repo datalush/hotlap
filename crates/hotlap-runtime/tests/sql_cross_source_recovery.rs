@@ -29,7 +29,15 @@ const CREATE_B: &str = "CREATE SOURCE b WITH (connector='inmem') WATERMARK FOR \
      k AS k - INTERVAL '1 s';";
 const VIEW: &str = "CREATE MATERIALIZED VIEW j AS SELECT a.k FROM a JOIN b ON a.k = b.k;";
 
-fn open(factory: &Arc<ResumableSessionFactory>, backend: &SharedBackend) -> Session {
+/// The order the session issues `CREATE SOURCE`, independent of the factory's
+/// own declaration order.
+#[derive(Clone, Copy)]
+enum Order {
+    Ab,
+    Ba,
+}
+
+fn open(factory: &Arc<ResumableSessionFactory>, backend: &SharedBackend, order: Order) -> Session {
     let config = SessionConfig::new()
         .with_source_factory(factory.clone())
         .with_checkpoint(
@@ -38,8 +46,16 @@ fn open(factory: &Arc<ResumableSessionFactory>, backend: &SharedBackend) -> Sess
             Box::new(backend.clone()),
         );
     let mut session = Session::open(config).expect("open session");
-    session.sql(CREATE_A).expect("create a");
-    session.sql(CREATE_B).expect("create b");
+    match order {
+        Order::Ab => {
+            session.sql(CREATE_A).expect("create a");
+            session.sql(CREATE_B).expect("create b");
+        }
+        Order::Ba => {
+            session.sql(CREATE_B).expect("create b");
+            session.sql(CREATE_A).expect("create a");
+        }
+    }
     session.sql(VIEW).expect("create view");
     session
 }
@@ -94,7 +110,7 @@ fn first_run(backend: &SharedBackend) -> Arc<ResumableSessionFactory> {
     let first = ResumableSessionFactory::new();
     first.declare("a", Dataset::new(vec![vec![1], vec![1]]));
     first.declare("b", Dataset::new(vec![vec![1]]));
-    let mut session = open(&first, backend);
+    let mut session = open(&first, backend, Order::Ab);
     session.sql("START;").expect("first start");
     assert_eq!(wait_ints(&mut session, &[1]), vec![1]);
     assert!(wait_offsets(&first, 2, 1), "both sources must be applied");
@@ -114,7 +130,7 @@ fn restart_restores_join_and_seeds_offsets() {
     let second = ResumableSessionFactory::new();
     second.declare("b", Dataset::new(vec![vec![1]]).with_retention(1));
     second.declare("a", Dataset::new(vec![vec![1], vec![1]]).with_retention(2));
-    let mut session = open(&second, &backend);
+    let mut session = open(&second, &backend, Order::Ba);
     session.sql("START;").expect("recovered start");
     assert_eq!(
         wait_ints(&mut session, &[1]),
@@ -136,12 +152,12 @@ fn restart_continues_from_captured_offset() {
     first_run(&backend);
 
     let third = ResumableSessionFactory::new();
+    third.declare("b", Dataset::new(vec![vec![1]]).with_retention(1));
     third.declare(
         "a",
         Dataset::new(vec![vec![1], vec![1], vec![1]]).with_retention(2),
     );
-    third.declare("b", Dataset::new(vec![vec![1]]).with_retention(1));
-    let mut session = open(&third, &backend);
+    let mut session = open(&third, &backend, Order::Ba);
     session
         .sql("START;")
         .expect("recovered start with new batch");
