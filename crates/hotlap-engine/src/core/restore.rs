@@ -22,7 +22,7 @@ impl EngineCore {
                 snapshot.format_version, ENGINE_SNAPSHOT_FORMAT_VERSION
             )));
         }
-        let mut core = EngineCore::with_registry(std::sync::Arc::clone(&self.metrics));
+        let mut core = EngineCore::with_registry(std::sync::Arc::clone(&self.metrics.registry));
         core.frozen = snapshot.frozen;
         core.epoch = snapshot.epoch;
         for input in &snapshot.inputs {
@@ -38,10 +38,10 @@ impl EngineCore {
         core.retention.invalidate();
         // Restored windows carry their dropped-closed counts; seed the publish
         // baseline so the first later push does not re-count them as new.
-        core.late_closed_seen = core.late_closed_total();
+        core.metrics.late_closed_seen = core.late_closed_total();
         *self = core;
         self.refresh_windows_open();
-        self.metrics.inc("checkpoints_restored");
+        self.metrics.registry.inc("checkpoints_restored");
         Ok(())
     }
 

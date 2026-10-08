@@ -20,10 +20,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 
-use hotlap_core::{
-    CoreError, InputId, Metric, MetricsRegistry, SplitId, ViewId, WatermarkSpec, ZSetBatch,
-};
+use hotlap_core::{CoreError, InputId, MetricsRegistry, SplitId, ViewId, WatermarkSpec, ZSetBatch};
 
+use metrics::MetricHandles;
 use retention::InputRetention;
 use view_state::ViewState;
 
@@ -66,56 +65,15 @@ pub struct EngineCore {
     /// earlier view's state was already mutated. A failed core is poisoned so
     /// partial state is never observable; the caller must recreate the engine.
     pub(super) failed: bool,
-    /// Shared counter registry; the runtime injects the same `Arc` so both see
-    /// one consistent snapshot.
-    pub(super) metrics: Arc<MetricsRegistry>,
-    /// Highest `late_closed_dropped` total already published to `metrics`, so a
-    /// push only adds the new window drops instead of the whole history.
-    pub(super) late_closed_seen: u64,
-    /// Cached lock-free handles for the hot per-push counters, resolved once
-    /// from `metrics` so updates never take the registry lock.
-    pub(super) rows_ingested: Metric,
-    pub(super) rows_emitted: Metric,
-    pub(super) late_dropped: Metric,
-    pub(super) late_closed_dropped: Metric,
-    /// Open tumbling windows across every built view, published as a gauge.
-    pub(super) windows_open: Metric,
+    /// Shared counter registry plus the cached lock-free handles for the hot
+    /// per-push counters, resolved once so updates never take the registry lock.
+    pub(super) metrics: MetricHandles,
 }
 
 impl EngineCore {
     /// Creates an empty core with no inputs, views or watermarks.
     pub fn new() -> Self {
         Self::with_registry(Arc::new(MetricsRegistry::new()))
-    }
-
-    /// Creates an empty core reporting into `metrics`, resolving the hot-path
-    /// handle cache once so later updates are lock-free.
-    pub(super) fn with_registry(metrics: Arc<MetricsRegistry>) -> Self {
-        let rows_ingested = metrics.metric("rows_ingested");
-        let rows_emitted = metrics.metric("rows_emitted");
-        let late_dropped = metrics.metric("late_dropped");
-        let late_closed_dropped = metrics.metric("late_closed_dropped");
-        let windows_open = metrics.metric("windows_open");
-        Self {
-            views: HashMap::new(),
-            registered: HashSet::new(),
-            specs: HashMap::new(),
-            watermarks: HashMap::new(),
-            split_watermarks: HashMap::new(),
-            schemas: HashMap::new(),
-            late: HashMap::new(),
-            frozen: false,
-            epoch: 0,
-            retention: InputRetention::disabled(),
-            failed: false,
-            metrics,
-            late_closed_seen: 0,
-            rows_ingested,
-            rows_emitted,
-            late_dropped,
-            late_closed_dropped,
-            windows_open,
-        }
     }
 
     /// Marks the core failed after a push that may have applied partially.
@@ -177,7 +135,7 @@ impl EngineCore {
             .map_err(CoreError::from)?;
         if let Some(output) = output {
             view.output.update(&output).map_err(CoreError::from)?;
-            self.rows_emitted.add(output.len() as u64);
+            self.metrics.rows_emitted.add(output.len() as u64);
             if view.tapped {
                 view.pending =
                     graph::accumulate(view.pending.take(), &output).map_err(CoreError::from)?;

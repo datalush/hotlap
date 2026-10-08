@@ -59,7 +59,7 @@ impl EngineCore {
         }
         // Publish the batch's drops at once through the cached counter handle.
         if late_rows > 0 {
-            self.late_dropped.add(late_rows);
+            self.metrics.late_dropped.add(late_rows);
         }
         self.advance_split(input, split, max_ts, spec.lag);
         filter(batch, &BooleanArray::from(mask))

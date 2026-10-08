@@ -24,7 +24,7 @@ impl EngineCore {
             inputs: self.input_snapshots()?,
             views: self.view_snapshots()?,
         };
-        self.metrics.inc("checkpoints_taken");
+        self.metrics.registry.inc("checkpoints_taken");
         Ok(snapshot)
     }
 
