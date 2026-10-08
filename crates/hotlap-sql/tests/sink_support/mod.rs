@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{Array, Int64Array};
 use arrow::record_batch::RecordBatch;
-use hotlap::{ChangeBatch, Scalar};
+use hotlap::ZSetBatch;
 use hotlap_connectors::source::SourceBatch;
 use hotlap_sql::{QueryResult, SqlSession};
 
@@ -57,23 +57,26 @@ pub fn recompute(batches: &[SourceBatch], size: i64, lag: i64) -> Vec<(i64, i64,
     counts.into_iter().map(|((k, w), c)| (k, w, c)).collect()
 }
 
-fn as_i64(value: Scalar) -> i64 {
-    match value {
-        Scalar::I64(v) => v,
-        other => panic!("expected I64, got {other:?}"),
-    }
-}
-
 /// Consolidate the sink's Z-set stream into a sorted multiset of view rows.
 ///
-/// Each surviving row is repeated by its positive multiplicity; a net-zero row
-/// cancels out, matching the engine's consolidated snapshot.
-pub fn consolidate(batches: &[ChangeBatch]) -> Vec<(i64, i64, i64)> {
+/// Each row's multiplicity is summed across batches; a net-zero row cancels
+/// out, matching the engine's consolidated snapshot.
+pub fn consolidate(batches: &[ZSetBatch]) -> Vec<(i64, i64, i64)> {
     let mut counts: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
-    for change in batches {
-        for (row, diff) in &change.rows {
-            let key = (as_i64(row.col(0)), as_i64(row.col(1)), as_i64(row.col(2)));
-            *counts.entry(key).or_insert(0) += diff;
+    for zset in batches {
+        let (k, w, c) = (
+            col(&zset.batch, 0),
+            col(&zset.batch, 1),
+            col(&zset.batch, 2),
+        );
+        let diff = zset
+            .diff
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 diff");
+        for i in 0..zset.len() {
+            let key = (k.value(i), w.value(i), c.value(i));
+            *counts.entry(key).or_insert(0) += diff.value(i);
         }
     }
     let mut out = Vec::new();
@@ -103,7 +106,7 @@ pub async fn wait_for_rows(
 
 /// Poll the sink accumulator until it matches `want` (or the deadline elapses).
 pub async fn wait_for_sink(
-    batches: &Arc<Mutex<Vec<ChangeBatch>>>,
+    batches: &Arc<Mutex<Vec<ZSetBatch>>>,
     want: &[(i64, i64, i64)],
 ) -> Vec<(i64, i64, i64)> {
     let deadline = Instant::now() + Duration::from_secs(5);

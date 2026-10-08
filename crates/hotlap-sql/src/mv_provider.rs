@@ -12,7 +12,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 
-use crate::convert::rows_to_batch;
+use crate::convert::zset_to_batch;
 use crate::session::Snapshotter;
 
 /// Exposes one engine view as a one-shot, in-memory DataFusion table.
@@ -81,11 +81,11 @@ async fn snapshot_batch(
     name: String,
     schema: SchemaRef,
 ) -> Result<RecordBatch> {
-    let rows = tokio::task::spawn_blocking(move || snapshotter.snapshot(&name))
+    let zset = tokio::task::spawn_blocking(move || snapshotter.snapshot(&name))
         .await
         .map_err(external)?
         .map_err(external)?;
-    rows_to_batch(&schema, &rows).map_err(external)
+    zset_to_batch(&schema, &zset).map_err(external)
 }
 
 fn external(error: impl std::error::Error + Send + Sync + 'static) -> DataFusionError {

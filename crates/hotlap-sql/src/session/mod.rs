@@ -11,10 +11,10 @@ pub use sink_factory::{FlussSinkFactory, SinkFactory};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
-use hotlap::{Plan, Row};
+use hotlap::{Plan, ZSetBatch};
 use hotlap_connectors::runtime::handle::{EngineHandle, SnapshotHandle};
 use hotlap_connectors::runtime::pipeline::Watermark;
 use hotlap_connectors::source::Source;
@@ -39,8 +39,8 @@ pub trait SourceFactory: Send + Sync {
 
 /// Reads consolidated view output for the MV table providers.
 pub trait Snapshotter: Send + Sync {
-    /// Return the current rows of `view`.
-    fn snapshot(&self, view: &str) -> Result<Vec<Row>, SqlError>;
+    /// Return the current consolidated Z-set of `view`.
+    fn snapshot(&self, view: &str) -> Result<ZSetBatch, SqlError>;
 }
 
 /// Outcome of a statement: an acknowledgement or a result set.
@@ -52,13 +52,13 @@ pub enum QueryResult {
 }
 
 impl Snapshotter for SnapshotHandle {
-    fn snapshot(&self, view: &str) -> Result<Vec<Row>, SqlError> {
+    fn snapshot(&self, view: &str) -> Result<ZSetBatch, SqlError> {
         // Before the first push the kernel has no built dataflow, so a declared
         // view reads as empty rather than erroring. `is_built` is set by the
         // engine after the first successful push, avoiding any dependence on
         // the kernel's error text.
         if !self.is_built() {
-            return Ok(Vec::new());
+            return Ok(ZSetBatch::empty(Arc::new(Schema::empty())));
         }
         SnapshotHandle::snapshot(self, view).map_err(to_engine)
     }

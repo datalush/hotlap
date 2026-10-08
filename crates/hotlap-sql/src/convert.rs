@@ -1,11 +1,10 @@
-//! Kernel `Row`/`Scalar` -> Arrow `RecordBatch` using a view schema.
+//! Engine `ZSetBatch` -> Arrow `RecordBatch` using a view schema.
 
-use std::sync::Arc;
-
-use arrow::array::{ArrayRef, BooleanBuilder, Int64Builder, StringBuilder};
+use arrow::array::{Array, ArrayRef, Int64Array, UInt32Array};
+use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use hotlap::{Row, Scalar};
+use hotlap::ZSetBatch;
 
 use crate::error::SqlError;
 
@@ -25,62 +24,39 @@ pub fn ensure_kernel_types(schema: &Schema) -> Result<(), SqlError> {
     Ok(())
 }
 
-/// Build one Arrow batch from kernel rows, using `schema` for column types.
-pub fn rows_to_batch(schema: &SchemaRef, rows: &[Row]) -> Result<RecordBatch, SqlError> {
+/// Build one Arrow batch from a consolidated Z-set, keeping rows with a
+/// non-zero multiplicity and dropping the rest.
+pub fn zset_to_batch(schema: &SchemaRef, zset: &ZSetBatch) -> Result<RecordBatch, SqlError> {
     ensure_kernel_types(schema)?;
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    for (col, field) in schema.fields().iter().enumerate() {
-        arrays.push(build_column(field.data_type(), col, rows)?);
+    if zset.is_empty() {
+        return Ok(RecordBatch::new_empty(schema.clone()));
     }
-    RecordBatch::try_new(schema.clone(), arrays)
-        .map_err(|e| SqlError::Unsupported(format!("record batch: {e}")))
+    let indices = nonzero_indices(zset.diff())?;
+    let columns: Vec<ArrayRef> = zset
+        .batch
+        .columns()
+        .iter()
+        .map(|column| take(column.as_ref(), &indices, None).map_err(bad))
+        .collect::<Result<_, _>>()?;
+    RecordBatch::try_new(schema.clone(), columns).map_err(bad)
 }
 
-fn build_column(dt: &DataType, col: usize, rows: &[Row]) -> Result<ArrayRef, SqlError> {
-    match dt {
-        DataType::Int64 => {
-            let mut b = Int64Builder::with_capacity(rows.len());
-            for r in rows {
-                match r.0.get(col) {
-                    Some(Scalar::I64(v)) => b.append_value(*v),
-                    Some(Scalar::Null) | None => b.append_null(),
-                    other => return Err(mismatch(dt, other)),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-        DataType::Utf8 => {
-            let mut b = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
-            for r in rows {
-                match r.0.get(col) {
-                    Some(Scalar::Str(v)) => b.append_value(v),
-                    Some(Scalar::Null) | None => b.append_null(),
-                    other => return Err(mismatch(dt, other)),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-        DataType::Boolean => {
-            let mut b = BooleanBuilder::with_capacity(rows.len());
-            for r in rows {
-                match r.0.get(col) {
-                    Some(Scalar::Bool(v)) => b.append_value(*v),
-                    Some(Scalar::Null) | None => b.append_null(),
-                    other => return Err(mismatch(dt, other)),
-                }
-            }
-            Ok(Arc::new(b.finish()))
-        }
-        other => Err(SqlError::Unsupported(format!(
-            "unsupported column type {other:?}"
-        ))),
-    }
+/// Indices of the rows whose multiplicity is non-zero.
+fn nonzero_indices(diff: &ArrayRef) -> Result<UInt32Array, SqlError> {
+    let casted = cast(diff.as_ref(), &DataType::Int64).map_err(bad)?;
+    let values = casted
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| SqlError::Unsupported("diff column is not int64".into()))?;
+    let indices: Vec<u32> = (0..values.len())
+        .filter(|&index| values.value(index) != 0)
+        .map(|index| index as u32)
+        .collect();
+    Ok(UInt32Array::from(indices))
 }
 
-fn mismatch(dt: &DataType, scalar: Option<&Scalar>) -> SqlError {
-    SqlError::Unsupported(format!(
-        "value {scalar:?} does not match column type {dt:?}"
-    ))
+fn bad(error: impl std::fmt::Display) -> SqlError {
+    SqlError::Unsupported(format!("record batch: {error}"))
 }
 
 #[cfg(test)]
@@ -89,7 +65,8 @@ mod tests {
 
     use arrow::array::{Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use hotlap::{Row, Scalar};
+    use arrow::record_batch::RecordBatch;
+    use hotlap::ZSetBatch;
 
     use super::*;
 
@@ -100,31 +77,45 @@ mod tests {
         ]))
     }
 
-    #[test]
-    fn rows_to_batch_maps_values_and_nulls() {
-        let rows = vec![
-            Row(vec![Scalar::I64(1), Scalar::Str("a".into())]),
-            Row(vec![Scalar::Null, Scalar::Null]),
+    fn zset(keys: &[i64], values: &[&str], diff: &[i64]) -> ZSetBatch {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(keys.to_vec())),
+            Arc::new(StringArray::from(values.to_vec())),
         ];
-        let b = rows_to_batch(&schema(), &rows).unwrap();
-        assert_eq!(b.num_rows(), 2);
+        let batch = RecordBatch::try_new(schema(), columns).unwrap();
+        ZSetBatch::new(batch, Arc::new(Int64Array::from(diff.to_vec()))).unwrap()
+    }
+
+    #[test]
+    fn zset_to_batch_keeps_nonzero_rows() {
+        let batch = zset_to_batch(&schema(), &zset(&[1, 2], &["a", "b"], &[1, 0])).unwrap();
+        assert_eq!(batch.num_rows(), 1);
         assert_eq!(
-            b.column(0)
+            batch
+                .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap()
                 .value(0),
             1
         );
-        assert!(b.column(0).is_null(1));
         assert_eq!(
-            b.column(1)
+            batch
+                .column(1)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap()
                 .value(0),
             "a"
         );
+    }
+
+    #[test]
+    fn empty_zset_yields_schema_only_batch() {
+        let empty = ZSetBatch::empty(schema());
+        let batch = zset_to_batch(&schema(), &empty).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 2);
     }
 
     #[test]

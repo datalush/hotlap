@@ -7,7 +7,7 @@ use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::stream::{self, StreamExt};
-use hotlap::ChangeBatch;
+use hotlap::ZSetBatch;
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError, Sink};
 use hotlap_sql::{SinkFactory, SourceFactory, SqlError, SqlSession};
@@ -60,7 +60,7 @@ impl SourceFactory for FakeFactory {
 
 /// Sink accumulating every received change batch for later inspection.
 struct FakeSink {
-    batches: Arc<Mutex<Vec<ChangeBatch>>>,
+    batches: Arc<Mutex<Vec<ZSetBatch>>>,
 }
 
 #[async_trait::async_trait]
@@ -81,7 +81,7 @@ impl Sink for FakeSink {
 
 /// Sink factory handing every create call a handle to one shared accumulator.
 struct FakeSinkFactory {
-    batches: Arc<Mutex<Vec<ChangeBatch>>>,
+    batches: Arc<Mutex<Vec<ZSetBatch>>>,
 }
 
 #[async_trait::async_trait]
@@ -99,10 +99,7 @@ impl SinkFactory for FakeSinkFactory {
 }
 
 /// Build a session wired to a fake source and a fake sink accumulator.
-pub fn session(
-    batches: Vec<SourceBatch>,
-    sink_batches: &Arc<Mutex<Vec<ChangeBatch>>>,
-) -> SqlSession {
+pub fn session(batches: Vec<SourceBatch>, sink_batches: &Arc<Mutex<Vec<ZSetBatch>>>) -> SqlSession {
     let source = Arc::new(FakeFactory {
         schema: kv_schema(),
         batches,
