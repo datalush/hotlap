@@ -125,6 +125,34 @@ async fn quoted_source_name_binds_its_view() {
 }
 
 #[tokio::test]
+async fn quoted_names_keep_case_and_literal_dots() {
+    let mut session = session(kv_schema());
+    // A double-quoted identifier keeps its case; a dot inside it is literal.
+    session
+        .sql(
+            "CREATE SOURCE \"Src\" WITH (connector='inmem') \
+             WATERMARK FOR _event_time AS _event_time - INTERVAL '1 s';",
+        )
+        .await
+        .unwrap();
+    session
+        .sql(
+            "CREATE SOURCE \"public.x\" WITH (connector='inmem') \
+             WATERMARK FOR _event_time AS _event_time - INTERVAL '1 s';",
+        )
+        .await
+        .unwrap();
+    session
+        .sql("CREATE MATERIALIZED VIEW mv1 AS SELECT k, count(*) FROM \"Src\" GROUP BY k;")
+        .await
+        .unwrap();
+    session
+        .sql("CREATE MATERIALIZED VIEW mv2 AS SELECT k, count(*) FROM \"public.x\" GROUP BY k;")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn unrepresentable_mv_output_rejected() {
     let mut session = session(unsupported_schema());
     session.sql(SOURCE).await.unwrap();

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use datafusion::common::TableReference;
 use hotlap_connectors::datafusion::provider::SourceTableProvider;
 use hotlap_connectors::source::Source;
 use hotlap_sql::bindings::canonical_relation;
@@ -43,8 +44,11 @@ impl SqlSession {
         );
         // Register the DataFusion table last: a failure undoes only this
         // operation and never leaves a live provider without its registry.
+        // `bare` keeps the canonical name verbatim (case and literal dots),
+        // unlike a `&str`, which would reparse it as a (schema.)table path.
         let provider = Arc::new(SourceTableProvider::new(source));
-        if let Err(error) = self.ctx.register_table(name.as_str(), provider) {
+        let table = TableReference::bare(name.clone());
+        if let Err(error) = self.ctx.register_table(table, provider) {
             self.sources.remove(&name);
             self.catalog.remove_source(&name);
             return Err(to_engine(error));
