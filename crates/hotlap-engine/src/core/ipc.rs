@@ -149,8 +149,12 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<EngineSnapshot, EngineError> {
     Ok(snapshot)
 }
 
-/// Fixed, deterministic bincode configuration: fixed-width integers and no
+/// Fixed, deterministic bincode 1.x configuration: fixed-width integers and no
 /// trailing bytes, so bytes produced once are read back identically.
+///
+/// The payload layout is coupled to bincode 1.x. Moving to a different bincode
+/// major is a wire break and must bump `FRAME_VERSION`, not just the crate
+/// version, or old frames would decode incorrectly.
 fn codec() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()

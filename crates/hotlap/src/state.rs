@@ -75,6 +75,10 @@ pub trait StateBackend {
     /// Return every key that starts with `prefix`, sorted ascending. These are
     /// the same keys as [`StateBackend::scan`], read without the values.
     fn list(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StateError>;
+
+    /// Remove `key`. Deleting an absent key is not an error, so retention can
+    /// retry safely after a partial cleanup.
+    fn delete(&mut self, key: &[u8]) -> Result<(), StateError>;
 }
 
 impl StateBackend for BTreeMap<Vec<u8>, Vec<u8>> {
@@ -105,5 +109,11 @@ impl StateBackend for BTreeMap<Vec<u8>, Vec<u8>> {
             .take_while(|(key, _)| key.starts_with(prefix))
             .map(|(key, _)| key.clone())
             .collect())
+    }
+
+    fn delete(&mut self, key: &[u8]) -> Result<(), StateError> {
+        path::validate_key(key)?;
+        self.remove(key);
+        Ok(())
     }
 }

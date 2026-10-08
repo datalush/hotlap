@@ -1,6 +1,6 @@
 //! The dedicated engine thread: owns `Hotlap`, drives the source and commands.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
@@ -11,10 +11,10 @@ use tokio::time::{Instant, Interval, interval_at};
 
 use crate::error::ConnectorError;
 use crate::runtime::checkpoint::Checkpointer;
-use crate::runtime::handle::Command;
-use crate::runtime::pipeline::{self, Pipeline};
+use crate::runtime::command::{self, Command};
+use crate::runtime::pipeline::{self, Pipeline, feed_source, record_error};
 use crate::runtime::sink::SinkPump;
-use crate::source::SourceBatch;
+use crate::source::SourceStream;
 
 /// Run the engine loop until shutdown or channel close.
 ///
@@ -24,6 +24,7 @@ pub(crate) fn run(
     pipeline: Pipeline,
     mut rx: UnboundedReceiver<Command>,
     last_error: Arc<Mutex<Option<String>>>,
+    checkpoint_error: Arc<Mutex<Option<String>>>,
     built: Arc<AtomicBool>,
     ready: oneshot::Sender<Result<(), ConnectorError>>,
 ) {
@@ -37,7 +38,23 @@ pub(crate) fn run(
             return;
         }
     };
-    rt.block_on(drive(pipeline, &mut rx, &last_error, &built, ready));
+    rt.block_on(drive(
+        pipeline,
+        &mut rx,
+        &last_error,
+        &checkpoint_error,
+        &built,
+        ready,
+    ));
+}
+
+/// Live state owned by the serving loop after startup.
+struct Engine {
+    hotlap: Hotlap,
+    source: SourceStream,
+    sinks: SinkPump,
+    checkpointer: Option<Checkpointer>,
+    ticker: Option<Interval>,
 }
 
 /// Open the kernel, wire the pipeline and then serve source data and commands.
@@ -45,72 +62,77 @@ async fn drive(
     mut pipeline: Pipeline,
     rx: &mut UnboundedReceiver<Command>,
     last_error: &Mutex<Option<String>>,
+    checkpoint_error: &Mutex<Option<String>>,
     built: &AtomicBool,
     ready: oneshot::Sender<Result<(), ConnectorError>>,
 ) {
-    let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
-    if let Err(error) = pipeline::setup(&mut hotlap, &pipeline) {
-        let _ = ready.send(Err(error));
-        return;
-    }
-    let mut source = match pipeline::merged_stream(pipeline.source.as_ref()) {
-        Ok(source) => source,
+    let engine = match prepare(&mut pipeline) {
+        Ok(engine) => engine,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
     };
+    let _ = ready.send(Ok(()));
+    serve(engine, pipeline, rx, last_error, checkpoint_error, built).await;
+}
+
+/// Open the kernel, merge the source streams and read the checkpoint config.
+fn prepare(pipeline: &mut Pipeline) -> Result<Engine, ConnectorError> {
+    let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
+    pipeline::setup(&mut hotlap, pipeline)?;
+    let source = pipeline::merged_stream(pipeline.source.as_ref())?;
     let sinks = SinkPump::start(&pipeline.sinks);
-    let (mut checkpointer, mut ticker) = match pipeline.checkpoint.take() {
+    let (checkpointer, ticker) = match pipeline.checkpoint.take() {
         Some(config) => {
             let tick = interval_at(Instant::now() + config.interval, config.interval);
-            (Some(Checkpointer::new(config.backend)), Some(tick))
+            (
+                Some(Checkpointer::new(config.backend, config.retain)),
+                Some(tick),
+            )
         }
         None => (None, None),
     };
-    let _ = ready.send(Ok(()));
+    Ok(Engine {
+        hotlap,
+        source,
+        sinks,
+        checkpointer,
+        ticker,
+    })
+}
+
+/// Serve the source stream and the command channel until shutdown.
+async fn serve(
+    mut engine: Engine,
+    pipeline: Pipeline,
+    rx: &mut UnboundedReceiver<Command>,
+    last_error: &Mutex<Option<String>>,
+    checkpoint_error: &Mutex<Option<String>>,
+    built: &AtomicBool,
+) {
     let mut source_done = false;
     loop {
         tokio::select! {
-            maybe = source.next(), if !source_done => {
+            maybe = engine.source.next(), if !source_done => {
                 source_done = feed_source(
-                    &mut hotlap, &pipeline, &sinks, maybe, last_error, built,
+                    &mut engine.hotlap, &pipeline, &engine.sinks, maybe, last_error, built,
                 )
                 .await;
             }
-            _ = tick(&mut ticker) => {
-                if let Some(active) = checkpointer.as_mut()
-                    && let Err(error) = active.take(&hotlap, pipeline.source.as_ref())
+            _ = tick(&mut engine.ticker) => {
+                command::run_periodic(
+                    &mut engine.checkpointer, &engine.hotlap, &pipeline, checkpoint_error,
+                );
+            }
+            cmd = rx.recv() => {
+                if command::handle(cmd, &mut engine.hotlap, &pipeline, &mut engine.checkpointer)
+                    .await
                 {
-                    record_error(last_error, error);
+                    close_sinks(engine.sinks, last_error).await;
+                    return;
                 }
             }
-            cmd = rx.recv() => match cmd {
-                Some(Command::Snapshot { view, reply }) => {
-                    let _ = reply.send(hotlap.snapshot(&view).map_err(map_err));
-                }
-                Some(Command::LateDropped { input, reply }) => {
-                    let _ = reply.send(hotlap.late_dropped(&input).map_err(map_err));
-                }
-                Some(Command::Checkpoint { reply }) => {
-                    let result = match checkpointer.as_mut() {
-                        Some(active) => active.take(&hotlap, pipeline.source.as_ref()),
-                        None => Err(ConnectorError::Unsupported(
-                            "checkpointing is not configured".into(),
-                        )),
-                    };
-                    let _ = reply.send(result);
-                }
-                Some(Command::Shutdown { reply }) => {
-                    close_sinks(sinks, last_error).await;
-                    let _ = reply.send(());
-                    return;
-                }
-                None => {
-                    close_sinks(sinks, last_error).await;
-                    return;
-                }
-            },
         }
     }
 }
@@ -130,68 +152,4 @@ async fn close_sinks(sinks: SinkPump, last_error: &Mutex<Option<String>>) {
     if let Err(error) = sinks.close().await {
         record_error(last_error, error);
     }
-}
-
-/// Ingest one source item and, if it succeeded, pump its deltas into the sinks.
-///
-/// Returns whether the source branch is finished (exhausted, errored or the
-/// sink channel broke), which disables that branch of the select loop.
-async fn feed_source(
-    hotlap: &mut Hotlap,
-    pipeline: &Pipeline,
-    sinks: &SinkPump,
-    item: Option<Result<SourceBatch, ConnectorError>>,
-    last_error: &Mutex<Option<String>>,
-    built: &AtomicBool,
-) -> bool {
-    if on_source_item(hotlap, pipeline, item, last_error, built) {
-        return true;
-    }
-    match sinks.pump(hotlap).await {
-        Ok(()) => false,
-        Err(error) => {
-            record_error(last_error, error);
-            true
-        }
-    }
-}
-
-/// Ingest one source item, recording any error and reporting source completion.
-fn on_source_item(
-    hotlap: &mut Hotlap,
-    pipeline: &Pipeline,
-    item: Option<Result<SourceBatch, ConnectorError>>,
-    last_error: &Mutex<Option<String>>,
-    built: &AtomicBool,
-) -> bool {
-    match item {
-        Some(Ok(sb)) => match pipeline::ingest(hotlap, &pipeline.input, &sb) {
-            Ok(()) => {
-                // The first successful push builds the dataflow, so views become
-                // readable even if later pushes add no rows.
-                built.store(true, Ordering::SeqCst);
-                false
-            }
-            Err(error) => {
-                record_error(last_error, error);
-                true
-            }
-        },
-        Some(Err(error)) => {
-            record_error(last_error, error);
-            true
-        }
-        None => true,
-    }
-}
-
-/// Store the first source error; it is the one that stopped the source branch.
-fn record_error(last_error: &Mutex<Option<String>>, error: ConnectorError) {
-    if let Ok(mut slot) = last_error.lock() {
-        slot.get_or_insert_with(|| error.to_string());
-    }
-}
-
-fn map_err(e: hotlap::HotlapError) -> ConnectorError {
-    ConnectorError::Infrastructure(e.0)
 }

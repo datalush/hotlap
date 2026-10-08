@@ -8,32 +8,16 @@ use hotlap::ZSetBatch;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ConnectorError;
+use crate::runtime::command::Command;
 use crate::runtime::engine;
 use crate::runtime::pipeline::Pipeline;
-
-/// Command sent from the handle to the engine thread.
-pub enum Command {
-    Snapshot {
-        view: String,
-        reply: oneshot::Sender<Result<ZSetBatch, ConnectorError>>,
-    },
-    LateDropped {
-        input: String,
-        reply: oneshot::Sender<Result<u64, ConnectorError>>,
-    },
-    Checkpoint {
-        reply: oneshot::Sender<Result<u64, ConnectorError>>,
-    },
-    Shutdown {
-        reply: oneshot::Sender<()>,
-    },
-}
 
 /// Owns the engine thread and speaks to it over a channel.
 pub struct EngineHandle {
     tx: mpsc::UnboundedSender<Command>,
     join: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
+    checkpoint_error: Arc<Mutex<Option<String>>>,
     built: Arc<AtomicBool>,
 }
 
@@ -46,11 +30,20 @@ impl EngineHandle {
         let (tx, rx) = mpsc::unbounded_channel();
         let last_error = Arc::new(Mutex::new(None));
         let engine_error = Arc::clone(&last_error);
+        let checkpoint_error = Arc::new(Mutex::new(None));
+        let engine_checkpoint_error = Arc::clone(&checkpoint_error);
         let built = Arc::new(AtomicBool::new(false));
         let engine_built = Arc::clone(&built);
         let (ready_tx, ready_rx) = oneshot::channel();
         let join = std::thread::spawn(move || {
-            engine::run(pipeline, rx, engine_error, engine_built, ready_tx)
+            engine::run(
+                pipeline,
+                rx,
+                engine_error,
+                engine_checkpoint_error,
+                engine_built,
+                ready_tx,
+            )
         });
         match ready_rx.blocking_recv() {
             Ok(Ok(())) => {}
@@ -67,6 +60,7 @@ impl EngineHandle {
             tx,
             join: Some(join),
             last_error,
+            checkpoint_error,
             built,
         })
     }
@@ -74,6 +68,14 @@ impl EngineHandle {
     /// First source/ingestion error that stopped the source branch, if any.
     pub fn last_error(&self) -> Result<Option<String>, ConnectorError> {
         self.snapshot_handle().last_error()
+    }
+
+    /// First periodic-checkpoint failure, kept separate from source errors.
+    pub fn checkpoint_error(&self) -> Result<Option<String>, ConnectorError> {
+        self.checkpoint_error
+            .lock()
+            .map(|slot| slot.clone())
+            .map_err(|_| ConnectorError::Infrastructure("checkpoint error state poisoned".into()))
     }
 
     /// Read the consolidated output of a view.

@@ -1,12 +1,14 @@
 //! Source -> kernel pipeline: setup, stream merging and batch ingestion.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use hotlap::{Hotlap, HotlapError, Plan};
 
 use crate::convert;
 use crate::error::ConnectorError;
 use crate::runtime::checkpoint::CheckpointConfig;
+use crate::runtime::sink::SinkPump;
 use crate::sink::Sink;
 use crate::source::{Source, SourceBatch, SourceStream};
 
@@ -72,6 +74,66 @@ pub fn merged_stream(source: &dyn Source) -> Result<SourceStream, ConnectorError
 pub fn ingest(hotlap: &mut Hotlap, input: &str, sb: &SourceBatch) -> Result<(), ConnectorError> {
     let zset = convert::to_zset(&sb.batch)?;
     hotlap.push(input, &zset).map_err(hotlap_err)
+}
+
+/// Ingest one source item and, if it succeeded, pump its deltas into the sinks.
+///
+/// Returns whether the source branch is finished (exhausted, errored or the
+/// sink channel broke), which disables that branch of the select loop.
+pub(crate) async fn feed_source(
+    hotlap: &mut Hotlap,
+    pipeline: &Pipeline,
+    sinks: &SinkPump,
+    item: Option<Result<SourceBatch, ConnectorError>>,
+    last_error: &Mutex<Option<String>>,
+    built: &AtomicBool,
+) -> bool {
+    if on_source_item(hotlap, pipeline, item, last_error, built) {
+        return true;
+    }
+    match sinks.pump(hotlap).await {
+        Ok(()) => false,
+        Err(error) => {
+            record_error(last_error, error);
+            true
+        }
+    }
+}
+
+/// Ingest one source item, recording any error and reporting source completion.
+fn on_source_item(
+    hotlap: &mut Hotlap,
+    pipeline: &Pipeline,
+    item: Option<Result<SourceBatch, ConnectorError>>,
+    last_error: &Mutex<Option<String>>,
+    built: &AtomicBool,
+) -> bool {
+    match item {
+        Some(Ok(sb)) => match ingest(hotlap, &pipeline.input, &sb) {
+            Ok(()) => {
+                // The first successful push builds the dataflow, so views become
+                // readable even if later pushes add no rows.
+                built.store(true, Ordering::SeqCst);
+                false
+            }
+            Err(error) => {
+                record_error(last_error, error);
+                true
+            }
+        },
+        Some(Err(error)) => {
+            record_error(last_error, error);
+            true
+        }
+        None => true,
+    }
+}
+
+/// Store the first error written to `slot`, ignoring later ones.
+pub(crate) fn record_error(slot: &Mutex<Option<String>>, error: ConnectorError) {
+    if let Ok(mut value) = slot.lock() {
+        value.get_or_insert_with(|| error.to_string());
+    }
 }
 
 fn hotlap_err(e: HotlapError) -> ConnectorError {

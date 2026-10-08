@@ -110,6 +110,17 @@ impl StateBackend for DurableStateBackend {
     fn list(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StateError> {
         self.keys_under(prefix)
     }
+
+    fn delete(&mut self, key: &[u8]) -> Result<(), StateError> {
+        validate_key(key)?;
+        let file = self.path_for(key);
+        match fs::remove_file(&file) {
+            Ok(()) => Ok(()),
+            // Already gone (or never stored), which keeps deletion idempotent.
+            Err(e) if is_absent(e.kind()) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 /// Recursively collect keys under `dir`. `segments` accumulates decoded

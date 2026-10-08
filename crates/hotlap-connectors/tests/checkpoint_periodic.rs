@@ -5,16 +5,21 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{SharedBackend, pipeline, wait_rows};
-use hotlap_connectors::runtime::checkpoint::Checkpointer;
+use hotlap_connectors::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
 use hotlap_connectors::runtime::handle::EngineHandle;
 
 #[test]
 fn periodic_trigger_writes_a_checkpoint() {
     let backend = SharedBackend::default();
-    let handle = EngineHandle::start(pipeline(backend.clone(), Duration::from_millis(25))).unwrap();
+    let handle = EngineHandle::start(pipeline(
+        backend.clone(),
+        Duration::from_millis(25),
+        DEFAULT_RETAIN,
+    ))
+    .unwrap();
     assert!(wait_rows(&handle, &[vec![1, 2], vec![2, 2]]));
 
-    let reader = Checkpointer::new(Box::new(backend.clone()));
+    let reader = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut latest = None;
     while Instant::now() < deadline {
@@ -32,7 +37,11 @@ fn periodic_trigger_writes_a_checkpoint() {
 
 #[test]
 fn checkpoint_without_config_is_rejected() {
-    let mut without = pipeline(SharedBackend::default(), Duration::from_secs(1));
+    let mut without = pipeline(
+        SharedBackend::default(),
+        Duration::from_secs(1),
+        DEFAULT_RETAIN,
+    );
     without.checkpoint = None;
     let handle = EngineHandle::start(without).unwrap();
     assert!(handle.checkpoint().is_err());

@@ -49,6 +49,10 @@ impl StateBackend for SharedBackend {
             .cloned()
             .collect())
     }
+    fn delete(&mut self, key: &[u8]) -> Result<(), StateError> {
+        self.map.lock().unwrap().remove(key);
+        Ok(())
+    }
 }
 
 /// A source that yields scripted int batches and advances its read offset.
@@ -103,7 +107,7 @@ fn schema() -> SchemaRef {
 }
 
 /// A one-view pipeline feeding three int batches through `backend`.
-pub fn pipeline(backend: SharedBackend, interval: Duration) -> Pipeline {
+pub fn pipeline(backend: SharedBackend, interval: Duration, retain: usize) -> Pipeline {
     Pipeline {
         input: "in".into(),
         source: Box::new(ScriptSource {
@@ -123,6 +127,7 @@ pub fn pipeline(backend: SharedBackend, interval: Duration) -> Pipeline {
         checkpoint: Some(CheckpointConfig {
             interval,
             backend: Box::new(backend),
+            retain,
         }),
     }
 }

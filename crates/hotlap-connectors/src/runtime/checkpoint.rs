@@ -3,7 +3,8 @@
 //! A checkpoint becomes visible only after every part is written: the engine
 //! snapshot and source offsets land first, then a `valid` marker, and only then
 //! the `latest` pointer. An interrupted write therefore never exposes a partial
-//! checkpoint as the current one.
+//! checkpoint as the current one. Older checkpoints are pruned, keeping at
+//! most `retain` of the newest.
 
 use std::time::Duration;
 
@@ -20,6 +21,8 @@ use crate::source::{Source, SourceState};
 const VALID_MARKER: &[u8] = b"1";
 /// Key holding the id of the newest fully written checkpoint.
 const LATEST_KEY: &[u8] = b"checkpoint/latest";
+/// How many checkpoints [`CheckpointConfig`] keeps by default.
+pub const DEFAULT_RETAIN: usize = 3;
 
 /// Periodic checkpoint settings for a running engine.
 pub struct CheckpointConfig {
@@ -27,6 +30,10 @@ pub struct CheckpointConfig {
     pub interval: Duration,
     /// Destination store, moved into the engine thread.
     pub backend: Box<dyn StateBackend + Send>,
+    /// Number of newest checkpoints to keep; older ones are deleted.
+    ///
+    /// Clamped to at least one, so the `latest` checkpoint always survives.
+    pub retain: usize,
 }
 
 /// A decoded checkpoint: engine snapshot plus resumable source offsets.
@@ -44,14 +51,16 @@ pub struct Checkpoint {
 pub struct Checkpointer {
     backend: Box<dyn StateBackend + Send>,
     next_id: u64,
+    retain: usize,
 }
 
 impl Checkpointer {
-    /// Open a checkpointer over `backend`; ids start at one.
-    pub fn new(backend: Box<dyn StateBackend + Send>) -> Self {
+    /// Open a checkpointer over `backend`, keeping the `retain` newest.
+    pub fn new(backend: Box<dyn StateBackend + Send>, retain: usize) -> Self {
         Self {
             backend,
             next_id: 1,
+            retain,
         }
     }
 
@@ -68,6 +77,8 @@ impl Checkpointer {
         self.put(&format!("{base}/sources"), source_bytes)?;
         self.put(&format!("{base}/valid"), VALID_MARKER.to_vec())?;
         self.put_bytes(LATEST_KEY, id.to_le_bytes().to_vec())?;
+        // The checkpoint is committed; pruning only trims older ones.
+        crate::runtime::retention::prune(self.backend.as_mut(), self.retain).map_err(state_err)?;
         self.next_id = self.next_id.saturating_add(1);
         Ok(id)
     }
