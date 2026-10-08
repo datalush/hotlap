@@ -5,21 +5,26 @@ use arrow::row::OwnedRow;
 /// Byte-keyed `(key, payload) -> diff` state that collapses zero-sum entries.
 #[derive(Default)]
 pub(super) struct RowState {
-    entries: HashMap<OwnedRow, HashMap<OwnedRow, i64>>,
+    entries: HashMap<Vec<u8>, HashMap<OwnedRow, i64>>,
 }
 
 impl RowState {
     /// Adds `diff` to one entry, forgetting entries whose sum becomes zero.
     pub(super) fn add(&mut self, key: OwnedRow, payload: OwnedRow, diff: i64) {
-        let payloads = self.entries.entry(key.clone()).or_default();
+        let payloads = self.entries.entry(key.as_ref().to_vec()).or_default();
         let sum = payloads.entry(payload.clone()).or_insert(0);
         *sum += diff;
         if *sum == 0 {
             payloads.remove(&payload);
         }
         if payloads.is_empty() {
-            self.entries.remove(&key);
+            self.entries.remove(key.as_ref());
         }
+    }
+
+    /// Returns the payload multiset for `key`, if the key is present.
+    pub(super) fn get(&self, key: &[u8]) -> Option<&HashMap<OwnedRow, i64>> {
+        self.entries.get(key)
     }
 
     /// Number of surviving `(key, payload)` entries.
@@ -33,8 +38,8 @@ impl RowState {
     }
 
     /// Returns entries as `(key, payload, diff)`, ordered by key then payload.
-    pub(super) fn sorted(&self) -> Vec<(&OwnedRow, &OwnedRow, i64)> {
-        let mut entries: Vec<(&OwnedRow, &OwnedRow, i64)> = Vec::new();
+    pub(super) fn sorted(&self) -> Vec<(&Vec<u8>, &OwnedRow, i64)> {
+        let mut entries: Vec<(&Vec<u8>, &OwnedRow, i64)> = Vec::new();
         for (key, payloads) in &self.entries {
             for (payload, &diff) in payloads {
                 entries.push((key, payload, diff));

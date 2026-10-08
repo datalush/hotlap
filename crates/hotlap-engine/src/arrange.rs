@@ -1,3 +1,4 @@
+mod per_key;
 mod state;
 
 use std::sync::Arc;
@@ -90,7 +91,7 @@ impl KeyedArrangement {
         self.state
             .sorted()
             .into_iter()
-            .map(|(key, payload, diff)| (key.as_ref().to_vec(), payload.as_ref().to_vec(), diff))
+            .map(|(key, payload, diff)| (key.to_vec(), payload.as_ref().to_vec(), diff))
     }
 
     /// Materializes the state as a deterministic [`ZSetBatch`].
@@ -101,8 +102,8 @@ impl KeyedArrangement {
         if entries.is_empty() {
             return self.empty_zset();
         }
-        let keys: Vec<&OwnedRow> = entries.iter().map(|entry| entry.0).collect();
-        let payloads: Vec<&OwnedRow> = entries.iter().map(|entry| entry.1).collect();
+        let keys: Vec<&[u8]> = entries.iter().map(|entry| entry.0.as_slice()).collect();
+        let payloads: Vec<&[u8]> = entries.iter().map(|entry| entry.1.as_ref()).collect();
         let key_arrays = decode(&self.key_converter, &keys)?;
         let payload_arrays = decode(&self.payload_converter, &payloads)?;
         let batch = self.assemble(&key_arrays, &payload_arrays)?;
@@ -191,8 +192,8 @@ impl KeyedArrangement {
 }
 
 /// Decodes `arrow::row` bytes back into column arrays for `converter`.
-fn decode(converter: &RowConverter, rows: &[&OwnedRow]) -> Result<Vec<ArrayRef>, EngineError> {
+fn decode(converter: &RowConverter, rows: &[&[u8]]) -> Result<Vec<ArrayRef>, EngineError> {
     let parser = converter.parser();
-    let parsed: Vec<Row<'_>> = rows.iter().map(|row| parser.parse(row.as_ref())).collect();
+    let parsed: Vec<Row<'_>> = rows.iter().map(|row| parser.parse(row)).collect();
     Ok(converter.convert_rows(parsed)?)
 }

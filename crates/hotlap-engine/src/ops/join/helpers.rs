@@ -1,27 +1,75 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, UInt32Array};
+use arrow::array::{Array, ArrayRef, Int64Array, UInt32Array};
 use arrow::compute::{concat, concat_batches, take};
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use crate::arrange::KeyedArrangement;
 use crate::batch::ZSetBatch;
 use crate::error::EngineError;
 use crate::keys::KeyConverter;
 use crate::zset::{consolidate, int64_diffs};
 
-/// Materializes both arrangements and joins their current relations.
-pub(super) fn snapshot(
-    left: &KeyedArrangement,
+/// Distinct join-key bytes present in the delta `z`, in first-seen order.
+pub(super) fn touched_keys(z: &ZSetBatch, keys: &[usize]) -> Result<Vec<Vec<u8>>, EngineError> {
+    if z.is_empty() {
+        return Ok(Vec::new());
+    }
+    let converter = KeyConverter::new(z.schema().as_ref(), keys)?;
+    let rows = converter.convert(z.batch.columns())?;
+    let mut seen = HashSet::new();
+    let mut touched = Vec::new();
+    for index in 0..rows.num_rows() {
+        let bytes = rows.row(index).as_ref().to_vec();
+        if seen.insert(bytes.clone()) {
+            touched.push(bytes);
+        }
+    }
+    Ok(touched)
+}
+
+/// Distinct keys touched by both deltas, de-duplicated across the two sides.
+pub(super) fn touched_union(
+    left: &ZSetBatch,
     left_keys: &[usize],
-    right: &KeyedArrangement,
+    right: &ZSetBatch,
     right_keys: &[usize],
+) -> Result<Vec<Vec<u8>>, EngineError> {
+    let mut touched = touched_keys(left, left_keys)?;
+    let mut seen: HashSet<Vec<u8>> = touched.iter().cloned().collect();
+    for key in touched_keys(right, right_keys)? {
+        if seen.insert(key.clone()) {
+            touched.push(key);
+        }
+    }
+    Ok(touched)
+}
+
+/// Builds the joined output schema as `left fields ++ right fields`.
+pub(super) fn joined_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
+    let mut fields: Vec<Field> = left
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields.extend(right.fields().iter().map(|field| field.as_ref().clone()));
+    Arc::new(Schema::new(fields))
+}
+
+/// Concatenates per-key deltas over a shared schema.
+pub(super) fn concat_zsets(
+    schema: &SchemaRef,
+    parts: &[ZSetBatch],
 ) -> Result<ZSetBatch, EngineError> {
-    let left = left.to_zset()?;
-    let right = right.to_zset()?;
-    equi_join(&left, left_keys, &right, right_keys)
+    if parts.is_empty() {
+        return Ok(ZSetBatch::empty(schema.clone()));
+    }
+    let batches: Vec<&RecordBatch> = parts.iter().map(|z| &z.batch).collect();
+    let batch = concat_batches(schema, batches)?;
+    let diffs: Vec<&dyn Array> = parts.iter().map(|z| z.diff.as_ref()).collect();
+    let diff = concat(&diffs)?;
+    Ok(ZSetBatch::new(batch, diff)?)
 }
 
 /// Returns `current - previous` as a consolidated Z-set.
@@ -35,16 +83,14 @@ pub(super) fn subtract(
     consolidate(&ZSetBatch::new(batch, diff)?)
 }
 
-/// Inner equi-joins two Z-sets on the given key columns.
-///
-/// Matching uses `arrow::row` bytes, so equal keys compare byte-wise. The result
-/// is consolidated by full joined row, summing the sides' diff products.
-fn equi_join(
+/// Inner equi-joins two Z-sets on the given key columns, also returning the
+/// number of joined pairs evaluated (both sides share the key by construction).
+pub(super) fn equi_join(
     left: &ZSetBatch,
     left_keys: &[usize],
     right: &ZSetBatch,
     right_keys: &[usize],
-) -> Result<ZSetBatch, EngineError> {
+) -> Result<(ZSetBatch, usize), EngineError> {
     let left_rows =
         KeyConverter::new(left.schema().as_ref(), left_keys)?.convert(left.batch.columns())?;
     let right_rows =
@@ -63,7 +109,8 @@ fn equi_join(
             matches.extend(left_indices.iter().map(|&left_index| (left_index, index)));
         }
     }
-    materialize(left, right, &matches)
+    let pairs = matches.len();
+    Ok((materialize(left, right, &matches)?, pairs))
 }
 
 /// Builds the joined Z-set for the `(left index, right index)` match pairs.

@@ -151,6 +151,34 @@ fn join_matches_full_recompute_with_retractions() {
 }
 
 #[test]
+fn zero_crossing_matches_full_recompute_across_epochs() {
+    // The joined pair retracts to zero, is re-inserted, then retracts again as
+    // each side cycles; the net changelog must equal full recomputation.
+    let left_epochs = [
+        vec![(1, "a", 1)],
+        vec![(1, "a", -1)],
+        vec![(1, "a", 1)],
+        vec![],
+    ];
+    let right_epochs = [vec![(1, "x", 1)], vec![], vec![], vec![(1, "x", -1)]];
+
+    let mut join = Join::new(&[0], &[0]);
+    let (mut history_left, mut history_right) = (Vec::new(), Vec::new());
+    let mut changelogs = Vec::new();
+    for (left_batch, right_batch) in left_epochs.iter().zip(&right_epochs) {
+        history_left.extend(left_batch.iter().copied());
+        history_right.extend(right_batch.iter().copied());
+        changelogs.push(join.apply(&left(left_batch), &right(right_batch)).unwrap());
+    }
+
+    assert_eq!(
+        consolidated(&changelogs),
+        recompute_join(&history_left, &history_right)
+    );
+    assert!(recompute_join(&history_left, &history_right).is_empty());
+}
+
+#[test]
 fn retracting_entire_side_empties_join() {
     let mut join = Join::new(&[0], &[0]);
     let first = join
