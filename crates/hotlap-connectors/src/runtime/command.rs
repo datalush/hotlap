@@ -46,7 +46,7 @@ pub(crate) async fn handle(
             false
         }
         Some(Command::Checkpoint { reply }) => {
-            let _ = reply.send(take(checkpointer, hotlap, pipeline.source.as_ref()));
+            let _ = reply.send(take(checkpointer, hotlap, pipeline.source.as_ref()).await);
             false
         }
         Some(Command::Shutdown { reply }) => {
@@ -58,27 +58,27 @@ pub(crate) async fn handle(
 }
 
 /// Run a periodic checkpoint, recording failures on their own error slot.
-pub(crate) fn run_periodic(
+pub(crate) async fn run_periodic(
     checkpointer: &mut Option<Checkpointer>,
     hotlap: &Hotlap,
     pipeline: &Pipeline,
     checkpoint_error: &Mutex<Option<String>>,
 ) {
     if let Some(active) = checkpointer
-        && let Err(error) = active.take(hotlap, pipeline.source.as_ref())
+        && let Err(error) = active.take(hotlap, pipeline.source.as_ref()).await
     {
         record_error(checkpoint_error, error);
     }
 }
 
 /// Take a checkpoint, or report that none is configured.
-fn take(
+async fn take(
     checkpointer: &mut Option<Checkpointer>,
     hotlap: &Hotlap,
     source: &dyn Source,
 ) -> Result<u64, ConnectorError> {
     match checkpointer {
-        Some(active) => active.take(hotlap, source),
+        Some(active) => active.take(hotlap, source).await,
         None => Err(ConnectorError::Unsupported(
             "checkpointing is not configured".into(),
         )),

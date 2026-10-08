@@ -6,6 +6,7 @@
 //! checkpoint as the current one. Older checkpoints are pruned, keeping at
 //! most `retain` of the newest.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use hotlap::Hotlap;
@@ -15,6 +16,8 @@ use hotlap_engine::{
 };
 
 use crate::error::ConnectorError;
+use crate::runtime::sink_barrier::SinkBarrier;
+use crate::sink::Sink;
 use crate::source::{Source, SourceState};
 
 /// Value stored under `checkpoint/<id>/valid` once a checkpoint is complete.
@@ -52,6 +55,7 @@ pub struct Checkpointer {
     backend: Box<dyn StateBackend + Send>,
     next_id: u64,
     retain: usize,
+    sinks: SinkBarrier,
 }
 
 impl Checkpointer {
@@ -61,26 +65,58 @@ impl Checkpointer {
             backend,
             next_id: 1,
             retain,
+            sinks: SinkBarrier::new(Vec::new()),
         }
     }
 
-    /// Capture `engine` and `source` and persist a new valid checkpoint.
+    /// Coordinate the given sinks with the two-phase-commit protocol.
+    pub fn with_sinks(mut self, sinks: Vec<Arc<dyn Sink>>) -> Self {
+        self.sinks = SinkBarrier::new(sinks);
+        self
+    }
+
+    /// Capture `engine` and `source` and persist a new valid checkpoint,
+    /// coordinating the sinks in two-phase-commit order.
+    ///
+    /// The order is prepare -> snapshot + write body -> commit -> mark valid.
+    /// A failure before the commit finishes aborts the prepared sinks and
+    /// discards the checkpoint, so the engine keeps its last valid one.
     ///
     /// Returns the id of the checkpoint; later reads must use [`Self::read`].
-    pub fn take(&mut self, engine: &Hotlap, source: &dyn Source) -> Result<u64, ConnectorError> {
-        let snapshot = engine.checkpoint().map_err(hotlap_err)?;
-        let engine_bytes = encode_snapshot(&snapshot).map_err(engine_err)?;
-        let source_bytes = encode_framed(&source.state()).map_err(engine_err)?;
+    pub async fn take(
+        &mut self,
+        engine: &Hotlap,
+        source: &dyn Source,
+    ) -> Result<u64, ConnectorError> {
         let id = self.next_id;
+        let backend = &mut self.backend;
+        let result = self
+            .sinks
+            .around(|| async {
+                let snapshot = engine.checkpoint().map_err(hotlap_err)?;
+                let engine_bytes = encode_snapshot(&snapshot).map_err(engine_err)?;
+                let source_bytes = encode_framed(&source.state()).map_err(engine_err)?;
+                let base = checkpoint_prefix(id);
+                backend
+                    .put(format!("{base}/engine").as_bytes(), engine_bytes)
+                    .map_err(state_err)?;
+                backend
+                    .put(format!("{base}/sources").as_bytes(), source_bytes)
+                    .map_err(state_err)
+            })
+            .await;
+        result?;
+        self.mark_valid(id)?;
+        self.next_id = self.next_id.saturating_add(1);
+        Ok(id)
+    }
+
+    fn mark_valid(&mut self, id: u64) -> Result<(), ConnectorError> {
         let base = checkpoint_prefix(id);
-        self.put(&format!("{base}/engine"), engine_bytes)?;
-        self.put(&format!("{base}/sources"), source_bytes)?;
         self.put(&format!("{base}/valid"), VALID_MARKER.to_vec())?;
         self.put_bytes(LATEST_KEY, id.to_le_bytes().to_vec())?;
         // The checkpoint is committed; pruning only trims older ones.
-        crate::runtime::retention::prune(self.backend.as_mut(), self.retain).map_err(state_err)?;
-        self.next_id = self.next_id.saturating_add(1);
-        Ok(id)
+        crate::runtime::retention::prune(self.backend.as_mut(), self.retain).map_err(state_err)
     }
 
     /// Id of the newest complete checkpoint, or `None` when none exists.
@@ -117,23 +153,19 @@ impl Checkpointer {
         self.put_bytes(key.as_bytes(), value)
     }
 
-    /// Store `value` under raw `key` bytes.
     fn put_bytes(&mut self, key: &[u8], value: Vec<u8>) -> Result<(), ConnectorError> {
         self.backend.put(key, value).map_err(state_err)
     }
 
-    /// Read the UTF-8 key `key`.
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, ConnectorError> {
         self.get_bytes(key.as_bytes())
     }
 
-    /// Read raw `key` bytes.
     fn get_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ConnectorError> {
         self.backend.get(key).map_err(state_err)
     }
 }
 
-/// Namespace key prefix for checkpoint `id`.
 fn checkpoint_prefix(id: u64) -> String {
     format!("checkpoint/{id}")
 }

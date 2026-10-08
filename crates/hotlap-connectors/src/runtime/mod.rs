@@ -7,3 +7,4 @@ pub mod handle;
 pub mod pipeline;
 pub(crate) mod retention;
 pub mod sink;
+pub mod sink_barrier;

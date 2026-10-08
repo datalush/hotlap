@@ -1,27 +1,34 @@
-//! Fluss append sink: writes a view's changelog to a Fluss log table.
+//! Fluss append/upsert sink: writes a view's changelog to a Fluss table.
+
+use std::sync::Arc;
 
 use arrow::array::Int64Array;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use fluss::client::{AppendWriter, FlussConnection};
+use fluss::client::FlussConnection;
 use fluss::config::Config;
 use futures::StreamExt;
 use hotlap::ZSetBatch;
 
 use crate::error::ConnectorError;
-use crate::sink::{ChangeStream, Sink};
+use crate::sink::{ChangeStream, Sink, SinkCapabilities};
 
 use super::sink_convert::rows_to_batch;
+use super::sink_writer::FlussWriter;
 use super::{fluss_err, parse_path};
 
-/// Append-only Fluss sink. Retractions (`diff < 0`) are rejected.
+/// Fluss sink. Log tables are appended (at-least-once); primary-key tables are
+/// upserted (idempotent). Retractions (`diff < 0`) are rejected in both modes.
 pub struct FlussSink {
-    writer: AppendWriter,
+    writer: FlussWriter,
     schema: SchemaRef,
 }
 
 impl FlussSink {
-    /// Connect to `bootstrap` and open `path` (`<database>/<table>`) for append.
+    /// Connect to `bootstrap` and open `path` (`<database>/<table>`).
+    ///
+    /// A table with a primary key is written through the upsert writer, which
+    /// makes replay after a crash idempotent; a log table is appended.
     pub async fn open_from_bootstrap(
         bootstrap: &str,
         path: &str,
@@ -36,16 +43,18 @@ impl FlussSink {
             .get_table(&parse_path(path)?)
             .await
             .map_err(fluss_err)?;
-        let writer = table
-            .new_append()
-            .map_err(fluss_err)?
-            .create_writer()
-            .map_err(fluss_err)?;
+        let writer = if table.has_primary_key() {
+            let row_type = Arc::new(table.get_table_info().row_type().clone());
+            let upsert = table.new_upsert().map_err(fluss_err)?;
+            FlussWriter::Upsert {
+                writer: upsert.create_writer().map_err(fluss_err)?,
+                row_type,
+            }
+        } else {
+            let append = table.new_append().map_err(fluss_err)?;
+            FlussWriter::Append(append.create_writer().map_err(fluss_err)?)
+        };
         Ok(Self { writer, schema })
-    }
-
-    fn writer(&self) -> &AppendWriter {
-        &self.writer
     }
 }
 
@@ -73,22 +82,23 @@ impl Sink for FlussSink {
             if records.num_rows() == 0 {
                 continue;
             }
-            // Fire-and-forget: errors surface on the awaited `flush` in commit.
-            drop(
-                self.writer()
-                    .append_arrow_batch(records)
-                    .map_err(fluss_err)?,
-            );
+            self.writer.write_batch(&records)?;
         }
         Ok(())
     }
 
+    fn capabilities(&self) -> SinkCapabilities {
+        self.writer.capabilities()
+    }
+
     async fn commit(&self) -> Result<(), ConnectorError> {
-        self.writer().flush().await.map_err(fluss_err)
+        // Fluss has no sink-side transaction; commit is the awaited flush.
+        self.writer.flush().await
     }
 
     async fn abort(&self) -> Result<(), ConnectorError> {
-        // Append has no transaction; already-queued writes are already visible.
+        // No transaction to drop: log appends are already visible and upserts
+        // are idempotent, so abort is intentionally a no-op.
         Ok(())
     }
 }

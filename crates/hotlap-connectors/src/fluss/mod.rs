@@ -11,6 +11,7 @@ pub mod assemble;
 pub mod log_reader;
 pub mod sink;
 mod sink_convert;
+mod sink_writer;
 pub mod source;
 pub mod stream;
 
