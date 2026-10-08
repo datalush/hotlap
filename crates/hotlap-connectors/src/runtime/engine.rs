@@ -13,8 +13,9 @@ use crate::error::ConnectorError;
 use crate::runtime::checkpoint::Checkpointer;
 use crate::runtime::command::{self, Command};
 use crate::runtime::pipeline::{self, Pipeline, feed_source, record_error};
+use crate::runtime::recovery::Recovery;
 use crate::runtime::sink::SinkPump;
-use crate::source::SourceStream;
+use crate::source::{Source, SourceStream};
 
 /// Run the engine loop until shutdown or channel close.
 ///
@@ -81,18 +82,21 @@ async fn drive(
 fn prepare(pipeline: &mut Pipeline) -> Result<Engine, ConnectorError> {
     let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
     pipeline::setup(&mut hotlap, pipeline)?;
-    let source = pipeline::merged_stream(pipeline.source.as_ref())?;
     let sinks = SinkPump::start(&pipeline.sinks);
     let coordinated = sinks.coordinated();
-    let (checkpointer, ticker) = match pipeline.checkpoint.take() {
+    let (source, checkpointer, ticker) = match pipeline.checkpoint.take() {
         Some(config) => {
+            let mut checkpointer =
+                Checkpointer::new(config.backend, config.retain).with_sinks(coordinated);
+            let source = recover(&mut hotlap, pipeline.source.as_ref(), &mut checkpointer)?;
             let tick = interval_at(Instant::now() + config.interval, config.interval);
-            (
-                Some(Checkpointer::new(config.backend, config.retain).with_sinks(coordinated)),
-                Some(tick),
-            )
+            (source, Some(checkpointer), Some(tick))
         }
-        None => (None, None),
+        None => (
+            pipeline::merged_stream(pipeline.source.as_ref())?,
+            None,
+            None,
+        ),
     };
     Ok(Engine {
         hotlap,
@@ -101,6 +105,22 @@ fn prepare(pipeline: &mut Pipeline) -> Result<Engine, ConnectorError> {
         checkpointer,
         ticker,
     })
+}
+
+/// Reopen the source at the newest valid checkpoint, or from the start when
+/// the store holds none (a clean start).
+fn recover(
+    hotlap: &mut Hotlap,
+    source: &dyn Source,
+    checkpointer: &mut Checkpointer,
+) -> Result<SourceStream, ConnectorError> {
+    match Recovery::load(checkpointer)? {
+        Some(checkpoint) => {
+            checkpointer.resume_after(checkpoint.id);
+            Recovery::resume(hotlap, source, &checkpoint)
+        }
+        None => pipeline::merged_stream(source),
+    }
 }
 
 /// Serve the source stream and the command channel until shutdown.

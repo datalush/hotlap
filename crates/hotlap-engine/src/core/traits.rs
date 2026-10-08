@@ -142,6 +142,11 @@ impl IncrementalCore for EngineCore {
         // Method-call syntax picks the inherent `EngineCore::checkpoint`.
         self.checkpoint().map_err(CoreError::from)
     }
+
+    fn restore(&mut self, snapshot: &EngineSnapshot) -> Result<(), CoreError> {
+        // Method-call syntax picks the inherent `EngineCore::restore`.
+        self.restore(snapshot).map_err(CoreError::from)
+    }
 }
 
 /// Engine-specific metrics that stay off the [`IncrementalCore`] contract.

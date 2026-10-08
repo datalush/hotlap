@@ -141,6 +141,13 @@ impl Hotlap {
             .map_err(|error| HotlapError(format!("{error}")))
     }
 
+    /// Rebuild the engine from a snapshot captured by [`Self::checkpoint`].
+    pub fn restore(&mut self, snapshot: &EngineSnapshot) -> Result<(), HotlapError> {
+        self.core
+            .restore(snapshot)
+            .map_err(|error| HotlapError(format!("{error}")))
+    }
+
     /// Shut the engine down. Dropping `Hotlap` also releases the core.
     pub fn shutdown(self) -> Result<(), HotlapError> {
         Ok(())

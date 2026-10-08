@@ -6,6 +6,7 @@ pub mod command;
 pub mod engine;
 pub mod handle;
 pub mod pipeline;
+pub mod recovery;
 pub(crate) mod retention;
 mod shared_sink;
 pub mod sink;

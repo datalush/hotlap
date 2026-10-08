@@ -72,6 +72,12 @@ impl Checkpointer {
         self
     }
 
+    /// Continue the id sequence after a recovered checkpoint `id`, so the next
+    /// checkpoint does not overwrite an existing one.
+    pub fn resume_after(&mut self, id: u64) {
+        self.next_id = self.next_id.max(id.saturating_add(1));
+    }
+
     /// Capture `engine` and `source` and persist a new valid checkpoint,
     /// coordinating the sinks in two-phase-commit order.
     ///

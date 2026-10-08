@@ -10,7 +10,7 @@ use crate::error::ConnectorError;
 use crate::runtime::checkpoint::CheckpointConfig;
 use crate::runtime::sink::SinkPump;
 use crate::sink::Sink;
-use crate::source::{Source, SourceBatch, SourceStream};
+use crate::source::{Source, SourceBatch, SourceStream, Split};
 
 /// Event-time declaration for the pipeline's input.
 #[derive(Clone, Copy, Debug)]
@@ -62,9 +62,16 @@ pub fn setup(hotlap: &mut Hotlap, pipeline: &Pipeline) -> Result<(), ConnectorEr
 
 /// Merge the per-split streams into a single stream.
 pub fn merged_stream(source: &dyn Source) -> Result<SourceStream, ConnectorError> {
-    let splits = source.splits()?;
+    merged_stream_from(source, &source.splits()?)
+}
+
+/// Merge `splits` into a single stream, reading each one from its `start`.
+pub fn merged_stream_from(
+    source: &dyn Source,
+    splits: &[Split],
+) -> Result<SourceStream, ConnectorError> {
     let mut streams = Vec::with_capacity(splits.len());
-    for split in &splits {
+    for split in splits {
         streams.push(source.read(split)?);
     }
     Ok(Box::pin(futures::stream::select_all(streams)))

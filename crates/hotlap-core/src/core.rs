@@ -45,4 +45,8 @@ pub trait IncrementalCore {
 
     /// Capture the engine's durable state as a versioned [`EngineSnapshot`].
     fn checkpoint(&self) -> Result<EngineSnapshot, CoreError>;
+
+    /// Rebuild this engine's state from a [`EngineSnapshot`] captured by
+    /// [`checkpoint`](Self::checkpoint). Rejects an unknown layout version.
+    fn restore(&mut self, snapshot: &EngineSnapshot) -> Result<(), CoreError>;
 }

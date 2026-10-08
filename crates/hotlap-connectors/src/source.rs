@@ -61,6 +61,22 @@ pub trait Source: Send + Sync {
     fn is_unbounded(&self) -> bool {
         false
     }
+    /// Reopen the source at previously captured offsets, returning the splits
+    /// to read from.
+    ///
+    /// The default reads the current splits and overrides each `start` with the
+    /// captured offset when one exists. A source that can no longer serve a
+    /// captured offset (data older than its retention) must instead return an
+    /// explicit error rather than silently skip records.
+    fn resume(&self, state: &SourceState) -> Result<Vec<Split>, ConnectorError> {
+        let mut splits = self.splits()?;
+        for split in &mut splits {
+            if let Some(offset) = state.offsets.get(&split.id) {
+                split.start = *offset;
+            }
+        }
+        Ok(splits)
+    }
 }
 
 #[cfg(test)]
