@@ -1,7 +1,7 @@
-//! Engine-owned incremental-core boundary, free of differential dataflow.
+//! Engine-owned incremental-core boundary.
 //!
 //! The trait speaks only in engine types ([`Plan`], [`ZSetBatch`], [`InputId`],
-//! [`ViewId`]); no `differential-dataflow`/`timely` type crosses it.
+//! [`ViewId`]); no third-party dataflow type crosses it.
 //!
 //! [`Plan`]: crate::plan::Plan
 //! [`ZSetBatch`]: crate::batch::ZSetBatch

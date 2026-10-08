@@ -158,7 +158,13 @@ fn materialize(
         .iter()
         .map(|field| field.as_ref().clone())
         .collect();
-    fields.extend(right.schema().fields().iter().map(|field| field.as_ref().clone()));
+    fields.extend(
+        right
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone()),
+    );
     let mut columns: Vec<ArrayRef> = left_taken.columns().to_vec();
     columns.extend(right_taken.columns().iter().cloned());
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;

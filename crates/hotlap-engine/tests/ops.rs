@@ -6,9 +6,9 @@ use arrow::compute::{concat, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
+use hotlap_engine::ZSetBatch;
 use hotlap_engine::consolidate;
 use hotlap_engine::ops::{GroupCount, filter, project};
-use hotlap_engine::ZSetBatch;
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -164,14 +164,10 @@ fn group_count_delta_retracts_old_and_inserts_new_count() {
 #[test]
 fn group_count_retracts_key_that_crosses_to_zero() {
     let mut reducer = GroupCount::new(&[0]);
-    let first = reducer
-        .apply(&zset(&[(1, "a", 1), (1, "b", 1)]))
-        .unwrap();
+    let first = reducer.apply(&zset(&[(1, "a", 1), (1, "b", 1)])).unwrap();
     assert_eq!(count_diff_rows(&first), vec![((1, 2), 1)]);
 
-    let second = reducer
-        .apply(&zset(&[(1, "a", -1), (1, "b", -1)]))
-        .unwrap();
+    let second = reducer.apply(&zset(&[(1, "a", -1), (1, "b", -1)])).unwrap();
     assert_eq!(count_diff_rows(&second), vec![((1, 2), -1)]);
     assert!(consolidated(&[first, second]).is_empty());
 }

@@ -84,7 +84,8 @@ fn recompute_join(
     for (lk, lv, ld) in left {
         for (rk, rv, rd) in right {
             if lk == rk {
-                *out.entry((*lk, lv.to_string(), rv.to_string())).or_default() += ld * rd;
+                *out.entry((*lk, lv.to_string(), rv.to_string()))
+                    .or_default() += ld * rd;
             }
         }
     }

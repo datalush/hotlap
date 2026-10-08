@@ -6,10 +6,10 @@ use arrow::compute::{concat, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
+use hotlap_engine::ZSetBatch;
 use hotlap_engine::consolidate;
 use hotlap_engine::ops::TumbleCount;
 use hotlap_engine::time::Watermark;
-use hotlap_engine::ZSetBatch;
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -110,7 +110,12 @@ fn run(batches: &[Vec<(i64, i64, i64)>], size: i64, lag: i64) -> Vec<ZSetBatch> 
 #[test]
 fn open_window_emits_nothing_until_watermark_reaches_end() {
     let mut window = TumbleCount::new(&[0], 1, 10);
-    assert!(window.apply(&zset(&[(5, 1, 1), (5, 3, 1), (7, 7, 1)]), 7).unwrap().is_empty());
+    assert!(
+        window
+            .apply(&zset(&[(5, 1, 1), (5, 3, 1), (7, 7, 1)]), 7)
+            .unwrap()
+            .is_empty()
+    );
 
     let out = window.apply(&zset(&[(5, 12, 1)]), 12).unwrap();
     assert_eq!(rows(&out), vec![(5, 0, 2, 1), (7, 0, 1, 1)]);
@@ -182,7 +187,9 @@ fn changelog_matches_full_recompute_across_windows() {
 #[test]
 fn groups_by_key_within_the_same_window() {
     let mut window = TumbleCount::new(&[0], 1, 10);
-    let out = window.apply(&zset(&[(5, 1, 1), (9, 2, 1), (5, 3, 1)]), 10).unwrap();
+    let out = window
+        .apply(&zset(&[(5, 1, 1), (9, 2, 1), (5, 3, 1)]), 10)
+        .unwrap();
     assert_eq!(rows(&out), vec![(5, 0, 2, 1), (9, 0, 1, 1)]);
 }
 

@@ -29,7 +29,9 @@ impl IncrementalCore for EngineCore {
             return Err(CoreError::Unsupported("engine already running".into()));
         }
         if self.views.contains_key(&view) {
-            return Err(CoreError::Unsupported(format!("view {view:?} already built")));
+            return Err(CoreError::Unsupported(format!(
+                "view {view:?} already built"
+            )));
         }
         let graph = ViewGraph::build(plan);
         for src in graph.sources() {

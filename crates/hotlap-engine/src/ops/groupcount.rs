@@ -156,7 +156,10 @@ impl GroupCount {
             .as_ref()
             .ok_or_else(|| EngineError::Infrastructure("group converter missing".to_string()))?;
         let parser = converter.parser();
-        let parsed: Vec<Row<'_>> = rows.iter().map(|(bytes, _, _)| parser.parse(bytes)).collect();
+        let parsed: Vec<Row<'_>> = rows
+            .iter()
+            .map(|(bytes, _, _)| parser.parse(bytes))
+            .collect();
         let mut columns = converter.convert_rows(parsed)?;
         columns.push(Arc::new(Int64Array::from(
             rows.iter().map(|(_, count, _)| *count).collect::<Vec<_>>(),
@@ -171,4 +174,3 @@ impl GroupCount {
 
 #[cfg(test)]
 mod tests;
-

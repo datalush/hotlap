@@ -33,10 +33,7 @@ pub(crate) fn accumulate(
 
 impl Node {
     /// Applies this node's operator to its inputs' deltas.
-    pub(super) fn eval(
-        &mut self,
-        ctx: &mut EvalCtx,
-    ) -> Result<Option<ZSetBatch>, EngineError> {
+    pub(super) fn eval(&mut self, ctx: &mut EvalCtx) -> Result<Option<ZSetBatch>, EngineError> {
         match self {
             Node::Source(id) => source_eval(*id, ctx),
             Node::Filter { input, pred } => filter_eval(input, pred, ctx),

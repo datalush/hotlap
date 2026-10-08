@@ -38,7 +38,9 @@ fn gt_compares_integers() {
 
 #[test]
 fn eq_compares_strings() {
-    let mask = Predicate::Eq(1, Scalar::Str("a".into())).eval(&batch()).unwrap();
+    let mask = Predicate::Eq(1, Scalar::Str("a".into()))
+        .eval(&batch())
+        .unwrap();
     assert_eq!(values(&mask), vec![true, false, true]);
 }
 

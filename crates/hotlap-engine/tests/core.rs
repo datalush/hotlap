@@ -57,7 +57,10 @@ fn recompute(history: &[(i64, &str, i64)]) -> Vec<(i64, i64)> {
     for (key, _value, diff) in history {
         *counts.entry(*key).or_default() += diff;
     }
-    counts.into_iter().filter(|(_, count)| *count != 0).collect()
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count != 0)
+        .collect()
 }
 
 /// Concatenates changelogs and consolidates them to net rows.

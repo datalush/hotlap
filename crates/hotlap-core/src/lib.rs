@@ -1,4 +1,4 @@
-//! Shared, differential-dataflow-free contract for the hotlap engine.
+//! Shared, engine-owned contract for the hotlap dataflow.
 //!
 //! Defines the plan IR, ids, watermark spec, Z-set batch and the
 //! [`IncrementalCore`] trait implemented by concrete engine kernels.

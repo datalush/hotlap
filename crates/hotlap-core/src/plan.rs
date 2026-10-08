@@ -44,8 +44,9 @@ impl Predicate {
             Predicate::Eq(col, want) => {
                 let column = column(batch, *col)?;
                 if matches!(want, Scalar::Null) {
-                    let mask: Vec<bool> =
-                        (0..column.len()).map(|index| column.is_null(index)).collect();
+                    let mask: Vec<bool> = (0..column.len())
+                        .map(|index| column.is_null(index))
+                        .collect();
                     return Ok(BooleanArray::from(mask));
                 }
                 let scalar = ArrowScalar::new(literal(want, column.data_type())?);

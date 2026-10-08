@@ -44,10 +44,30 @@ type JoinedRow = (i64, String, i64, String);
 
 /// Reads a joined Z-set as sorted `((lk, lv, rk, rv), diff)` rows.
 fn joined_rows(z: &ZSetBatch) -> Vec<(JoinedRow, i64)> {
-    let lk = z.batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let lv = z.batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-    let rk = z.batch.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
-    let rv = z.batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+    let lk = z
+        .batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let lv = z
+        .batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let rk = z
+        .batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let rv = z
+        .batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     let diffs = z.diff.as_any().downcast_ref::<Int64Array>().unwrap();
     let mut out: Vec<(JoinedRow, i64)> = (0..z.len())
         .map(|i| {
@@ -133,7 +153,9 @@ fn join_matches_full_recompute_with_retractions() {
 #[test]
 fn retracting_entire_side_empties_join() {
     let mut join = Join::new(&[0], &[0]);
-    let first = join.apply(&left(&[(1, "a", 1)]), &right(&[(1, "x", 1)])).unwrap();
+    let first = join
+        .apply(&left(&[(1, "a", 1)]), &right(&[(1, "x", 1)]))
+        .unwrap();
     assert_eq!(
         joined_rows(&first),
         vec![((1, "a".to_string(), 1, "x".to_string()), 1)]

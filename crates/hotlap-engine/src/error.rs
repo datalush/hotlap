@@ -30,9 +30,7 @@ impl From<hotlap_core::CoreError> for EngineError {
     fn from(error: hotlap_core::CoreError) -> Self {
         match error {
             hotlap_core::CoreError::Unsupported(message) => EngineError::Unsupported(message),
-            hotlap_core::CoreError::Infrastructure(message) => {
-                EngineError::Infrastructure(message)
-            }
+            hotlap_core::CoreError::Infrastructure(message) => EngineError::Infrastructure(message),
         }
     }
 }
@@ -41,9 +39,7 @@ impl From<EngineError> for hotlap_core::CoreError {
     fn from(error: EngineError) -> Self {
         match error {
             EngineError::Unsupported(message) => hotlap_core::CoreError::Unsupported(message),
-            EngineError::Infrastructure(message) => {
-                hotlap_core::CoreError::Infrastructure(message)
-            }
+            EngineError::Infrastructure(message) => hotlap_core::CoreError::Infrastructure(message),
         }
     }
 }

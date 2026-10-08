@@ -85,9 +85,10 @@ impl EngineCore {
         if self.specs.is_empty() {
             return Ok(batch.clone());
         }
-        let spec = self.specs.get(&input).copied().ok_or_else(|| {
-            EngineError::Unsupported(format!("input {input:?} has no watermark"))
-        })?;
+        let spec =
+            self.specs.get(&input).copied().ok_or_else(|| {
+                EngineError::Unsupported(format!("input {input:?} has no watermark"))
+            })?;
         let current = *self.watermarks.get(&input).unwrap_or(&0);
         let times = time_values(&batch.batch, spec.time_col)?;
         let diffs = int64_diffs(batch.diff())?;
@@ -129,7 +130,8 @@ impl EngineCore {
             .eval(input, delta, &self.schemas, watermark)
             .map_err(CoreError::from)?;
         if let Some(output) = output {
-            view.output = graph::accumulate(view.output.take(), &output).map_err(CoreError::from)?;
+            view.output =
+                graph::accumulate(view.output.take(), &output).map_err(CoreError::from)?;
             if view.tapped {
                 view.pending =
                     graph::accumulate(view.pending.take(), &output).map_err(CoreError::from)?;
@@ -166,9 +168,10 @@ fn time_values(
     use arrow::compute::cast;
     use arrow::datatypes::DataType;
 
-    let column = batch.columns().get(col).ok_or_else(|| {
-        EngineError::Unsupported(format!("time column {col} out of range"))
-    })?;
+    let column = batch
+        .columns()
+        .get(col)
+        .ok_or_else(|| EngineError::Unsupported(format!("time column {col} out of range")))?;
     let casted = cast(column.as_ref(), &DataType::Int64)?;
     let ints = casted
         .as_any()

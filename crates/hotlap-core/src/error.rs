@@ -1,4 +1,4 @@
-//! Error type of the differential-dataflow-free contract.
+//! Error type of the engine-owned contract.
 
 use std::fmt;
 
