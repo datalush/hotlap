@@ -24,10 +24,9 @@ type Windows = BTreeMap<i64, BTreeMap<Vec<u8>, (OwnedRow, i64)>>;
 /// Stateful tumbling-window count over event-time.
 ///
 /// Open buckets live in a `BTreeMap` keyed by window start, so closing visits
-/// only windows whose end the watermark reached (O(closed)), not the whole
-/// keyspace. Each delta row is assigned to its `[ws, ws + size)` bucket
-/// (`ws = (event_ts / size) * size`) unless it is below the previous watermark
-/// (late). Closed windows are emitted once, append-only, then freed.
+/// only windows whose end the watermark reached (O(closed)). Each delta row
+/// joins its `[ws, ws + size)` bucket (`ws = (event_ts / size) * size`). Only
+/// late insertions (`diff > 0`) drop; retractions always apply.
 pub struct TumbleCount {
     key: Vec<usize>,
     time_col: usize,
@@ -116,7 +115,8 @@ impl TumbleCount {
         let diffs = int64_diffs(z.diff())?;
         for index in 0..z.len() {
             let ts = times.value(index);
-            if ts < self.watermark {
+            let diff = diffs.value(index);
+            if diff > 0 && ts < self.watermark {
                 self.dropped_late += 1;
                 continue;
             }
@@ -128,7 +128,7 @@ impl TumbleCount {
                 .or_default()
                 .entry(bytes)
                 .or_insert((key, 0))
-                .1 += diffs.value(index);
+                .1 += diff;
         }
         Ok(())
     }

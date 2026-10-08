@@ -71,8 +71,10 @@ fn consolidated(changelogs: &[ZSetBatch]) -> Vec<(i64, i64, i64, i64)> {
     rows(&consolidate(&all).unwrap())
 }
 
-/// Full-recomputation oracle: per-batch late-drop against the previous
-/// watermark, then keep the non-empty windows closed by the final watermark.
+/// Full-recomputation oracle: group every event by its `(key, window)` bucket,
+/// dropping only late insertions (an insertion below the batch's previous
+/// watermark) while always applying retractions; finally keep the non-empty
+/// windows closed by the final watermark.
 fn recompute(batches: &[Vec<(i64, i64, i64)>], size: i64, lag: i64) -> Vec<(i64, i64, i64, i64)> {
     let mut watermark = 0i64;
     let mut counts: BTreeMap<(i64, i64), i64> = BTreeMap::new();
@@ -80,7 +82,7 @@ fn recompute(batches: &[Vec<(i64, i64, i64)>], size: i64, lag: i64) -> Vec<(i64,
         let mut max_ts = 0i64;
         for (key, ts, diff) in batch {
             max_ts = max_ts.max(*ts);
-            if *ts < watermark {
+            if *diff > 0 && *ts < watermark {
                 continue;
             }
             *counts.entry((*key, (*ts / size) * size)).or_default() += diff;
@@ -150,6 +152,20 @@ fn retraction_before_close_adjusts_open_window() {
 }
 
 #[test]
+fn below_watermark_retraction_adjusts_open_window() {
+    let mut window = TumbleCount::new(&[0], 1, 10);
+    // Window [0, 10) accumulates two insertions; the watermark reaches 5.
+    window.apply(&zset(&[(5, 1, 1), (5, 5, 1)]), 5).unwrap();
+    // A retraction at ts 1 is below the watermark but must still be applied.
+    let retraction = window.apply(&zset(&[(5, 1, -1)]), 5).unwrap();
+    assert!(retraction.is_empty());
+    assert_eq!(window.late_dropped(), 0);
+    // Closing the window with ts 10 emits the corrected count of 1, not 2.
+    let out = window.apply(&zset(&[(5, 10, 1)]), 10).unwrap();
+    assert_eq!(rows(&out), vec![(5, 0, 1, 1)]);
+}
+
+#[test]
 fn fully_retracted_window_emits_nothing_on_close() {
     let mut window = TumbleCount::new(&[0], 1, 10);
     window.apply(&zset(&[(5, 1, 1), (5, 1, -1)]), 1).unwrap();
@@ -182,6 +198,18 @@ fn changelog_matches_full_recompute_across_windows() {
     let changelogs = run(&batches, 10, 2);
     assert_eq!(consolidated(&changelogs), recompute(&batches, 10, 2));
     assert_eq!(rows(&changelogs[2]), vec![(5, 0, 3, 1)]);
+}
+
+#[test]
+fn changelog_matches_recompute_with_below_watermark_retraction() {
+    let batches = vec![
+        vec![(5, 1, 1), (5, 5, 1)],
+        vec![(5, 1, -1)], // below watermark 5, but a retraction must apply
+        vec![(5, 10, 1)],
+    ];
+    let changelogs = run(&batches, 10, 0);
+    assert_eq!(consolidated(&changelogs), recompute(&batches, 10, 0));
+    assert_eq!(consolidated(&changelogs), vec![(5, 0, 1, 1)]);
 }
 
 #[test]

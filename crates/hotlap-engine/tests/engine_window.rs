@@ -82,3 +82,41 @@ fn tumbling_window_closes_and_drops_late_records() {
     assert_eq!(core.late_dropped(InputId(0)).unwrap(), 1);
     assert_eq!(core.snapshot(ViewId(0)).unwrap().len(), 1);
 }
+
+#[test]
+fn below_watermark_retraction_is_applied_not_dropped() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.declare_watermark(
+        InputId(0),
+        hotlap_core::WatermarkSpec {
+            time_col: 1,
+            lag: 0,
+        },
+    )
+    .unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::TumbleCount {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![0],
+            time_col: 1,
+            size: 10,
+        },
+    )
+    .unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+
+    core.push(InputId(0), &time_zset(&[(1, 1, 1), (1, 5, 1)]))
+        .unwrap();
+    // Retraction below watermark 5: filter_late keeps it, and the window applies
+    // it to the still-open [0, 10) bucket.
+    core.push(InputId(0), &time_zset(&[(1, 1, -1)])).unwrap();
+    // Closing [0, 10) emits the corrected count of 1, not 2.
+    core.push(InputId(0), &time_zset(&[(1, 10, 1)])).unwrap();
+
+    let snapshot = core.snapshot(ViewId(0)).unwrap();
+    assert_eq!(ints(&snapshot, 0), vec![1]);
+    assert_eq!(ints(&snapshot, 1), vec![0]);
+    assert_eq!(ints(&snapshot, 2), vec![1]);
+}
