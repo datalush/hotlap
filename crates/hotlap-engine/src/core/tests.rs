@@ -39,21 +39,45 @@ fn output_rows(core: &EngineCore, view: ViewId) -> usize {
 fn view_output_state_does_not_grow_with_history() {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();
-    core.build_view(ViewId(0), &group_plan()).unwrap();
+    core.build_view(ViewId(0), &Plan::Source(InputId(0))).unwrap();
 
-    // Each push nets to zero, so the view's current state stays empty while a
-    // history accumulator would retain rows proportional to the push count.
+    // Every push is a single non-zero row. Insert each key once, then retract
+    // and re-insert as the pattern cycles: the output map never exceeds the
+    // distinct-key count no matter how many pushes run.
+    let keys = 10i64;
     let epochs = 200;
-    for _ in 0..epochs {
-        core.push(InputId(0), &zset(&[(1, 1), (2, 1), (1, -1), (2, -1)]))
-            .unwrap();
+    for epoch in 0..epochs {
+        let key = epoch % keys;
+        let diff = if (epoch / keys) % 2 == 0 { 1 } else { -1 };
+        core.push(InputId(0), &zset(&[(key, diff)])).unwrap();
     }
 
     assert!(
-        output_rows(&core, ViewId(0)) <= 8,
+        output_rows(&core, ViewId(0)) <= keys as usize,
         "view output state grew with history"
     );
+    // The final cycle was a retraction block, so the net state is empty.
     assert!(core.snapshot(ViewId(0)).unwrap().is_empty());
+}
+
+#[test]
+fn row_converter_is_built_once_not_per_push() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
+    core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+
+    // After the first push freezes the schema, further pushes must reuse the
+    // cached converters instead of building O(pushes) of them.
+    crate::work::reset();
+    for _ in 0..200 {
+        core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+    }
+    assert_eq!(
+        crate::work::converter_builds(),
+        0,
+        "row converters were rebuilt per push"
+    );
 }
 
 #[test]

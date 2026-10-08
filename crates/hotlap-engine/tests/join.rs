@@ -242,3 +242,157 @@ fn join_rejects_mismatched_key_arity() {
             .is_err()
     );
 }
+
+type PairRow = (i64, i64, i64);
+type PairJoined = (i64, i64, i64, i64, i64, i64);
+
+fn pair_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("b", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]))
+}
+
+/// Builds a Z-set of `(a, b, v, diff)` rows over the two-key schema.
+fn pair_zset(rows: &[(i64, i64, i64, i64)]) -> ZSetBatch {
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+        )),
+    ];
+    let diffs: Vec<i64> = rows.iter().map(|row| row.3).collect();
+    let batch = RecordBatch::try_new(pair_schema(), columns).unwrap();
+    ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs))).unwrap()
+}
+
+/// Reads a six-column Int64 joined Z-set as sorted `(row, diff)` pairs.
+fn pair_joined_rows(zset: &ZSetBatch) -> Vec<(PairJoined, i64)> {
+    let columns: Vec<Vec<i64>> = (0..6)
+        .map(|column| {
+            let array = zset
+                .batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..array.len()).map(|index| array.value(index)).collect()
+        })
+        .collect();
+    let diffs = zset.diff.as_any().downcast_ref::<Int64Array>().unwrap();
+    let mut out: Vec<(PairJoined, i64)> = (0..zset.len())
+        .map(|index| {
+            let row = (
+                columns[0][index],
+                columns[1][index],
+                columns[2][index],
+                columns[3][index],
+                columns[4][index],
+                columns[5][index],
+            );
+            (row, diffs.value(index))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn consolidated_pairs(changelogs: &[ZSetBatch]) -> Vec<(PairJoined, i64)> {
+    let schema = changelogs[0].schema();
+    let batches: Vec<&RecordBatch> = changelogs.iter().map(|z| &z.batch).collect();
+    let batch = concat_batches(&schema, batches).unwrap();
+    let diffs: Vec<&dyn Array> = changelogs.iter().map(|z| z.diff.as_ref()).collect();
+    let all = ZSetBatch::new(batch, concat(&diffs).unwrap()).unwrap();
+    pair_joined_rows(&consolidate(&all).unwrap())
+}
+
+/// Full-recompute oracle joining the net sides on `matches`.
+fn recompute_with<F: Fn(&PairRow, &PairRow) -> bool>(
+    left: &[(i64, i64, i64, i64)],
+    right: &[(i64, i64, i64, i64)],
+    matches: F,
+) -> Vec<(PairJoined, i64)> {
+    let net = |rows: &[(i64, i64, i64, i64)]| {
+        let mut map: BTreeMap<PairRow, i64> = BTreeMap::new();
+        for &(a, b, v, diff) in rows {
+            *map.entry((a, b, v)).or_default() += diff;
+        }
+        map.retain(|_, diff| *diff != 0);
+        map
+    };
+    let (left, right) = (net(left), net(right));
+    let mut out: BTreeMap<PairJoined, i64> = BTreeMap::new();
+    for ((la, lb, lv), ld) in &left {
+        for ((ra, rb, rv), rd) in &right {
+            if matches(&(*la, *lb, *lv), &(*ra, *rb, *rv)) {
+                *out.entry((*la, *lb, *lv, *ra, *rb, *rv)).or_default() += ld * rd;
+            }
+        }
+    }
+    out.retain(|_, diff| *diff != 0);
+    out.into_iter().collect()
+}
+
+#[test]
+fn composite_key_join_matches_full_recompute() {
+    let left_epochs = [
+        vec![(1, 1, 10, 1), (1, 2, 11, 1), (2, 1, 12, 1)],
+        vec![(1, 2, 11, 1), (2, 1, 12, -1)],
+        vec![(1, 1, 10, -1), (3, 3, 13, 1)],
+    ];
+    let right_epochs = [
+        vec![(1, 1, 20, 1), (1, 2, 21, 1)],
+        vec![(1, 2, 21, 1), (1, 2, 22, 1)],
+        vec![(1, 1, 20, -1), (1, 2, 22, -1)],
+    ];
+
+    // Join on the two-column key (a, b) on both sides.
+    let mut join = Join::new(&[0, 1], &[0, 1]);
+    let (mut history_left, mut history_right) = (Vec::new(), Vec::new());
+    let mut changelogs = Vec::new();
+    for (left_batch, right_batch) in left_epochs.iter().zip(&right_epochs) {
+        history_left.extend(left_batch.iter().copied());
+        history_right.extend(right_batch.iter().copied());
+        changelogs.push(join.apply(&pair_zset(left_batch), &pair_zset(right_batch)).unwrap());
+    }
+
+    let expected =
+        recompute_with(&history_left, &history_right, |l, r| l.0 == r.0 && l.1 == r.1);
+    assert!(!expected.is_empty());
+    assert_eq!(consolidated_pairs(&changelogs), expected);
+}
+
+#[test]
+fn mismatched_left_right_key_indices_match_recompute() {
+    // Left key is column 0, right key is column 1: the positions differ, so a
+    // positional match would be wrong.
+    let left_epochs = [
+        vec![(1, 5, 10, 1), (2, 6, 11, 1)],
+        vec![(1, 5, 10, 1), (3, 7, 12, 1)],
+        vec![(2, 6, 11, -1)],
+    ];
+    let right_epochs = [
+        vec![(8, 1, 20, 1)],
+        vec![(8, 1, 20, 1), (9, 2, 21, 1)],
+        vec![(9, 2, 21, -1)],
+    ];
+
+    let mut join = Join::new(&[0], &[1]);
+    let (mut history_left, mut history_right) = (Vec::new(), Vec::new());
+    let mut changelogs = Vec::new();
+    for (left_batch, right_batch) in left_epochs.iter().zip(&right_epochs) {
+        history_left.extend(left_batch.iter().copied());
+        history_right.extend(right_batch.iter().copied());
+        changelogs.push(join.apply(&pair_zset(left_batch), &pair_zset(right_batch)).unwrap());
+    }
+
+    let expected = recompute_with(&history_left, &history_right, |l, r| l.0 == r.1);
+    assert!(!expected.is_empty());
+    assert_eq!(consolidated_pairs(&changelogs), expected);
+}

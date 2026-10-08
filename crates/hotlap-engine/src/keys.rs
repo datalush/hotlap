@@ -56,6 +56,25 @@ pub(crate) fn converter_for(
         })?;
         fields.push(SortField::new(field.data_type().clone()));
     }
+    build(fields)
+}
+
+/// Builds a full-row `RowConverter` over every field of `schema`.
+///
+/// The schema is frozen once known, so callers cache the result and reuse it
+/// across pushes instead of rebuilding it per delta.
+pub(crate) fn full_converter(schema: &Schema) -> Result<RowConverter, EngineError> {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| SortField::new(field.data_type().clone()))
+        .collect();
+    build(fields)
+}
+
+/// Counts one converter construction (test instrumentation) and builds it.
+fn build(fields: Vec<SortField>) -> Result<RowConverter, EngineError> {
+    crate::work::record_converter();
     Ok(RowConverter::new(fields)?)
 }
 

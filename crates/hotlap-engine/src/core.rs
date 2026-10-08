@@ -26,6 +26,14 @@ pub(super) struct ViewState {
     pub(super) windowed: bool,
     pub(super) tapped: bool,
     pub(in crate::core) output: ViewOutput,
+    /// Buffered changelog for a tapped view.
+    ///
+    /// Only tapped views fill this: every propagated output delta is appended
+    /// (via [`graph::accumulate`]) and it grows unbounded until [`take_changes`]
+    /// drains it by taking the batch. An untapped view always leaves it `None`,
+    /// so it never grows with history.
+    ///
+    /// [`take_changes`]: crate::IncrementalCore::take_changes
     pub(super) pending: Option<ZSetBatch>,
 }
 

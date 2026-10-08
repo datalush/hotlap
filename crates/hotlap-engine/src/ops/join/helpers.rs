@@ -5,18 +5,23 @@ use arrow::array::{Array, ArrayRef, Int64Array, UInt32Array};
 use arrow::compute::{concat, concat_batches, take};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use arrow::row::RowConverter;
 
 use crate::batch::ZSetBatch;
 use crate::error::EngineError;
 use crate::keys::KeyConverter;
-use crate::zset::{consolidate, int64_diffs};
+use crate::zset::{consolidate_with, int64_diffs};
 
 /// Distinct join-key bytes present in the delta `z`, in first-seen order.
-pub(super) fn touched_keys(z: &ZSetBatch, keys: &[usize]) -> Result<Vec<Vec<u8>>, EngineError> {
+///
+/// `converter` is the caller's cached key converter for `z`'s schema.
+pub(super) fn touched_keys(
+    z: &ZSetBatch,
+    converter: &KeyConverter,
+) -> Result<Vec<Vec<u8>>, EngineError> {
     if z.is_empty() {
         return Ok(Vec::new());
     }
-    let converter = KeyConverter::new(z.schema().as_ref(), keys)?;
     let rows = converter.convert(z.batch.columns())?;
     let mut seen = HashSet::new();
     let mut touched = Vec::new();
@@ -32,13 +37,13 @@ pub(super) fn touched_keys(z: &ZSetBatch, keys: &[usize]) -> Result<Vec<Vec<u8>>
 /// Distinct keys touched by both deltas, de-duplicated across the two sides.
 pub(super) fn touched_union(
     left: &ZSetBatch,
-    left_keys: &[usize],
+    left_conv: &KeyConverter,
     right: &ZSetBatch,
-    right_keys: &[usize],
+    right_conv: &KeyConverter,
 ) -> Result<Vec<Vec<u8>>, EngineError> {
-    let mut touched = touched_keys(left, left_keys)?;
+    let mut touched = touched_keys(left, left_conv)?;
     let mut seen: HashSet<Vec<u8>> = touched.iter().cloned().collect();
-    for key in touched_keys(right, right_keys)? {
+    for key in touched_keys(right, right_conv)? {
         if seen.insert(key.clone()) {
             touched.push(key);
         }
@@ -73,28 +78,32 @@ pub(super) fn concat_zsets(
 }
 
 /// Returns `current - previous` as a consolidated Z-set.
+///
+/// `converter` is the caller's cached full-row converter for the joined schema.
 pub(super) fn subtract(
     current: &ZSetBatch,
     previous: &ZSetBatch,
+    converter: &RowConverter,
 ) -> Result<ZSetBatch, EngineError> {
     let batch = concat_batches(&current.schema(), [&current.batch, &previous.batch])?;
     let retracted = negate(previous.diff())?;
     let diff = concat(&[current.diff().as_ref(), retracted.as_ref()])?;
-    consolidate(&ZSetBatch::new(batch, diff)?)
+    consolidate_with(converter, &ZSetBatch::new(batch, diff)?)
 }
 
 /// Inner equi-joins two Z-sets on the given key columns, also returning the
 /// number of joined pairs evaluated (both sides share the key by construction).
+///
+/// The key converters come from the caller's cache, keyed by each side schema.
 pub(super) fn equi_join(
     left: &ZSetBatch,
-    left_keys: &[usize],
+    left_conv: &KeyConverter,
     right: &ZSetBatch,
-    right_keys: &[usize],
+    right_conv: &KeyConverter,
+    out_conv: &RowConverter,
 ) -> Result<(ZSetBatch, usize), EngineError> {
-    let left_rows =
-        KeyConverter::new(left.schema().as_ref(), left_keys)?.convert(left.batch.columns())?;
-    let right_rows =
-        KeyConverter::new(right.schema().as_ref(), right_keys)?.convert(right.batch.columns())?;
+    let left_rows = left_conv.convert(left.batch.columns())?;
+    let right_rows = right_conv.convert(right.batch.columns())?;
 
     let mut buckets: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
     for index in 0..left_rows.num_rows() {
@@ -110,7 +119,7 @@ pub(super) fn equi_join(
         }
     }
     let pairs = matches.len();
-    Ok((materialize(left, right, &matches)?, pairs))
+    Ok((materialize(left, right, &matches, out_conv)?, pairs))
 }
 
 /// Builds the joined Z-set for the `(left index, right index)` match pairs.
@@ -118,6 +127,7 @@ fn materialize(
     left: &ZSetBatch,
     right: &ZSetBatch,
     matches: &[(usize, usize)],
+    out_conv: &RowConverter,
 ) -> Result<ZSetBatch, EngineError> {
     let left_indices = UInt32Array::from(
         matches
@@ -153,13 +163,17 @@ fn materialize(
 
     let left_diffs = int64_diffs(&left.diff)?;
     let right_diffs = int64_diffs(&right.diff)?;
-    let diffs: Vec<i64> = matches
-        .iter()
-        .map(|&(left_index, right_index)| {
-            left_diffs.value(left_index) * right_diffs.value(right_index)
-        })
-        .collect();
-    consolidate(&ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs)))?)
+    let mut diffs: Vec<i64> = Vec::with_capacity(matches.len());
+    for &(left_index, right_index) in matches {
+        let product = left_diffs
+            .value(left_index)
+            .checked_mul(right_diffs.value(right_index))
+            .ok_or_else(|| {
+                EngineError::Infrastructure("join diff product overflowed i64".to_string())
+            })?;
+        diffs.push(product);
+    }
+    consolidate_with(out_conv, &ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs)))?)
 }
 
 /// Applies `indices` to every column of `batch`.

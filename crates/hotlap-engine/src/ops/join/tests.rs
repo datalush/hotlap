@@ -8,6 +8,7 @@ use arrow::record_batch::RecordBatch;
 
 use super::Join;
 use crate::batch::ZSetBatch;
+use crate::error::EngineError;
 
 /// Builds a Z-set of `(key, value, diff)` rows with one schema for both sides.
 fn zset(rows: &[(i64, &str, i64)]) -> ZSetBatch {
@@ -59,4 +60,13 @@ fn retraction_touches_one_key_and_work_stays_bounded() {
     let out = join.apply(&zset(&[]), &zset(&[(3, "r2", -1)])).unwrap();
     assert_eq!(join.work(), 1);
     assert_eq!(out.len(), 1);
+}
+
+#[test]
+fn join_rejects_diff_product_overflow() {
+    // i64::MAX * 2 cannot be represented; the join must surface an error
+    // instead of wrapping or panicking.
+    let mut join = Join::new(&[0], &[0]);
+    let result = join.apply(&zset(&[(1, "l", i64::MAX)]), &zset(&[(1, "r", 2)]));
+    assert!(matches!(result, Err(EngineError::Infrastructure(_))));
 }
