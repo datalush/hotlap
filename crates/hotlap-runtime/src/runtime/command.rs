@@ -6,10 +6,10 @@ use hotlap::Hotlap;
 use hotlap::{Plan, ZSetBatch};
 use tokio::sync::oneshot;
 
-use crate::error::ConnectorError;
 use crate::runtime::checkpoint::Checkpointer;
 use crate::runtime::pipeline::{Pipeline, record_error};
-use crate::source::Source;
+use hotlap_connectors::error::ConnectorError;
+use hotlap_connectors::source::Source;
 
 /// Command sent from the handle to the engine thread.
 pub enum Command {

@@ -10,12 +10,12 @@ use arrow::record_batch::RecordBatch;
 use futures::stream;
 use hotlap::{InputId, Plan};
 
-use hotlap_connectors::runtime::handle::EngineHandle;
-use hotlap_connectors::runtime::pipeline::Pipeline;
+use hotlap_connectors::ConnectorError;
 use hotlap_connectors::source::{
     Offset, Source, SourceBatch, SourceState, SourceStream, Split, SplitId,
 };
-use hotlap_connectors::ConnectorError;
+use hotlap_runtime::runtime::handle::EngineHandle;
+use hotlap_runtime::runtime::pipeline::Pipeline;
 
 /// Shared view of what the source has produced and what the runtime has acked.
 #[derive(Clone, Default)]

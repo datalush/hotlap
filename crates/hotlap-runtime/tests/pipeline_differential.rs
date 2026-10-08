@@ -8,8 +8,8 @@ use futures::StreamExt;
 use hotlap::{Hotlap, InputId, Plan};
 use hotlap_engine::EngineCore;
 
-use hotlap_connectors::runtime::pipeline::{self, Pipeline};
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
+use hotlap_runtime::runtime::pipeline::{self, Pipeline};
 
 struct FakeSource {
     schema: SchemaRef,

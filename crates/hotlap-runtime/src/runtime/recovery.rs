@@ -9,11 +9,11 @@
 use hotlap::Hotlap;
 use hotlap_engine::EngineSnapshot;
 
-use crate::error::ConnectorError;
 use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
 use crate::runtime::checkpoint_body::hotlap_err;
 use crate::runtime::pipeline;
-use crate::source::{Source, SourceStream};
+use hotlap_connectors::error::ConnectorError;
+use hotlap_connectors::source::{Source, SourceStream};
 
 /// The last valid checkpoint, if the store holds one.
 pub struct Recovery;
@@ -43,7 +43,7 @@ impl Recovery {
     /// Restore `checkpoint` into `hotlap` and reopen `source` at the captured
     /// offsets, yielding a stream that replays from the checkpoint.
     ///
-    /// [`SourceState`](crate::source::SourceState) holds the offset of the
+    /// [`SourceState`](hotlap_connectors::source::SourceState) holds the offset of the
     /// **next** record to read, advanced only after a batch is applied. The
     /// checkpoint therefore already contains every record below that offset and
     /// replay must start exactly there: starting one record earlier duplicates,

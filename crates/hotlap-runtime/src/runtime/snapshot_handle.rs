@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use hotlap::{Plan, ZSetBatch};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::error::ConnectorError;
 use crate::runtime::command::Command;
 use crate::runtime::handle::stopped;
+use hotlap_connectors::error::ConnectorError;
 
 /// Cloneable, thread-safe handle to a running engine.
 ///

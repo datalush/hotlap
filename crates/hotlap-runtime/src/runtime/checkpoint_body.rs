@@ -4,8 +4,8 @@ use hotlap::Hotlap;
 use hotlap::state::{StateBackend, StateError};
 use hotlap_engine::{EngineError, encode_framed, encode_snapshot};
 
-use crate::error::ConnectorError;
-use crate::source::Source;
+use hotlap_connectors::error::ConnectorError;
+use hotlap_connectors::source::Source;
 
 /// Value stored under `checkpoint/<id>/valid` once a checkpoint is complete.
 pub(crate) const VALID_MARKER: &[u8] = b"1";

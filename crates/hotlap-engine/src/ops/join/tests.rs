@@ -72,7 +72,9 @@ fn hot_key_delta_cost_is_linear_not_quadratic() {
 
 /// Borrows owned `(key, value, diff)` rows as the `&str` form `zset` takes.
 fn row_refs(rows: &[(i64, String, i64)]) -> Vec<(i64, &str, i64)> {
-    rows.iter().map(|row| (row.0, row.1.as_str(), row.2)).collect()
+    rows.iter()
+        .map(|row| (row.0, row.1.as_str(), row.2))
+        .collect()
 }
 
 #[test]

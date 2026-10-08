@@ -5,8 +5,8 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{SharedBackend, pipeline, wait_rows};
-use hotlap_connectors::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
-use hotlap_connectors::runtime::handle::EngineHandle;
+use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
+use hotlap_runtime::runtime::handle::EngineHandle;
 
 #[test]
 fn periodic_trigger_writes_a_checkpoint() {

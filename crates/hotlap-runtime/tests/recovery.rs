@@ -4,9 +4,9 @@
 mod recovery;
 
 use hotlap::state::StateBackend;
-use hotlap_connectors::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
-use hotlap_connectors::runtime::pipeline;
-use hotlap_connectors::runtime::recovery::Recovery;
+use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
+use hotlap_runtime::runtime::pipeline;
+use hotlap_runtime::runtime::recovery::Recovery;
 use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, rows, take};
 
 /// The fixed log used by the differential and boundary tests.
@@ -42,7 +42,12 @@ fn crash_and_recovery_equals_no_crash() {
     let loaded = Recovery::load(&checkpointer).unwrap().unwrap();
     let (mut recovered, pipe) = engine_with(ResumableSource::new(log()));
     let mut replay = Recovery::resume(&mut recovered, pipe.source.as_ref(), &loaded).unwrap();
-    drain(&mut recovered, pipe.source.as_ref(), &mut replay, usize::MAX);
+    drain(
+        &mut recovered,
+        pipe.source.as_ref(),
+        &mut replay,
+        usize::MAX,
+    );
     let after = rows(&recovered.snapshot("c").unwrap());
 
     assert_eq!(after, expected, "recovery must match the no-crash run");
@@ -69,7 +74,12 @@ fn recovery_does_not_lose_or_duplicate_at_the_boundary() {
     let loaded = Recovery::load(&checkpointer).unwrap().unwrap();
     let (mut recovered, pipe) = engine_with(ResumableSource::new(log()));
     let mut replay = Recovery::resume(&mut recovered, pipe.source.as_ref(), &loaded).unwrap();
-    drain(&mut recovered, pipe.source.as_ref(), &mut replay, usize::MAX);
+    drain(
+        &mut recovered,
+        pipe.source.as_ref(),
+        &mut replay,
+        usize::MAX,
+    );
 
     assert_eq!(rows(&recovered.snapshot("c").unwrap()), expected);
 }

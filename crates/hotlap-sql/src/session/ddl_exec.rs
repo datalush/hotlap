@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use hotlap::InputId;
 use hotlap_connectors::datafusion::provider::SourceTableProvider;
-use hotlap_connectors::runtime::pipeline::Watermark;
 use hotlap_connectors::source::Source;
+use hotlap_runtime::runtime::pipeline::Watermark;
 
 use super::{QueryResult, SinkDef, SqlSession, to_engine};
 use crate::catalog::{MvDef, SourceDef};

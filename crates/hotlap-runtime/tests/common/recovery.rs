@@ -13,12 +13,12 @@ use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use hotlap::{Hotlap, InputId, Plan};
 use hotlap_connectors::ConnectorError;
-use hotlap_connectors::runtime::checkpoint::{CheckpointConfig, Checkpointer};
-use hotlap_connectors::runtime::pipeline::{self, Pipeline};
 use hotlap_connectors::source::{
     Offset, Source, SourceBatch, SourceState, SourceStream, Split, SplitId,
 };
 use hotlap_engine::EngineCore;
+use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, Checkpointer};
+use hotlap_runtime::runtime::pipeline::{self, Pipeline};
 
 /// A shared, immutable log plus the earliest offset still retained.
 #[derive(Clone)]

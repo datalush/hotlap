@@ -7,11 +7,11 @@ use std::thread::JoinHandle;
 use hotlap::ZSetBatch;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::error::ConnectorError;
 use crate::runtime::command::Command;
 use crate::runtime::engine;
 use crate::runtime::pipeline::Pipeline;
 use crate::runtime::snapshot_handle::SnapshotHandle;
+use hotlap_connectors::error::ConnectorError;
 
 /// Owns the engine thread and speaks to it over a channel.
 pub struct EngineHandle {

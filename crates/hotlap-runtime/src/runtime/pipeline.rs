@@ -5,12 +5,12 @@ use std::sync::{Arc, Mutex};
 
 use hotlap::{Hotlap, HotlapError, Plan};
 
-use crate::convert;
-use crate::error::ConnectorError;
 use crate::runtime::checkpoint::CheckpointConfig;
 use crate::runtime::sink::SinkPump;
-use crate::sink::Sink;
-use crate::source::{Source, SourceBatch, SourceStream, Split};
+use hotlap_connectors::convert;
+use hotlap_connectors::error::ConnectorError;
+use hotlap_connectors::sink::Sink;
+use hotlap_connectors::source::{Source, SourceBatch, SourceStream, Split};
 
 /// Event-time declaration for the pipeline's input.
 #[derive(Clone, Copy, Debug)]

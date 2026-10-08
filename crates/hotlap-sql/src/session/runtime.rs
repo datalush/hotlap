@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use hotlap::Plan;
-use hotlap_connectors::runtime::handle::EngineHandle;
-use hotlap_connectors::runtime::pipeline::{Pipeline, SinkSpec};
+use hotlap_runtime::runtime::handle::EngineHandle;
+use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
 
 use super::{
     MvTableProvider, QueryResult, SharedSource, Snapshotter, SqlError, SqlSession, to_engine,

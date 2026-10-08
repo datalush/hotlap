@@ -7,10 +7,10 @@ use hotlap::{Hotlap, HotlapError};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::error::ConnectorError;
 use crate::runtime::pipeline::SinkSpec;
 pub use crate::runtime::shared_sink::SharedSink;
 pub use crate::runtime::sink_sync::{ChangelogSender, SinkMessage, SinkSync};
+use hotlap_connectors::error::ConnectorError;
 
 /// Bound on how far a sink may lag the engine before backpressure bites.
 const CHANNEL_CAPACITY: usize = 64;

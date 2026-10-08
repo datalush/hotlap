@@ -5,8 +5,8 @@ use std::sync::Arc;
 use hotlap::ZSetBatch;
 use tokio::sync::Mutex;
 
-use crate::error::ConnectorError;
-use crate::sink::{Sink, SinkCapabilities};
+use hotlap_connectors::error::ConnectorError;
+use hotlap_connectors::sink::{Sink, SinkCapabilities};
 
 /// A sink shared by its write task and the checkpoint barrier.
 ///
@@ -72,7 +72,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::sink::ChangeStream;
+    use hotlap_connectors::sink::ChangeStream;
 
     /// A transactional sink whose `write` blocks until released.
     struct BlockingSink {

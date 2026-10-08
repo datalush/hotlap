@@ -15,13 +15,13 @@ use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use hotlap::state::{StateBackend, StateEntry, StateError};
 use hotlap::{Hotlap, InputId, Plan, ZSetBatch};
-use hotlap_connectors::runtime::checkpoint::Checkpointer;
-use hotlap_connectors::runtime::pipeline::SinkSpec;
-use hotlap_connectors::runtime::sink::SinkPump;
 use hotlap_connectors::sink::{Sink, SinkCapabilities};
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError};
 use hotlap_engine::EngineCore;
+use hotlap_runtime::runtime::checkpoint::Checkpointer;
+use hotlap_runtime::runtime::pipeline::SinkSpec;
+use hotlap_runtime::runtime::sink::SinkPump;
 
 /// Ordered record of the observable events the test asserts on.
 #[derive(Clone, Default)]

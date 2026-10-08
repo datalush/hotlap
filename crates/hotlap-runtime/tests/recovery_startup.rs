@@ -5,9 +5,9 @@ mod recovery;
 
 use std::time::{Duration, Instant};
 
-use hotlap_connectors::runtime::checkpoint::{CheckpointConfig, Checkpointer, DEFAULT_RETAIN};
-use hotlap_connectors::runtime::handle::EngineHandle;
-use hotlap_connectors::runtime::pipeline as runtime;
+use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, Checkpointer, DEFAULT_RETAIN};
+use hotlap_runtime::runtime::handle::EngineHandle;
+use hotlap_runtime::runtime::pipeline as runtime;
 use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, pipeline, rows, take};
 
 fn log() -> Dataset {
@@ -19,7 +19,12 @@ fn startup_recovers_from_the_last_checkpoint() {
     let backend = SharedBackend::default();
     let (mut reference, ref_pipe) = engine_with(ResumableSource::new(log()));
     let mut ref_stream = runtime::merged_stream(ref_pipe.source.as_ref()).unwrap();
-    drain(&mut reference, ref_pipe.source.as_ref(), &mut ref_stream, usize::MAX);
+    drain(
+        &mut reference,
+        ref_pipe.source.as_ref(),
+        &mut ref_stream,
+        usize::MAX,
+    );
     let expected = rows(&reference.snapshot("c").unwrap());
 
     // Seed a checkpoint at read offset 3.

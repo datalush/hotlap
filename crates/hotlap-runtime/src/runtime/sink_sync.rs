@@ -5,8 +5,8 @@ use std::sync::Arc;
 use hotlap::ZSetBatch;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::error::ConnectorError;
 use crate::runtime::shared_sink::SharedSink;
+use hotlap_connectors::error::ConnectorError;
 
 /// One message on a sink's bounded changelog channel.
 ///

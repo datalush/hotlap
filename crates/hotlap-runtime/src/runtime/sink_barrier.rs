@@ -21,9 +21,9 @@ use std::future::Future;
 
 use tokio::sync::oneshot;
 
-use crate::error::ConnectorError;
 use crate::runtime::sink::{SinkMessage, SinkSync};
-use crate::sink::SinkCapabilities;
+use hotlap_connectors::error::ConnectorError;
+use hotlap_connectors::sink::SinkCapabilities;
 
 /// The sinks a checkpoint barrier coordinates.
 pub struct SinkBarrier {

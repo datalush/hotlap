@@ -12,13 +12,13 @@ use hotlap::Hotlap;
 use hotlap::state::StateBackend;
 use hotlap_engine::{EngineSnapshot, decode_framed, decode_snapshot};
 
-use crate::error::ConnectorError;
 use crate::runtime::checkpoint_body::{
     LATEST_KEY, checkpoint_prefix, engine_err, invalid, mark_valid, parse_id, state_err, write,
 };
 use crate::runtime::sink::SinkSync;
 use crate::runtime::sink_barrier::SinkBarrier;
-use crate::source::{Source, SourceState};
+use hotlap_connectors::error::ConnectorError;
+use hotlap_connectors::source::{Source, SourceState};
 
 /// How many checkpoints [`CheckpointConfig`] keeps by default.
 pub const DEFAULT_RETAIN: usize = 3;

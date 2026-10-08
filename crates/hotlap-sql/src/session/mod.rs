@@ -15,10 +15,10 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use hotlap::{Plan, ZSetBatch};
-use hotlap_connectors::runtime::SnapshotHandle;
-use hotlap_connectors::runtime::handle::EngineHandle;
-use hotlap_connectors::runtime::pipeline::Watermark;
 use hotlap_connectors::source::Source;
+use hotlap_runtime::runtime::SnapshotHandle;
+use hotlap_runtime::runtime::handle::EngineHandle;
+use hotlap_runtime::runtime::pipeline::Watermark;
 
 use crate::catalog::Catalog;
 use crate::ddl::{self, Statement};

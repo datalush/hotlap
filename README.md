@@ -10,7 +10,8 @@ earlier `differential-dataflow` spike has been removed.
 crates/hotlap/             Public facade over the incremental core
 crates/hotlap-core/        Engine contract (Plan IR, IncrementalCore, ZSetBatch)
 crates/hotlap-engine/      Arrow-native incremental engine (no differential-dataflow)
-crates/hotlap-connectors/  Source/Sink SPI, Fluss source/sink and runtime
+crates/hotlap-connectors/  Source/Sink SPI and Fluss source/sink
+crates/hotlap-runtime/     Kernel composition root, engine thread and checkpointing
 crates/hotlap-sql/         Embedded SQL/DDL surface and catalog
 crates/fluss-datafusion/   DataFusion Fluss provider integration
 clients/rust/crates/fluss/ Native protocol, metadata, routing, Arrow codecs and writers
@@ -21,8 +22,10 @@ docs/                      Contracts, ownership boundaries and verification evid
 The incremental engine owns Arrow-native Z-set batches and row-format key
 encoding behind the `hotlap-core` `IncrementalCore` contract, so the
 `differential-dataflow`/`timely` dependency is gone. `hotlap-connectors` carries
-the Source/Sink SPI, the Fluss source/sink and the driver runtime; `hotlap-sql`
-translates embedded SQL/DDL into engine plans. Durability is engine-owned:
+the Source/Sink SPI and the Fluss source/sink; `hotlap-runtime` is the
+composition root that selects a kernel and drives the engine thread, so the
+connector crate never depends on a concrete engine. `hotlap-sql` translates
+embedded SQL/DDL into engine plans. Durability is engine-owned:
 checkpoints and recovery, capacity-gated sink 2PC coordination and materialized
 views created after `START` (see [durability](docs/hotlap-durability.md)).
 

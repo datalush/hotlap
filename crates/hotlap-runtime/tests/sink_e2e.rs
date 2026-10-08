@@ -9,11 +9,11 @@ use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use hotlap::{InputId, Plan, ZSetBatch};
 
-use hotlap_connectors::runtime::handle::EngineHandle;
-use hotlap_connectors::runtime::pipeline::{Pipeline, SinkSpec};
 use hotlap_connectors::sink::Sink;
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError};
+use hotlap_runtime::runtime::handle::EngineHandle;
+use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
 
 /// Emits a fixed set of `(k, _event_time)` batches, like the differential test.
 struct FakeSource {

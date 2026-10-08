@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use hotlap::Hotlap;
 use hotlap::state::{StateBackend, StateEntry, StateError};
-use hotlap_connectors::runtime::checkpoint::Checkpointer;
-use hotlap_connectors::runtime::sink::{SharedSink, SinkSync};
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError, Sink, SinkCapabilities};
+use hotlap_runtime::runtime::checkpoint::Checkpointer;
+use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 
 /// Call order recorded by a fake sink.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

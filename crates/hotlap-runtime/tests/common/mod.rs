@@ -10,12 +10,12 @@ use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use hotlap::state::{StateBackend, StateEntry, StateError};
 use hotlap::{InputId, Plan};
-use hotlap_connectors::runtime::checkpoint::CheckpointConfig;
-use hotlap_connectors::runtime::handle::EngineHandle;
-use hotlap_connectors::runtime::pipeline::Pipeline;
 use hotlap_connectors::source::{
     Offset, Source, SourceBatch, SourceState, SourceStream, Split, SplitId,
 };
+use hotlap_runtime::runtime::checkpoint::CheckpointConfig;
+use hotlap_runtime::runtime::handle::EngineHandle;
+use hotlap_runtime::runtime::pipeline::Pipeline;
 
 /// In-memory backend shared with the test, so writes stay observable.
 #[derive(Clone, Default)]
@@ -92,7 +92,11 @@ impl Source for ScriptSource {
             });
         Ok(Box::pin(stream))
     }
-    fn commit(&self, _split: SplitId, offset: Offset) -> Result<(), hotlap_connectors::ConnectorError> {
+    fn commit(
+        &self,
+        _split: SplitId,
+        offset: Offset,
+    ) -> Result<(), hotlap_connectors::ConnectorError> {
         self.progress.lock().unwrap().offsets.insert(0, offset);
         Ok(())
     }

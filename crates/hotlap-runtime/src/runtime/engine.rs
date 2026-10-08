@@ -9,13 +9,13 @@ use hotlap_engine::EngineCore;
 use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 use tokio::time::{Instant, Interval, interval_at};
 
-use crate::error::ConnectorError;
 use crate::runtime::checkpoint::Checkpointer;
 use crate::runtime::command::{self, Command};
 use crate::runtime::pipeline::{self, Pipeline, feed_source, record_error};
 use crate::runtime::recovery::Recovery;
 use crate::runtime::sink::SinkPump;
-use crate::source::{Source, SourceStream};
+use hotlap_connectors::error::ConnectorError;
+use hotlap_connectors::source::{Source, SourceStream};
 
 /// Run the engine loop until shutdown or channel close.
 ///

@@ -4,8 +4,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use hotlap::Hotlap;
 use hotlap_engine::EngineCore;
 
-use hotlap_connectors::runtime::pipeline::{self, Pipeline, Watermark};
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
+use hotlap_runtime::runtime::pipeline::{self, Pipeline, Watermark};
 
 struct FakeSource {
     schema: SchemaRef,

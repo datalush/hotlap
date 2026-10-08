@@ -5,8 +5,8 @@ mod common;
 use std::time::Duration;
 
 use common::{SharedBackend, pipeline, wait_rows};
-use hotlap_connectors::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
-use hotlap_connectors::runtime::handle::EngineHandle;
+use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
+use hotlap_runtime::runtime::handle::EngineHandle;
 
 #[test]
 fn on_demand_checkpoint_is_coherent_and_readable() {

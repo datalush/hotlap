@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use common::{SharedBackend, pipeline, wait_rows};
 use hotlap::state::StateBackend;
-use hotlap_connectors::runtime::checkpoint::Checkpointer;
-use hotlap_connectors::runtime::handle::EngineHandle;
+use hotlap_runtime::runtime::checkpoint::Checkpointer;
+use hotlap_runtime::runtime::handle::EngineHandle;
 
 #[test]
 fn retention_keeps_only_the_newest_checkpoints() {

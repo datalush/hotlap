@@ -2078,7 +2078,6 @@ dependencies = [
  "futures",
  "hotlap",
  "hotlap-core",
- "hotlap-engine",
  "serde",
  "serde_json",
  "tokio",
@@ -2103,6 +2102,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotlap-runtime"
+version = "0.0.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "futures",
+ "hotlap",
+ "hotlap-connectors",
+ "hotlap-engine",
+ "tokio",
+]
+
+[[package]]
 name = "hotlap-sql"
 version = "0.0.0"
 dependencies = [
@@ -2112,6 +2124,7 @@ dependencies = [
  "futures",
  "hotlap",
  "hotlap-connectors",
+ "hotlap-runtime",
  "serde",
  "serde_json",
  "tokio",

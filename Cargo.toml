@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fluss-datafusion", "crates/hotlap", "crates/hotlap-connectors", "crates/hotlap-core", "crates/hotlap-engine", "crates/hotlap-sql"]
+members = ["crates/fluss-datafusion", "crates/hotlap", "crates/hotlap-connectors", "crates/hotlap-core", "crates/hotlap-engine", "crates/hotlap-runtime", "crates/hotlap-sql"]
 exclude = ["clients/rust", "vendor/datafusion-55.1.0"]
 
 [workspace.package]
