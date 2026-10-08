@@ -6,16 +6,20 @@
 //! is restored to the checkpoint before the offset is replayed, replaying the
 //! log from that offset yields exactly the state the crashed run had reached.
 
+mod pending;
+mod restore;
+
 use std::sync::Mutex;
 
 use hotlap::Hotlap;
-use hotlap_engine::{EngineSnapshot, MetricsRegistry};
+use hotlap_engine::MetricsRegistry;
 
 use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
-use crate::runtime::checkpoint_body::hotlap_err;
 use crate::runtime::pipeline;
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::{Source, SourceState, SourceStream};
+use hotlap_connectors::source::{Source, SourceStream};
+use pending::{discard, pending_commit};
+use restore::{restore, seed_applied};
 
 /// The last valid checkpoint, if the store holds one.
 pub struct Recovery;
@@ -169,75 +173,4 @@ impl Recovery {
         seed_applied(source, &checkpoint.sources)?;
         pipeline::merged_stream_from(source, &splits)
     }
-}
-
-/// Seeds the source's applied position with the captured offsets.
-///
-/// `Source::resume` reopens the splits at the captured offsets, but a custom
-/// source may not record them as applied. Without this seed a checkpoint taken
-/// before the first post-recovery commit captures a stale position, and a later
-/// crash replays the log over the restored snapshot (double-apply). `commit`
-/// only advances the position, so seeding an offset the source already recorded
-/// is a no-op.
-fn seed_applied(source: &dyn Source, state: &SourceState) -> Result<(), ConnectorError> {
-    for (&split, &offset) in &state.offsets {
-        source.commit(split, offset)?;
-    }
-    Ok(())
-}
-
-/// Restore the engine snapshot through the public facade.
-fn restore(hotlap: &mut Hotlap, snapshot: &EngineSnapshot) -> Result<(), ConnectorError> {
-    hotlap.restore(snapshot).map_err(hotlap_err)
-}
-
-/// Newest checkpoint above `floor` with a `commit` marker but no `valid` one.
-///
-/// The floor is the newest valid id: an interrupted commit is always later, so
-/// older markers are ignored.
-fn pending_commit(
-    checkpointer: &Checkpointer,
-    floor: Option<u64>,
-) -> Result<Option<u64>, ConnectorError> {
-    let floor = floor.unwrap_or(0);
-    for id in checkpointer.ids_descending()? {
-        if id <= floor {
-            break;
-        }
-        let base = format!("checkpoint/{id}");
-        if checkpointer.has_key(&format!("{base}/commit"))?
-            && !checkpointer.has_key(&format!("{base}/valid"))?
-        {
-            return Ok(Some(id));
-        }
-    }
-    Ok(None)
-}
-
-/// Record the discard of `pending`, delete it, and return the checkpoint to
-/// replay from (`None` means start clean).
-///
-/// The warning names the actual destination: replaying an older checkpoint is
-/// not the same as a clean start, and the message must not claim otherwise.
-fn discard(
-    checkpointer: &mut Checkpointer,
-    metrics: &MetricsRegistry,
-    signal: &Mutex<Option<String>>,
-    pending: u64,
-    fallback: Option<Checkpoint>,
-    reason: &str,
-) -> Result<Option<Checkpoint>, ConnectorError> {
-    metrics.inc("checkpoints_discarded");
-    let destination = match &fallback {
-        Some(checkpoint) => format!("replaying from checkpoint {}", checkpoint.id),
-        None => "starting clean".to_string(),
-    };
-    pipeline::record_error(
-        signal,
-        ConnectorError::Infrastructure(format!(
-            "discarded interrupted checkpoint {pending}: {reason}, {destination}"
-        )),
-    );
-    checkpointer.discard_commit(pending)?;
-    Ok(fallback)
 }

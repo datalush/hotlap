@@ -6,20 +6,21 @@
 //! checkpoint as the current one. Older checkpoints are pruned, keeping at
 //! most `retain` of the newest.
 
+mod commit;
+
 use std::time::Duration;
 
-use hotlap::Hotlap;
 use hotlap::state::StateBackend;
 use hotlap_engine::{EngineSnapshot, decode_framed, decode_snapshot};
 
 use crate::runtime::checkpoint_body::{
-    LATEST_KEY, checkpoint_prefix, clear_commit, engine_err, invalid, mark_valid, parse_id,
-    read_body as decode_body, state_err, write,
+    LATEST_KEY, checkpoint_prefix, engine_err, invalid, parse_id, read_body as decode_body,
+    state_err,
 };
 use crate::runtime::sink::SinkSync;
 use crate::runtime::sink_barrier::SinkBarrier;
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::{Source, SourceState};
+use hotlap_connectors::source::SourceState;
 
 /// How many checkpoints [`CheckpointConfig`] keeps by default.
 pub const DEFAULT_RETAIN: usize = 3;
@@ -79,78 +80,6 @@ impl Checkpointer {
     /// checkpoint does not overwrite an existing one.
     pub fn resume_after(&mut self, id: u64) {
         self.next_id = self.next_id.max(id.saturating_add(1));
-    }
-
-    /// Capture `engine` and `source` and persist a new valid checkpoint,
-    /// coordinating the sinks in two-phase-commit order.
-    ///
-    /// The order is drain -> prepare -> snapshot + write body + durable commit
-    /// marker -> commit -> mark valid -> clear marker. A failure aborts the
-    /// prepared sinks and clears the marker, so the engine keeps its last valid
-    /// checkpoint. A crash between the marker and validity leaves the marker for
-    /// recovery to resolve.
-    ///
-    /// The marker is cleared *before* the abort on a commit failure: otherwise a
-    /// crash between the abort and the clear would leave a complete body with a
-    /// marker over rolled-back sinks, which recovery might promote.
-    ///
-    /// Returns the id of the checkpoint; later reads must use [`Self::read`].
-    pub async fn take(
-        &mut self,
-        engine: &Hotlap,
-        source: &dyn Source,
-    ) -> Result<u64, ConnectorError> {
-        let id = self.next_id;
-        self.sinks.drain().await?;
-        let prepared = self.sinks.prepare().await?;
-        if let Err(error) = write(self.backend.as_mut(), id, engine, source).await {
-            let _ = clear_commit(self.backend.as_mut(), id);
-            self.sinks.abort(&prepared).await;
-            return Err(error);
-        }
-        if let Err((error, remaining)) = self.sinks.commit(&prepared).await {
-            let _ = clear_commit(self.backend.as_mut(), id);
-            self.sinks.abort(&remaining).await;
-            return Err(error);
-        }
-        mark_valid(self.backend.as_mut(), id, self.retain)?;
-        let _ = clear_commit(self.backend.as_mut(), id);
-        self.next_id = self.next_id.saturating_add(1);
-        Ok(id)
-    }
-
-    /// Finish an interrupted commit detected by recovery: re-drive the sinks'
-    /// `commit` (idempotent, only valid when every sink is re-drivable), publish
-    /// `valid` and clear the marker.
-    pub async fn promote(&mut self, id: u64) -> Result<(), ConnectorError> {
-        self.sinks.redrive_commit().await?;
-        mark_valid(self.backend.as_mut(), id, self.retain)?;
-        let _ = clear_commit(self.backend.as_mut(), id);
-        Ok(())
-    }
-
-    /// Delete an interrupted checkpoint that recovery cannot promote.
-    pub fn discard_commit(&mut self, id: u64) -> Result<(), ConnectorError> {
-        let prefix = format!("{}/", checkpoint_prefix(id));
-        for key in self.backend.list(prefix.as_bytes()).map_err(state_err)? {
-            self.backend.delete(&key).map_err(state_err)?;
-        }
-        Ok(())
-    }
-
-    /// Drop stale commit markers left by a crash after [`Self::promote`] or
-    /// [`Self::take`] published `valid` but before the marker was cleared.
-    ///
-    /// A checkpoint with both `valid` and `commit` is already published, so the
-    /// marker is redundant; recovery sweeps it best-effort before deciding.
-    pub fn sweep_stale_commits(&mut self) -> Result<(), ConnectorError> {
-        for id in self.ids_descending()? {
-            let base = checkpoint_prefix(id);
-            if self.has_key(&format!("{base}/valid"))? && self.has_key(&format!("{base}/commit"))? {
-                let _ = clear_commit(self.backend.as_mut(), id);
-            }
-        }
-        Ok(())
     }
 
     /// Whether every coordinated sink declares a re-drivable `commit`.
