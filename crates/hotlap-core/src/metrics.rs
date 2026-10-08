@@ -12,10 +12,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 ///
 /// Counters are advanced with [`inc`](MetricsRegistry::inc) and
 /// [`add`](MetricsRegistry::add); gauges are overwritten with
-/// [`set`](MetricsRegistry::set). Each metric lives in its own atomic cell,
-/// so updates are lock-free once the metric exists. The lock is only taken to
-/// create a metric or to read a consistent view in
-/// [`snapshot`](MetricsRegistry::snapshot).
+/// [`set`](MetricsRegistry::set). Each metric lives in its own atomic cell, but
+/// the name-to-cell map is behind a [`Mutex`]: every update takes that short
+/// lock to resolve the cell and then updates the atomic. Callers must therefore
+/// publish values at coarse granularity — once per batch, never once per row.
+/// [`snapshot`](MetricsRegistry::snapshot) also takes the lock to read a
+/// consistent view.
 ///
 /// ```
 /// use hotlap_core::MetricsRegistry;

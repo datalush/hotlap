@@ -1,8 +1,9 @@
 //! Engine-side metric increments.
 //!
 //! The counters live in the shared [`MetricsRegistry`], so the runtime that
-//! drives this core observes the same snapshot. Updates are lock-free atomics:
-//! the hot path never contends on a lock once a counter exists.
+//! drives this core observes the same snapshot. Updates resolve a cell under the
+//! registry lock, so they happen once per batch: the per-row loops accumulate
+//! locally and publish a single total.
 
 use std::sync::Arc;
 

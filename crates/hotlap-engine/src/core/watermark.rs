@@ -46,15 +46,21 @@ impl EngineCore {
         let diffs = int64_diffs(batch.diff())?;
         let mut mask = Vec::with_capacity(batch.len());
         let mut max_ts = i64::MIN;
+        let mut late_rows = 0u64;
         for index in 0..batch.len() {
             let ts = times.value(index);
             max_ts = max_ts.max(ts);
             let late = diffs.value(index) > 0 && ts < current;
             if late {
                 *self.late.entry(input).or_insert(0) += 1;
-                self.metrics.inc("late_dropped");
+                late_rows += 1;
             }
             mask.push(!late);
+        }
+        // Publish the batch's drops at once: the registry takes a lock to
+        // resolve the cell, so the per-row loop must not touch it.
+        if late_rows > 0 {
+            self.metrics.add("late_dropped", late_rows);
         }
         self.advance_split(input, split, max_ts, spec.lag);
         filter(batch, &BooleanArray::from(mask))
