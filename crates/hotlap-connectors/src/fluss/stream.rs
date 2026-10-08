@@ -95,7 +95,14 @@ async fn advance(
                     }
                     Err(error) => return Some((Err(error), None)),
                 }
-                return Some((Ok(SourceBatch { batch, base_offset }), Some(task)));
+                return Some((
+                    Ok(SourceBatch {
+                        batch,
+                        base_offset,
+                        split: bucket,
+                    }),
+                    Some(task),
+                ));
             }
         }
     }

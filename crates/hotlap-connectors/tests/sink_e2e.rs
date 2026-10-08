@@ -113,6 +113,7 @@ fn batch(keys: &[i64], times: &[i64]) -> SourceBatch {
     SourceBatch {
         batch: RecordBatch::try_new(schema, cols).unwrap(),
         base_offset: 0,
+        split: 0,
     }
 }
 

@@ -15,7 +15,7 @@ pub mod watermark;
 pub use batch::ZSetBatch;
 pub use core::IncrementalCore;
 pub use error::CoreError;
-pub use ids::{InputId, ViewId};
+pub use ids::{InputId, SplitId, ViewId};
 pub use plan::{Plan, Predicate, Scalar};
 pub use snapshot::{ENGINE_SNAPSHOT_FORMAT_VERSION, EngineSnapshot};
 pub use watermark::WatermarkSpec;

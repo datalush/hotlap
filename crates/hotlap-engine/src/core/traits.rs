@@ -5,7 +5,8 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 
 use hotlap_core::{
-    CoreError, EngineSnapshot, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch,
+    CoreError, EngineSnapshot, IncrementalCore, InputId, Plan, SplitId, ViewId, WatermarkSpec,
+    ZSetBatch,
 };
 
 use super::graph::ViewGraph;
@@ -77,6 +78,15 @@ impl IncrementalCore for EngineCore {
     }
 
     fn push(&mut self, input: InputId, batch: &ZSetBatch) -> Result<(), CoreError> {
+        self.push_split(input, 0, batch)
+    }
+
+    fn push_split(
+        &mut self,
+        input: InputId,
+        split: SplitId,
+        batch: &ZSetBatch,
+    ) -> Result<(), CoreError> {
         if !self.registered.contains(&input) {
             return Err(CoreError::Unsupported(format!("unknown input {input:?}")));
         }
@@ -84,7 +94,9 @@ impl IncrementalCore for EngineCore {
             self.freeze()?;
         }
         self.schemas.insert(input, batch.schema());
-        let kept = self.filter_late(input, batch).map_err(CoreError::from)?;
+        let kept = self
+            .filter_late(input, split, batch)
+            .map_err(CoreError::from)?;
         let watermark = self.watermarks.get(&input).copied().unwrap_or(0);
         self.retention.record(input, &kept, watermark);
         let targets: Vec<ViewId> = self

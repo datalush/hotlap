@@ -8,7 +8,7 @@
 
 use crate::batch::ZSetBatch;
 use crate::error::CoreError;
-use crate::ids::{InputId, ViewId};
+use crate::ids::{InputId, SplitId, ViewId};
 use crate::plan::Plan;
 use crate::snapshot::EngineSnapshot;
 use crate::watermark::WatermarkSpec;
@@ -40,7 +40,26 @@ pub trait IncrementalCore {
     fn declare_watermark(&mut self, input: InputId, spec: WatermarkSpec) -> Result<(), CoreError>;
 
     /// Feed a Z-set to the given source, consolidating every consuming view.
+    ///
+    /// Equivalent to [`push_split`](Self::push_split) with the implicit split
+    /// [`0`](crate::ids::SplitId), for callers that do not model splits.
     fn push(&mut self, input: InputId, batch: &ZSetBatch) -> Result<(), CoreError>;
+
+    /// Feed a Z-set that came from `split` of `input`.
+    ///
+    /// Engines tracking per-split watermarks use this to derive the input's
+    /// watermark as the minimum across its splits, so a fast split cannot mark
+    /// records of a slower one as late. The default ignores `split` and
+    /// delegates to [`push`](Self::push), preserving single-stream behaviour.
+    fn push_split(
+        &mut self,
+        input: InputId,
+        split: SplitId,
+        batch: &ZSetBatch,
+    ) -> Result<(), CoreError> {
+        let _ = split;
+        self.push(input, batch)
+    }
 
     /// Current consolidated output of a view.
     fn snapshot(&mut self, view: ViewId) -> Result<ZSetBatch, CoreError>;

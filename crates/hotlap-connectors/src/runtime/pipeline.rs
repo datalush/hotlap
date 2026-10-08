@@ -80,10 +80,13 @@ pub fn merged_stream_from(
     Ok(Box::pin(futures::stream::select_all(streams)))
 }
 
-/// Convert one source batch and push it into the input.
+/// Convert one source batch and push it, tagged with its source split, into the
+/// input.
 pub fn ingest(hotlap: &mut Hotlap, input: &str, sb: &SourceBatch) -> Result<(), ConnectorError> {
     let zset = convert::to_zset(&sb.batch)?;
-    hotlap.push(input, &zset).map_err(hotlap_err)
+    hotlap
+        .push_split(input, sb.split, &zset)
+        .map_err(hotlap_err)
 }
 
 /// Ingest one source item and, if it succeeded, pump its deltas into the sinks.

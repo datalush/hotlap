@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use hotlap_core::{
-    EngineSnapshot, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch,
+    EngineSnapshot, IncrementalCore, InputId, Plan, SplitId, ViewId, WatermarkSpec, ZSetBatch,
 };
 
 /// Error returned by the public [`Hotlap`] API.
@@ -116,13 +116,28 @@ impl Hotlap {
     }
 
     /// Feed `batch` into the input registered as `name`.
+    ///
+    /// Equivalent to [`push_split`](Self::push_split) with the implicit split 0.
     pub fn push(&mut self, input: &str, batch: &ZSetBatch) -> Result<(), HotlapError> {
+        self.push_split(input, 0, batch)
+    }
+
+    /// Feed `batch`, read from `split`, into the input registered as `name`.
+    ///
+    /// Keeping the split lets the engine track one watermark per split and use
+    /// their minimum, so a fast split cannot mark a slower one's records late.
+    pub fn push_split(
+        &mut self,
+        input: &str,
+        split: SplitId,
+        batch: &ZSetBatch,
+    ) -> Result<(), HotlapError> {
         let id = *self
             .inputs
             .get(input)
             .ok_or_else(|| HotlapError("no such input".into()))?;
         self.core
-            .push(id, batch)
+            .push_split(id, split, batch)
             .map_err(|e| HotlapError(format!("{e}")))
     }
 

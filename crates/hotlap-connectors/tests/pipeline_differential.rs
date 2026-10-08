@@ -49,6 +49,7 @@ fn batch(keys: &[i64], times: &[i64]) -> SourceBatch {
     SourceBatch {
         batch: RecordBatch::try_new(schema, cols).unwrap(),
         base_offset: 0,
+        split: 0,
     }
 }
 
@@ -113,6 +114,7 @@ async fn empty_batch_is_a_noop() {
     let empty = SourceBatch {
         batch: RecordBatch::new_empty(good.batch.schema()),
         base_offset: 0,
+        split: 0,
     };
     let (mut hotlap, pipeline) = group_count(good.batch.schema(), vec![good, empty]);
     pipeline::setup(&mut hotlap, &pipeline).unwrap();

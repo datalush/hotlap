@@ -44,6 +44,9 @@ pub struct SourceBatch {
     /// Offset of the **first** record of `batch`; the records are ordered but
     /// their offsets are not assumed to be contiguous.
     pub base_offset: Offset,
+    /// Split (bucket) the records were read from, propagated to the engine so
+    /// it can track a watermark per split.
+    pub split: SplitId,
 }
 
 /// A source's stream of batches.

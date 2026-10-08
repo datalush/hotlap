@@ -10,18 +10,14 @@ mod retention;
 mod tests;
 mod time;
 mod traits;
+mod watermark;
 
 use std::collections::{HashMap, HashSet};
 
-use arrow::array::BooleanArray;
 use arrow::datatypes::SchemaRef;
 
 use hotlap_core::plan::has_window;
-use hotlap_core::{CoreError, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
-
-use crate::error::EngineError;
-use crate::ops::filter;
-use crate::zset::int64_diffs;
+use hotlap_core::{CoreError, InputId, Plan, SplitId, ViewId, WatermarkSpec, ZSetBatch};
 
 use graph::ViewGraph;
 use output::ViewOutput;
@@ -67,7 +63,12 @@ pub struct EngineCore {
     pub(super) views: HashMap<ViewId, ViewState>,
     pub(super) registered: HashSet<InputId>,
     pub(super) specs: HashMap<InputId, WatermarkSpec>,
+    /// Effective input watermark: the minimum across each input's splits.
     pub(super) watermarks: HashMap<InputId, i64>,
+    /// Monotonic watermark per `(input, split)`: `max(event_ts) - lag`, clamped
+    /// at zero. A split joins this map on its first batch ("not yet started"
+    /// splits do not hold the input back).
+    pub(super) split_watermarks: HashMap<(InputId, SplitId), i64>,
     pub(super) schemas: HashMap<InputId, SchemaRef>,
     pub(super) late: HashMap<InputId, u64>,
     pub(super) frozen: bool,
@@ -85,6 +86,7 @@ impl EngineCore {
             registered: HashSet::new(),
             specs: HashMap::new(),
             watermarks: HashMap::new(),
+            split_watermarks: HashMap::new(),
             schemas: HashMap::new(),
             late: HashMap::new(),
             frozen: false,
@@ -109,46 +111,6 @@ impl EngineCore {
         }
         self.frozen = true;
         Ok(())
-    }
-
-    /// Drops late insertions and advances `input`'s logical watermark.
-    ///
-    /// Only insertions (`diff > 0`) below the current watermark are dropped; a
-    /// retraction must always be applied or downstream state would be corrupted.
-    pub(super) fn filter_late(
-        &mut self,
-        input: InputId,
-        batch: &ZSetBatch,
-    ) -> Result<ZSetBatch, EngineError> {
-        if self.specs.is_empty() {
-            return Ok(batch.clone());
-        }
-        let spec =
-            self.specs.get(&input).copied().ok_or_else(|| {
-                EngineError::Unsupported(format!("input {input:?} has no watermark"))
-            })?;
-        let current = *self.watermarks.get(&input).unwrap_or(&0);
-        let times = time::time_values(&batch.batch, spec.time_col)?;
-        let diffs = int64_diffs(batch.diff())?;
-        let mut mask = Vec::with_capacity(batch.len());
-        let mut max_ts = i64::MIN;
-        for index in 0..batch.len() {
-            let ts = times.value(index);
-            max_ts = max_ts.max(ts);
-            let late = diffs.value(index) > 0 && ts < current;
-            if late {
-                *self.late.entry(input).or_insert(0) += 1;
-            }
-            mask.push(!late);
-        }
-        let kept = filter(batch, &BooleanArray::from(mask))?;
-        let next = if kept.is_empty() {
-            current
-        } else {
-            current.max((max_ts - spec.lag).max(0))
-        };
-        self.watermarks.insert(input, next);
-        Ok(kept)
     }
 
     /// Propagates one input's delta through the graph of view `id`.

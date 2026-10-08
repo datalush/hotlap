@@ -50,6 +50,11 @@ impl EngineCore {
             self.specs.insert(input.id, spec);
         }
         self.watermarks.insert(input.id, input.watermark);
+        // Snapshots persist only the effective (minimum) watermark. Seed the
+        // implicit split 0 with it, so a caller that keeps pushing without
+        // split tags resumes exactly where it stopped.
+        self.split_watermarks
+            .insert((input.id, 0), input.watermark);
         self.late.insert(input.id, input.late);
         Ok(())
     }

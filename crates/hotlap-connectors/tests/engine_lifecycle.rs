@@ -101,6 +101,7 @@ impl Source for OneBatchSource {
         let item = Ok(SourceBatch {
             batch,
             base_offset: 0,
+            split: 0,
         });
         Ok(Box::pin(stream::iter(vec![item])))
     }

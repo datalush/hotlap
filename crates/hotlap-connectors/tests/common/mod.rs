@@ -88,6 +88,7 @@ impl Source for ScriptSource {
                         Ok(SourceBatch {
                             batch,
                             base_offset: index as i64,
+                            split: 0,
                         });
                     item
                 }

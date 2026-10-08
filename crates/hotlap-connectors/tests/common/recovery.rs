@@ -93,6 +93,7 @@ impl Source for ResumableSource {
                 Ok(SourceBatch {
                     batch,
                     base_offset: index as i64,
+                    split: 0,
                 })
             }
         });
