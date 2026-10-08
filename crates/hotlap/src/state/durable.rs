@@ -1,22 +1,22 @@
-//! Durable local [`StateBackend`]: one file per key under a root directory.
+//! Durable local [`StateBackend`]: one file per key under prefix subdirectories.
 
 use std::fs;
-use std::io;
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use super::StateBackend;
-
-const HEX: &[u8; 16] = b"0123456789abcdef";
+use super::StateEntry;
+use super::StateError;
+use super::path::{decode_segment, encode_segment, join_segments, split_prefix, validate_key};
 
 /// File-per-key state backend rooted at a directory.
 ///
-/// Each key is hex-encoded and stored as `<root>/<hex(key)>`, which keeps
-/// arbitrary key bytes file-name safe. A `put` writes `<hex(key)>.tmp` first
-/// and then atomically renames it over the final name, so an interrupted write
-/// never exposes a half-written value.
-///
-/// The trait has no error channel, so I/O failures panic. A missing file is a
-/// normal `None` from [`StateBackend::get`], not an error.
+/// Key segments become hex-encoded path components, so a namespace prefix maps
+/// to a subdirectory and `scan`/`list` only walk the relevant subtree. `put`
+/// writes `<name>.tmp`, fsyncs it, atomically renames it over the final name,
+/// then best-effort fsyncs the parent directory, so an interrupted write never
+/// exposes a half-written value and a crash does not lose a committed one.
 pub struct DurableStateBackend {
     root: PathBuf,
 }
@@ -34,93 +34,131 @@ impl DurableStateBackend {
         &self.root
     }
 
-    /// Final on-disk path for `key`.
+    /// On-disk path for `key`, one hex-encoded component per segment.
     fn path_for(&self, key: &[u8]) -> PathBuf {
-        self.root.join(hex_encode(key))
+        let mut path = self.root.clone();
+        for segment in key.split(|b| *b == b'/') {
+            path.push(encode_segment(segment));
+        }
+        path
+    }
+
+    /// Directory holding every key that starts with the `dirs` segments.
+    fn dir_for(&self, dirs: &[&[u8]]) -> PathBuf {
+        let mut path = self.root.clone();
+        for segment in dirs {
+            path.push(encode_segment(segment));
+        }
+        path
+    }
+
+    /// Keys matching `prefix`, sorted ascending, read from the relevant subtree.
+    fn keys_under(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StateError> {
+        let Some(parsed) = split_prefix(prefix) else {
+            return Ok(Vec::new());
+        };
+        let start = self.dir_for(&parsed.dirs);
+        let mut segments: Vec<Vec<u8>> = parsed.dirs.iter().map(|s| s.to_vec()).collect();
+        let mut keys = Vec::new();
+        collect_dir(&start, &mut segments, parsed.partial, &mut keys)?;
+        keys.sort();
+        Ok(keys)
     }
 }
 
 impl StateBackend for DurableStateBackend {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        match fs::read(self.path_for(key)) {
-            Ok(value) => Some(value),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => panic!("durable state get failed: {e}"),
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        validate_key(key)?;
+        let file = self.path_for(key);
+        if file.is_dir() {
+            return Ok(None);
+        }
+        match fs::read(&file) {
+            Ok(value) => Ok(Some(value)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
-    fn put(&mut self, key: &[u8], value: Vec<u8>) {
-        let final_path = self.path_for(key);
-        let tmp_path = final_path.with_extension("tmp");
-        fs::write(&tmp_path, &value)
-            .unwrap_or_else(|e| panic!("durable state temp write failed: {e}"));
-        fs::rename(&tmp_path, &final_path)
-            .unwrap_or_else(|e| panic!("durable state rename failed: {e}"));
+    fn put(&mut self, key: &[u8], value: Vec<u8>) -> Result<(), StateError> {
+        validate_key(key)?;
+        let file = self.path_for(key);
+        if file.is_dir() {
+            return Err(StateError::InvalidKey);
+        }
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        write_atomic(&file, &value)?;
+        Ok(())
     }
 
-    fn scan(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.list(prefix)
-            .into_iter()
-            .map(|key| {
-                let value = self
-                    .get(&key)
-                    .expect("listed durable key must still be readable");
-                (key, value)
-            })
-            .collect()
-    }
-
-    fn list(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
-        let entries =
-            fs::read_dir(&self.root).unwrap_or_else(|e| panic!("durable state list failed: {e}"));
-        let mut keys = Vec::new();
-        for entry in entries {
-            let entry = entry.unwrap_or_else(|e| panic!("durable state entry failed: {e}"));
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            // Non-hex names (including `.tmp` leftovers) decode to `None` and
-            // are ignored; only committed values carry valid hex names.
-            let Some(key) = hex_decode(&name) else {
-                continue;
-            };
-            if key.starts_with(prefix) {
-                keys.push(key);
+    fn scan(&self, prefix: &[u8]) -> Result<Vec<StateEntry>, StateError> {
+        let mut out = Vec::new();
+        for key in self.keys_under(prefix)? {
+            match fs::read(self.path_for(&key)) {
+                Ok(value) => out.push((key, value)),
+                // A key listed then removed concurrently is simply skipped.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
             }
         }
-        keys.sort();
-        keys
+        Ok(out)
+    }
+
+    fn list(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StateError> {
+        self.keys_under(prefix)
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
+/// Recursively collect keys under `dir`. `segments` accumulates decoded
+/// segments; `partial` filters the immediate entries (empty means all).
+fn collect_dir(
+    dir: &Path,
+    segments: &mut Vec<Vec<u8>>,
+    partial: &[u8],
+    out: &mut Vec<Vec<u8>>,
+) -> Result<(), StateError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(segment) = decode_segment(&name) else {
+            continue;
+        };
+        if !partial.is_empty() && !segment.starts_with(partial) {
+            continue;
+        }
+        let is_dir = entry.file_type()?.is_dir();
+        segments.push(segment);
+        if is_dir {
+            collect_dir(&entry.path(), segments, &[], out)?;
+        } else {
+            out.push(join_segments(segments));
+        }
+        segments.pop();
     }
-    out
+    Ok(())
 }
 
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    let bytes = text.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
-        return None;
+/// Write `value` atomically: temp file, fsync, rename, best-effort dir fsync.
+fn write_atomic(path: &Path, value: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(value)?;
+        file.sync_all()?;
     }
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        let hi = hex_digit(pair[0])?;
-        let lo = hex_digit(pair[1])?;
-        out.push((hi << 4) | lo);
+    fs::rename(&tmp, path)?;
+    // Directory fsync is not supported everywhere, so it is best-effort.
+    if let Some(parent) = path.parent() {
+        let _ = File::open(parent).and_then(|dir| dir.sync_all());
     }
-    Some(out)
-}
-
-fn hex_digit(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
+    Ok(())
 }
