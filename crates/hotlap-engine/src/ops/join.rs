@@ -8,6 +8,7 @@ use crate::arrange::KeyedArrangement;
 use crate::batch::ZSetBatch;
 use crate::error::EngineError;
 use crate::keys::KeyConverter;
+use crate::zset::consolidate;
 
 use helpers::{concat_zsets, equi_join, joined_schema, subtract, touched_union};
 
@@ -71,7 +72,9 @@ impl Join {
                 parts.push(delta);
             }
         }
-        concat_zsets(&schema, &parts)
+        // Consolidate the per-key parts into one canonical, sorted changelog so
+        // the join's output ordering does not depend on touched-key order.
+        consolidate(&concat_zsets(&schema, &parts)?)
     }
 
     /// Number of join pairs re-evaluated by the last `apply` (test only).

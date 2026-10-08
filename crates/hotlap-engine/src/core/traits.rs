@@ -98,7 +98,10 @@ impl IncrementalCore for EngineCore {
             .get(&view)
             .ok_or_else(|| CoreError::Unsupported(format!("unknown view {view:?}")))?;
         match &state.output {
-            Some(output) => consolidate(output).map_err(CoreError::from),
+            // The output is consolidated per push, so a snapshot is a clone of
+            // the current state: neither its size nor its cost grows with
+            // accumulated history.
+            Some(output) => Ok(output.clone()),
             None => Ok(ZSetBatch::empty(Arc::new(Schema::empty()))),
         }
     }

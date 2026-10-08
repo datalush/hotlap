@@ -127,6 +127,32 @@ fn take_changes_is_empty_without_a_new_push() {
 }
 
 #[test]
+fn take_changes_returns_only_deltas_since_last_drain() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+
+    core.push(InputId(0), &text_zset(&[(1, "a", 1)])).unwrap();
+    let first = core.take_changes(ViewId(0)).unwrap();
+    assert_eq!(count_pairs(&first), vec![(1, 1)]);
+
+    // A second identical delta reports only that delta, not the accumulated
+    // history: the drained changelog is incremental, not a re-consolidation
+    // of everything seen so far.
+    core.push(InputId(0), &text_zset(&[(1, "a", 1)])).unwrap();
+    let second = core.take_changes(ViewId(0)).unwrap();
+    assert_eq!(count_pairs(&second), vec![(1, 1), (1, 2)]);
+
+    let third = core.take_changes(ViewId(0)).unwrap();
+    assert!(third.is_empty());
+    assert_eq!(
+        count_pairs(&core.snapshot(ViewId(0)).unwrap()),
+        vec![(1, 2)]
+    );
+}
+
+#[test]
 fn untapped_view_has_no_changes() {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();

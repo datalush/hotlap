@@ -1,6 +1,8 @@
 //! Arrow-native [`IncrementalCore`]: persistent per-view operator graphs.
 
 mod graph;
+#[cfg(test)]
+mod tests;
 mod traits;
 
 use std::collections::{HashMap, HashSet};
@@ -131,7 +133,7 @@ impl EngineCore {
             .map_err(CoreError::from)?;
         if let Some(output) = output {
             view.output =
-                graph::accumulate(view.output.take(), &output).map_err(CoreError::from)?;
+                graph::consolidate_into(view.output.take(), &output).map_err(CoreError::from)?;
             if view.tapped {
                 view.pending =
                     graph::accumulate(view.pending.take(), &output).map_err(CoreError::from)?;

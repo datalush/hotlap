@@ -4,6 +4,7 @@ use arrow::compute::{concat, concat_batches};
 
 use crate::error::EngineError;
 use crate::ops::{GroupCount, Join, TumbleCount, filter, project};
+use crate::zset::consolidate;
 use hotlap_core::{InputId, Predicate, ZSetBatch};
 
 use super::{EvalCtx, Node};
@@ -28,6 +29,21 @@ pub(crate) fn accumulate(
     match current {
         None => Ok(Some(delta.clone())),
         Some(current) => Ok(Some(merge(&current, delta)?)),
+    }
+}
+
+/// Accumulates `delta` into `current` and consolidates to the current state.
+///
+/// Used for a view's materialized output so its retained size (and the work of
+/// later `snapshot`s) stays proportional to the current state instead of the
+/// accumulated history.
+pub(crate) fn consolidate_into(
+    current: Option<ZSetBatch>,
+    delta: &ZSetBatch,
+) -> Result<Option<ZSetBatch>, EngineError> {
+    match accumulate(current, delta)? {
+        Some(merged) => Ok(Some(consolidate(&merged)?)),
+        None => Ok(None),
     }
 }
 
