@@ -59,6 +59,11 @@ impl ViewState {
 /// stateful operators retain their state, so per-push work does not grow with
 /// accumulated history. A view's output is an incremental map updated only for
 /// the push delta (O(delta)); snapshots materialize and sort it once (O(state)).
+///
+/// A push is **not** transactional across views: each view mutates its state in
+/// turn, so an error after an earlier view applied leaves a partial state. Such
+/// a core is marked failed (the `failed` flag) and must be recreated; see
+/// `ensure_healthy`.
 pub struct EngineCore {
     pub(super) views: HashMap<ViewId, ViewState>,
     pub(super) registered: HashSet<InputId>,
@@ -81,6 +86,10 @@ pub struct EngineCore {
     pub(super) epoch: u64,
     /// Applied input deltas kept for building views after `START`.
     pub(super) retention: InputRetention,
+    /// Set once a push may have applied partially: a later view errored after an
+    /// earlier view's state was already mutated. A failed core is poisoned so
+    /// partial state is never observable; the caller must recreate the engine.
+    pub(super) failed: bool,
 }
 
 impl EngineCore {
@@ -97,7 +106,31 @@ impl EngineCore {
             frozen: false,
             epoch: 0,
             retention: InputRetention::disabled(),
+            failed: false,
         }
+    }
+
+    /// Marks the core failed after a push that may have applied partially.
+    ///
+    /// The engine cannot safely continue (an earlier view may have committed a
+    /// delta the failed view did not), so every state-observing call after this
+    /// returns an explicit error until the caller recreates the core.
+    pub(super) fn fail(&mut self) {
+        self.failed = true;
+    }
+
+    /// Rejects state-observing work once a push may have applied partially.
+    ///
+    /// A failed core holds a mix of applied and unapplied views, so a snapshot
+    /// or a further push would silently expose or compound that partial state.
+    /// Returning an error forces the caller to recreate the engine instead.
+    pub(super) fn ensure_healthy(&self) -> Result<(), CoreError> {
+        if self.failed {
+            return Err(CoreError::Infrastructure(
+                "engine failed after a partially-applied push; recreate the engine".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Freezes the schema: rejects mixed watermark declarations and windowed

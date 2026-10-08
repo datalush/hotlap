@@ -87,6 +87,7 @@ impl IncrementalCore for EngineCore {
         split: SplitId,
         batch: &ZSetBatch,
     ) -> Result<(), CoreError> {
+        self.ensure_healthy()?;
         if !self.registered.contains(&input) {
             return Err(CoreError::Unsupported(format!("unknown input {input:?}")));
         }
@@ -106,13 +107,19 @@ impl IncrementalCore for EngineCore {
             .map(|(id, _)| *id)
             .collect();
         for id in targets {
-            self.push_view(id, input, &kept)?;
+            // A failure may leave earlier views applied; poison the core
+            // instead of serving that partial state.
+            if let Err(error) = self.push_view(id, input, &kept) {
+                self.fail();
+                return Err(error);
+            }
         }
         self.epoch = self.epoch.wrapping_add(1);
         Ok(())
     }
 
     fn snapshot(&mut self, view: ViewId) -> Result<ZSetBatch, CoreError> {
+        self.ensure_healthy()?;
         let state = self
             .views
             .get(&view)
@@ -127,6 +134,7 @@ impl IncrementalCore for EngineCore {
     }
 
     fn take_changes(&mut self, view: ViewId) -> Result<ZSetBatch, CoreError> {
+        self.ensure_healthy()?;
         let state = self
             .views
             .get_mut(&view)
