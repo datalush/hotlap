@@ -185,7 +185,7 @@ fn checkpoint_after_a_normal_end_still_works() {
 
     drop(a_tx);
     drop(b_tx);
-    assert!(wait_for(|| handle.last_error().unwrap().is_none()));
+    assert!(wait_for(|| a.is_exhausted() && b.is_exhausted()), "no EOF");
     let id = handle.checkpoint().expect("checkpoint after a normal end");
     assert_eq!(id, 1);
 

@@ -3,6 +3,7 @@
 //! The test pushes batches (or closes a channel) to sequence a stream without
 //! sleeping: a split stays pending until its channel produces an item.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::SchemaRef;
@@ -23,6 +24,7 @@ pub struct ControlledSource {
     splits: Vec<Split>,
     receivers: Mutex<Vec<Option<UnboundedReceiver<BatchItem>>>>,
     fail_read: bool,
+    exhausted: Arc<AtomicBool>,
     commits: Arc<Mutex<Vec<(SplitId, Offset)>>>,
     applied: Arc<Mutex<SourceState>>,
 }
@@ -42,6 +44,7 @@ impl ControlledSource {
             splits,
             receivers: Mutex::new(receivers),
             fail_read: false,
+            exhausted: Arc::new(AtomicBool::new(false)),
             commits: Arc::new(Mutex::new(Vec::new())),
             applied: Arc::new(Mutex::new(SourceState::default())),
         });
@@ -55,6 +58,7 @@ impl ControlledSource {
             splits: vec![Split { id: 0, start: 0 }],
             receivers: Mutex::new(vec![None]),
             fail_read: true,
+            exhausted: Arc::new(AtomicBool::new(false)),
             commits: Arc::new(Mutex::new(Vec::new())),
             applied: Arc::new(Mutex::new(SourceState::default())),
         })
@@ -68,6 +72,11 @@ impl ControlledSource {
     /// The applied state the runtime would persist.
     pub fn applied(&self) -> SourceState {
         self.applied.lock().unwrap().clone()
+    }
+
+    /// Whether the read stream has ended (all senders dropped and drained).
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::SeqCst)
     }
 }
 
@@ -97,8 +106,18 @@ impl Source for ControlledSource {
             .ok_or_else(|| {
                 ConnectorError::Infrastructure(format!("split {} already opened", split.id))
             })?;
-        let stream = futures::stream::unfold(receiver, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
+        let exhausted = Arc::clone(&self.exhausted);
+        let stream = futures::stream::unfold(receiver, move |mut rx| {
+            let exhausted = Arc::clone(&exhausted);
+            async move {
+                match rx.recv().await {
+                    Some(item) => Some((item, rx)),
+                    None => {
+                        exhausted.store(true, Ordering::SeqCst);
+                        None
+                    }
+                }
+            }
         });
         Ok(Box::pin(stream))
     }
