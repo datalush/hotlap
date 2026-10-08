@@ -19,8 +19,11 @@ pub struct MetricsSnapshot {
 /// A synchronous embedded session: DDL, `START`, queries, metrics and
 /// checkpoints over one source and its materialized views.
 ///
-/// Owns a single-threaded Tokio runtime, so callers need not be inside one; the
-/// blocking engine handle is only ever driven from this runtime.
+/// Owns a multi-threaded Tokio runtime, so callers need not be inside one.
+/// `enable_all` provides the IO and time drivers the Fluss connectors need
+/// (`TcpStream::connect`, retry timers), and the worker thread keeps driving the
+/// connector tasks spawned during `CREATE SOURCE` while the engine thread reads
+/// from the source on its own runtime.
 pub struct Session {
     sql: SqlSession,
     runtime: tokio::runtime::Runtime,
@@ -29,8 +32,9 @@ pub struct Session {
 impl Session {
     /// Open a session from `config`; the engine starts on `START`.
     pub fn open(config: SessionConfig) -> Result<Self, SessionError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
             .build()
             .map_err(|error| SessionError::Engine(error.to_string()))?;
         let (source_factory, sink_factory, checkpoint) = config.into_parts();
