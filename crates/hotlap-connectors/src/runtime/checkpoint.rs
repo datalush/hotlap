@@ -108,6 +108,16 @@ impl Checkpointer {
         }
     }
 
+    /// Every checkpoint id present in the store, newest first.
+    pub fn ids_descending(&self) -> Result<Vec<u64>, ConnectorError> {
+        let mut ids =
+            crate::runtime::retention::checkpoint_ids(self.backend.as_ref()).map_err(state_err)?;
+        ids.sort_unstable();
+        ids.dedup();
+        ids.reverse();
+        Ok(ids)
+    }
+
     /// Read and decode the checkpoint `id`, rejecting an incomplete one.
     pub fn read(&self, id: u64) -> Result<Checkpoint, ConnectorError> {
         let base = checkpoint_prefix(id);

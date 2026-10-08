@@ -3,6 +3,7 @@
 #[path = "common/recovery.rs"]
 mod recovery;
 
+use hotlap::state::StateBackend;
 use hotlap_connectors::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
 use hotlap_connectors::runtime::pipeline;
 use hotlap_connectors::runtime::recovery::Recovery;
@@ -78,6 +79,28 @@ fn missing_checkpoint_is_a_clean_start() {
     let backend = SharedBackend::default();
     let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     assert!(Recovery::load(&checkpointer).unwrap().is_none());
+}
+
+#[test]
+fn corrupt_latest_falls_back_to_an_older_checkpoint() {
+    let backend = SharedBackend::default();
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
+    let mut stream = pipeline::merged_stream(pipe.source.as_ref()).unwrap();
+    drain(&mut engine, &mut stream, 2);
+    take(&mut checkpointer, &engine, pipe.source.as_ref());
+    drain(&mut engine, &mut stream, 1);
+    take(&mut checkpointer, &engine, pipe.source.as_ref());
+    assert_eq!(checkpointer.latest().unwrap(), Some(2));
+
+    // Corrupt the newest body while it stays the `latest` pointer.
+    let mut writer = backend.clone();
+    writer
+        .put(b"checkpoint/2/engine", b"not-a-snapshot".to_vec())
+        .unwrap();
+
+    let loaded = Recovery::load(&checkpointer).unwrap().unwrap();
+    assert_eq!(loaded.id, 1, "expected fallback to the older checkpoint");
 }
 
 #[test]

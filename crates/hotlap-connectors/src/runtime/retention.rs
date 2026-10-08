@@ -31,7 +31,7 @@ pub(crate) fn prune(
 }
 
 /// Every id that appears under the checkpoint namespace.
-fn checkpoint_ids(backend: &dyn StateBackend) -> Result<Vec<u64>, StateError> {
+pub(crate) fn checkpoint_ids(backend: &dyn StateBackend) -> Result<Vec<u64>, StateError> {
     Ok(backend
         .list(PREFIX)?
         .iter()

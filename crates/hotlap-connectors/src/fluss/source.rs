@@ -3,12 +3,14 @@
 //! Records are assembled one-by-one from the per-record scanner so the broker
 //! `timestamp` can be surfaced as an `Int64` `_event_time` column (ms).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::SchemaRef;
 use fluss::client::{EARLIEST_OFFSET, FlussConnection};
 use fluss::config::Config;
 use fluss::metadata::TablePath;
+use fluss::rpc::message::OffsetSpec;
 
 use crate::error::ConnectorError;
 use crate::source::{Source, SourceState, SourceStream, Split};
@@ -25,6 +27,9 @@ pub struct FlussSource {
     buckets: Vec<i32>,
     event_time_idx: usize,
     progress: Arc<Mutex<SourceState>>,
+    /// Earliest retained offset per bucket, or `None` when the broker probe
+    /// failed. `None` makes recovery fail loudly rather than skip records.
+    earliest: Option<HashMap<i32, i64>>,
 }
 
 impl FlussSource {
@@ -61,6 +66,9 @@ impl FlussSource {
             .schema();
         crate::convert::ensure_supported(&base_schema)?;
         let buckets: Vec<i32> = (0..info.get_num_buckets()).collect();
+        // Probe retention now, while the table handle is open. A failed probe
+        // is remembered as `None` so recovery can reject an unverifiable resume.
+        let earliest = fetch_earliest(&connection, &table_path, &buckets).await;
         drop(table);
 
         let event_time_idx = base_schema.fields().len();
@@ -76,8 +84,26 @@ impl FlussSource {
             buckets,
             event_time_idx,
             progress: Arc::new(Mutex::new(progress)),
+            earliest,
         })
     }
+}
+
+/// Ask the broker for the earliest retained offset of each bucket.
+///
+/// Uses `FlussAdmin::list_offsets` with `OffsetSpec::Earliest` (the Rust client
+/// has no dedicated `list_earliest_offsets` helper). Returns `None` when the
+/// admin or the RPC is unavailable, so recovery treats retention as unverified.
+async fn fetch_earliest(
+    connection: &FlussConnection,
+    table_path: &TablePath,
+    buckets: &[i32],
+) -> Option<HashMap<i32, i64>> {
+    let admin = connection.get_admin().ok()?;
+    admin
+        .list_offsets(table_path, buckets, OffsetSpec::Earliest)
+        .await
+        .ok()
 }
 
 impl Source for FlussSource {
@@ -132,5 +158,40 @@ impl Source for FlussSource {
 
     fn is_unbounded(&self) -> bool {
         true
+    }
+
+    /// Reopen each bucket at its captured offset, checking it against the
+    /// broker's earliest retained offset.
+    ///
+    /// A non-negative captured offset behind the earliest retained offset
+    /// returns an explicit insufficient-retention error. When retention could
+    /// not be probed the resume is rejected as unverified, never silently
+    /// truncated. Negative offsets are symbolic (`EARLIEST_OFFSET`) and pass
+    /// through unchecked.
+    fn resume(&self, state: &SourceState) -> Result<Vec<Split>, ConnectorError> {
+        let mut splits = self.splits()?;
+        for split in &mut splits {
+            let Some(offset) = state.offsets.get(&split.id).copied() else {
+                continue;
+            };
+            if offset >= 0 {
+                let earliest = self.earliest.as_ref().ok_or_else(|| {
+                    ConnectorError::Unsupported(format!(
+                        "split {} checkpoint offset {offset} cannot be verified against broker retention",
+                        split.id
+                    ))
+                })?;
+                if let Some(&start) = earliest.get(&split.id)
+                    && offset < start
+                {
+                    return Err(ConnectorError::Unsupported(format!(
+                        "split {} checkpoint offset {offset} is older than the earliest retained offset {start}",
+                        split.id
+                    )));
+                }
+            }
+            split.start = offset;
+        }
+        Ok(splits)
     }
 }

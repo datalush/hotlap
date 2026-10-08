@@ -21,17 +21,33 @@ pub struct Recovery;
 impl Recovery {
     /// Newest valid checkpoint, or `None` for a clean start.
     ///
-    /// An interrupted write never becomes `latest`, so a returned checkpoint is
-    /// always complete and decodable.
+    /// The `latest` pointer is tried first. If its checkpoint fails to decode
+    /// or validate, older checkpoints are tried newest-first, so a corrupt tip
+    /// does not abort startup while a valid predecessor remains. A checkpoint
+    /// is only visible once every part (engine, sources, `valid` marker) is
+    /// written, so a readable one is always coherent.
     pub fn load(checkpointer: &Checkpointer) -> Result<Option<Checkpoint>, ConnectorError> {
-        match checkpointer.latest()? {
-            Some(id) => Ok(Some(checkpointer.read(id)?)),
-            None => Ok(None),
+        if let Some(id) = checkpointer.latest()?
+            && let Ok(checkpoint) = checkpointer.read(id)
+        {
+            return Ok(Some(checkpoint));
         }
+        for id in checkpointer.ids_descending()? {
+            if let Ok(checkpoint) = checkpointer.read(id) {
+                return Ok(Some(checkpoint));
+            }
+        }
+        Ok(None)
     }
 
     /// Restore `checkpoint` into `hotlap` and reopen `source` at the captured
     /// offsets, yielding a stream that replays from the checkpoint.
+    ///
+    /// [`SourceState`](crate::source::SourceState) holds the offset of the
+    /// **next** record to read, so the checkpoint already contains every record
+    /// below that offset and replay must start exactly there: starting one
+    /// record earlier duplicates, one later loses. Checkpoints are taken
+    /// between source polls, so no in-flight batch can break the invariant.
     ///
     /// Errors when the source can no longer serve a captured offset, so
     /// insufficient retention fails loudly instead of losing records.

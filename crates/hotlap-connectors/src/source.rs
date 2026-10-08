@@ -27,6 +27,11 @@ pub struct Split {
 /// The offsets reflect the **read position** of each split: the offset of the
 /// next record to be read. They do not track what has been fully consumed by
 /// downstream views.
+///
+/// Replay invariant: a checkpoint taken between source polls contains every
+/// record with offset strictly below the captured offset (`records < offset`
+/// are already applied) and none at or above it (`records >= offset` are
+/// replayed). Reading from `offset` therefore neither loses nor duplicates.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceState {
     pub offsets: BTreeMap<SplitId, Offset>,
