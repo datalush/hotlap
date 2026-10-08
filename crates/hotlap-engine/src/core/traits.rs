@@ -151,6 +151,10 @@ impl IncrementalCore for EngineCore {
     }
 
     fn late_dropped(&self, input: InputId) -> Result<u64, CoreError> {
+        self.ensure_healthy()?;
+        if !self.registered.contains(&input) {
+            return Err(CoreError::Unsupported(format!("unknown input {input:?}")));
+        }
         Ok(self.late.get(&input).copied().unwrap_or(0))
     }
 

@@ -26,6 +26,7 @@ impl EngineCore {
     /// already closed when the delta arrived (append-only output cannot retract
     /// an emitted window).
     pub fn window_late_closed(&self, view: ViewId) -> Result<u64, CoreError> {
+        self.ensure_healthy()?;
         let state = self
             .views
             .get(&view)

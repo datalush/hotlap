@@ -13,7 +13,7 @@ use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
 use crate::runtime::checkpoint_body::hotlap_err;
 use crate::runtime::pipeline;
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::{Source, SourceStream};
+use hotlap_connectors::source::{Source, SourceState, SourceStream};
 
 /// The last valid checkpoint, if the store holds one.
 pub struct Recovery;
@@ -59,8 +59,24 @@ impl Recovery {
     ) -> Result<SourceStream, ConnectorError> {
         restore(hotlap, &checkpoint.engine)?;
         let splits = source.resume(&checkpoint.sources)?;
+        seed_applied(source, &checkpoint.sources)?;
         pipeline::merged_stream_from(source, &splits)
     }
+}
+
+/// Seeds the source's applied position with the captured offsets.
+///
+/// `Source::resume` reopens the splits at the captured offsets, but a custom
+/// source may not record them as applied. Without this seed a checkpoint taken
+/// before the first post-recovery commit captures a stale position, and a later
+/// crash replays the log over the restored snapshot (double-apply). `commit`
+/// only advances the position, so seeding an offset the source already recorded
+/// is a no-op.
+fn seed_applied(source: &dyn Source, state: &SourceState) -> Result<(), ConnectorError> {
+    for (&split, &offset) in &state.offsets {
+        source.commit(split, offset)?;
+    }
+    Ok(())
 }
 
 /// Restore the engine snapshot through the public facade.

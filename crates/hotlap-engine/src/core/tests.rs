@@ -174,6 +174,19 @@ fn failed_push_poisons_snapshot_push_and_take_changes() {
         core.build_view(ViewId(2), &Plan::Source(InputId(0)))
             .is_err()
     );
+    // Counter reads must not serve a partial count either.
+    assert!(core.late_dropped(InputId(0)).is_err());
+    assert!(core.window_late_closed(ViewId(0)).is_err());
+}
+
+/// `late_dropped` rejects an input the engine never registered.
+#[test]
+fn late_dropped_rejects_an_unknown_input() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+
+    assert_eq!(core.late_dropped(InputId(0)).unwrap(), 0);
+    assert!(core.late_dropped(InputId(7)).is_err());
 }
 
 /// The multi-view path without a failure is unchanged (differential).

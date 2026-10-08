@@ -85,6 +85,27 @@ fn recovery_does_not_lose_or_duplicate_at_the_boundary() {
 }
 
 #[test]
+fn resume_seeds_the_captured_offsets_into_the_source() {
+    let backend = SharedBackend::default();
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
+    let mut stream = pipeline::merged_stream(pipe.source.as_ref()).unwrap();
+    drain(&mut engine, pipe.source.as_ref(), &mut stream, 3);
+    take(&mut checkpointer, &engine, pipe.source.as_ref());
+    let loaded = Recovery::load(&checkpointer).unwrap().unwrap();
+
+    // A freshly built source has no applied position until recovery seeds it.
+    let (mut target, pipe) = engine_with(ResumableSource::new(log()));
+    assert!(pipe.source.state().offsets.is_empty());
+
+    let _ = Recovery::resume(&mut target, pipe.source.as_ref(), &loaded).unwrap();
+
+    // Otherwise a checkpoint taken before the next commit captures nothing and
+    // a second crash replays the log over the restored snapshot.
+    assert_eq!(pipe.source.state().offsets.get(&0).copied(), Some(3));
+}
+
+#[test]
 fn missing_checkpoint_is_a_clean_start() {
     let backend = SharedBackend::default();
     let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
