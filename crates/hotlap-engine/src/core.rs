@@ -5,6 +5,7 @@ mod graph;
 pub mod ipc;
 mod output;
 mod restore;
+mod retention;
 #[cfg(test)]
 mod tests;
 mod time;
@@ -15,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use arrow::array::BooleanArray;
 use arrow::datatypes::SchemaRef;
 
+use hotlap_core::plan::has_window;
 use hotlap_core::{CoreError, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
 
 use crate::error::EngineError;
@@ -23,6 +25,7 @@ use crate::zset::int64_diffs;
 
 use graph::ViewGraph;
 use output::ViewOutput;
+use retention::InputRetention;
 
 /// A view's persistent graph plus its incremental output and pending changes.
 pub(super) struct ViewState {
@@ -31,15 +34,26 @@ pub(super) struct ViewState {
     pub(super) windowed: bool,
     pub(super) tapped: bool,
     pub(in crate::core) output: ViewOutput,
-    /// Buffered changelog for a tapped view.
-    ///
-    /// Only tapped views fill this: every propagated output delta is appended
-    /// (via [`graph::accumulate`]) and it grows unbounded until [`take_changes`]
-    /// drains it by taking the batch. An untapped view always leaves it `None`,
-    /// so it never grows with history.
+    /// Buffered changelog for a tapped view: every propagated output delta is
+    /// appended (via [`graph::accumulate`]) until [`take_changes`] drains it.
+    /// An untapped view leaves it `None`, so it never grows with history.
     ///
     /// [`take_changes`]: crate::IncrementalCore::take_changes
     pub(super) pending: Option<ZSetBatch>,
+}
+
+impl ViewState {
+    /// Builds a view's state from its graph, plan and initial output.
+    pub(in crate::core) fn new(graph: ViewGraph, plan: Plan, output: ViewOutput) -> Self {
+        Self {
+            windowed: has_window(&plan),
+            graph,
+            plan,
+            tapped: false,
+            output,
+            pending: None,
+        }
+    }
 }
 
 /// Differential-dataflow-free engine kernel.
@@ -59,6 +73,8 @@ pub struct EngineCore {
     pub(super) frozen: bool,
     /// Logical epoch: the number of deltas pushed so far.
     pub(super) epoch: u64,
+    /// Applied input deltas kept for building views after `START`.
+    pub(super) retention: InputRetention,
 }
 
 impl EngineCore {
@@ -73,6 +89,7 @@ impl EngineCore {
             late: HashMap::new(),
             frozen: false,
             epoch: 0,
+            retention: InputRetention::disabled(),
         }
     }
 

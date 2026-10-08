@@ -129,6 +129,7 @@ pub fn pipeline(backend: SharedBackend, interval: Duration, retain: usize) -> Pi
             backend: Box::new(backend),
             retain,
         }),
+        retention: None,
     }
 }
 

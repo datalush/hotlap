@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 
 use hotlap::Hotlap;
-use hotlap::ZSetBatch;
+use hotlap::{Plan, ZSetBatch};
 use tokio::sync::oneshot;
 
 use crate::error::ConnectorError;
@@ -23,6 +23,11 @@ pub enum Command {
     },
     Checkpoint {
         reply: oneshot::Sender<Result<u64, ConnectorError>>,
+    },
+    BuildView {
+        view: String,
+        plan: Plan,
+        reply: oneshot::Sender<Result<(), ConnectorError>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -47,6 +52,10 @@ pub(crate) async fn handle(
         }
         Some(Command::Checkpoint { reply }) => {
             let _ = reply.send(take(checkpointer, hotlap, pipeline.source.as_ref()).await);
+            false
+        }
+        Some(Command::BuildView { view, plan, reply }) => {
+            let _ = reply.send(hotlap.create_view(&view, plan).map_err(map_err));
             false
         }
         Some(Command::Shutdown { reply }) => {

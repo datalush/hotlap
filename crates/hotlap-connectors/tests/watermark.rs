@@ -49,6 +49,7 @@ async fn watermark_uses_the_source_event_time_column() {
         views: vec![],
         sinks: vec![],
         checkpoint: None,
+        retention: None,
     };
     let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
@@ -66,6 +67,7 @@ async fn watermark_without_source_event_time_errors() {
         views: vec![],
         sinks: vec![],
         checkpoint: None,
+        retention: None,
     };
     let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
     let error = pipeline::setup(&mut hotlap, &pipeline).unwrap_err();

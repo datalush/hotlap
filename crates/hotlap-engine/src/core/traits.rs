@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 
-use hotlap_core::plan::has_window;
 use hotlap_core::{
     CoreError, EngineSnapshot, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch,
 };
@@ -28,31 +27,33 @@ impl IncrementalCore for EngineCore {
     }
 
     fn build_view(&mut self, view: ViewId, plan: &Plan) -> Result<(), CoreError> {
-        if self.frozen {
-            return Err(CoreError::Unsupported("engine already running".into()));
-        }
         if self.views.contains_key(&view) {
             return Err(CoreError::Unsupported(format!(
                 "view {view:?} already built"
             )));
         }
-        let graph = ViewGraph::build(plan);
+        let mut graph = ViewGraph::build(plan);
         for src in graph.sources() {
             if !self.registered.contains(src) {
                 return Err(CoreError::Unsupported(format!("unknown input {src:?}")));
             }
         }
-        self.views.insert(
-            view,
-            ViewState {
-                graph,
-                plan: plan.clone(),
-                windowed: has_window(plan),
-                tapped: false,
-                output: ViewOutput::default(),
-                pending: None,
-            },
-        );
+        let output = self.replay_or_empty(&mut graph)?;
+        self.views
+            .insert(view, ViewState::new(graph, plan.clone(), output));
+        Ok(())
+    }
+
+    fn set_input_retention(&mut self, events: usize) -> Result<(), CoreError> {
+        if self.frozen {
+            return Err(CoreError::Unsupported("engine already running".into()));
+        }
+        if events == 0 {
+            return Err(CoreError::Unsupported(
+                "input retention must keep at least one delta".into(),
+            ));
+        }
+        self.retention = super::retention::InputRetention::new(events);
         Ok(())
     }
 
@@ -84,6 +85,8 @@ impl IncrementalCore for EngineCore {
         }
         self.schemas.insert(input, batch.schema());
         let kept = self.filter_late(input, batch).map_err(CoreError::from)?;
+        let watermark = self.watermarks.get(&input).copied().unwrap_or(0);
+        self.retention.record(input, &kept, watermark);
         let targets: Vec<ViewId> = self
             .views
             .iter()
@@ -149,8 +152,20 @@ impl IncrementalCore for EngineCore {
     }
 }
 
-/// Engine-specific metrics that stay off the [`IncrementalCore`] contract.
+/// Engine-specific helpers that stay off the [`IncrementalCore`] contract.
 impl EngineCore {
+    /// Initial output of a freshly built view: replayed from retained inputs
+    /// when the engine is already running, empty otherwise.
+    fn replay_or_empty(&self, graph: &mut ViewGraph) -> Result<ViewOutput, CoreError> {
+        if !self.frozen {
+            return Ok(ViewOutput::default());
+        }
+        let sources = graph.sources().to_vec();
+        self.retention
+            .replay(graph, &self.schemas, &sources)
+            .map_err(CoreError::from)
+    }
+
     /// Deltas dropped by `view`'s window operators because their window had
     /// already closed when the delta arrived (append-only output cannot retract
     /// an emitted window).

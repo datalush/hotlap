@@ -68,7 +68,18 @@ impl Hotlap {
             .map_err(|e| HotlapError(format!("{e}")))
     }
 
+    /// Retain the last `events` input deltas so a view can be created after the
+    /// first push. Only before the first push; off by default.
+    pub fn set_input_retention(&mut self, events: usize) -> Result<(), HotlapError> {
+        self.core
+            .set_input_retention(events)
+            .map_err(|error| HotlapError(format!("{error}")))
+    }
+
     /// Compile `plan` into a new view registered under `name`.
+    ///
+    /// After the first push this succeeds only when input retention covers the
+    /// whole run; see [`IncrementalCore::build_view`].
     pub fn create_view(&mut self, name: &str, plan: Plan) -> Result<(), HotlapError> {
         // Reject duplicate names up front: overwriting the mapping would orphan
         // the previously-built view (still alive in the core, unreachable here).

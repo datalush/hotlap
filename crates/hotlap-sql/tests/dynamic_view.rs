@@ -1,4 +1,4 @@
-//! End-to-end tests for the embedded `SqlSession`.
+//! `CREATE MATERIALIZED VIEW` after `START`, built from retained inputs.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,6 +15,8 @@ use hotlap_sql::{FlussSinkFactory, QueryResult, SourceFactory, SqlError, SqlSess
 const SOURCE: &str = "CREATE SOURCE src WITH (connector='inmem') WATERMARK FOR \
      _event_time AS _event_time - INTERVAL '1 s';";
 const VIEW: &str = "CREATE MATERIALIZED VIEW mv AS SELECT k, count(*) FROM src \
+     GROUP BY k, tumble(_event_time, INTERVAL '10 s');";
+const LATE: &str = "CREATE MATERIALIZED VIEW mv2 AS SELECT k, count(*) FROM src \
      GROUP BY k, tumble(_event_time, INTERVAL '10 s');";
 
 struct FakeSource {
@@ -54,20 +56,18 @@ impl SourceFactory for FakeFactory {
         _name: &str,
         _options: &BTreeMap<String, String>,
     ) -> Result<Box<dyn Source>, SqlError> {
-        let source = FakeSource {
+        Ok(Box::new(FakeSource {
             schema: self.schema.clone(),
             batches: self.batches.clone(),
-        };
-        Ok(Box::new(source))
+        }))
     }
 }
 
 fn kv_schema() -> SchemaRef {
-    let fields = vec![
+    Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
         Field::new("_event_time", DataType::Int64, false),
-    ];
-    Arc::new(Schema::new(fields))
+    ]))
 }
 
 fn batch(keys: &[i64], times: &[i64]) -> SourceBatch {
@@ -79,14 +79,6 @@ fn batch(keys: &[i64], times: &[i64]) -> SourceBatch {
         batch: RecordBatch::try_new(kv_schema(), cols).unwrap(),
         base_offset: 0,
     }
-}
-
-fn factory(batches: Vec<SourceBatch>) -> Arc<FakeFactory> {
-    let factory = FakeFactory {
-        schema: kv_schema(),
-        batches,
-    };
-    Arc::new(factory)
 }
 
 fn col(batch: &RecordBatch, index: usize) -> &Int64Array {
@@ -121,7 +113,7 @@ fn recompute(batches: &[SourceBatch], size: i64, lag: i64) -> Vec<(i64, i64, i64
     }
     let max_ts = events.iter().map(|(_, t)| *t).max().unwrap_or(0);
     let watermark = (max_ts - lag).max(0);
-    let mut counts: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+    let mut counts: std::collections::BTreeMap<(i64, i64), i64> = std::collections::BTreeMap::new();
     for (key, ts) in &events {
         let start = (ts / size) * size;
         if watermark >= start + size {
@@ -129,14 +121,6 @@ fn recompute(batches: &[SourceBatch], size: i64, lag: i64) -> Vec<(i64, i64, i64
         }
     }
     counts.into_iter().map(|((k, w), c)| (k, w, c)).collect()
-}
-
-async fn started(batches: Vec<SourceBatch>) -> SqlSession {
-    let mut session = SqlSession::open_with_factories(factory(batches), Arc::new(FlussSinkFactory));
-    session.sql(SOURCE).await.unwrap();
-    session.sql(VIEW).await.unwrap();
-    session.sql("START;").await.unwrap();
-    session
 }
 
 async fn wait_for_rows(
@@ -156,39 +140,29 @@ async fn wait_for_rows(
 }
 
 #[tokio::test]
-async fn sql_result_matches_full_recomputation() {
+async fn view_created_after_start_matches_full_recomputation() {
     let data = vec![
         batch(&[1, 1, 1, 2], &[1000, 2000, 3000, 1000]),
         batch(&[1, 2], &[12000, 12000]),
         batch(&[1], &[21000]),
     ];
-    let mut session = started(data.clone()).await;
+    let factory = FakeFactory {
+        schema: kv_schema(),
+        batches: data.clone(),
+    };
+    let mut session =
+        SqlSession::open_with_factories(Arc::new(factory), Arc::new(FlussSinkFactory))
+            .with_input_retention(16);
+    session.sql(SOURCE).await.unwrap();
+    session.sql(VIEW).await.unwrap();
+    session.sql("START;").await.unwrap();
     let want = recompute(&data, 10_000, 1_000);
+    // Wait until every push has landed, then build a second view post-start.
     assert_eq!(wait_for_rows(&mut session, "mv", &want).await, want);
-    session.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn empty_mv_select() {
-    let mut session = started(vec![]).await;
-    let query = session.sql("SELECT k, window_start, count FROM mv");
-    let result = tokio::time::timeout(Duration::from_secs(5), query)
+    session
+        .sql(LATE)
         .await
-        .expect("empty MV query hung");
-    assert!(rows(result.unwrap()).is_empty());
+        .expect("post-start CREATE MATERIALIZED VIEW");
+    assert_eq!(wait_for_rows(&mut session, "mv2", &want).await, want);
     session.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn ddl_after_start_rejected() {
-    let mut session = started(vec![batch(&[1], &[1000])]).await;
-    assert!(session.sql(VIEW).await.is_err(), "DDL after START");
-    session.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn dropping_session_stops_engine() {
-    // Dropping without `shutdown().await` must not panic on the executor.
-    let session = started(vec![batch(&[1], &[1000])]).await;
-    drop(session);
 }

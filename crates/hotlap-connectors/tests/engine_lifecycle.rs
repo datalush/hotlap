@@ -44,6 +44,7 @@ fn start_snapshot_shutdown() {
         views: vec![],
         sinks: vec![],
         checkpoint: None,
+        retention: None,
     })
     .unwrap();
     // No view registered: snapshot of an unknown view errors, but the handle must respond.
@@ -129,6 +130,7 @@ fn snapshot_handle_reads_a_built_view() {
         )],
         sinks: vec![],
         checkpoint: None,
+        retention: None,
     })
     .unwrap();
     let snap = handle.snapshot_handle();
@@ -167,6 +169,7 @@ fn source_error_is_surfaced() {
         views: vec![],
         sinks: vec![],
         checkpoint: None,
+        retention: None,
     })
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -199,6 +202,7 @@ fn start_reports_setup_failure() {
         )],
         sinks: vec![],
         checkpoint: None,
+        retention: None,
     });
     assert!(result.is_err());
 }

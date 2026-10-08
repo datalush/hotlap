@@ -15,7 +15,8 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use hotlap::{Plan, ZSetBatch};
-use hotlap_connectors::runtime::handle::{EngineHandle, SnapshotHandle};
+use hotlap_connectors::runtime::SnapshotHandle;
+use hotlap_connectors::runtime::handle::EngineHandle;
 use hotlap_connectors::runtime::pipeline::Watermark;
 use hotlap_connectors::source::Source;
 
@@ -85,6 +86,9 @@ pub struct SqlSession {
     sinks: Vec<SinkDef>,
     engine: Option<EngineHandle>,
     started: bool,
+    /// Input deltas to retain for views created after `START`; `None` disables
+    /// retention, so those views are rejected.
+    retention: Option<usize>,
 }
 
 impl SqlSession {
@@ -115,7 +119,15 @@ impl SqlSession {
             sinks: Vec::new(),
             engine: None,
             started: false,
+            retention: None,
         }
+    }
+
+    /// Retain the last `events` input deltas so a materialized view can be
+    /// created after `START`. Must be set before `START`; off by default.
+    pub fn with_input_retention(mut self, events: usize) -> Self {
+        self.retention = Some(events);
+        self
     }
 
     /// Execute one statement: DDL, `START`, or an ad-hoc query.

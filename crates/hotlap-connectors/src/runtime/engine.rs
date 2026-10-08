@@ -81,6 +81,11 @@ async fn drive(
 /// Open the kernel, merge the source streams and read the checkpoint config.
 fn prepare(pipeline: &mut Pipeline) -> Result<Engine, ConnectorError> {
     let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
+    if let Some(events) = pipeline.retention {
+        hotlap
+            .set_input_retention(events)
+            .map_err(|error| ConnectorError::Unsupported(error.0))?;
+    }
     pipeline::setup(&mut hotlap, pipeline)?;
     let sinks = SinkPump::start(&pipeline.sinks);
     let coordinated = sinks.coordinated();

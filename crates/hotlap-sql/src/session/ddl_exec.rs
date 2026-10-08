@@ -45,7 +45,6 @@ impl SqlSession {
     }
 
     pub(super) async fn create_view(&mut self, cv: CreateView) -> Result<QueryResult, SqlError> {
-        self.reject_after_start("CREATE MATERIALIZED VIEW")?;
         let source_schema = self
             .source
             .as_ref()
@@ -58,15 +57,22 @@ impl SqlSession {
         // Reject unrepresentable output types here so the view fails at DDL
         // time rather than later, when a `SELECT` reads the consolidated rows.
         crate::convert::ensure_kernel_types(&schema)?;
-        // Register after validation; a rejected view must not poison its name.
-        self.catalog.add_view(
-            &cv.name,
-            MvDef {
-                query: cv.query.clone(),
-            },
-        )?;
-        self.mv_schemas.insert(cv.name.clone(), schema);
-        self.views.push((cv.name, plan));
+        if self.started {
+            // Post-start: the engine replays retained inputs, or rejects when
+            // retention does not cover the run.
+            self.build_view_late(&cv.name, plan, schema, cv.query)
+                .await?;
+        } else {
+            // Register after validation; a rejected view must not poison its name.
+            self.catalog.add_view(
+                &cv.name,
+                MvDef {
+                    query: cv.query.clone(),
+                },
+            )?;
+            self.mv_schemas.insert(cv.name.clone(), schema);
+            self.views.push((cv.name, plan));
+        }
         Ok(QueryResult::Ack("CREATE MATERIALIZED VIEW".into()))
     }
 

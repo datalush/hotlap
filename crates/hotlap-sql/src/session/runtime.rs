@@ -2,12 +2,15 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
+use hotlap::Plan;
 use hotlap_connectors::runtime::handle::EngineHandle;
 use hotlap_connectors::runtime::pipeline::{Pipeline, SinkSpec};
 
 use super::{
     MvTableProvider, QueryResult, SharedSource, Snapshotter, SqlError, SqlSession, to_engine,
 };
+use crate::catalog::MvDef;
 
 impl SqlSession {
     /// Start the engine with the declared source and views.
@@ -58,6 +61,7 @@ impl SqlSession {
             views: self.views.clone(),
             sinks,
             checkpoint: None,
+            retention: self.retention,
         })
     }
 
@@ -80,6 +84,47 @@ impl SqlSession {
             });
         }
         Ok(sinks)
+    }
+
+    /// Build a view on the running engine and expose it as an MV table.
+    ///
+    /// The engine replays retained inputs (or rejects when retention does not
+    /// cover the run), then the view is registered so `SELECT` can read it.
+    pub(super) async fn build_view_late(
+        &mut self,
+        name: &str,
+        plan: Plan,
+        schema: SchemaRef,
+        query: String,
+    ) -> Result<(), SqlError> {
+        if self.catalog.view(name).is_some() {
+            return Err(SqlError::Catalog(format!("view already exists: {name}")));
+        }
+        // Gate on the session's own config: the engine's frozen flag is a race
+        // with source ingestion, so it cannot decide this deterministically.
+        if self.retention.is_none() {
+            return Err(SqlError::Unsupported(
+                "CREATE MATERIALIZED VIEW after START requires input retention".into(),
+            ));
+        }
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| SqlError::Unsupported("CREATE MATERIALIZED VIEW after START".into()))?;
+        let handle = engine.snapshot_handle();
+        let view = name.to_string();
+        tokio::task::spawn_blocking(move || handle.build_view(&view, plan))
+            .await
+            .map_err(to_engine)?
+            .map_err(to_engine)?;
+        let snapshotter: Arc<dyn Snapshotter> = Arc::new(engine.snapshot_handle());
+        let provider = MvTableProvider::new(name.to_string(), schema.clone(), snapshotter);
+        self.ctx
+            .register_table(name, Arc::new(provider))
+            .map_err(to_engine)?;
+        self.catalog.add_view(name, MvDef { query })?;
+        self.mv_schemas.insert(name.to_string(), schema);
+        Ok(())
     }
 
     fn register_mv_providers(&self, engine: &EngineHandle) -> Result<(), SqlError> {

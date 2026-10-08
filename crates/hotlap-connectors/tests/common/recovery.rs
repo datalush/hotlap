@@ -150,6 +150,7 @@ pub fn pipeline(source: ResumableSource, checkpoint: Option<CheckpointConfig>) -
         )],
         sinks: vec![],
         checkpoint,
+        retention: None,
     }
 }
 

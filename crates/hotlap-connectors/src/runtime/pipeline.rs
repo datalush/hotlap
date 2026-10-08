@@ -33,6 +33,9 @@ pub struct Pipeline {
     pub sinks: Vec<SinkSpec>,
     /// Periodic checkpoint settings; `None` disables checkpointing.
     pub checkpoint: Option<CheckpointConfig>,
+    /// Maximum input deltas retained for views created after `START`; `None`
+    /// disables retention, so post-start views are rejected.
+    pub retention: Option<usize>,
 }
 
 /// Register the input, optional watermark and views on `hotlap`.
