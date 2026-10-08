@@ -34,6 +34,23 @@ pub trait Sink: Send + Sync {
     fn capabilities(&self) -> SinkCapabilities {
         SinkCapabilities::AtLeastOnce
     }
+    /// Whether [`Sink::commit`] may be safely re-driven after a restart.
+    ///
+    /// Recovery finds a checkpoint whose body is complete but whose `valid`
+    /// marker never landed (the process stopped mid-commit). When every sink
+    /// declares its commit re-drivable, recovery re-drives `commit` and
+    /// publishes the checkpoint without replay. Running `commit` twice must
+    /// therefore not duplicate output: [`SinkCapabilities::Transactional`] and
+    /// [`SinkCapabilities::Idempotent`] sinks qualify by default, while an
+    /// [`SinkCapabilities::AtLeastOnce`] sink may already have exposed its
+    /// writes and must be discarded and replayed instead.
+    ///
+    /// Override this when a capability understates or overstates the guarantee,
+    /// e.g. an idempotent-looking sink whose external side effects cannot
+    /// actually be repeated.
+    fn commit_redriable(&self) -> bool {
+        !matches!(self.capabilities(), SinkCapabilities::AtLeastOnce)
+    }
     /// First phase of two-phase commit.
     ///
     /// Called before the checkpoint body is written and before the engine
@@ -44,7 +61,46 @@ pub trait Sink: Send + Sync {
         Ok(())
     }
     /// Commit the data written since the last commit.
+    ///
+    /// Must tolerate running more than once: recovery re-drives it after an
+    /// interrupted commit when [`Sink::commit_redriable`] holds.
     async fn commit(&self) -> Result<(), ConnectorError>;
     /// Drop uncommitted data written since the last commit.
     async fn abort(&self) -> Result<(), ConnectorError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fake {
+        capabilities: SinkCapabilities,
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for Fake {
+        async fn write(&self, _changes: ChangeStream) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        fn capabilities(&self) -> SinkCapabilities {
+            self.capabilities
+        }
+
+        async fn commit(&self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn abort(&self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_redrivability_follows_the_delivery_capability() {
+        let sink = |capabilities| Fake { capabilities };
+        assert!(sink(SinkCapabilities::Transactional).commit_redriable());
+        assert!(sink(SinkCapabilities::Idempotent).commit_redriable());
+        assert!(!sink(SinkCapabilities::AtLeastOnce).commit_redriable());
+    }
 }

@@ -31,8 +31,8 @@ pub enum RecoveryDecision {
     Clean,
     /// Resume from this already valid checkpoint.
     Resume(Checkpoint),
-    /// Re-drive the interrupted commit for `Checkpoint` (all sinks are
-    /// re-drivable), publish it and resume from it without replay.
+    /// Re-drive the interrupted commit for `Checkpoint` (every sink declares its
+    /// commit re-drivable), publish it and resume from it without replay.
     Promote(Checkpoint),
     /// The interrupted checkpoint cannot be re-driven: discard `pending` and
     /// replay from `fallback` (the newest valid checkpoint, if any).
@@ -50,8 +50,9 @@ impl Recovery {
     ///
     /// Without a commit marker this is exactly [`Self::load`]: the newest valid
     /// checkpoint, or a clean start. With a marker and a complete body, an
-    /// interrupted commit is either promoted (every sink can re-drive `commit`)
-    /// or explicitly discarded and replayed from the previous valid checkpoint.
+    /// interrupted commit is either promoted (every sink declares its commit
+    /// re-drivable) or explicitly discarded and replayed from the previous valid
+    /// checkpoint.
     pub fn inspect(checkpointer: &Checkpointer) -> Result<RecoveryDecision, ConnectorError> {
         let fallback = Self::load(checkpointer)?;
         if let Some(pending) = pending_commit(checkpointer, fallback.as_ref().map(|c| c.id))? {

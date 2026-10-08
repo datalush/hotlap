@@ -62,14 +62,15 @@ impl SinkBarrier {
         }
     }
 
-    /// Whether every coordinated sink can re-drive `commit` after a restart.
+    /// Whether every coordinated sink declares its `commit` re-drivable.
     ///
-    /// `Transactional` and `Idempotent` sinks qualify; an `AtLeastOnce` sink
-    /// cannot, so an interrupted commit over one must be discarded and replayed.
+    /// The barrier trusts each sink's
+    /// [`commit_redriable`](hotlap_connectors::sink::Sink::commit_redriable)
+    /// declaration: `Transactional` and `Idempotent` sinks qualify by default,
+    /// but a sink may opt out when its effects are not actually repeatable, and
+    /// an `AtLeastOnce` sink must be discarded and replayed.
     pub fn redriable(&self) -> bool {
-        self.sinks
-            .iter()
-            .all(|sync| sync.sink().capabilities() != SinkCapabilities::AtLeastOnce)
+        self.sinks.iter().all(|sync| sync.sink().commit_redriable())
     }
 
     /// Re-drive `commit` for every sink after an interrupted commit.

@@ -47,6 +47,11 @@ impl SharedSink {
         self.inner.capabilities()
     }
 
+    /// Whether the wrapped sink declares its `commit` re-drivable.
+    pub fn commit_redriable(&self) -> bool {
+        self.inner.commit_redriable()
+    }
+
     /// Write one batch, serialized against the barrier's control calls.
     pub async fn write_batch(&self, batch: ZSetBatch) -> Result<(), ConnectorError> {
         let _guard = self.lock.lock().await;
