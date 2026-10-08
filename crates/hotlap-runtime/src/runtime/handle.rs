@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use hotlap::ZSetBatch;
+use hotlap_engine::MetricsRegistry;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::runtime::command::Command;
@@ -20,6 +21,7 @@ pub struct EngineHandle {
     last_error: Arc<Mutex<Option<String>>>,
     checkpoint_error: Arc<Mutex<Option<String>>>,
     built: Arc<AtomicBool>,
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl EngineHandle {
@@ -35,6 +37,8 @@ impl EngineHandle {
         let engine_checkpoint_error = Arc::clone(&checkpoint_error);
         let built = Arc::new(AtomicBool::new(false));
         let engine_built = Arc::clone(&built);
+        let metrics = Arc::new(MetricsRegistry::new());
+        let engine_metrics = Arc::clone(&metrics);
         let (ready_tx, ready_rx) = oneshot::channel();
         let join = std::thread::spawn(move || {
             engine::run(
@@ -43,6 +47,7 @@ impl EngineHandle {
                 engine_error,
                 engine_checkpoint_error,
                 engine_built,
+                engine_metrics,
                 ready_tx,
             )
         });
@@ -63,7 +68,13 @@ impl EngineHandle {
             last_error,
             checkpoint_error,
             built,
+            metrics,
         })
+    }
+
+    /// The registry shared with the engine core and sink tasks.
+    pub fn metrics(&self) -> Arc<MetricsRegistry> {
+        Arc::clone(&self.metrics)
     }
 
     /// First source/ingestion error that stopped the source branch, if any.

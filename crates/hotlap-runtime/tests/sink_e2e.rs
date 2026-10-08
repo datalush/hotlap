@@ -243,3 +243,17 @@ fn commit_runs_after_the_stream_ends() {
     assert!(sink.committed(), "commit must run once the stream ends");
     assert!(!sink.aborted(), "a healthy run must not abort");
 }
+
+#[test]
+fn metrics_count_sink_commits() {
+    let batches = vec![batch(&[1, 1], &[10, 10]), batch(&[999], &[99])];
+    let (handle, sink) = start(batches, FakeSink::new(None));
+    wait_converged(&handle, &sink);
+
+    let metrics = handle.metrics();
+    handle.shutdown().unwrap();
+    assert!(
+        metrics.snapshot().get("sinks_committed").copied().unwrap_or(0) >= 1,
+        "a completed sink must be counted as committed"
+    );
+}

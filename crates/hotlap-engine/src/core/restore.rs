@@ -23,6 +23,7 @@ impl EngineCore {
             )));
         }
         let mut core = EngineCore::new();
+        core.metrics = std::sync::Arc::clone(&self.metrics);
         core.frozen = snapshot.frozen;
         core.epoch = snapshot.epoch;
         for input in &snapshot.inputs {
@@ -36,7 +37,11 @@ impl EngineCore {
         // take happens once decoding succeeded, keeping restore all-or-nothing.
         core.retention = std::mem::take(&mut self.retention);
         core.retention.invalidate();
+        // Restored windows carry their dropped-closed counts; seed the publish
+        // baseline so the first later push does not re-count them as new.
+        core.late_closed_seen = core.late_closed_total();
         *self = core;
+        self.metrics.inc("checkpoints_restored");
         Ok(())
     }
 

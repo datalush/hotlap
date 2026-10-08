@@ -52,6 +52,7 @@ impl EngineCore {
             let late = diffs.value(index) > 0 && ts < current;
             if late {
                 *self.late.entry(input).or_insert(0) += 1;
+                self.metrics.inc("late_dropped");
             }
             mask.push(!late);
         }

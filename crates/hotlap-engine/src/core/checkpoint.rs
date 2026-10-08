@@ -17,13 +17,15 @@ impl EngineCore {
     /// faithfully restore the corruption.
     pub fn checkpoint(&self) -> Result<EngineSnapshot, EngineError> {
         self.ensure_healthy()?;
-        Ok(EngineSnapshot {
+        let snapshot = EngineSnapshot {
             format_version: ENGINE_SNAPSHOT_FORMAT_VERSION,
             epoch: self.epoch,
             frozen: self.frozen,
             inputs: self.input_snapshots()?,
             views: self.view_snapshots()?,
-        })
+        };
+        self.metrics.inc("checkpoints_taken");
+        Ok(snapshot)
     }
 
     /// Snapshot of every registered input, ordered by id.

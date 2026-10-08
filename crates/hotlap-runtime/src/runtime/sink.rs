@@ -11,6 +11,7 @@ use crate::runtime::pipeline::SinkSpec;
 pub use crate::runtime::shared_sink::SharedSink;
 pub use crate::runtime::sink_sync::{ChangelogSender, SinkMessage, SinkSync};
 use hotlap_connectors::error::ConnectorError;
+use hotlap_engine::MetricsRegistry;
 
 /// Bound on how far a sink may lag the engine before backpressure bites.
 const CHANNEL_CAPACITY: usize = 64;
@@ -74,10 +75,20 @@ pub struct SinkPump {
 impl SinkPump {
     /// Spawn one sink task per spec; the views were tapped during setup.
     pub fn start(specs: &[SinkSpec]) -> Self {
+        Self::start_with_metrics(specs, None)
+    }
+
+    /// Like [`Self::start`], but counts successful commits into `metrics`.
+    pub fn start_with_metrics(specs: &[SinkSpec], metrics: Option<Arc<MetricsRegistry>>) -> Self {
         let entries = specs
             .iter()
             .map(|spec| {
-                let shared = SharedSink::new(Arc::clone(&spec.sink));
+                let shared = match &metrics {
+                    Some(metrics) => {
+                        SharedSink::with_metrics(Arc::clone(&spec.sink), Arc::clone(metrics))
+                    }
+                    None => SharedSink::new(Arc::clone(&spec.sink)),
+                };
                 let (tx, handle) = spawn_sink(Arc::clone(&shared), CHANNEL_CAPACITY);
                 SinkEntry {
                     view: spec.view.clone(),

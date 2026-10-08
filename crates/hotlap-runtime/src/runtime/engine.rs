@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 use hotlap::Hotlap;
-use hotlap_engine::EngineCore;
+use hotlap_engine::{EngineCore, MetricsRegistry};
 use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 use tokio::time::{Instant, Interval, interval_at};
 
@@ -27,6 +27,7 @@ pub(crate) fn run(
     last_error: Arc<Mutex<Option<String>>>,
     checkpoint_error: Arc<Mutex<Option<String>>>,
     built: Arc<AtomicBool>,
+    metrics: Arc<MetricsRegistry>,
     ready: oneshot::Sender<Result<(), ConnectorError>>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -45,6 +46,7 @@ pub(crate) fn run(
         &last_error,
         &checkpoint_error,
         &built,
+        metrics,
         ready,
     ));
 }
@@ -65,9 +67,10 @@ async fn drive(
     last_error: &Mutex<Option<String>>,
     checkpoint_error: &Mutex<Option<String>>,
     built: &AtomicBool,
+    metrics: Arc<MetricsRegistry>,
     ready: oneshot::Sender<Result<(), ConnectorError>>,
 ) {
-    let engine = match prepare(&mut pipeline) {
+    let engine = match prepare(&mut pipeline, metrics) {
         Ok(engine) => engine,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -79,15 +82,19 @@ async fn drive(
 }
 
 /// Open the kernel, merge the source streams and read the checkpoint config.
-fn prepare(pipeline: &mut Pipeline) -> Result<Engine, ConnectorError> {
-    let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
+fn prepare(
+    pipeline: &mut Pipeline,
+    metrics: Arc<MetricsRegistry>,
+) -> Result<Engine, ConnectorError> {
+    let core = EngineCore::with_metrics(Arc::clone(&metrics));
+    let mut hotlap = Hotlap::open_with(Box::new(core));
     if let Some(events) = pipeline.retention {
         hotlap
             .set_input_retention(events)
             .map_err(|error| ConnectorError::Unsupported(error.0))?;
     }
     pipeline::setup(&mut hotlap, pipeline)?;
-    let sinks = SinkPump::start(&pipeline.sinks);
+    let sinks = SinkPump::start_with_metrics(&pipeline.sinks, Some(metrics));
     let coordinated = sinks.coordinated();
     let (source, checkpointer, ticker) = match pipeline.checkpoint.take() {
         Some(config) => {

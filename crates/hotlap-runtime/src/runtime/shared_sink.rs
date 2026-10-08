@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::{Sink, SinkCapabilities};
+use hotlap_engine::MetricsRegistry;
 
 /// A sink shared by its write task and the checkpoint barrier.
 ///
@@ -18,14 +19,26 @@ use hotlap_connectors::sink::{Sink, SinkCapabilities};
 pub struct SharedSink {
     inner: Arc<dyn Sink>,
     lock: Mutex<()>,
+    /// Shared counter registry; `None` for a sink built outside the runtime.
+    metrics: Option<Arc<MetricsRegistry>>,
 }
 
 impl SharedSink {
     /// Wrap `inner` so writes and barrier control calls are serialized.
     pub fn new(inner: Arc<dyn Sink>) -> Arc<Self> {
+        Self::build(inner, None)
+    }
+
+    /// Like [`Self::new`], but reports successful commits into `metrics`.
+    pub fn with_metrics(inner: Arc<dyn Sink>, metrics: Arc<MetricsRegistry>) -> Arc<Self> {
+        Self::build(inner, Some(metrics))
+    }
+
+    fn build(inner: Arc<dyn Sink>, metrics: Option<Arc<MetricsRegistry>>) -> Arc<Self> {
         Arc::new(Self {
             inner,
             lock: Mutex::new(()),
+            metrics,
         })
     }
 
@@ -50,7 +63,11 @@ impl SharedSink {
     /// Commit, serialized against writes.
     pub async fn commit(&self) -> Result<(), ConnectorError> {
         let _guard = self.lock.lock().await;
-        self.inner.commit().await
+        self.inner.commit().await?;
+        if let Some(metrics) = &self.metrics {
+            metrics.inc("sinks_committed");
+        }
+        Ok(())
     }
 
     /// Abort, serialized against writes.

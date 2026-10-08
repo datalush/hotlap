@@ -42,3 +42,23 @@ fn on_demand_checkpoint_is_coherent_and_readable() {
 
     handle.shutdown().unwrap();
 }
+
+#[test]
+fn handle_metrics_share_engine_counters() {
+    let backend = SharedBackend::default();
+    let handle = EngineHandle::start(pipeline(
+        backend.clone(),
+        Duration::from_secs(3600),
+        DEFAULT_RETAIN,
+    ))
+    .unwrap();
+    assert!(wait_rows(&handle, &[vec![1, 2], vec![2, 2]]));
+
+    let _ = handle.checkpoint().unwrap();
+
+    let counts = handle.metrics().snapshot();
+    assert_eq!(counts.get("rows_ingested"), Some(&4));
+    assert!(counts.get("checkpoints_taken").copied().unwrap_or(0) >= 1);
+
+    handle.shutdown().unwrap();
+}

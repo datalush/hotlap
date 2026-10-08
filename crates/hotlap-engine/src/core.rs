@@ -2,7 +2,9 @@
 
 mod checkpoint;
 mod graph;
+mod helpers;
 pub mod ipc;
+mod metrics;
 mod output;
 mod restore;
 mod retention;
@@ -10,47 +12,20 @@ mod retention;
 mod tests;
 mod time;
 mod traits;
+mod view_state;
 mod watermark;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 
-use hotlap_core::plan::has_window;
-use hotlap_core::{CoreError, InputId, Plan, SplitId, ViewId, WatermarkSpec, ZSetBatch};
+use hotlap_core::{
+    CoreError, InputId, MetricsRegistry, SplitId, ViewId, WatermarkSpec, ZSetBatch,
+};
 
-use graph::ViewGraph;
-use output::ViewOutput;
 use retention::InputRetention;
-
-/// A view's persistent graph plus its incremental output and pending changes.
-pub(super) struct ViewState {
-    pub(super) graph: ViewGraph,
-    pub(super) plan: Plan,
-    pub(super) windowed: bool,
-    pub(super) tapped: bool,
-    pub(in crate::core) output: ViewOutput,
-    /// Buffered changelog for a tapped view: every propagated output delta is
-    /// appended (via [`graph::accumulate`]) until [`take_changes`] drains it.
-    /// An untapped view leaves it `None`, so it never grows with history.
-    ///
-    /// [`take_changes`]: crate::IncrementalCore::take_changes
-    pub(super) pending: Option<ZSetBatch>,
-}
-
-impl ViewState {
-    /// Builds a view's state from its graph, plan and initial output.
-    pub(in crate::core) fn new(graph: ViewGraph, plan: Plan, output: ViewOutput) -> Self {
-        Self {
-            windowed: has_window(&plan),
-            graph,
-            plan,
-            tapped: false,
-            output,
-            pending: None,
-        }
-    }
-}
+use view_state::ViewState;
 
 /// Differential-dataflow-free engine kernel.
 ///
@@ -91,6 +66,12 @@ pub struct EngineCore {
     /// earlier view's state was already mutated. A failed core is poisoned so
     /// partial state is never observable; the caller must recreate the engine.
     pub(super) failed: bool,
+    /// Shared counter registry; the runtime injects the same `Arc` so both see
+    /// one consistent snapshot.
+    pub(super) metrics: Arc<MetricsRegistry>,
+    /// Highest `late_closed_dropped` total already published to `metrics`, so a
+    /// push only adds the new window drops instead of the whole history.
+    pub(super) late_closed_seen: u64,
 }
 
 impl EngineCore {
@@ -108,6 +89,8 @@ impl EngineCore {
             epoch: 0,
             retention: InputRetention::disabled(),
             failed: false,
+            metrics: Arc::new(MetricsRegistry::new()),
+            late_closed_seen: 0,
         }
     }
 
@@ -170,6 +153,7 @@ impl EngineCore {
             .map_err(CoreError::from)?;
         if let Some(output) = output {
             view.output.update(&output).map_err(CoreError::from)?;
+            self.metrics.add("rows_emitted", output.len() as u64);
             if view.tapped {
                 view.pending =
                     graph::accumulate(view.pending.take(), &output).map_err(CoreError::from)?;
