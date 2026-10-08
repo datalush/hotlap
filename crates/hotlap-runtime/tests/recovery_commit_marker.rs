@@ -171,7 +171,9 @@ fn recovery_discards_a_non_redrivable_interrupted_commit() {
         .with_sinks(vec![SinkSync::sink_only(sink)]);
 
     match Recovery::inspect(&checkpointer).unwrap() {
-        RecoveryDecision::Discard { pending, fallback } => {
+        RecoveryDecision::Discard {
+            pending, fallback, ..
+        } => {
             assert_eq!(pending, 2);
             assert_eq!(fallback.expect("fallback").id, 1);
         }

@@ -106,7 +106,9 @@ fn a_sink_can_declare_commit_non_redrivable_despite_its_capability() {
         .with_sinks(vec![SinkSync::sink_only(sink)]);
 
     match Recovery::inspect(&checkpointer).unwrap() {
-        RecoveryDecision::Discard { pending, fallback } => {
+        RecoveryDecision::Discard {
+            pending, fallback, ..
+        } => {
             assert_eq!(pending, 2);
             assert_eq!(fallback.expect("fallback").id, 1);
         }
@@ -164,6 +166,10 @@ fn discarding_emits_a_warning_signal_and_metric() {
     assert!(
         warning.contains("discarded interrupted checkpoint 2"),
         "signal must name the discarded checkpoint: {warning}"
+    );
+    assert!(
+        warning.contains("not re-drivable"),
+        "signal must name the un-redrivable sink: {warning}"
     );
     assert_eq!(metrics.snapshot().get("checkpoints_discarded"), Some(&1));
 }

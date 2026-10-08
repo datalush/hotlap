@@ -45,6 +45,8 @@ pub enum RecoveryDecision {
         pending: u64,
         /// Newest valid checkpoint to replay from, if one exists.
         fallback: Option<Checkpoint>,
+        /// Why the commit cannot be re-driven, for the warning signal.
+        reason: &'static str,
     },
 }
 
@@ -62,13 +64,20 @@ impl Recovery {
         if let Some(pending) = pending_commit(checkpointer, fallback.as_ref().map(|c| c.id))? {
             // A pending body that fails to decode is not promotable: fall
             // through to Discard so the tolerant newest-first fallback wins.
-            let body = checkpointer.read_body(pending).ok().flatten();
-            if let Some(checkpoint) = body
-                && checkpointer.redriable()
-            {
-                return Ok(RecoveryDecision::Promote(checkpoint));
-            }
-            return Ok(RecoveryDecision::Discard { pending, fallback });
+            // The reason distinguishes an undecodable body from a body whose
+            // sinks simply cannot re-drive the commit.
+            let reason = match checkpointer.read_body(pending).ok().flatten() {
+                Some(checkpoint) if checkpointer.redriable() => {
+                    return Ok(RecoveryDecision::Promote(checkpoint));
+                }
+                Some(_) => "a sink is not re-drivable",
+                None => "the pending commit body is corrupt or incomplete",
+            };
+            return Ok(RecoveryDecision::Discard {
+                pending,
+                fallback,
+                reason,
+            });
         }
         match fallback {
             Some(checkpoint) => Ok(RecoveryDecision::Resume(checkpoint)),
@@ -114,14 +123,11 @@ impl Recovery {
                     }
                 }
             }
-            RecoveryDecision::Discard { pending, fallback } => match discard(
-                checkpointer,
-                metrics,
-                signal,
+            RecoveryDecision::Discard {
                 pending,
                 fallback,
-                "a sink is not re-drivable",
-            )? {
+                reason,
+            } => match discard(checkpointer, metrics, signal, pending, fallback, reason)? {
                 Some(checkpoint) => checkpoint,
                 None => return pipeline::merged_stream(source),
             },

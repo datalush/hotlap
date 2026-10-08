@@ -28,7 +28,9 @@ fn transactional_sink_is_not_redrivable_by_default() {
         ]);
 
     match Recovery::inspect(&checkpointer).unwrap() {
-        RecoveryDecision::Discard { pending, fallback } => {
+        RecoveryDecision::Discard {
+            pending, fallback, ..
+        } => {
             assert_eq!(pending, 2);
             assert_eq!(fallback.expect("fallback").id, 1);
         }
@@ -70,8 +72,8 @@ fn corrupt_pending_body_falls_back_to_a_valid_predecessor() {
     assert!(writer.get(b"checkpoint/2/engine").unwrap().is_none());
     let warning = signal.lock().unwrap().clone().expect("explicit signal");
     assert!(
-        warning.contains("checkpoint 1"),
-        "must name the fallback: {warning}"
+        warning.contains("checkpoint 1") && warning.contains("corrupt or incomplete"),
+        "must name the fallback and the corrupt body: {warning}"
     );
 }
 
@@ -88,7 +90,9 @@ fn a_commit_marker_over_an_incomplete_body_is_discarded() {
             SinkSync::sink_only(capability(SinkCapabilities::Idempotent)),
         ]);
     match Recovery::inspect(&checkpointer).unwrap() {
-        RecoveryDecision::Discard { pending, fallback } => {
+        RecoveryDecision::Discard {
+            pending, fallback, ..
+        } => {
             assert_eq!(pending, 2);
             assert_eq!(fallback.expect("fallback").id, 1);
         }
