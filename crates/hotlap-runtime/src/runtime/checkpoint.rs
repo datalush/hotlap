@@ -138,6 +138,21 @@ impl Checkpointer {
         Ok(())
     }
 
+    /// Drop stale commit markers left by a crash after [`Self::promote`] or
+    /// [`Self::take`] published `valid` but before the marker was cleared.
+    ///
+    /// A checkpoint with both `valid` and `commit` is already published, so the
+    /// marker is redundant; recovery sweeps it best-effort before deciding.
+    pub fn sweep_stale_commits(&mut self) -> Result<(), ConnectorError> {
+        for id in self.ids_descending()? {
+            let base = checkpoint_prefix(id);
+            if self.has_key(&format!("{base}/valid"))? && self.has_key(&format!("{base}/commit"))? {
+                let _ = clear_commit(self.backend.as_mut(), id);
+            }
+        }
+        Ok(())
+    }
+
     /// Whether every coordinated sink declares a re-drivable `commit`.
     pub(crate) fn redriable(&self) -> bool {
         self.sinks.redriable()

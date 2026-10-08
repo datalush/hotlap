@@ -56,7 +56,10 @@ impl Recovery {
     pub fn inspect(checkpointer: &Checkpointer) -> Result<RecoveryDecision, ConnectorError> {
         let fallback = Self::load(checkpointer)?;
         if let Some(pending) = pending_commit(checkpointer, fallback.as_ref().map(|c| c.id))? {
-            if let Some(checkpoint) = checkpointer.read_body(pending)?
+            // A pending body that fails to decode is not promotable: fall
+            // through to Discard so the tolerant newest-first fallback wins.
+            let body = checkpointer.read_body(pending).ok().flatten();
+            if let Some(checkpoint) = body
                 && checkpointer.redriable()
             {
                 return Ok(RecoveryDecision::Promote(checkpoint));
@@ -73,7 +76,9 @@ impl Recovery {
     ///
     /// This is the layer that holds the sinks, so it executes [`Self::inspect`]:
     /// a promoted checkpoint re-drives the commit before resuming; a discarded
-    /// one replays from the fallback and records an explicit warning signal.
+    /// one replays from the fallback and records an explicit warning signal. A
+    /// failed re-drive is itself discarded and replayed rather than aborting
+    /// startup, so a hostile marker cannot wedge every restart in a retry loop.
     pub async fn start(
         hotlap: &mut Hotlap,
         source: &dyn Source,
@@ -81,28 +86,41 @@ impl Recovery {
         signal: &Mutex<Option<String>>,
         metrics: &MetricsRegistry,
     ) -> Result<SourceStream, ConnectorError> {
+        checkpointer.sweep_stale_commits()?;
         let checkpoint = match Self::inspect(checkpointer)? {
             RecoveryDecision::Clean => return pipeline::merged_stream(source),
             RecoveryDecision::Resume(checkpoint) => checkpoint,
             RecoveryDecision::Promote(checkpoint) => {
-                checkpointer.promote(checkpoint.id).await?;
-                checkpoint
-            }
-            RecoveryDecision::Discard { pending, fallback } => {
-                metrics.inc("checkpoints_discarded");
-                pipeline::record_error(
-                    signal,
-                    ConnectorError::Infrastructure(format!(
-                        "discarded interrupted checkpoint {pending}: a sink is not \
-                         re-drivable, replaying from the previous valid checkpoint"
-                    )),
-                );
-                checkpointer.discard_commit(pending)?;
-                match fallback {
-                    Some(checkpoint) => checkpoint,
-                    None => return pipeline::merged_stream(source),
+                match checkpointer.promote(checkpoint.id).await {
+                    Ok(()) => checkpoint,
+                    Err(error) => {
+                        let fallback = Self::load(checkpointer)?;
+                        let reason = format!("commit re-drive failed ({error})");
+                        match discard(
+                            checkpointer,
+                            metrics,
+                            signal,
+                            checkpoint.id,
+                            fallback,
+                            &reason,
+                        )? {
+                            Some(fallback) => fallback,
+                            None => return pipeline::merged_stream(source),
+                        }
+                    }
                 }
             }
+            RecoveryDecision::Discard { pending, fallback } => match discard(
+                checkpointer,
+                metrics,
+                signal,
+                pending,
+                fallback,
+                "a sink is not re-drivable",
+            )? {
+                Some(checkpoint) => checkpoint,
+                None => return pipeline::merged_stream(source),
+            },
         };
         checkpointer.resume_after(checkpoint.id);
         Self::resume(hotlap, source, &checkpoint)
@@ -194,4 +212,32 @@ fn pending_commit(
         }
     }
     Ok(None)
+}
+
+/// Record the discard of `pending`, delete it, and return the checkpoint to
+/// replay from (`None` means start clean).
+///
+/// The warning names the actual destination: replaying an older checkpoint is
+/// not the same as a clean start, and the message must not claim otherwise.
+fn discard(
+    checkpointer: &mut Checkpointer,
+    metrics: &MetricsRegistry,
+    signal: &Mutex<Option<String>>,
+    pending: u64,
+    fallback: Option<Checkpoint>,
+    reason: &str,
+) -> Result<Option<Checkpoint>, ConnectorError> {
+    metrics.inc("checkpoints_discarded");
+    let destination = match &fallback {
+        Some(checkpoint) => format!("replaying from checkpoint {}", checkpoint.id),
+        None => "starting clean".to_string(),
+    };
+    pipeline::record_error(
+        signal,
+        ConnectorError::Infrastructure(format!(
+            "discarded interrupted checkpoint {pending}: {reason}, {destination}"
+        )),
+    );
+    checkpointer.discard_commit(pending)?;
+    Ok(fallback)
 }
