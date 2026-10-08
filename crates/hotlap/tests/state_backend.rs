@@ -96,6 +96,22 @@ fn durable_persists_across_reopen() {
 }
 
 #[test]
+fn durable_creates_and_persists_fresh_namespace() {
+    let dir = TempDir::new("fresh");
+    {
+        let mut be = DurableStateBackend::open(dir.path()).unwrap();
+        // A brand-new multi-level namespace must be created and durable.
+        be.put(b"brand/new/deep/key", b"v".to_vec()).unwrap();
+    }
+
+    let reopened = DurableStateBackend::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened.get(b"brand/new/deep/key").unwrap(),
+        Some(b"v".to_vec())
+    );
+}
+
+#[test]
 fn durable_put_is_atomic_and_overwrites() {
     let dir = TempDir::new("atomic");
     let mut be = DurableStateBackend::open(dir.path()).unwrap();

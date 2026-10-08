@@ -1,13 +1,13 @@
 //! Durable local [`StateBackend`]: one file per key under prefix subdirectories.
 
 use std::fs;
-use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use super::StateBackend;
 use super::StateEntry;
 use super::StateError;
+use super::fsio::{create_dirs_synced, is_absent, write_atomic};
 use super::path::{decode_segment, encode_segment, join_segments, split_prefix, validate_key};
 
 /// File-per-key state backend rooted at a directory.
@@ -15,8 +15,9 @@ use super::path::{decode_segment, encode_segment, join_segments, split_prefix, v
 /// Key segments become hex-encoded path components, so a namespace prefix maps
 /// to a subdirectory and `scan`/`list` only walk the relevant subtree. `put`
 /// writes `<name>.tmp`, fsyncs it, atomically renames it over the final name,
-/// then best-effort fsyncs the parent directory, so an interrupted write never
-/// exposes a half-written value and a crash does not lose a committed one.
+/// then fsyncs the parent directory and any freshly created ancestors, so an
+/// interrupted write never exposes a half-written value and a crash does not
+/// lose a committed one.
 pub struct DurableStateBackend {
     root: PathBuf,
 }
@@ -25,7 +26,7 @@ impl DurableStateBackend {
     /// Open a backend rooted at `root`, creating the directory if needed.
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
-        fs::create_dir_all(&root)?;
+        create_dirs_synced(&root)?;
         Ok(Self { root })
     }
 
@@ -75,7 +76,7 @@ impl StateBackend for DurableStateBackend {
         }
         match fs::read(&file) {
             Ok(value) => Ok(Some(value)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) if is_absent(e.kind()) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -87,7 +88,7 @@ impl StateBackend for DurableStateBackend {
             return Err(StateError::InvalidKey);
         }
         if let Some(parent) = file.parent() {
-            fs::create_dir_all(parent)?;
+            create_dirs_synced(parent)?;
         }
         write_atomic(&file, &value)?;
         Ok(())
@@ -99,7 +100,7 @@ impl StateBackend for DurableStateBackend {
             match fs::read(self.path_for(&key)) {
                 Ok(value) => out.push((key, value)),
                 // A key listed then removed concurrently is simply skipped.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) if is_absent(e.kind()) => continue,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -121,7 +122,7 @@ fn collect_dir(
 ) -> Result<(), StateError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if is_absent(e.kind()) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     for entry in entries {
@@ -143,22 +144,6 @@ fn collect_dir(
             out.push(join_segments(segments));
         }
         segments.pop();
-    }
-    Ok(())
-}
-
-/// Write `value` atomically: temp file, fsync, rename, best-effort dir fsync.
-fn write_atomic(path: &Path, value: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(value)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    // Directory fsync is not supported everywhere, so it is best-effort.
-    if let Some(parent) = path.parent() {
-        let _ = File::open(parent).and_then(|dir| dir.sync_all());
     }
     Ok(())
 }

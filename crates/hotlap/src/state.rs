@@ -15,6 +15,7 @@ use std::fmt;
 use std::io;
 
 mod durable;
+mod fsio;
 mod path;
 
 pub use durable::DurableStateBackend;

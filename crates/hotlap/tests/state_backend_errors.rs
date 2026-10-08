@@ -45,6 +45,36 @@ fn durable_io_errors_are_returned_not_panicked() {
     assert!(result.is_err(), "parent is a file");
 }
 
+#[test]
+fn prefix_traversing_file_key_is_absent_like_memory() {
+    let dir = TempDir::new("enotdir");
+    let mut durable = DurableStateBackend::open(dir.path()).unwrap();
+    let mut memory: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    StateBackend::put(&mut memory, b"a", b"1".to_vec()).unwrap();
+    durable.put(b"a", b"1".to_vec()).unwrap();
+
+    // Descending through the file-key `a` reads as absent, not an error.
+    for prefix in [&b"a/"[..], &b"a/b"[..], &b"a/b/c"[..]] {
+        assert_eq!(
+            memory.list(prefix).unwrap(),
+            durable.list(prefix).unwrap(),
+            "list {prefix:?}"
+        );
+        assert_eq!(
+            memory.scan(prefix).unwrap(),
+            durable.scan(prefix).unwrap(),
+            "scan {prefix:?}"
+        );
+    }
+    for key in [&b"a/b"[..], &b"a/b/c"[..]] {
+        assert_eq!(
+            StateBackend::get(&memory, key).unwrap(),
+            durable.get(key).unwrap(),
+            "get {key:?}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn durable_read_only_dir_errors() {
