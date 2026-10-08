@@ -72,9 +72,9 @@ fn consolidated(changelogs: &[ZSetBatch]) -> Vec<(i64, i64, i64, i64)> {
 }
 
 /// Full-recomputation oracle: group every event by its `(key, window)` bucket,
-/// dropping only late insertions (an insertion below the batch's previous
-/// watermark) while always applying retractions; finally keep the non-empty
-/// windows closed by the final watermark.
+/// dropping late insertions (below the previous watermark) and any delta whose
+/// window the previous watermark already closed, while applying retractions to
+/// still-open windows; finally keep the non-empty windows closed at the end.
 fn recompute(batches: &[Vec<(i64, i64, i64)>], size: i64, lag: i64) -> Vec<(i64, i64, i64, i64)> {
     let mut watermark = 0i64;
     let mut counts: BTreeMap<(i64, i64), i64> = BTreeMap::new();
@@ -82,10 +82,14 @@ fn recompute(batches: &[Vec<(i64, i64, i64)>], size: i64, lag: i64) -> Vec<(i64,
         let mut max_ts = 0i64;
         for (key, ts, diff) in batch {
             max_ts = max_ts.max(*ts);
+            let ws = (*ts / size) * size;
+            if ws + size <= watermark {
+                continue; // window already closed and emitted
+            }
             if *diff > 0 && *ts < watermark {
                 continue;
             }
-            *counts.entry((*key, (*ts / size) * size)).or_default() += diff;
+            *counts.entry((*key, ws)).or_default() += diff;
         }
         watermark = watermark.max((max_ts - lag).max(0));
     }
@@ -163,6 +167,21 @@ fn below_watermark_retraction_adjusts_open_window() {
     // Closing the window with ts 10 emits the corrected count of 1, not 2.
     let out = window.apply(&zset(&[(5, 10, 1)]), 10).unwrap();
     assert_eq!(rows(&out), vec![(5, 0, 1, 1)]);
+}
+
+#[test]
+fn retraction_after_window_close_is_dropped() {
+    let mut window = TumbleCount::new(&[0], 1, 10);
+    // Close and emit [0, 10) by advancing the watermark to 10.
+    let out = window.apply(&zset(&[(5, 1, 1), (5, 2, 1)]), 10).unwrap();
+    assert_eq!(rows(&out), vec![(5, 0, 2, 1)]);
+
+    // A retraction for the already-emitted window cannot be applied: the output
+    // is append-only, so no bogus (5, 0, -1) row may be emitted.
+    let out = window.apply(&zset(&[(5, 1, -1)]), 10).unwrap();
+    assert!(out.is_empty());
+    assert_eq!(window.late_closed_dropped(), 1);
+    assert_eq!(window.late_dropped(), 0);
 }
 
 #[test]

@@ -3,7 +3,7 @@ mod helpers;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, new_empty_array};
+use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter};
@@ -25,14 +25,14 @@ type Windows = BTreeMap<i64, BTreeMap<Vec<u8>, (OwnedRow, i64)>>;
 ///
 /// Open buckets live in a `BTreeMap` keyed by window start, so closing visits
 /// only windows whose end the watermark reached (O(closed)). Each delta row
-/// joins its `[ws, ws + size)` bucket (`ws = (event_ts / size) * size`). Only
-/// late insertions (`diff > 0`) drop; retractions always apply.
+/// joins `[ws, ws + size)`. Late insertions and closed-window deltas drop.
 pub struct TumbleCount {
     key: Vec<usize>,
     time_col: usize,
     size: i64,
     watermark: i64,
     dropped_late: u64,
+    dropped_closed: u64,
     schema: Option<SchemaRef>,
     converter: Option<RowConverter>,
     windows: Windows,
@@ -48,6 +48,7 @@ impl TumbleCount {
             size,
             watermark: 0,
             dropped_late: 0,
+            dropped_closed: 0,
             schema: None,
             converter: None,
             windows: BTreeMap::new(),
@@ -67,6 +68,11 @@ impl TumbleCount {
     /// Number of rows dropped as late since construction.
     pub fn late_dropped(&self) -> u64 {
         self.dropped_late
+    }
+
+    /// Number of deltas dropped because their window had already closed.
+    pub fn late_closed_dropped(&self) -> u64 {
+        self.dropped_closed
     }
 
     /// Validates the window against the input schema, learning it on first use.
@@ -121,6 +127,11 @@ impl TumbleCount {
                 continue;
             }
             let window_start = (ts / self.size) * self.size;
+            if window_start <= self.watermark.saturating_sub(self.size) {
+                // Already closed/emitted: append-only output cannot retract it.
+                self.dropped_closed += 1;
+                continue;
+            }
             let key = key_rows.row(index).owned();
             let bytes = key.as_ref().to_vec();
             self.windows
@@ -166,18 +177,7 @@ impl TumbleCount {
         let fields = Arc::new(Schema::new(fields));
 
         if closed.is_empty() {
-            let mut columns: Vec<ArrayRef> = self
-                .key
-                .iter()
-                .map(|&i| new_empty_array(schema.field(i).data_type()))
-                .collect();
-            columns.push(Arc::new(Int64Array::from(Vec::<i64>::new())));
-            columns.push(Arc::new(Int64Array::from(Vec::<i64>::new())));
-            let batch = RecordBatch::try_new(fields, columns)?;
-            return Ok(ZSetBatch::new(
-                batch,
-                Arc::new(Int64Array::from(Vec::<i64>::new())),
-            )?);
+            return helpers::empty_output(fields, &self.key, schema);
         }
 
         let converter = self
