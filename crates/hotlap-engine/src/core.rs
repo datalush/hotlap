@@ -20,9 +20,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 
-use hotlap_core::{
-    CoreError, InputId, MetricsRegistry, SplitId, ViewId, WatermarkSpec, ZSetBatch,
-};
+use hotlap_core::{CoreError, InputId, MetricsRegistry, SplitId, ViewId, WatermarkSpec, ZSetBatch};
 
 use retention::InputRetention;
 use view_state::ViewState;

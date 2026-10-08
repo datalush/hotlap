@@ -2,9 +2,9 @@
 
 use hotlap_core::{CoreError, ViewId};
 
+use super::EngineCore;
 use super::graph::ViewGraph;
 use super::output::ViewOutput;
-use super::EngineCore;
 
 impl EngineCore {
     /// Initial output of a freshly built view: replayed from retained inputs

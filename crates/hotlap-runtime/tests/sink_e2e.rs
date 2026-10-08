@@ -253,7 +253,12 @@ fn metrics_count_sink_commits() {
     let metrics = handle.metrics();
     handle.shutdown().unwrap();
     assert!(
-        metrics.snapshot().get("sinks_committed").copied().unwrap_or(0) >= 1,
+        metrics
+            .snapshot()
+            .get("sinks_committed")
+            .copied()
+            .unwrap_or(0)
+            >= 1,
         "a completed sink must be counted as committed"
     );
 }
