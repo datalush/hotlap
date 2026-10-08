@@ -3,7 +3,7 @@
 use hotlap_core::snapshot::{
     ENGINE_SNAPSHOT_FORMAT_VERSION, EngineSnapshot, InputSnapshot, SnapshotTable, ViewSnapshot,
 };
-use hotlap_core::{InputId, ViewId, ZSetBatch};
+use hotlap_core::{InputId, SplitId, ViewId, ZSetBatch};
 
 use super::EngineCore;
 use super::ipc::{encode_schema, encode_zset};
@@ -36,10 +36,23 @@ impl EngineCore {
                 schema,
                 spec: self.specs.get(&id).copied(),
                 watermark: self.watermarks.get(&id).copied().unwrap_or(0),
+                splits: self.split_snapshot(id),
                 late: self.late.get(&id).copied().unwrap_or(0),
             });
         }
         Ok(out)
+    }
+
+    /// Per-split watermarks of `input`, ordered by split id.
+    fn split_snapshot(&self, input: InputId) -> Vec<(SplitId, i64)> {
+        let mut splits: Vec<(SplitId, i64)> = self
+            .split_watermarks
+            .iter()
+            .filter(|((owner, _), _)| *owner == input)
+            .map(|(&(_, split), &watermark)| (split, watermark))
+            .collect();
+        splits.sort();
+        splits
     }
 
     /// Snapshot of every built view, ordered by id.

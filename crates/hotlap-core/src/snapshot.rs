@@ -11,7 +11,7 @@ mod operator;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{InputId, ViewId};
+use crate::ids::{InputId, SplitId, ViewId};
 use crate::plan::Plan;
 use crate::watermark::WatermarkSpec;
 
@@ -21,7 +21,7 @@ pub use operator::{GroupState, JoinState, OperatorState, WindowBucket, WindowSta
 ///
 /// Bump this whenever the meaning of an existing field changes; readers reject
 /// any other version instead of guessing.
-pub const ENGINE_SNAPSHOT_FORMAT_VERSION: u32 = 1;
+pub const ENGINE_SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// An Arrow IPC table plus its signed multiplicity column.
 ///
@@ -44,8 +44,11 @@ pub struct InputSnapshot {
     pub schema: Option<Vec<u8>>,
     /// Declared watermark, if any.
     pub spec: Option<WatermarkSpec>,
-    /// Monotonic watermark value.
+    /// Effective (minimum) watermark value across the input's splits.
     pub watermark: i64,
+    /// Monotonic watermark per split, ordered by split id. Restored exactly so
+    /// a slow split does not restart at zero and re-admit stale records.
+    pub splits: Vec<(SplitId, i64)>,
     /// Number of events dropped as late.
     pub late: u64,
 }

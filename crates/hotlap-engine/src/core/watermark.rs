@@ -15,7 +15,7 @@ use crate::error::EngineError;
 use crate::ops::filter;
 use crate::zset::int64_diffs;
 
-use super::{time, EngineCore};
+use super::{EngineCore, time};
 
 impl EngineCore {
     /// Drops late insertions and advances `split`'s watermark.

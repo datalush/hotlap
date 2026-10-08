@@ -13,7 +13,9 @@ use crate::error::ConnectorError;
 /// Log offset within a split.
 pub type Offset = i64;
 /// Identifies a split (v1: a Fluss bucket id).
-pub type SplitId = i32;
+///
+/// Re-exported from `hotlap` so the engine and the connectors cannot drift.
+pub use hotlap::SplitId;
 
 /// A read unit with its starting offset.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

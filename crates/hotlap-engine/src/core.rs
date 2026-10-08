@@ -64,6 +64,11 @@ pub struct EngineCore {
     pub(super) registered: HashSet<InputId>,
     pub(super) specs: HashMap<InputId, WatermarkSpec>,
     /// Effective input watermark: the minimum across each input's splits.
+    ///
+    /// Unlike a single stream's watermark this is **not monotonic**: when a
+    /// lagging split is first seen, the minimum can drop so its records are not
+    /// dropped as late. Window operators clamp the value with `max`, so a
+    /// lowered minimum never reopens a closed window.
     pub(super) watermarks: HashMap<InputId, i64>,
     /// Monotonic watermark per `(input, split)`: `max(event_ts) - lag`, clamped
     /// at zero. A split joins this map on its first batch ("not yet started"

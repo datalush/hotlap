@@ -78,6 +78,62 @@ fn group_plan() -> Plan {
 }
 
 #[test]
+fn own_split_late_drop_is_distinct_from_the_input_minimum() {
+    let mut core = engine_with(group_plan());
+    // Split 0 races ahead, split 1 lags, split 2 joins last and lowers the min.
+    core.push_split(InputId(0), 0, &inserts(&[(1, 100)]))
+        .unwrap();
+    core.push_split(InputId(0), 1, &inserts(&[(2, 5)])).unwrap();
+    core.push_split(InputId(0), 2, &inserts(&[(3, 1)])).unwrap();
+    // Split 2's ts 1 is below the previous input minimum (5), but it is the
+    // split's own first record, so it is not late.
+    assert_eq!(core.late_dropped(InputId(0)).unwrap(), 0);
+
+    // A record below the *fast split's* own watermark (100) is dropped even
+    // though the input minimum is now only 1.
+    core.push_split(InputId(0), 0, &inserts(&[(4, 10)]))
+        .unwrap();
+    assert_eq!(core.late_dropped(InputId(0)).unwrap(), 1);
+    let mut counts = keys(&core.snapshot(ViewId(0)).unwrap());
+    counts.sort();
+    assert_eq!(counts, vec![1, 2, 3]);
+}
+
+#[test]
+fn restored_non_zero_split_does_not_readmit_stale_records() {
+    let mut original = engine_with(group_plan());
+    original
+        .push_split(InputId(0), 1, &inserts(&[(1, 5)]))
+        .unwrap();
+    original
+        .push_split(InputId(0), 0, &inserts(&[(2, 100)]))
+        .unwrap();
+    let snapshot = original.checkpoint().unwrap();
+
+    let mut restored = EngineCore::new();
+    restored.restore(&snapshot).unwrap();
+    assert_eq!(
+        original.checkpoint().unwrap(),
+        restored.checkpoint().unwrap()
+    );
+
+    // ts 3 is below split 1's own watermark (5): late on both engines.
+    original
+        .push_split(InputId(0), 1, &inserts(&[(3, 3)]))
+        .unwrap();
+    restored
+        .push_split(InputId(0), 1, &inserts(&[(3, 3)]))
+        .unwrap();
+    assert_eq!(original.late_dropped(InputId(0)).unwrap(), 1);
+    assert_eq!(restored.late_dropped(InputId(0)).unwrap(), 1);
+    let mut before = keys(&original.snapshot(ViewId(0)).unwrap());
+    let mut after = keys(&restored.snapshot(ViewId(0)).unwrap());
+    before.sort();
+    after.sort();
+    assert_eq!(before, after);
+}
+
+#[test]
 fn slow_split_records_survive_a_fast_split_watermark() {
     let mut core = engine_with(group_plan());
     // Split 1 is slow (low timestamps); split 0 races ahead.
@@ -120,7 +176,8 @@ fn window_close_uses_the_minimum_across_splits() {
     assert!(core.snapshot(ViewId(0)).unwrap().is_empty());
 
     // The slow split reaches 15, so the minimum reaches the window end.
-    core.push_split(InputId(0), 1, &inserts(&[(1, 15)])).unwrap();
+    core.push_split(InputId(0), 1, &inserts(&[(1, 15)]))
+        .unwrap();
     let snapshot = core.snapshot(ViewId(0)).unwrap();
     assert_eq!(ints(&snapshot, 1), vec![0], "window [0, 10) did not close");
     assert_eq!(ints(&snapshot, 2), vec![2], "window missed slow records");
