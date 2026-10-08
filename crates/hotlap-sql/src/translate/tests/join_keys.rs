@@ -63,3 +63,20 @@ async fn mixed_case_unquoted_relation_matches_its_binding() {
         "the canonical DDL name must match the plan's relation name"
     );
 }
+
+#[tokio::test]
+async fn quoted_relation_with_escaped_quote_matches_its_binding() {
+    let ctx = SessionContext::new();
+    register_tumble_udf(&ctx);
+    register_empty_table(&ctx, "Src\"X");
+    let df = ctx
+        .sql("SELECT k FROM \"Src\"\"X\"")
+        .await
+        .expect("DataFusion resolves a quoted relation with an embedded quote");
+    let name = crate::bindings::canonical_relation("\"Src\"\"X\"");
+    let bindings = SourceBindings::from([(name, InputId(7))]);
+    assert!(
+        to_kernel_plan(df.logical_plan(), &bindings).is_ok(),
+        "the unescaped quoted name must match the plan's relation name"
+    );
+}

@@ -19,7 +19,8 @@ pub type InputSchemas = BTreeMap<InputId, SchemaRef>;
 
 /// Canonicalize a relation name the way DataFusion resolves it in SQL: an
 /// unquoted identifier is case-folded to lowercase, while a double-quoted
-/// identifier keeps its case and drops its quotes.
+/// identifier keeps its case, drops its outer quotes and unescapes doubled
+/// quotes (`"Src""X"` -> `Src"X`).
 ///
 /// Callers use this when building [`SourceBindings`] so the name written in
 /// `CREATE SOURCE` matches the relation name DataFusion reports in the plan.
@@ -28,7 +29,7 @@ pub fn canonical_relation(name: &str) -> String {
         .strip_prefix('"')
         .and_then(|inner| inner.strip_suffix('"'))
     {
-        Some(inner) => inner.to_string(),
+        Some(inner) => inner.replace("\"\"", "\""),
         None => name.to_ascii_lowercase(),
     }
 }
@@ -47,5 +48,11 @@ mod tests {
     fn quoted_names_keep_their_case() {
         assert_eq!(canonical_relation("\"Src\""), "Src");
         assert_eq!(canonical_relation("\"my Table\""), "my Table");
+    }
+
+    #[test]
+    fn quoted_names_unescape_doubled_quotes() {
+        // SQL doubles a quote to embed one inside a quoted identifier.
+        assert_eq!(canonical_relation("\"Src\"\"X\""), "Src\"X");
     }
 }
