@@ -6,15 +6,37 @@ use super::{Hotlap, HotlapError};
 
 impl Hotlap {
     /// Declare a source under `name`; plans reference it as `Plan::Source(id)`.
+    ///
+    /// The id is assigned automatically after the highest id registered so far.
     pub fn register_input(&mut self, name: &str) -> Result<(), HotlapError> {
+        self.register_named_input(name, InputId(self.next_input))
+    }
+
+    /// Declare `name` with the caller-chosen `id`.
+    ///
+    /// SQL and runtime must agree on the identity of every source, so the
+    /// caller owns the id here instead of letting the facade renumber it. A
+    /// duplicate name or id is rejected, and a failed core registration leaves
+    /// the maps untouched.
+    pub fn register_input_with_id(&mut self, name: &str, id: InputId) -> Result<(), HotlapError> {
+        self.register_named_input(name, id)
+    }
+
+    /// Shared registration body: validate, claim the id, then record the name.
+    fn register_named_input(&mut self, name: &str, id: InputId) -> Result<(), HotlapError> {
         if self.inputs.contains_key(name) {
             return Err(HotlapError(format!("input already exists: {name}")));
         }
-        let id = InputId(self.next_input);
+        if self.inputs.values().any(|existing| *existing == id) {
+            return Err(HotlapError(format!("input id already exists: {}", id.0)));
+        }
+        let next =
+            id.0.checked_add(1)
+                .ok_or_else(|| HotlapError("input id space exhausted".into()))?;
         self.core
             .register_input(id)
             .map_err(|e| HotlapError(format!("{e}")))?;
-        self.next_input += 1;
+        self.next_input = self.next_input.max(next);
         self.inputs.insert(name.to_string(), id);
         Ok(())
     }
