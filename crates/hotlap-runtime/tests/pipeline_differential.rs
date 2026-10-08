@@ -1,115 +1,34 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use hotlap::{AggSpec, Hotlap, InputId, Plan};
-use hotlap_engine::EngineCore;
-
-use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
+use hotlap::{Hotlap, InputId, Plan};
+use hotlap_connectors::source::SourceBatch;
 use hotlap_runtime::runtime::pipeline::{self, Pipeline};
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
-struct FakeSource {
-    schema: SchemaRef,
-    batches: Vec<SourceBatch>,
-}
+#[path = "pipeline_differential/harness.rs"]
+mod harness;
 
-impl Source for FakeSource {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-    fn splits(&self) -> Result<Vec<Split>, hotlap_connectors::ConnectorError> {
-        Ok(vec![Split { id: 0, start: 0 }])
-    }
-    fn read(&self, _split: &Split) -> Result<SourceStream, hotlap_connectors::ConnectorError> {
-        let items: Vec<Result<SourceBatch, _>> = self.batches.iter().cloned().map(Ok).collect();
-        Ok(Box::pin(futures::stream::iter(items)))
-    }
-    fn state(&self) -> SourceState {
-        SourceState {
-            offsets: BTreeMap::new(),
-        }
-    }
-    fn event_time_column(&self) -> Option<usize> {
-        Some(1)
-    }
-}
+use harness::{FakeSource, TwoSplit, batch, group_count, open, snap_rows};
 
-fn batch(keys: &[i64], times: &[i64]) -> SourceBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("k", DataType::Int64, false),
-        Field::new("_event_time", DataType::Int64, false),
-    ]));
-    let cols: Vec<ArrayRef> = vec![
-        Arc::new(Int64Array::from(keys.to_vec())),
-        Arc::new(Int64Array::from(times.to_vec())),
-    ];
-    SourceBatch {
-        batch: RecordBatch::try_new(schema, cols).unwrap(),
-        base_offset: 0,
-        next_offset: keys.len() as i64,
-        split: 0,
+/// Drain the pipeline's tagged stream into `hotlap`.
+async fn ingest_all(hotlap: &mut Hotlap, pipeline: &Pipeline) {
+    let mut stream = pipeline.sources.stream().unwrap();
+    while let Some(item) = stream.next().await {
+        pipeline::ingest_event(hotlap, &pipeline.sources, &item.unwrap()).unwrap();
     }
-}
-
-/// Read a consolidated Z-set of Int64 columns as sorted integer rows.
-fn snap_rows(h: &mut Hotlap, view: &str) -> Vec<Vec<i64>> {
-    let z = h.snapshot(view).unwrap();
-    let columns: Vec<&Int64Array> = z
-        .batch
-        .columns()
-        .iter()
-        .map(|c| c.as_any().downcast_ref::<Int64Array>().unwrap())
-        .collect();
-    let mut rows: Vec<Vec<i64>> = (0..z.len())
-        .map(|row| columns.iter().map(|c| c.value(row)).collect())
-        .collect();
-    rows.sort();
-    rows
-}
-
-fn open() -> Hotlap {
-    Hotlap::open_with(Box::new(EngineCore::new()))
-}
-
-fn group_count(schema: SchemaRef, batches: Vec<SourceBatch>) -> (Hotlap, Pipeline) {
-    let source = Arc::new(FakeSource { schema, batches });
-    let pipeline = Pipeline {
-        sources: Sources::new(vec![InputSource {
-            id: InputId(0),
-            name: "in".into(),
-            source,
-            watermark: None,
-        }])
-        .unwrap(),
-        views: vec![(
-            "c".into(),
-            Plan::GroupAggregate {
-                input: Box::new(Plan::Source(InputId(0))),
-                key: vec![0],
-                aggs: vec![AggSpec::count()],
-            },
-        )],
-        sinks: vec![],
-        checkpoint: None,
-        retention: None,
-    };
-    (open(), pipeline)
 }
 
 #[tokio::test]
 async fn fake_source_feeds_view() {
-    let source = batch(&[1, 1, 2], &[10, 10, 10]);
-    let schema = source.batch.schema();
-    let (mut hotlap, pipeline) = group_count(schema, vec![source, batch(&[2, 3], &[20, 20])]);
+    let source = Arc::new(FakeSource {
+        schema: batch(&[0], &[0]).batch.schema(),
+        batches: vec![batch(&[1, 1, 2], &[10, 10, 10]), batch(&[2, 3], &[20, 20])],
+    });
+    let (mut hotlap, pipeline) = group_count(source);
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
-    let mut stream = pipeline.sources.stream().unwrap();
-    while let Some(item) = stream.next().await {
-        pipeline::ingest_event(&mut hotlap, &pipeline.sources, &item.unwrap()).unwrap();
-    }
+    ingest_all(&mut hotlap, &pipeline).await;
     assert_eq!(
         snap_rows(&mut hotlap, "c"),
         vec![vec![1, 2], vec![2, 2], vec![3, 1]]
@@ -125,41 +44,17 @@ async fn empty_batch_is_a_noop() {
         next_offset: 0,
         split: 0,
     };
-    let (mut hotlap, pipeline) = group_count(good.batch.schema(), vec![good, empty]);
+    let (mut hotlap, pipeline) = group_count(Arc::new(FakeSource {
+        schema: good.batch.schema(),
+        batches: vec![good, empty],
+    }));
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
-    let mut stream = pipeline.sources.stream().unwrap();
-    while let Some(item) = stream.next().await {
-        pipeline::ingest_event(&mut hotlap, &pipeline.sources, &item.unwrap()).unwrap();
-    }
+    ingest_all(&mut hotlap, &pipeline).await;
     assert_eq!(snap_rows(&mut hotlap, "c"), vec![vec![1, 1]]);
 }
 
 #[tokio::test]
 async fn two_splits_merge() {
-    struct TwoSplit {
-        schema: SchemaRef,
-        a: Vec<SourceBatch>,
-        b: Vec<SourceBatch>,
-    }
-    impl Source for TwoSplit {
-        fn schema(&self) -> SchemaRef {
-            self.schema.clone()
-        }
-        fn splits(&self) -> Result<Vec<Split>, hotlap_connectors::ConnectorError> {
-            Ok(vec![Split { id: 0, start: 0 }, Split { id: 1, start: 0 }])
-        }
-        fn read(&self, s: &Split) -> Result<SourceStream, hotlap_connectors::ConnectorError> {
-            let src = if s.id == 0 { &self.a } else { &self.b };
-            let items: Vec<Result<SourceBatch, _>> = src.iter().cloned().map(Ok).collect();
-            Ok(Box::pin(futures::stream::iter(items)))
-        }
-        fn state(&self) -> SourceState {
-            SourceState::default()
-        }
-        fn event_time_column(&self) -> Option<usize> {
-            Some(1)
-        }
-    }
     let a = batch(&[1, 1], &[10, 10]);
     let b = batch(&[1, 2], &[10, 10]);
     let source = Arc::new(TwoSplit {
@@ -167,32 +62,9 @@ async fn two_splits_merge() {
         a: vec![a],
         b: vec![b],
     });
-    let pipeline = Pipeline {
-        sources: Sources::new(vec![InputSource {
-            id: InputId(0),
-            name: "in".into(),
-            source,
-            watermark: None,
-        }])
-        .unwrap(),
-        views: vec![(
-            "c".into(),
-            Plan::GroupAggregate {
-                input: Box::new(Plan::Source(InputId(0))),
-                key: vec![0],
-                aggs: vec![AggSpec::count()],
-            },
-        )],
-        sinks: vec![],
-        checkpoint: None,
-        retention: None,
-    };
-    let mut hotlap = open();
+    let (mut hotlap, pipeline) = group_count(source);
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
-    let mut stream = pipeline.sources.stream().unwrap();
-    while let Some(item) = stream.next().await {
-        pipeline::ingest_event(&mut hotlap, &pipeline.sources, &item.unwrap()).unwrap();
-    }
+    ingest_all(&mut hotlap, &pipeline).await;
     assert_eq!(snap_rows(&mut hotlap, "c"), vec![vec![1, 3], vec![2, 1]]);
 }
 
