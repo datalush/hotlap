@@ -11,6 +11,6 @@ pub mod state;
 pub use engine::{Hotlap, HotlapError};
 pub use hotlap_core::plan;
 pub use hotlap_core::{
-    CoreError, IncrementalCore, InputId, Plan, Predicate, Scalar, SplitId, ViewId, WatermarkSpec,
-    ZSetBatch,
+    CmpOp, CoreError, IncrementalCore, InputId, Plan, Predicate, Scalar, SplitId, ViewId,
+    WatermarkSpec, ZSetBatch,
 };

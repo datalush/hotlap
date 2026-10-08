@@ -13,8 +13,9 @@ use hotlap::{InputId, Plan};
 use crate::error::SqlError;
 use crate::translate_expr::{
     column_index, ensure_count_only, ensure_identity_projection, is_tumble, parse_tumble,
-    predicate, projection_indices,
+    projection_indices,
 };
+use crate::translate_predicate::predicate;
 
 /// Register the planning-only `tumble(ts, size)` scalar function.
 pub fn register_tumble_udf(ctx: &SessionContext) {

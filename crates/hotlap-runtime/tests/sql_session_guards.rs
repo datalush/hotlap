@@ -66,9 +66,11 @@ fn kv_schema() -> SchemaRef {
     ]))
 }
 
-fn float_schema() -> SchemaRef {
+/// UInt64 is not representable by the kernel (unlike Float64, which Task 1
+/// added), so a view selecting it must be rejected at DDL time.
+fn unsupported_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("f", DataType::Float64, false),
+        Field::new("u", DataType::UInt64, false),
         Field::new("_event_time", DataType::Int64, false),
     ]))
 }
@@ -87,9 +89,9 @@ async fn second_source_rejected() {
 
 #[tokio::test]
 async fn unrepresentable_mv_output_rejected() {
-    let mut session = session(float_schema());
+    let mut session = session(unsupported_schema());
     session.sql(SOURCE).await.unwrap();
-    let view = "CREATE MATERIALIZED VIEW mv AS SELECT f FROM src;";
+    let view = "CREATE MATERIALIZED VIEW mv AS SELECT u FROM src;";
     assert!(matches!(
         session.sql(view).await,
         Err(SqlError::Unsupported(_))
@@ -116,9 +118,9 @@ async fn global_count_rejected_at_planning() {
 
 #[tokio::test]
 async fn rejected_view_does_not_poison_its_name() {
-    let mut session = session(float_schema());
+    let mut session = session(unsupported_schema());
     session.sql(SOURCE).await.unwrap();
-    let bad = "CREATE MATERIALIZED VIEW mv AS SELECT f FROM src;";
+    let bad = "CREATE MATERIALIZED VIEW mv AS SELECT u FROM src;";
     assert!(matches!(
         session.sql(bad).await,
         Err(SqlError::Unsupported(_))

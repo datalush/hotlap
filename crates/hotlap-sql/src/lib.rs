@@ -13,6 +13,7 @@ pub mod error;
 pub mod mv_schema;
 pub mod translate;
 mod translate_expr;
+mod translate_predicate;
 pub mod tumble;
 pub mod watermark;
 

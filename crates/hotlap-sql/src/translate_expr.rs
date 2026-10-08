@@ -1,12 +1,12 @@
-//! Expression helpers for `translate`: predicates, columns, literals, `tumble`.
+//! Expression helpers for `translate`: columns, literals and `tumble`.
 
 use datafusion::common::{DFSchema, ScalarValue};
-use datafusion::logical_expr::expr::{AggregateFunction, BinaryExpr, ScalarFunction};
-use datafusion::logical_expr::{Expr, Operator};
+use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction};
 use hotlap::Scalar;
-use hotlap::plan::Predicate;
 
 use crate::error::SqlError;
+use crate::translate_predicate::scalar;
 
 /// Column position of `expr` in `schema`; rejects non-column expressions.
 pub(crate) fn column_index(expr: &Expr, schema: &DFSchema) -> Result<usize, SqlError> {
@@ -49,31 +49,6 @@ pub(crate) fn ensure_identity_projection(
             .map_err(|e| SqlError::Unsupported(format!("unknown column `{col}`: {e}")))?;
     }
     Ok(())
-}
-
-/// Translate a filter expression into an IR predicate (`Eq`/`Gt` only).
-pub(crate) fn predicate(expr: &Expr, schema: &DFSchema) -> Result<Predicate, SqlError> {
-    let Expr::BinaryExpr(b) = expr else {
-        return Err(unsupported("filter", expr));
-    };
-    match b.op {
-        Operator::Eq => {
-            let (col, lit) = column_literal(b, true)?;
-            Ok(Predicate::Eq(column_index(col, schema)?, scalar(lit)?))
-        }
-        Operator::Gt => {
-            let (col, lit) = column_literal(b, false)?;
-            match scalar(lit)? {
-                Scalar::I64(n) => Ok(Predicate::Gt(column_index(col, schema)?, n)),
-                other => Err(SqlError::Unsupported(format!(
-                    "`>` expects an Int64 literal, got {other:?}"
-                ))),
-            }
-        }
-        op => Err(SqlError::Unsupported(format!(
-            "unsupported predicate operator: {op:?}"
-        ))),
-    }
 }
 
 /// Is this scalar function a tumbling-window call?
@@ -126,38 +101,11 @@ fn is_count_star(args: &[Expr]) -> bool {
     matches!(args, [] | [Expr::Literal(ScalarValue::Int64(Some(1)), _)])
 }
 
-fn column_literal(b: &BinaryExpr, swap_ok: bool) -> Result<(&Expr, &Expr), SqlError> {
-    let left_col = matches!(b.left.as_ref(), Expr::Column(_));
-    let right_col = matches!(b.right.as_ref(), Expr::Column(_));
-    match (left_col, right_col) {
-        (true, false) => Ok((&b.left, &b.right)),
-        (false, true) if swap_ok => Ok((&b.right, &b.left)),
-        _ => Err(SqlError::Unsupported(format!(
-            "expected `column <op> literal`, got `{b}`"
-        ))),
-    }
-}
-
 fn int_literal(expr: &Expr) -> Result<i64, SqlError> {
     match scalar(expr)? {
         Scalar::I64(v) => Ok(v),
         other => Err(SqlError::Unsupported(format!(
             "expected an Int64 literal, got {other:?}"
-        ))),
-    }
-}
-
-fn scalar(expr: &Expr) -> Result<Scalar, SqlError> {
-    let Expr::Literal(value, _) = expr else {
-        return Err(unsupported("literal", expr));
-    };
-    match value {
-        ScalarValue::Int64(Some(v)) => Ok(Scalar::I64(*v)),
-        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => Ok(Scalar::Str(v.clone())),
-        ScalarValue::Boolean(Some(v)) => Ok(Scalar::Bool(*v)),
-        ScalarValue::Int64(None) => Ok(Scalar::Null),
-        other => Err(SqlError::Unsupported(format!(
-            "unsupported literal `{other:?}`"
         ))),
     }
 }

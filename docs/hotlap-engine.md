@@ -133,7 +133,7 @@ declaración. El core concreto se inyecta con `Hotlap::open_with`.
 
 | Operador | Implementación | Notas |
 |---|---|---|
-| `Filter` | `arrow::compute::filter_record_batch` | Filtra columnas de datos y `diff` juntos, de modo que las retracciones sobreviven si su fila pasa el filtro. `Predicate::{Eq,Gt}`. |
+| `Filter` | `arrow::compute::filter_record_batch` | Filtra columnas de datos y `diff` juntos, de modo que las retracciones sobreviven si su fila pasa el filtro. `Predicate::Cmp`/`And`/`Or`/`Not`/`IsNull` con lógica de tres valores (Kleene). |
 | `Project` | `arrow::compute` (`ArrayRef::clone`) | Selecciona/reordena columnas compartiendo arrays; O(nº de columnas). Conserva `diff`. |
 | `GroupCount` | claves `arrow::row` + reduce incremental | Mantiene `clave → count`; actualiza **solo las claves tocadas** por el delta (coste O(delta), no O(keyspace)). Emite un changelog `(clave..., count)` con `diff` firmado: al cruzar a cero retrae el conteo viejo; una clave nueva inserta el suyo; una cambiada retrae el viejo e inserta el nuevo. |
 | `Join` (inner equi) | claves `arrow::row` ambos lados | Cada lado acumula en un `KeyedArrangement`; cada `apply` recomputa el join y emite el changelog contra la relación anterior. La fila de salida es `left ‖ right`; las multiplicidades se multiplican. |

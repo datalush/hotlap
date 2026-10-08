@@ -10,6 +10,7 @@ pub mod error;
 pub mod ids;
 pub mod metrics;
 pub mod plan;
+pub mod predicate;
 pub mod snapshot;
 pub mod watermark;
 
@@ -18,6 +19,6 @@ pub use core::IncrementalCore;
 pub use error::CoreError;
 pub use ids::{InputId, SplitId, ViewId};
 pub use metrics::{Metric, MetricsRegistry};
-pub use plan::{Plan, Predicate, Scalar};
+pub use plan::{CmpOp, Plan, Predicate, Scalar};
 pub use snapshot::{ENGINE_SNAPSHOT_FORMAT_VERSION, EngineSnapshot};
 pub use watermark::WatermarkSpec;

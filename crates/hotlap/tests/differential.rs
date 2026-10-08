@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use hotlap::{Hotlap, InputId, Plan, Predicate, ZSetBatch};
+use hotlap::{CmpOp, Hotlap, InputId, Plan, Predicate, Scalar, ZSetBatch};
 use hotlap_engine::EngineCore;
 
 /// Build a Z-set whose columns are all Int64 and whose diffs are signed.
@@ -141,7 +141,11 @@ fn filter_project_group_count_via_api() {
         input: Box::new(Plan::Project {
             input: Box::new(Plan::Filter {
                 input: Box::new(Plan::Source(InputId(0))),
-                pred: Predicate::Gt(0, 1),
+                pred: Predicate::Cmp {
+                    op: CmpOp::Gt,
+                    col: 0,
+                    scalar: Scalar::I64(1),
+                },
             }),
             cols: vec![0],
         }),
