@@ -1,4 +1,5 @@
 mod helpers;
+mod snapshot;
 mod state;
 
 use std::collections::HashMap;

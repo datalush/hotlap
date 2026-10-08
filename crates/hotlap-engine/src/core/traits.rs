@@ -44,6 +44,7 @@ impl IncrementalCore for EngineCore {
             view,
             ViewState {
                 graph,
+                plan: plan.clone(),
                 windowed: has_window(plan),
                 tapped: false,
                 output: ViewOutput::default(),
@@ -90,6 +91,7 @@ impl IncrementalCore for EngineCore {
         for id in targets {
             self.push_view(id, input, &kept)?;
         }
+        self.epoch = self.epoch.wrapping_add(1);
         Ok(())
     }
 

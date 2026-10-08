@@ -129,3 +129,17 @@ fn push_encodes_only_the_delta() {
         "1-row push re-encoded the resident state"
     );
 }
+
+#[test]
+fn restore_rejects_unknown_format_version() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
+    core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+
+    let mut snapshot = core.checkpoint().unwrap();
+    snapshot.format_version = u32::MAX;
+
+    let mut target = EngineCore::new();
+    assert!(target.restore(&snapshot).is_err());
+}

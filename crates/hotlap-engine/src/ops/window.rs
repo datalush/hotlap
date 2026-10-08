@@ -1,4 +1,5 @@
 mod helpers;
+mod snapshot;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

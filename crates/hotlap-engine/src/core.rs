@@ -1,9 +1,13 @@
 //! Arrow-native [`IncrementalCore`]: persistent per-view operator graphs.
 
+mod checkpoint;
 mod graph;
+pub(crate) mod ipc;
 mod output;
+mod restore;
 #[cfg(test)]
 mod tests;
+mod time;
 mod traits;
 
 use std::collections::{HashMap, HashSet};
@@ -11,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use arrow::array::BooleanArray;
 use arrow::datatypes::SchemaRef;
 
-use hotlap_core::{CoreError, InputId, ViewId, WatermarkSpec, ZSetBatch};
+use hotlap_core::{CoreError, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
 
 use crate::error::EngineError;
 use crate::ops::filter;
@@ -23,6 +27,7 @@ use output::ViewOutput;
 /// A view's persistent graph plus its incremental output and pending changes.
 pub(super) struct ViewState {
     pub(super) graph: ViewGraph,
+    pub(super) plan: Plan,
     pub(super) windowed: bool,
     pub(super) tapped: bool,
     pub(in crate::core) output: ViewOutput,
@@ -52,6 +57,8 @@ pub struct EngineCore {
     pub(super) schemas: HashMap<InputId, SchemaRef>,
     pub(super) late: HashMap<InputId, u64>,
     pub(super) frozen: bool,
+    /// Logical epoch: the number of deltas pushed so far.
+    pub(super) epoch: u64,
 }
 
 impl EngineCore {
@@ -65,6 +72,7 @@ impl EngineCore {
             schemas: HashMap::new(),
             late: HashMap::new(),
             frozen: false,
+            epoch: 0,
         }
     }
 
@@ -103,7 +111,7 @@ impl EngineCore {
                 EngineError::Unsupported(format!("input {input:?} has no watermark"))
             })?;
         let current = *self.watermarks.get(&input).unwrap_or(&0);
-        let times = time_values(&batch.batch, spec.time_col)?;
+        let times = time::time_values(&batch.batch, spec.time_col)?;
         let diffs = int64_diffs(batch.diff())?;
         let mut mask = Vec::with_capacity(batch.len());
         let mut max_ts = i64::MIN;
@@ -170,28 +178,4 @@ impl Default for EngineCore {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Reads an event-time column as non-negative `i64`; nulls map to zero.
-fn time_values(
-    batch: &arrow::record_batch::RecordBatch,
-    col: usize,
-) -> Result<arrow::array::Int64Array, EngineError> {
-    use arrow::compute::cast;
-    use arrow::datatypes::DataType;
-
-    let column = batch
-        .columns()
-        .get(col)
-        .ok_or_else(|| EngineError::Unsupported(format!("time column {col} out of range")))?;
-    let casted = cast(column.as_ref(), &DataType::Int64)?;
-    let ints = casted
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .ok_or_else(|| EngineError::Infrastructure("int64 cast produced wrong type".to_string()))?;
-    Ok(arrow::array::Int64Array::from(
-        ints.iter()
-            .map(|value| value.unwrap_or(0).max(0))
-            .collect::<Vec<_>>(),
-    ))
 }

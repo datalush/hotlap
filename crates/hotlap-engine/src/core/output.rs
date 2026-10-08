@@ -112,4 +112,15 @@ impl ViewOutput {
         ));
         Ok(ZSetBatch::new(batch, diff)?)
     }
+
+    /// Materializes the output for checkpointing.
+    ///
+    /// Returns `None` when no push has established the output schema yet, so a
+    /// restored output stays uninitialized instead of adopting an empty schema.
+    pub(super) fn to_snapshot(&self) -> Result<Option<ZSetBatch>, EngineError> {
+        if self.schema.is_none() {
+            return Ok(None);
+        }
+        self.snapshot().map(Some)
+    }
 }

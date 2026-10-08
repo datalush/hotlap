@@ -27,5 +27,6 @@ pub use time::Watermark;
 pub use zset::{consolidate, sort_rows};
 
 pub use hotlap_core::{
-    CoreError, IncrementalCore, InputId, Plan, Predicate, Scalar, ViewId, WatermarkSpec,
+    CoreError, ENGINE_SNAPSHOT_FORMAT_VERSION, EngineSnapshot, IncrementalCore, InputId, Plan,
+    Predicate, Scalar, ViewId, WatermarkSpec,
 };
