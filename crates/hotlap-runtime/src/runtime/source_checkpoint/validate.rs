@@ -124,14 +124,22 @@ fn validate_snapshot(
                 )));
             }
         }
-        if let Some(spec) = &input.spec
-            && (Some(spec.lag) != entry.watermark_lag
-                || Some(spec.time_col) != entry.event_time_column)
-        {
-            return Err(unsupported(format!(
-                "engine watermark for {:?} does not match",
-                input.id
-            )));
+        match (entry.watermark_lag, &input.spec) {
+            (Some(lag), Some(spec)) => {
+                if spec.lag != lag || entry.event_time_column != Some(spec.time_col) {
+                    return Err(unsupported(format!(
+                        "engine watermark for {:?} does not match",
+                        input.id
+                    )));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(unsupported(format!(
+                    "engine watermark presence for {:?} does not match",
+                    input.id
+                )));
+            }
         }
     }
     Ok(())
