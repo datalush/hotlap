@@ -18,7 +18,7 @@ fn log() -> Dataset {
 fn reference() -> Vec<Vec<i64>> {
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
     let mut stream = pipeline::merged_stream(pipe.source.as_ref()).unwrap();
-    drain(&mut engine, &mut stream, usize::MAX);
+    drain(&mut engine, pipe.source.as_ref(), &mut stream, usize::MAX);
     rows(&engine.snapshot("c").unwrap())
 }
 
@@ -32,17 +32,17 @@ fn crash_and_recovery_equals_no_crash() {
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let (mut crashed, pipe) = engine_with(ResumableSource::new(log()));
     let mut stream = pipeline::merged_stream(pipe.source.as_ref()).unwrap();
-    drain(&mut crashed, &mut stream, 3);
+    drain(&mut crashed, pipe.source.as_ref(), &mut stream, 3);
     let id = take(&mut checkpointer, &crashed, pipe.source.as_ref());
     assert_eq!(id, 1);
-    drain(&mut crashed, &mut stream, 2);
+    drain(&mut crashed, pipe.source.as_ref(), &mut stream, 2);
     drop(crashed);
 
     // Recovery restores the checkpoint and replays from the captured offset.
     let loaded = Recovery::load(&checkpointer).unwrap().unwrap();
     let (mut recovered, pipe) = engine_with(ResumableSource::new(log()));
     let mut replay = Recovery::resume(&mut recovered, pipe.source.as_ref(), &loaded).unwrap();
-    drain(&mut recovered, &mut replay, usize::MAX);
+    drain(&mut recovered, pipe.source.as_ref(), &mut replay, usize::MAX);
     let after = rows(&recovered.snapshot("c").unwrap());
 
     assert_eq!(after, expected, "recovery must match the no-crash run");
@@ -62,14 +62,14 @@ fn recovery_does_not_lose_or_duplicate_at_the_boundary() {
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let (mut crashed, pipe) = engine_with(ResumableSource::new(log()));
     let mut stream = pipeline::merged_stream(pipe.source.as_ref()).unwrap();
-    drain(&mut crashed, &mut stream, 3);
+    drain(&mut crashed, pipe.source.as_ref(), &mut stream, 3);
     take(&mut checkpointer, &crashed, pipe.source.as_ref());
     drop(crashed);
 
     let loaded = Recovery::load(&checkpointer).unwrap().unwrap();
     let (mut recovered, pipe) = engine_with(ResumableSource::new(log()));
     let mut replay = Recovery::resume(&mut recovered, pipe.source.as_ref(), &loaded).unwrap();
-    drain(&mut recovered, &mut replay, usize::MAX);
+    drain(&mut recovered, pipe.source.as_ref(), &mut replay, usize::MAX);
 
     assert_eq!(rows(&recovered.snapshot("c").unwrap()), expected);
 }
@@ -87,9 +87,9 @@ fn corrupt_latest_falls_back_to_an_older_checkpoint() {
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
     let mut stream = pipeline::merged_stream(pipe.source.as_ref()).unwrap();
-    drain(&mut engine, &mut stream, 2);
+    drain(&mut engine, pipe.source.as_ref(), &mut stream, 2);
     take(&mut checkpointer, &engine, pipe.source.as_ref());
-    drain(&mut engine, &mut stream, 1);
+    drain(&mut engine, pipe.source.as_ref(), &mut stream, 1);
     take(&mut checkpointer, &engine, pipe.source.as_ref());
     assert_eq!(checkpointer.latest().unwrap(), Some(2));
 
@@ -109,7 +109,7 @@ fn insufficient_retention_is_an_explicit_error() {
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
     let mut stream = pipeline::merged_stream(pipe.source.as_ref()).unwrap();
-    drain(&mut engine, &mut stream, 3);
+    drain(&mut engine, pipe.source.as_ref(), &mut stream, 3);
     take(&mut checkpointer, &engine, pipe.source.as_ref());
     let loaded = Recovery::load(&checkpointer).unwrap().unwrap();
 

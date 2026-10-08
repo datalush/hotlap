@@ -13,7 +13,9 @@ use hotlap::{InputId, Plan};
 use hotlap_connectors::runtime::checkpoint::CheckpointConfig;
 use hotlap_connectors::runtime::handle::EngineHandle;
 use hotlap_connectors::runtime::pipeline::Pipeline;
-use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
+use hotlap_connectors::source::{
+    Offset, Source, SourceBatch, SourceState, SourceStream, Split, SplitId,
+};
 
 /// In-memory backend shared with the test, so writes stay observable.
 #[derive(Clone, Default)]
@@ -71,29 +73,28 @@ impl Source for ScriptSource {
     }
     fn read(&self, _split: &Split) -> Result<SourceStream, hotlap_connectors::ConnectorError> {
         let schema = self.schema.clone();
-        let progress = Arc::clone(&self.progress);
         let batches = self.batches.clone();
         let stream =
             futures::stream::iter(batches.into_iter().enumerate()).then(move |(index, rows)| {
                 let schema = schema.clone();
-                let progress = Arc::clone(&progress);
                 async move {
                     let array: ArrayRef = Arc::new(Int64Array::from(rows));
                     let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-                    // The read position becomes the offset after this batch.
-                    if let Ok(mut state) = progress.lock() {
-                        state.offsets.insert(0, index as i64 + 1);
-                    }
                     let item: Result<SourceBatch, hotlap_connectors::ConnectorError> =
                         Ok(SourceBatch {
                             batch,
                             base_offset: index as i64,
+                            next_offset: index as i64 + 1,
                             split: 0,
                         });
                     item
                 }
             });
         Ok(Box::pin(stream))
+    }
+    fn commit(&self, _split: SplitId, offset: Offset) -> Result<(), hotlap_connectors::ConnectorError> {
+        self.progress.lock().unwrap().offsets.insert(0, offset);
+        Ok(())
     }
     fn state(&self) -> SourceState {
         self.progress.lock().unwrap().clone()

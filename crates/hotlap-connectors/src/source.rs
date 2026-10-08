@@ -26,14 +26,14 @@ pub struct Split {
 
 /// Resumable per-split offsets (serializable for future checkpoints).
 ///
-/// The offsets reflect the **read position** of each split: the offset of the
-/// next record to be read. They do not track what has been fully consumed by
-/// downstream views.
+/// The offsets reflect the **applied position** of each split: the offset of
+/// the next record to be read, advanced only once the engine has ingested a
+/// batch (see [`Source::commit`]). A split never runs ahead of applied records.
 ///
-/// Replay invariant: a checkpoint taken between source polls contains every
-/// record with offset strictly below the captured offset (`records < offset`
-/// are already applied) and none at or above it (`records >= offset` are
-/// replayed). Reading from `offset` therefore neither loses nor duplicates.
+/// Replay invariant: a checkpoint contains every record with offset strictly
+/// below the captured offset (`records < offset` are already applied) and none
+/// at or above it (`records >= offset` are replayed). Reading from `offset`
+/// therefore neither loses nor duplicates.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceState {
     pub offsets: BTreeMap<SplitId, Offset>,
@@ -46,6 +46,9 @@ pub struct SourceBatch {
     /// Offset of the **first** record of `batch`; the records are ordered but
     /// their offsets are not assumed to be contiguous.
     pub base_offset: Offset,
+    /// Offset to resume from after this batch: one past its last record. The
+    /// runtime passes it to [`Source::commit`] once the batch is applied.
+    pub next_offset: Offset,
     /// Split (bucket) the records were read from, propagated to the engine so
     /// it can track a watermark per split.
     pub split: SplitId,
@@ -62,12 +65,22 @@ pub trait Source: Send + Sync {
     fn splits(&self) -> Result<Vec<Split>, ConnectorError>;
     /// Read `split` as an ordered stream of batches.
     fn read(&self, split: &Split) -> Result<SourceStream, ConnectorError>;
-    /// Current resumable state, reflecting the **read position** (not the
-    /// consumption position) of each split.
+    /// Acknowledge that the batch ending at `offset - 1` from `split` has been
+    /// applied to the engine, advancing the split's applied position to
+    /// `offset`.
     ///
-    /// A checkpoint may advance the read position when a batch is produced, but
-    /// the engine only calls `state()` between polls, after the previous batch
-    /// was ingested, so a persisted offset never runs ahead of applied records.
+    /// The runtime calls this only after `ingest` succeeds, so a failed push
+    /// leaves the position untouched and recovery replays the batch. A source
+    /// with resumable state must override it; stateless sources keep the no-op.
+    fn commit(&self, _split: SplitId, _offset: Offset) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+    /// Current resumable state, reflecting the **applied position** (not the
+    /// read position) of each split.
+    ///
+    /// A checkpoint advances the applied position only when [`Source::commit`]
+    /// is called, which the runtime does after a batch is ingested, so a
+    /// persisted offset never runs ahead of applied records.
     fn state(&self) -> SourceState;
     /// Column index of the event-time column (ms), if the source has one.
     fn event_time_column(&self) -> Option<usize>;

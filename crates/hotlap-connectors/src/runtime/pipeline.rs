@@ -127,7 +127,15 @@ fn on_source_item(
                 // The first successful push builds the dataflow, so views become
                 // readable even if later pushes add no rows.
                 built.store(true, Ordering::SeqCst);
-                false
+                // Ack only now, so the source never reports a batch as applied
+                // before the engine has actually ingested it.
+                match pipeline.source.commit(sb.split, sb.next_offset) {
+                    Ok(()) => false,
+                    Err(error) => {
+                        record_error(last_error, error);
+                        true
+                    }
+                }
             }
             Err(error) => {
                 record_error(last_error, error);

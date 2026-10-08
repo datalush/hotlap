@@ -9,6 +9,7 @@ use crate::source::SourceState;
 
 pub mod assemble;
 pub mod log_reader;
+mod retention;
 pub mod sink;
 mod sink_convert;
 mod sink_writer;

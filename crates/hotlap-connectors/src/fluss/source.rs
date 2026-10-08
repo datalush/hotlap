@@ -10,13 +10,13 @@ use arrow::datatypes::SchemaRef;
 use fluss::client::{EARLIEST_OFFSET, FlussConnection};
 use fluss::config::Config;
 use fluss::metadata::TablePath;
-use fluss::rpc::message::OffsetSpec;
 
 use crate::error::ConnectorError;
-use crate::source::{Source, SourceState, SourceStream, Split};
+use crate::source::{Offset, Source, SourceState, SourceStream, Split, SplitId};
 
 use super::assemble::with_event_time;
 use super::lock_progress;
+use super::retention::fetch_earliest;
 use super::{fluss_err, parse_path};
 
 /// A Fluss log-table source exposing per-record broker timestamps.
@@ -89,23 +89,6 @@ impl FlussSource {
     }
 }
 
-/// Ask the broker for the earliest retained offset of each bucket.
-///
-/// Uses `FlussAdmin::list_offsets` with `OffsetSpec::Earliest` (the Rust client
-/// has no dedicated `list_earliest_offsets` helper). Returns `None` when the
-/// admin or the RPC is unavailable, so recovery treats retention as unverified.
-async fn fetch_earliest(
-    connection: &FlussConnection,
-    table_path: &TablePath,
-    buckets: &[i32],
-) -> Option<HashMap<i32, i64>> {
-    let admin = connection.get_admin().ok()?;
-    admin
-        .list_offsets(table_path, buckets, OffsetSpec::Earliest)
-        .await
-        .ok()
-}
-
 impl Source for FlussSource {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
@@ -140,8 +123,17 @@ impl Source for FlussSource {
             self.schema.clone(),
             split.id,
             split.start,
-            Arc::clone(&self.progress),
         ))
+    }
+
+    /// Advance the bucket's applied offset, never moving it backwards.
+    fn commit(&self, split: SplitId, offset: Offset) -> Result<(), ConnectorError> {
+        let mut progress = lock_progress(&self.progress)?;
+        let entry = progress.offsets.entry(split).or_insert(offset);
+        if offset > *entry {
+            *entry = offset;
+        }
+        Ok(())
     }
 
     fn state(&self) -> SourceState {

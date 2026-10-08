@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use hotlap_connectors::ConnectorError;
-use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
+use hotlap_connectors::source::{Offset, Source, SourceState, SourceStream, Split, SplitId};
 
 /// A [`Source`] that delegates to an already-registered, shared source.
 ///
@@ -23,6 +23,9 @@ impl Source for SharedSource {
     }
     fn read(&self, split: &Split) -> Result<SourceStream, ConnectorError> {
         self.0.read(split)
+    }
+    fn commit(&self, split: SplitId, offset: Offset) -> Result<(), ConnectorError> {
+        self.0.commit(split, offset)
     }
     fn state(&self) -> SourceState {
         self.0.state()

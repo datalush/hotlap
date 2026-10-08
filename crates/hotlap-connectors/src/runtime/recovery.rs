@@ -44,10 +44,11 @@ impl Recovery {
     /// offsets, yielding a stream that replays from the checkpoint.
     ///
     /// [`SourceState`](crate::source::SourceState) holds the offset of the
-    /// **next** record to read, so the checkpoint already contains every record
-    /// below that offset and replay must start exactly there: starting one
-    /// record earlier duplicates, one later loses. Checkpoints are taken
-    /// between source polls, so no in-flight batch can break the invariant.
+    /// **next** record to read, advanced only after a batch is applied. The
+    /// checkpoint therefore already contains every record below that offset and
+    /// replay must start exactly there: starting one record earlier duplicates,
+    /// one later loses. The runtime commits offsets after ingestion, so no
+    /// in-flight batch can break the invariant.
     ///
     /// Errors when the source can no longer serve a captured offset, so
     /// insufficient retention fails loudly instead of losing records.

@@ -27,6 +27,7 @@ impl Source for OneBatchSource {
         let items: Vec<Result<SourceBatch, _>> = vec![Ok(SourceBatch {
             batch: self.batch.clone(),
             base_offset: 0,
+            next_offset: 3,
             split: 0,
         })];
         Ok(Box::pin(futures::stream::iter(items)))

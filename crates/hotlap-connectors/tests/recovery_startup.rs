@@ -19,14 +19,14 @@ fn startup_recovers_from_the_last_checkpoint() {
     let backend = SharedBackend::default();
     let (mut reference, ref_pipe) = engine_with(ResumableSource::new(log()));
     let mut ref_stream = runtime::merged_stream(ref_pipe.source.as_ref()).unwrap();
-    drain(&mut reference, &mut ref_stream, usize::MAX);
+    drain(&mut reference, ref_pipe.source.as_ref(), &mut ref_stream, usize::MAX);
     let expected = rows(&reference.snapshot("c").unwrap());
 
     // Seed a checkpoint at read offset 3.
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let (mut seeded, seed_pipe) = engine_with(ResumableSource::new(log()));
     let mut seed_stream = runtime::merged_stream(seed_pipe.source.as_ref()).unwrap();
-    drain(&mut seeded, &mut seed_stream, 3);
+    drain(&mut seeded, seed_pipe.source.as_ref(), &mut seed_stream, 3);
     take(&mut checkpointer, &seeded, seed_pipe.source.as_ref());
     drop(seeded);
 

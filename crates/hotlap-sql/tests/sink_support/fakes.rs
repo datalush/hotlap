@@ -126,6 +126,7 @@ pub fn source_batch(keys: &[i64], times: &[i64]) -> SourceBatch {
     SourceBatch {
         batch: RecordBatch::try_new(kv_schema(), cols).unwrap(),
         base_offset: 0,
+        next_offset: keys.len() as i64,
         split: 0,
     }
 }

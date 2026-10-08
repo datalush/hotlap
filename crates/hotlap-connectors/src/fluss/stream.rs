@@ -1,7 +1,7 @@
 //! Lazy tailing read for one Fluss bucket: open on demand, poll repeatedly,
 //! assemble one `SourceBatch` per non-empty poll.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
@@ -10,10 +10,9 @@ use fluss::metadata::TablePath;
 use futures::stream;
 
 use crate::error::ConnectorError;
-use crate::source::{SourceBatch, SourceState, SourceStream};
+use crate::source::{SourceBatch, SourceStream};
 
 use super::assemble::assemble;
-use super::lock_progress;
 use super::log_reader::FlussLogReader;
 
 /// Poll window while waiting for new records; the stream polls repeatedly.
@@ -26,7 +25,6 @@ pub(crate) fn read_bucket(
     full_schema: SchemaRef,
     bucket: i32,
     start: i64,
-    progress: Arc<Mutex<SourceState>>,
 ) -> SourceStream {
     let task = ReadTask {
         connection,
@@ -36,10 +34,7 @@ pub(crate) fn read_bucket(
         start,
         reader: None,
     };
-    let stream = stream::unfold(Some(task), move |state| {
-        let progress = Arc::clone(&progress);
-        async move { advance(state, progress, bucket).await }
-    });
+    let stream = stream::unfold(Some(task), |state| async move { advance(state).await });
     Box::pin(stream)
 }
 
@@ -56,8 +51,6 @@ struct ReadTask {
 /// One unfold step: open on demand, poll until records arrive, assemble a batch.
 async fn advance(
     state: Option<ReadTask>,
-    progress: Arc<Mutex<SourceState>>,
-    bucket: i32,
 ) -> Option<(Result<SourceBatch, ConnectorError>, Option<ReadTask>)> {
     let mut task = state?;
     if task.reader.is_none() {
@@ -85,21 +78,14 @@ async fn advance(
                 };
                 let base_offset = records.first().map_or(0, |record| record.offset);
                 let last_offset = records.last().map_or(base_offset, |record| record.offset);
-                // Advance the read position as the batch is produced. The engine
-                // only snapshots `state()` between polls, after the previous
-                // batch was ingested, so a checkpoint never persists an offset
-                // ahead of the records it has applied.
-                match lock_progress(&progress) {
-                    Ok(mut guard) => {
-                        guard.offsets.insert(bucket, last_offset + 1);
-                    }
-                    Err(error) => return Some((Err(error), None)),
-                }
+                // The applied position is not advanced here: the runtime commits
+                // it via `Source::commit` only after the batch is ingested.
                 return Some((
                     Ok(SourceBatch {
                         batch,
                         base_offset,
-                        split: bucket,
+                        next_offset: last_offset + 1,
+                        split: task.bucket,
                     }),
                     Some(task),
                 ));

@@ -15,7 +15,9 @@ use hotlap::{Hotlap, InputId, Plan};
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::runtime::checkpoint::{CheckpointConfig, Checkpointer};
 use hotlap_connectors::runtime::pipeline::{self, Pipeline};
-use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
+use hotlap_connectors::source::{
+    Offset, Source, SourceBatch, SourceState, SourceStream, Split, SplitId,
+};
 use hotlap_engine::EngineCore;
 
 /// A shared, immutable log plus the earliest offset still retained.
@@ -74,10 +76,8 @@ impl Source for ResumableSource {
         let retained = self.dataset.retained_from;
         let schema = self.schema.clone();
         let data = Arc::clone(&self.dataset.batches);
-        let progress = Arc::clone(&self.progress);
         let stream = futures::stream::iter(start..data.len()).then(move |index| {
             let schema = schema.clone();
-            let progress = Arc::clone(&progress);
             let rows = data[index].clone();
             async move {
                 if index < retained {
@@ -87,17 +87,20 @@ impl Source for ResumableSource {
                 }
                 let array: ArrayRef = Arc::new(Int64Array::from(rows));
                 let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-                if let Ok(mut state) = progress.lock() {
-                    state.offsets.insert(0, index as i64 + 1);
-                }
                 Ok(SourceBatch {
                     batch,
                     base_offset: index as i64,
+                    next_offset: index as i64 + 1,
                     split: 0,
                 })
             }
         });
         Ok(Box::pin(stream))
+    }
+
+    fn commit(&self, _split: SplitId, offset: Offset) -> Result<(), ConnectorError> {
+        self.progress.lock().unwrap().offsets.insert(0, offset);
+        Ok(())
     }
 
     fn state(&self) -> SourceState {
@@ -168,13 +171,15 @@ pub fn take(checkpointer: &mut Checkpointer, engine: &Hotlap, source: &dyn Sourc
     futures::executor::block_on(checkpointer.take(engine, source)).unwrap()
 }
 
-/// Push up to `limit` readable batches from `stream` into `hotlap`.
-pub fn drain(hotlap: &mut Hotlap, stream: &mut SourceStream, limit: usize) {
+/// Push up to `limit` readable batches from `stream` into `hotlap`, acking each
+/// one through `source` once it is applied (mirrors the runtime).
+pub fn drain(hotlap: &mut Hotlap, source: &dyn Source, stream: &mut SourceStream, limit: usize) {
     let mut pushed = 0;
     while pushed < limit {
         match futures::executor::block_on(stream.next()) {
             Some(Ok(batch)) => {
                 pipeline::ingest(hotlap, "in", &batch).unwrap();
+                source.commit(batch.split, batch.next_offset).unwrap();
                 pushed += 1;
             }
             Some(Err(error)) => panic!("unexpected source error: {error}"),
