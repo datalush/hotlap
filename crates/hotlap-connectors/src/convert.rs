@@ -13,7 +13,11 @@ use crate::error::ConnectorError;
 pub fn ensure_supported(schema: &Schema) -> Result<(), ConnectorError> {
     for field in schema.fields() {
         match field.data_type() {
-            DataType::Int64 | DataType::Utf8 | DataType::Boolean => {}
+            DataType::Int64
+            | DataType::Int32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Boolean => {}
             // Only millisecond timestamps are representable as epoch milliseconds;
             // any other unit is rejected explicitly rather than coerced.
             DataType::Timestamp(TimeUnit::Millisecond, _) => {}
@@ -72,9 +76,18 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_type() {
-        let schema = Schema::new(vec![Field::new("f", DataType::Float64, true)]);
+        let schema = Schema::new(vec![Field::new("f", DataType::UInt64, true)]);
         let err = ensure_supported(&schema).unwrap_err();
         assert!(matches!(err, ConnectorError::Unsupported(_)));
+    }
+
+    #[test]
+    fn accepts_int32_and_float64() {
+        let schema = Schema::new(vec![
+            Field::new("i", DataType::Int32, true),
+            Field::new("f", DataType::Float64, true),
+        ]);
+        assert!(ensure_supported(&schema).is_ok());
     }
 
     #[test]

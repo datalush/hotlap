@@ -12,7 +12,11 @@ use crate::error::SqlError;
 pub fn ensure_kernel_types(schema: &Schema) -> Result<(), SqlError> {
     for f in schema.fields() {
         match f.data_type() {
-            DataType::Int64 | DataType::Utf8 | DataType::Boolean => {}
+            DataType::Int64
+            | DataType::Int32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Boolean => {}
             other => {
                 return Err(SqlError::Unsupported(format!(
                     "column `{}` has type {other:?}, not representable by the kernel",
@@ -120,7 +124,16 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_type() {
-        let bad = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
+        let bad = Arc::new(Schema::new(vec![Field::new("f", DataType::UInt64, true)]));
         assert!(ensure_kernel_types(&bad).is_err());
+    }
+
+    #[test]
+    fn accepts_int32_and_float64() {
+        let schema = Schema::new(vec![
+            Field::new("i", DataType::Int32, true),
+            Field::new("f", DataType::Float64, true),
+        ]);
+        assert!(ensure_kernel_types(&schema).is_ok());
     }
 }

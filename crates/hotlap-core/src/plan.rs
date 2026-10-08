@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, Scalar as ArrowScalar, StringArray};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, Scalar as ArrowScalar,
+    StringArray,
+};
 use arrow::compute::{cast, kernels::cmp};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -12,16 +15,23 @@ use crate::error::CoreError;
 use crate::ids::InputId;
 
 /// A scalar literal used by [`Predicate`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is implemented manually because the `F64` payload is not `Eq`; the
+/// equality itself still follows `f64` semantics.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Scalar {
     Null,
     I64(i64),
+    I32(i32),
+    F64(f64),
     Str(String),
     Bool(bool),
 }
 
+impl Eq for Scalar {}
+
 /// Filter predicate over a row: `Eq` compares a column to a literal, `Gt` is
-/// `column > literal` on signed integers.
+/// `column > literal` on numeric columns.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Predicate {
     Eq(usize, Scalar),
@@ -35,12 +45,7 @@ impl Predicate {
     /// treats as `false`. An out-of-range column is `Unsupported`.
     pub fn eval(&self, batch: &RecordBatch) -> Result<BooleanArray, CoreError> {
         match self {
-            Predicate::Gt(col, bound) => {
-                let column = column(batch, *col)?;
-                let casted = cast(column.as_ref(), &DataType::Int64)?;
-                let scalar = ArrowScalar::new(Int64Array::from(vec![*bound]));
-                Ok(cmp::gt(&casted, &scalar)?)
-            }
+            Predicate::Gt(col, bound) => gt(column(batch, *col)?, *bound),
             Predicate::Eq(col, want) => {
                 let column = column(batch, *col)?;
                 if matches!(want, Scalar::Null) {
@@ -66,11 +71,28 @@ fn column(batch: &RecordBatch, col: usize) -> Result<&ArrayRef, CoreError> {
     })
 }
 
+/// Compares `column > bound`, keeping the bound's numeric value on floats.
+///
+/// A `Float64` column is compared in `f64` so `1.5 > 1` stays true; any other
+/// numeric column is cast to `i64`.
+fn gt(column: &ArrayRef, bound: i64) -> Result<BooleanArray, CoreError> {
+    if column.data_type() == &DataType::Float64 {
+        let casted = cast(column.as_ref(), &DataType::Float64)?;
+        let scalar = ArrowScalar::new(Float64Array::from(vec![bound as f64]));
+        return Ok(cmp::gt(&casted, &scalar)?);
+    }
+    let casted = cast(column.as_ref(), &DataType::Int64)?;
+    let scalar = ArrowScalar::new(Int64Array::from(vec![bound]));
+    Ok(cmp::gt(&casted, &scalar)?)
+}
+
 /// Builds a length-one array holding `value`, cast to `data_type`.
 fn literal(value: &Scalar, data_type: &DataType) -> Result<ArrayRef, CoreError> {
     let base: ArrayRef = match value {
         Scalar::Null => return Ok(arrow::array::new_null_array(data_type, 1)),
         Scalar::I64(v) => Arc::new(Int64Array::from(vec![*v])),
+        Scalar::I32(v) => Arc::new(Int32Array::from(vec![*v])),
+        Scalar::F64(v) => Arc::new(Float64Array::from(vec![*v])),
         Scalar::Str(s) => Arc::new(StringArray::from(vec![s.as_str()])),
         Scalar::Bool(b) => Arc::new(BooleanArray::from(vec![*b])),
     };
