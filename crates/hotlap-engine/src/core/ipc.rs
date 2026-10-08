@@ -41,7 +41,7 @@ pub(crate) fn decode_zset(table: &SnapshotTable) -> Result<ZSetBatch, EngineErro
 }
 
 /// Encodes only a schema, as an Arrow IPC stream with no batches.
-pub(crate) fn encode_schema(schema: &SchemaRef) -> Result<Vec<u8>, EngineError> {
+pub fn encode_schema(schema: &SchemaRef) -> Result<Vec<u8>, EngineError> {
     let mut buffer = Vec::new();
     let mut writer = StreamWriter::try_new(&mut buffer, schema.as_ref())?;
     writer.finish()?;
@@ -49,7 +49,7 @@ pub(crate) fn encode_schema(schema: &SchemaRef) -> Result<Vec<u8>, EngineError> 
 }
 
 /// Reads the schema carried by an Arrow IPC stream.
-pub(crate) fn decode_schema(bytes: &[u8]) -> Result<SchemaRef, EngineError> {
+pub fn decode_schema(bytes: &[u8]) -> Result<SchemaRef, EngineError> {
     let reader = StreamReader::try_new(Cursor::new(bytes), None)?;
     Ok(reader.schema())
 }

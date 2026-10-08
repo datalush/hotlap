@@ -2126,6 +2126,7 @@ dependencies = [
  "hotlap-connectors",
  "hotlap-engine",
  "hotlap-sql",
+ "serde",
  "tokio",
 ]
 

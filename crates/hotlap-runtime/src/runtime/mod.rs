@@ -13,6 +13,7 @@ pub mod sink;
 pub mod sink_barrier;
 mod sink_sync;
 mod snapshot_handle;
+pub mod source_checkpoint;
 pub mod sources;
 
 pub use snapshot_handle::SnapshotHandle;
