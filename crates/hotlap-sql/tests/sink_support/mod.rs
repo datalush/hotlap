@@ -12,7 +12,7 @@ use arrow::array::{Array, Int64Array};
 use arrow::record_batch::RecordBatch;
 use hotlap::ZSetBatch;
 use hotlap_connectors::source::SourceBatch;
-use hotlap_sql::{QueryResult, SqlSession};
+use hotlap_runtime::{QueryResult, SqlSession};
 
 fn col(batch: &RecordBatch, index: usize) -> &Int64Array {
     batch

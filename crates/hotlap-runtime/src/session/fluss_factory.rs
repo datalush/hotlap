@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 use hotlap_connectors::fluss::source::FlussSource;
 use hotlap_connectors::source::Source;
 
+use hotlap_sql::error::SqlError;
+
 use super::SourceFactory;
-use crate::error::SqlError;
 
 /// Builds a [`FlussSource`] from the DDL options (`bootstrap`, `table`).
 #[derive(Debug, Default)]

@@ -12,8 +12,9 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 
-use crate::convert::zset_to_batch;
-use crate::session::Snapshotter;
+use hotlap_sql::convert::zset_to_batch;
+
+use super::Snapshotter;
 
 /// Exposes one engine view as a one-shot, in-memory DataFusion table.
 pub struct MvTableProvider {

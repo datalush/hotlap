@@ -1,10 +1,14 @@
 //! Embedded SQL session: DDL, START and materialized-view queries.
 
+mod api;
 mod ddl_exec;
 mod fluss_factory;
+mod mv_provider;
 mod runtime;
+mod session_source;
 mod sink_factory;
 
+pub use api::{MetricsSnapshot, Session};
 pub use fluss_factory::FlussSourceFactory;
 pub use sink_factory::{FlussSinkFactory, SinkFactory};
 
@@ -16,16 +20,15 @@ use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use hotlap::{Plan, ZSetBatch};
 use hotlap_connectors::source::Source;
-use hotlap_runtime::runtime::SnapshotHandle;
-use hotlap_runtime::runtime::handle::EngineHandle;
-use hotlap_runtime::runtime::pipeline::Watermark;
+use hotlap_sql::catalog::Catalog;
+use hotlap_sql::ddl::{self, Statement};
+use hotlap_sql::error::SqlError;
+use hotlap_sql::translate::register_tumble_udf;
 
-use crate::catalog::Catalog;
-use crate::ddl::{self, Statement};
-use crate::error::SqlError;
-use crate::mv_provider::MvTableProvider;
-use crate::session_source::SharedSource;
-use crate::translate::register_tumble_udf;
+use crate::runtime::SnapshotHandle;
+use crate::runtime::checkpoint::CheckpointConfig;
+use crate::runtime::handle::EngineHandle;
+use crate::runtime::pipeline::Watermark;
 
 /// Builds engine sources from `CREATE SOURCE` options.
 #[async_trait::async_trait]
@@ -89,6 +92,8 @@ pub struct SqlSession {
     /// Input deltas to retain for views created after `START`; `None` disables
     /// retention, so those views are rejected.
     retention: Option<usize>,
+    /// Periodic checkpoint settings, moved into the engine at `START`.
+    checkpoint: Option<CheckpointConfig>,
 }
 
 impl SqlSession {
@@ -120,7 +125,14 @@ impl SqlSession {
             engine: None,
             started: false,
             retention: None,
+            checkpoint: None,
         }
+    }
+
+    /// Configure periodic checkpointing, moved into the engine at `START`.
+    pub fn with_checkpoint(mut self, config: CheckpointConfig) -> Self {
+        self.checkpoint = Some(config);
+        self
     }
 
     /// Retain the last `events` input deltas so a materialized view can be

@@ -5,15 +5,15 @@ use std::sync::Arc;
 use hotlap::InputId;
 use hotlap_connectors::datafusion::provider::SourceTableProvider;
 use hotlap_connectors::source::Source;
-use hotlap_runtime::runtime::pipeline::Watermark;
+use hotlap_sql::catalog::{MvDef, SourceDef};
+use hotlap_sql::ddl::{CreateSink, CreateSource, CreateView};
+use hotlap_sql::error::SqlError;
+use hotlap_sql::mv_schema::mv_schema;
+use hotlap_sql::translate::to_kernel_plan;
+use hotlap_sql::tumble::normalize_tumble_intervals;
 
 use super::{QueryResult, SinkDef, SqlSession, to_engine};
-use crate::catalog::{MvDef, SourceDef};
-use crate::ddl::{CreateSink, CreateSource, CreateView};
-use crate::error::SqlError;
-use crate::mv_schema::mv_schema;
-use crate::translate::to_kernel_plan;
-use crate::tumble::normalize_tumble_intervals;
+use crate::runtime::pipeline::Watermark;
 
 impl SqlSession {
     pub(super) async fn create_source(
@@ -29,7 +29,7 @@ impl SqlSession {
             ));
         }
         let source: Arc<dyn Source> = self.factory.create(&cs.name, &cs.options).await?.into();
-        crate::watermark::column_index(&source.schema(), &cs.time_col)?;
+        hotlap_sql::watermark::column_index(&source.schema(), &cs.time_col)?;
         let connector = cs.options.get("connector").cloned().unwrap_or_default();
         self.catalog.add_source(&cs.name, SourceDef { connector })?;
         self.ctx
@@ -56,7 +56,7 @@ impl SqlSession {
         let schema = mv_schema(&plan, source_schema.as_ref())?;
         // Reject unrepresentable output types here so the view fails at DDL
         // time rather than later, when a `SELECT` reads the consolidated rows.
-        crate::convert::ensure_kernel_types(&schema)?;
+        hotlap_sql::convert::ensure_kernel_types(&schema)?;
         if self.started {
             // Post-start: the engine replays retained inputs, or rejects when
             // retention does not cover the run.

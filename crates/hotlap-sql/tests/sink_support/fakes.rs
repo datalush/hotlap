@@ -10,7 +10,8 @@ use futures::stream::{self, StreamExt};
 use hotlap::ZSetBatch;
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError, Sink};
-use hotlap_sql::{SinkFactory, SourceFactory, SqlError, SqlSession};
+use hotlap_runtime::{SinkFactory, SourceFactory, SqlSession};
+use hotlap_sql::SqlError;
 
 /// A finite in-memory source replaying a fixed list of batches.
 pub struct FakeSource {

@@ -1,16 +1,17 @@
 //! Engine lifecycle for [`SqlSession`](super::SqlSession).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use hotlap::Plan;
-use hotlap_runtime::runtime::handle::EngineHandle;
-use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
+use hotlap::{Plan, ZSetBatch};
+use hotlap_sql::catalog::MvDef;
 
-use super::{
-    MvTableProvider, QueryResult, SharedSource, Snapshotter, SqlError, SqlSession, to_engine,
-};
-use crate::catalog::MvDef;
+use super::mv_provider::MvTableProvider;
+use super::session_source::SharedSource;
+use super::{QueryResult, Snapshotter, SqlError, SqlSession, to_engine};
+use crate::runtime::handle::EngineHandle;
+use crate::runtime::pipeline::{Pipeline, SinkSpec};
 
 impl SqlSession {
     /// Start the engine with the declared source and views.
@@ -43,8 +44,28 @@ impl SqlSession {
         Ok(())
     }
 
+    /// Read the consolidated output of `view` from the running engine.
+    pub fn snapshot(&self, view: &str) -> Result<ZSetBatch, SqlError> {
+        let engine = self.engine.as_ref().ok_or_else(not_started)?;
+        engine.snapshot(view).map_err(to_engine)
+    }
+
+    /// Take a checkpoint now and return its id.
+    pub fn checkpoint(&self) -> Result<u64, SqlError> {
+        let engine = self.engine.as_ref().ok_or_else(not_started)?;
+        engine.checkpoint().map_err(to_engine)
+    }
+
+    /// A point-in-time copy of the engine metrics; empty before `START`.
+    pub fn metrics(&self) -> BTreeMap<String, u64> {
+        self.engine
+            .as_ref()
+            .map(|engine| engine.metrics().snapshot())
+            .unwrap_or_default()
+    }
+
     /// Build the pipeline, opening each declared sink against its view schema.
-    async fn build_pipeline(&self) -> Result<Pipeline, SqlError> {
+    async fn build_pipeline(&mut self) -> Result<Pipeline, SqlError> {
         let name = self
             .source_name
             .clone()
@@ -60,7 +81,7 @@ impl SqlSession {
             watermark: self.watermark,
             views: self.views.clone(),
             sinks,
-            checkpoint: None,
+            checkpoint: self.checkpoint.take(),
             retention: self.retention,
         })
     }
@@ -138,4 +159,8 @@ impl SqlSession {
         }
         Ok(())
     }
+}
+
+fn not_started() -> SqlError {
+    SqlError::Engine("session not started".into())
 }

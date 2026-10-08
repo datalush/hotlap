@@ -6,8 +6,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use hotlap_connectors::fluss::sink::FlussSink;
 use hotlap_connectors::sink::Sink;
-
-use crate::error::SqlError;
+use hotlap_sql::error::SqlError;
 
 /// Builds engine sinks from `CREATE SINK` options and the target view schema.
 #[async_trait::async_trait]

@@ -2107,10 +2107,12 @@ version = "0.0.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "datafusion",
  "futures",
  "hotlap",
  "hotlap-connectors",
  "hotlap-engine",
+ "hotlap-sql",
  "tokio",
 ]
 

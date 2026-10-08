@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 hotlap = { path = "../hotlap" }
 hotlap-connectors = { path = "../hotlap-connectors" }
-hotlap-runtime = { path = "../hotlap-runtime" }
 arrow = "59.2"
 async-trait = "0.1"
 datafusion = { version = "55.1", default-features = false, features = ["sql"] }
@@ -15,4 +14,5 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+hotlap-runtime = { path = "../hotlap-runtime" }
 serde_json = "1"

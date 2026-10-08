@@ -10,7 +10,8 @@ use arrow::record_batch::RecordBatch;
 use futures::stream;
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
-use hotlap_sql::{FlussSinkFactory, QueryResult, SourceFactory, SqlError, SqlSession};
+use hotlap_runtime::{FlussSinkFactory, QueryResult, SourceFactory, SqlSession};
+use hotlap_sql::SqlError;
 
 const SOURCE: &str = "CREATE SOURCE src WITH (connector='inmem') WATERMARK FOR \
      _event_time AS _event_time - INTERVAL '1 s';";
