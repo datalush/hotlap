@@ -39,10 +39,40 @@ fn work_is_scoped_to_touched_key_not_keyspace() {
         assert_eq!(join.work(), 1);
     }
 
-    // One more left row for key 0 re-evaluates only key 0's 2x1 pairs, even
-    // though 64 keys are resident: the count stays independent of keyspace.
+    // One more left row for key 0 pairs only the new row against key 0's one
+    // retained right row (1 pair), even though 64 keys are resident.
     join.apply(&zset(&[(0, "l2", 1)]), &zset(&[])).unwrap();
-    assert_eq!(join.work(), 2);
+    assert_eq!(join.work(), 1);
+}
+
+#[test]
+fn hot_key_delta_cost_is_linear_not_quadratic() {
+    const N: usize = 64;
+    // A single hot key with N rows per side: N*N resident joined pairs.
+    let seed = |prefix: &str| -> Vec<(i64, String, i64)> {
+        (0..N)
+            .map(|index| (0, format!("{prefix}{index}"), 1))
+            .collect()
+    };
+    let (seed_left, seed_right) = (seed("l"), seed("r"));
+
+    let mut join = Join::new(&[0], &[0]);
+    join.apply(&zset(&row_refs(&seed_left)), &zset(&row_refs(&seed_right)))
+        .unwrap();
+
+    // A one-row left delta must cost ~N pairs (dL x R_prev), not the full N*N
+    // recompute: this assertion fails under a quadratic per-key recompute.
+    join.apply(&zset(&[(0, "l-new", 1)]), &zset(&[])).unwrap();
+    assert!(
+        join.work() <= 2 * N as u64,
+        "hot-key delta evaluated {} pairs, expected ~{N}",
+        join.work()
+    );
+}
+
+/// Borrows owned `(key, value, diff)` rows as the `&str` form `zset` takes.
+fn row_refs(rows: &[(i64, String, i64)]) -> Vec<(i64, &str, i64)> {
+    rows.iter().map(|row| (row.0, row.1.as_str(), row.2)).collect()
 }
 
 #[test]
@@ -52,9 +82,10 @@ fn retraction_touches_one_key_and_work_stays_bounded() {
         join.apply(&zset(&[(key, "l", 1)]), &zset(&[(key, "r", 1)]))
             .unwrap();
     }
-    // Give key 3 a second right row, then retract it again.
+    // Give key 3 a second right row: only key 3's retained left row pairs with
+    // the new right row (1 pair), not all 32 keys.
     join.apply(&zset(&[]), &zset(&[(3, "r2", 1)])).unwrap();
-    assert_eq!(join.work(), 2);
+    assert_eq!(join.work(), 1);
 
     // Only key 3 is re-evaluated (1 left x 1 remaining right), not all 32.
     let out = join.apply(&zset(&[]), &zset(&[(3, "r2", -1)])).unwrap();

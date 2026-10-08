@@ -1,8 +1,7 @@
+mod delta;
 mod helpers;
 mod snapshot;
 mod state;
-
-use std::collections::HashMap;
 
 use arrow::datatypes::SchemaRef;
 use arrow::row::RowConverter;
@@ -18,10 +17,12 @@ use helpers::{concat_zsets, touched_union};
 /// Stateful delta-incremental inner equi-join of two keyed streams.
 ///
 /// Both sides accumulate in [`KeyedArrangement`]s keyed by their join columns.
-/// Each `apply` re-evaluates only the join keys touched by the two deltas,
-/// emitting `retract old ++ insert new` per key against the stored join, so a
-/// push costs `O(sum over touched keys |L[k]| * |R[k]| + |delta|)`, independent
-/// of untouched keyspace.
+/// Each `apply` evaluates only the join keys touched by the two deltas and, per
+/// key, emits the *change* to the join using the delta-join identity
+/// `Δ(L×R) = ΔL×R_prev + L_prev×ΔR + ΔL×ΔR`, where the `_prev` states are the
+/// retained per-key sides from before this push. A push therefore costs
+/// `O(sum over touched keys |ΔL[k]|*|R[k]| + |L[k]|*|ΔR[k]|)` rather than the
+/// full `|L[k]|*|R[k]|` product, independent of untouched keyspace.
 ///
 /// Output is `left || right` plus the signed `diff` (the product of both diffs).
 /// The schema is frozen after the first `apply`, so the side key converters and
@@ -31,7 +32,6 @@ pub struct Join {
     right_keys: Vec<usize>,
     left: Option<KeyedArrangement>,
     right: Option<KeyedArrangement>,
-    joined: HashMap<Vec<u8>, ZSetBatch>,
     left_schema: Option<SchemaRef>,
     right_schema: Option<SchemaRef>,
     out_schema: Option<SchemaRef>,
@@ -51,7 +51,6 @@ impl Join {
             right_keys: right_keys.to_vec(),
             left: None,
             right: None,
-            joined: HashMap::new(),
             left_schema: None,
             right_schema: None,
             out_schema: None,
@@ -71,11 +70,7 @@ impl Join {
                 "join sides must share the same key arity".to_string(),
             ));
         }
-        self.accumulate(left, right)?;
-        #[cfg(test)]
-        {
-            self.work = 0;
-        }
+        self.ensure_ready(left, right)?;
         let schema = self.output_schema()?;
         if self.out_conv.is_none() {
             self.out_conv = Some(full_converter(schema.as_ref())?);
@@ -85,20 +80,24 @@ impl Join {
             let right_conv = self.right_converter()?;
             touched_union(left, left_conv, right, right_conv)?
         };
-        let mut parts = Vec::new();
-        for key in &touched {
-            let delta = self.recompute_key(key, &schema)?;
-            if !delta.is_empty() {
-                parts.push(delta);
-            }
+        // Capture the retained per-key sides *before* folding in this push's
+        // deltas: the delta-join formula multiplies the deltas by these states.
+        let previous = self.previous_states(&touched)?;
+        self.apply_deltas(left, right)?;
+        let (parts, work) = self.delta_join(&touched, &previous, left, right, &schema)?;
+        #[cfg(test)]
+        {
+            self.work = work;
         }
+        #[cfg(not(test))]
+        let _ = work;
         // Consolidate the per-key parts into one canonical, sorted changelog so
         // the join's output ordering does not depend on touched-key order.
         let out_conv = self.out_converter()?;
         consolidate_with(out_conv, &concat_zsets(&schema, &parts)?)
     }
 
-    /// Number of join pairs re-evaluated by the last `apply` (test only).
+    /// Number of join pairs evaluated by the last `apply` (test only).
     #[cfg(test)]
     pub fn work(&self) -> u64 {
         self.work

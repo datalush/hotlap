@@ -77,20 +77,6 @@ pub(super) fn concat_zsets(
     Ok(ZSetBatch::new(batch, diff)?)
 }
 
-/// Returns `current - previous` as a consolidated Z-set.
-///
-/// `converter` is the caller's cached full-row converter for the joined schema.
-pub(super) fn subtract(
-    current: &ZSetBatch,
-    previous: &ZSetBatch,
-    converter: &RowConverter,
-) -> Result<ZSetBatch, EngineError> {
-    let batch = concat_batches(&current.schema(), [&current.batch, &previous.batch])?;
-    let retracted = negate(previous.diff())?;
-    let diff = concat(&[current.diff().as_ref(), retracted.as_ref()])?;
-    consolidate_with(converter, &ZSetBatch::new(batch, diff)?)
-}
-
 /// Inner equi-joins two Z-sets on the given key columns, also returning the
 /// number of joined pairs evaluated (both sides share the key by construction).
 ///
@@ -186,11 +172,4 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch,
         columns.push(take(column.as_ref(), indices, None)?);
     }
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
-}
-
-/// Negates an integer diff column, preserving its length.
-fn negate(diff: &ArrayRef) -> Result<ArrayRef, EngineError> {
-    let ints = int64_diffs(diff)?;
-    let negated: Int64Array = ints.iter().map(|value| value.map(|v| -v)).collect();
-    Ok(Arc::new(negated))
 }

@@ -1,4 +1,4 @@
-//! Cached converters, schema derivation and side accumulation for [`Join`].
+//! Cached converters, schema derivation and side-state updates for [`Join`].
 
 use arrow::datatypes::SchemaRef;
 use arrow::row::RowConverter;
@@ -9,7 +9,7 @@ use crate::error::EngineError;
 use crate::keys::KeyConverter;
 
 use super::Join;
-use super::helpers::{equi_join, joined_schema, subtract};
+use super::helpers::joined_schema;
 
 impl Join {
     /// Cached converter for the left side's join-key columns.
@@ -33,48 +33,6 @@ impl Join {
             .ok_or_else(|| EngineError::Infrastructure("join output converter missing".into()))
     }
 
-    /// Re-evaluates one join key and returns the delta against the stored join.
-    pub(super) fn recompute_key(
-        &mut self,
-        key: &[u8],
-        schema: &SchemaRef,
-    ) -> Result<ZSetBatch, EngineError> {
-        let left = self
-            .left
-            .as_ref()
-            .ok_or_else(|| EngineError::Infrastructure("left arrangement uninitialized".into()))?;
-        let left_slice = left.to_zset_for_key(key)?;
-        let right = self
-            .right
-            .as_ref()
-            .ok_or_else(|| EngineError::Infrastructure("right arrangement uninitialized".into()))?;
-        let right_slice = right.to_zset_for_key(key)?;
-        let right_conv = self.right_converter()?;
-        let out_conv = self.out_converter()?;
-        let (current, pairs) = equi_join(
-            &left_slice,
-            self.left_converter()?,
-            &right_slice,
-            right_conv,
-            out_conv,
-        )?;
-        #[cfg(test)]
-        {
-            self.work += pairs as u64;
-        }
-        #[cfg(not(test))]
-        let _ = pairs;
-        let previous = self
-            .joined
-            .remove(key)
-            .unwrap_or_else(|| ZSetBatch::empty(schema.clone()));
-        let delta = subtract(&current, &previous, self.out_converter()?)?;
-        if !current.is_empty() {
-            self.joined.insert(key.to_vec(), current);
-        }
-        Ok(delta)
-    }
-
     /// Joined output schema (`left || right`), built once from the first apply.
     pub(super) fn output_schema(&mut self) -> Result<SchemaRef, EngineError> {
         if self.out_schema.is_none() {
@@ -91,21 +49,31 @@ impl Join {
         })
     }
 
-    /// Adds each side's delta to its arrangement, creating the arrangements and
-    /// converters from the incoming schemas on the first call.
+    /// Prepares the arrangements and converters from the incoming schemas.
     ///
     /// Rejects a schema change on either side (the converters are cached and
     /// only valid for the schema they were built from) and rejects key columns
     /// whose `DataType`s differ across sides (their `arrow::row` encodings would
     /// not be byte-comparable).
-    pub(super) fn accumulate(
+    pub(super) fn ensure_ready(
         &mut self,
         left: &ZSetBatch,
         right: &ZSetBatch,
     ) -> Result<(), EngineError> {
         self.ensure_left(left)?;
         self.ensure_right(right)?;
-        self.ensure_key_types_match()?;
+        self.ensure_key_types_match()
+    }
+
+    /// Folds each side's delta into its retained arrangement.
+    ///
+    /// Runs after the previous per-key states have been captured and never
+    /// learns new schemas; [`Join::ensure_ready`] must run first.
+    pub(super) fn apply_deltas(
+        &mut self,
+        left: &ZSetBatch,
+        right: &ZSetBatch,
+    ) -> Result<(), EngineError> {
         let left_keys = self
             .left_conv
             .as_ref()

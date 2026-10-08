@@ -1,6 +1,10 @@
-//! Versioned export/import of [`Join`]'s retained side relations and join.
+//! Versioned export/import of [`Join`]'s retained side relations.
+//!
+//! The delta join derives each change from the retained sides, so no cached
+//! join product is stored or restored. `JoinState::joined` is kept in the
+//! snapshot schema for wire compatibility but is always empty in new exports.
 
-use hotlap_core::snapshot::{JoinState, SnapshotTable};
+use hotlap_core::snapshot::JoinState;
 
 use super::Join;
 use crate::arrange::KeyedArrangement;
@@ -9,7 +13,7 @@ use crate::error::EngineError;
 use crate::keys::KeyConverter;
 
 impl Join {
-    /// Exports both side arrangements and the cached per-key join.
+    /// Exports both side arrangements; the join product is not retained.
     ///
     /// Buffered side deltas live on the enclosing graph node and are filled in
     /// by the graph's export; this method leaves them `None`.
@@ -22,21 +26,19 @@ impl Join {
             Some(arrangement) => Some(encode_zset(&arrangement.to_zset()?)?),
             None => None,
         };
-        let mut joined: Vec<(Vec<u8>, SnapshotTable)> = Vec::new();
-        for (key, batch) in &self.joined {
-            joined.push((key.clone(), encode_zset(batch)?));
-        }
-        joined.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(JoinState {
             left,
             right,
-            joined,
+            joined: Vec::new(),
             left_pending: None,
             right_pending: None,
         })
     }
 
-    /// Restores both side arrangements and the cached per-key join.
+    /// Restores both side arrangements.
+    ///
+    /// Any `joined` table in `state` is ignored: the next push recomputes the
+    /// join change from the restored sides.
     pub(crate) fn import_state(&mut self, state: &JoinState) -> Result<(), EngineError> {
         self.left = None;
         self.right = None;
@@ -46,7 +48,6 @@ impl Join {
         self.right_conv = None;
         self.out_schema = None;
         self.out_conv = None;
-        self.joined.clear();
 
         if let Some(table) = &state.left {
             let zset = decode_zset(table)?;
@@ -67,9 +68,6 @@ impl Join {
             self.right = Some(arrangement);
             self.right_conv = Some(converter);
             self.right_schema = Some(schema);
-        }
-        for (key, table) in &state.joined {
-            self.joined.insert(key.clone(), decode_zset(table)?);
         }
         #[cfg(test)]
         {
