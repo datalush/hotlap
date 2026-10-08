@@ -1,74 +1,25 @@
+//! Fail-stop for stream-read and push failures across two sources.
+
 #[path = "common/backend.rs"]
 mod backend;
-#[path = "cross_source_support/source.rs"]
-mod source_support;
+#[path = "runtime_fail_stop_modes/harness.rs"]
+mod harness;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use hotlap::{InputId, Plan};
-use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
+use hotlap_connectors::source::{Source, SourceBatch, Split};
 use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline::Pipeline;
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
-use source_support::{BatchSender, ControlledSource};
 
 use backend::SharedBackend;
-
-enum Outcome {
-    Error(String),
-    Batch(SourceBatch),
-}
-
-struct ScriptSource {
-    schema: SchemaRef,
-    outcome: Outcome,
-}
-
-impl Source for ScriptSource {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-    fn splits(&self) -> Result<Vec<Split>, ConnectorError> {
-        Ok(vec![split()])
-    }
-    fn read(&self, _split: &Split) -> Result<SourceStream, ConnectorError> {
-        let item = match &self.outcome {
-            Outcome::Error(message) => Err(ConnectorError::Infrastructure(message.clone())),
-            Outcome::Batch(batch) => Ok(batch.clone()),
-        };
-        Ok(Box::pin(futures::stream::iter(vec![item])))
-    }
-    fn state(&self) -> SourceState {
-        SourceState::default()
-    }
-    fn event_time_column(&self) -> Option<usize> {
-        None
-    }
-}
-
-fn error_source() -> Arc<ScriptSource> {
-    Arc::new(ScriptSource {
-        schema: schema(),
-        outcome: Outcome::Error("read boom".into()),
-    })
-}
-
-fn one_shot(batch: SourceBatch) -> Arc<ScriptSource> {
-    Arc::new(ScriptSource {
-        schema: batch.batch.schema(),
-        outcome: Outcome::Batch(batch),
-    })
-}
-
-fn schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
-}
+use harness::{BatchSender, ControlledB, error_source, one_shot, schema};
 
 fn split() -> Split {
     Split { id: 0, start: 0 }
@@ -85,6 +36,7 @@ fn batch_on(key: i64) -> SourceBatch {
     }
 }
 
+/// A batch the window plan rejects: `_event_time` without a watermark.
 fn two_col_batch() -> SourceBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
@@ -163,7 +115,8 @@ fn wait_for(done: impl Fn() -> bool) -> bool {
     false
 }
 
-fn assert_stops(pipeline: Pipeline, b: Arc<ControlledSource>, b_tx: Vec<BatchSender>) {
+/// The failure must stop the runtime and leave the other source unacked.
+fn assert_stops(pipeline: Pipeline, b: Arc<ControlledB>, b_tx: Vec<BatchSender>) {
     let handle = EngineHandle::start(pipeline).unwrap();
     assert!(wait_for(|| handle.last_error().unwrap().is_some()));
     b_tx[0].send(Ok(batch_on(9))).unwrap();
@@ -179,7 +132,7 @@ fn assert_stops(pipeline: Pipeline, b: Arc<ControlledSource>, b_tx: Vec<BatchSen
 #[test]
 fn stream_read_failure_stops_the_runtime() {
     let a = error_source();
-    let (b, b_tx) = ControlledSource::new(schema(), vec![split()]);
+    let (b, b_tx) = ControlledB::new(schema(), vec![split()]);
     let pipeline = view_pipeline(sources(a, b.clone()), join_view(), SharedBackend::default());
     assert_stops(pipeline, b, b_tx);
 }
@@ -187,7 +140,7 @@ fn stream_read_failure_stops_the_runtime() {
 #[test]
 fn push_failure_stops_the_runtime() {
     let a = one_shot(two_col_batch());
-    let (b, b_tx) = ControlledSource::new(schema(), vec![split()]);
+    let (b, b_tx) = ControlledB::new(schema(), vec![split()]);
     let pipeline = view_pipeline(
         sources(a, b.clone()),
         window_view(),
