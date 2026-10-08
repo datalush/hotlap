@@ -10,7 +10,8 @@ new scheduler/checkpoint implementation is required for this gate.
 
 > **Superseded framing (2026-10-06):** for the `ydvk` gate the engine was the
 > in-repo DataFusion session. A later decision makes Hotlap an explicit engine
-> built on DataFusion, with `differential-dataflow` as its incremental core;
+> built on DataFusion, with the Arrow-native `hotlap-engine` kernel as its
+> incremental core (the earlier `differential-dataflow` spike was replaced);
 > `ydvk`'s scope and evidence are unchanged. See
 > [incremental core decision and boundary](hotlap-incremental-core.md).
 

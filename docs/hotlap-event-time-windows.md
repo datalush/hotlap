@@ -13,12 +13,13 @@ Dos ejes que no se funden:
 
 1. **Reloj de orden/cierre** = event-time/watermark. Decide el cierre de ventana, el
    descarte de tardíos y el GC.
-2. **Modelo de cambio del core** = Z-sets de `differential-dataflow` (DD).
+2. **Modelo de cambio del core** = Z-sets del kernel Arrow-native `hotlap-engine`
+   (el spike `differential-dataflow` fue reemplazado).
 
 El event-time es un **atributo de fila** (no el tiempo lógico del core), pero el
-watermark **avanza la frontera de DD** por input. Así la propagación mínima y el cierre
-reutilizan la maquinaria de DD sin atar el versionado del motor a los timestamps de
-negocio, y no se obliga a que toda tabla tenga tiempo.
+watermark **gobierna el descarte de tardíos y el cierre de ventanas** por input. Así la
+propagación mínima y el cierre reutilizan la maquinaria del motor sin atar el versionado
+del motor a los timestamps de negocio, y no se obliga a que toda tabla tenga tiempo.
 
 ## 2. Unidades
 
@@ -81,7 +82,8 @@ escalada ante event-times extremos.
 
 ## 9. Verificación
 
-`crates/hotlap/tests/differential_windows.rs` compara el snapshot incremental con una
-recomputación completa (`recompute_tumble`) que replica esta regla a través de la API
-pública; la cobertura de frontera exacta, GC y retracciones vive en los tests del módulo
-DD.
+`crates/hotlap-engine/tests/window.rs` compara el changelog incremental con una
+recomputación completa de primera mano (`recompute`) que agrupa los eventos por ventana,
+descarta solo las inserciones tardías y aplica las retracciones; la cobertura de frontera
+exacta, GC y retracciones vive en los tests de `hotlap-engine`
+(`tests/engine_window.rs`).

@@ -7,8 +7,9 @@ public API versions remained stable across the Rust-only migration; at that time
 no placeholder engine crate was introduced.
 
 > **Superseded (2026-10-06):** Hotlap is now an explicit **engine** layer built on
-> DataFusion. The incremental core is `differential-dataflow` behind an
-> `IncrementalCore` boundary, and the provider crate is to be renamed
+> DataFusion. Its incremental core is the Arrow-native `hotlap-engine` kernel
+> behind an `IncrementalCore` boundary; the earlier
+> `differential-dataflow` spike was replaced. The provider crate is to be renamed
 > `connector-datafusion`. See
 > [incremental core decision and boundary](hotlap-incremental-core.md).
 
