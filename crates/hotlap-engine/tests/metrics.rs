@@ -104,6 +104,22 @@ fn windows_open_gauge_tracks_open_windows() {
 }
 
 #[test]
+fn restored_core_reports_into_the_injected_registry() {
+    let metrics = Arc::new(MetricsRegistry::new());
+    let mut core = window_core(Arc::clone(&metrics));
+    core.push(InputId(0), &time_zset(&[(1, 1, 1)])).unwrap();
+    let snapshot = core.checkpoint().unwrap();
+
+    let mut restored = EngineCore::with_metrics(Arc::clone(&metrics));
+    restored.restore(&snapshot).unwrap();
+    restored.push(InputId(0), &time_zset(&[(1, 2, 1)])).unwrap();
+
+    // The restored core's hot-path handles must target the same registry, so
+    // both the pre-crash and post-restore pushes land there.
+    assert_eq!(metrics.snapshot().get("rows_ingested"), Some(&2));
+}
+
+#[test]
 fn cores_without_injection_get_their_own_registry() {
     let mut core = window_core(Arc::new(MetricsRegistry::new()));
     core.push(InputId(0), &time_zset(&[(1, 1, 1)])).unwrap();

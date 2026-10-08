@@ -22,8 +22,7 @@ impl EngineCore {
                 snapshot.format_version, ENGINE_SNAPSHOT_FORMAT_VERSION
             )));
         }
-        let mut core = EngineCore::new();
-        core.metrics = std::sync::Arc::clone(&self.metrics);
+        let mut core = EngineCore::with_registry(std::sync::Arc::clone(&self.metrics));
         core.frozen = snapshot.frozen;
         core.epoch = snapshot.epoch;
         for input in &snapshot.inputs {
@@ -41,6 +40,7 @@ impl EngineCore {
         // baseline so the first later push does not re-count them as new.
         core.late_closed_seen = core.late_closed_total();
         *self = core;
+        self.refresh_windows_open();
         self.metrics.inc("checkpoints_restored");
         Ok(())
     }
