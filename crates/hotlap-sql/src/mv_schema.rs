@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use hotlap::Plan;
+use hotlap::{Plan, aggregate_output_type};
 
 use crate::error::SqlError;
 
@@ -26,10 +26,18 @@ fn output_fields(plan: &Plan, source: &Schema) -> Result<Vec<Field>, SqlError> {
             let input = output_fields(input, source)?;
             cols.iter().map(|&i| field_at(&input, i)).collect()
         }
-        Plan::GroupCount { input, key } => {
+        Plan::GroupAggregate { input, key, aggs } => {
             let input = output_fields(input, source)?;
             let mut fields = key_fields(&input, key)?;
-            fields.push(int_field("count"));
+            for agg in aggs {
+                let input_ty = match agg.input {
+                    Some(index) => Some(field_at(&input, index)?.data_type().clone()),
+                    None => None,
+                };
+                let ty = aggregate_output_type(agg.func, input_ty.as_ref())
+                    .map_err(|e| SqlError::Unsupported(e.to_string()))?;
+                fields.push(Field::new(agg.func.output_name(), ty, true));
+            }
             Ok(fields)
         }
         Plan::TumbleCount { input, key, .. } => {
@@ -64,7 +72,7 @@ fn int_field(name: &str) -> Field {
 
 #[cfg(test)]
 mod tests {
-    use hotlap::InputId;
+    use hotlap::{AggSpec, InputId};
 
     use super::*;
 
@@ -92,13 +100,16 @@ mod tests {
     }
 
     #[test]
-    fn group_order_is_key_count() {
-        let plan = Plan::GroupCount {
+    fn group_order_is_key_then_aggregates() {
+        let plan = Plan::GroupAggregate {
             input: Box::new(Plan::Source(InputId(0))),
             key: vec![0],
+            aggs: vec![AggSpec::count(), AggSpec::sum(0), AggSpec::avg(0)],
         };
         let schema = mv_schema(&plan, &source()).unwrap();
-        assert_eq!(names(&schema), vec!["k", "count"]);
+        assert_eq!(names(&schema), vec!["k", "count", "sum", "avg"]);
+        assert_eq!(schema.field(2).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(3).data_type(), &DataType::Float64);
     }
 
     #[test]

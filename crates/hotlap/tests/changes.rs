@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use hotlap::{Hotlap, InputId, Plan, ZSetBatch};
+use hotlap::{AggSpec, Hotlap, InputId, Plan, ZSetBatch};
 use hotlap_engine::EngineCore;
 
 fn zset(columns: &[Vec<i64>], diffs: &[i64]) -> ZSetBatch {
@@ -47,9 +47,10 @@ fn open() -> Hotlap {
 }
 
 fn count_by_key() -> Plan {
-    Plan::GroupCount {
+    Plan::GroupAggregate {
         input: Box::new(Plan::Source(InputId(0))),
         key: vec![0],
+        aggs: vec![AggSpec::count()],
     }
 }
 

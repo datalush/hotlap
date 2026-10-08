@@ -78,14 +78,14 @@ DataFusion planifica cada `SELECT` y `translate::to_kernel_plan` mapea su
 | `TableScan` | `Source` | — |
 | `Filter` | `Filter` | predicado `col = literal` o `col > literal Int64` |
 | `Projection` | `Project` | proyección de columnas; la proyección identidad sobre un `Aggregate` se desenvuelve |
-| `Aggregate` | `GroupCount` / `TumbleCount` | exactamente un `count(*)`; grupo formado por columnas y, como mucho, un `tumble(col, size)` |
+| `Aggregate` | `GroupAggregate` / `TumbleCount` | `count`/`sum`/`avg` (con `GROUP BY` de columnas); `count(*)` por ventana con, como mucho, un `tumble(col, size)` |
 | `Join` | `Join` | inner equi-join; ambos lados leen **el mismo** source |
 
 Todo lo demás se **rechaza explícitamente** con `SqlError::Unsupported`, nunca
-con una traducción parcial o silenciosa: agregados distintos de `count(*)`
-(`sum`, `avg`, `count(DISTINCT ...)`, `FILTER`, `ORDER BY`), operadores de
-predicado fuera de `Eq`/`Gt`, más de un `tumble`, o un join entre sources
-distintos. Los tipos de columna que el kernel no representa
+con una traducción parcial o silenciosa: agregados fuera de `count`/`sum`/`avg`
+(`min`/`max` quedan para más adelante, igual que `count(DISTINCT ...)`,
+`FILTER`, `ORDER BY`), agregados sin `GROUP BY`, operadores de predicado fuera
+de `Eq`/`Gt`, más de un `tumble`, o un join entre sources distintos. Los tipos de columna que el kernel no representa
 (`Int64`/`Utf8`/`Boolean` son los admitidos) también se rechazan: el esquema de
 salida de la MV se valida con `convert::ensure_kernel_types` en el propio
 `CREATE MATERIALIZED VIEW`, de modo que un tipo no representable falla en DDL y
@@ -104,8 +104,10 @@ planifica como una tabla normal:
   `convert::rows_to_batch` y lo envuelve en un ejecutor en memoria.
 - El **esquema** de la MV (`mv_schema.rs`) sigue el contrato de salida del
   kernel: `key ++ [window_start, count]` para `TumbleCount` y
-  `key ++ [count]` para `GroupCount`. Los nombres de las columnas clave se
-  toman del esquema del source en los índices del `key`.
+  `key ++ [count, sum, avg, ...]` para `GroupAggregate`. Los nombres de las
+  columnas agregadas son `count`/`sum`/`avg` y sus tipos se derivan del tipo de
+  la columna de entrada; los nombres de las columnas clave se toman del
+  esquema del source en los índices del `key`.
 - Si el dataflow aún no se ha construido (ningún batch ingerido), el snapshot
   se sirve como **vacío** en vez de error (`SnapshotHandle::is_built`), de forma
   que una MV recién arrancada responde 0 filas sin colgarse.

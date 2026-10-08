@@ -10,7 +10,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use hotlap_core::{
-    EngineSnapshot, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch,
+    AggSpec, EngineSnapshot, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch,
 };
 use hotlap_engine::{EngineCore, decode_snapshot, encode_snapshot};
 
@@ -105,9 +105,10 @@ fn engine() -> EngineCore {
     )
     .unwrap();
 
-    let group = Plan::GroupCount {
+    let group = Plan::GroupAggregate {
         input: Box::new(Plan::Source(InputId(0))),
         key: vec![0],
+        aggs: vec![AggSpec::count()],
     };
     let window = Plan::TumbleCount {
         input: Box::new(Plan::Source(InputId(0))),

@@ -15,13 +15,15 @@ use crate::ids::{InputId, SplitId, ViewId};
 use crate::plan::Plan;
 use crate::watermark::WatermarkSpec;
 
-pub use operator::{GroupState, JoinState, OperatorState, WindowBucket, WindowState};
+pub use operator::{
+    AggValue, GroupEntry, GroupState, JoinState, OperatorState, WindowBucket, WindowState,
+};
 
 /// Current at-rest layout version of [`EngineSnapshot`].
 ///
 /// Bump this whenever the meaning of an existing field changes; readers reject
 /// any other version instead of guessing.
-pub const ENGINE_SNAPSHOT_FORMAT_VERSION: u32 = 2;
+pub const ENGINE_SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// An Arrow IPC table plus its signed multiplicity column.
 ///

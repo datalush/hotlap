@@ -1,31 +1,31 @@
-//! Versioned export/import of [`GroupCount`]'s retained counts.
+//! Versioned export/import of [`GroupAggregate`]'s retained groups.
 
-use hotlap_core::snapshot::GroupState;
+use hotlap_core::snapshot::{GroupEntry, GroupState};
 
-use super::GroupCount;
+use super::GroupAggregate;
 use crate::core::ipc::{decode_schema, encode_schema};
 use crate::error::EngineError;
 use crate::keys::converter_for;
 
-impl GroupCount {
-    /// Exports the schema and live counts in deterministic key order.
+impl GroupAggregate {
+    /// Exports the schema and live groups in deterministic key order.
     pub(crate) fn export_state(&self) -> Result<GroupState, EngineError> {
         let schema = match &self.schema {
             Some(schema) => Some(encode_schema(schema)?),
             None => None,
         };
-        let mut counts: Vec<(Vec<u8>, i64)> = self
-            .counts
+        let mut groups: Vec<(Vec<u8>, GroupEntry)> = self
+            .groups
             .iter()
-            .map(|(key, &count)| (key.clone(), count))
+            .map(|(key, entry)| (key.clone(), entry.clone()))
             .collect();
-        counts.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(GroupState { schema, counts })
+        groups.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(GroupState { schema, groups })
     }
 
-    /// Restores the schema and counts, resetting the test-only work counter.
+    /// Restores the schema and groups, resetting the test-only work counter.
     pub(crate) fn import_state(&mut self, state: &GroupState) -> Result<(), EngineError> {
-        self.counts.clear();
+        self.groups.clear();
         match &state.schema {
             Some(bytes) => {
                 let schema = decode_schema(bytes)?;
@@ -37,8 +37,8 @@ impl GroupCount {
                 self.schema = None;
             }
         }
-        for (key, count) in &state.counts {
-            self.counts.insert(key.clone(), *count);
+        for (key, entry) in &state.groups {
+            self.groups.insert(key.clone(), entry.clone());
         }
         #[cfg(test)]
         {

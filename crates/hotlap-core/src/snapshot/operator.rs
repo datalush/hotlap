@@ -7,7 +7,7 @@ use super::SnapshotTable;
 /// Retained state of one node, in plan pre-order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperatorState {
-    /// A `groupcount` reducer.
+    /// A grouped-aggregate reducer.
     Group(GroupState),
     /// A tumbling-window reducer.
     Window(WindowState),
@@ -15,13 +15,55 @@ pub enum OperatorState {
     Join(JoinState),
 }
 
-/// `groupcount` retained counts: encoded key bytes to count.
+/// Accumulated value of one aggregate for one group.
+///
+/// Floats are compared by `f64` equality; `Eq` is implemented manually to keep
+/// the snapshot container usable as an `Eq` type, mirroring `Scalar`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum AggValue {
+    /// A `count` accumulator.
+    Count(i64),
+    /// An integer `sum` accumulator plus its non-null count.
+    SumInteger {
+        /// Running sum, widened to `i128`.
+        sum: i128,
+        /// Number of non-null values folded in; zero means the sum is null.
+        count: i64,
+    },
+    /// A float `sum` accumulator plus its non-null count.
+    SumFloat {
+        /// Running sum.
+        sum: f64,
+        /// Number of non-null values folded in; zero means the sum is null.
+        count: i64,
+    },
+    /// An `avg` accumulator: the running sum plus its non-null count.
+    Avg {
+        /// Running sum of the input values.
+        sum: f64,
+        /// Number of non-null values folded in.
+        count: i64,
+    },
+}
+
+impl Eq for AggValue {}
+
+/// Retained state of one group: its row multiplicity and one value per agg.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupEntry {
+    /// Net row multiplicity; the group exists while this is non-zero.
+    pub rows: i64,
+    /// One accumulated value per aggregate, in plan order.
+    pub values: Vec<AggValue>,
+}
+
+/// `groupaggregate` retained state: encoded key bytes to accumulator values.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupState {
     /// Arrow IPC schema bytes of the reducer's input, or `None` before use.
     pub schema: Option<Vec<u8>>,
-    /// Live `key bytes -> count` entries, ordered by key bytes.
-    pub counts: Vec<(Vec<u8>, i64)>,
+    /// Live `key bytes -> entry` groups, ordered by key bytes.
+    pub groups: Vec<(Vec<u8>, GroupEntry)>,
 }
 
 /// A single open window bucket.

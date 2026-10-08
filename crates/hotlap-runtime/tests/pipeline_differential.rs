@@ -5,7 +5,7 @@ use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use hotlap::{Hotlap, InputId, Plan};
+use hotlap::{AggSpec, Hotlap, InputId, Plan};
 use hotlap_engine::EngineCore;
 
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
@@ -81,9 +81,10 @@ fn group_count(schema: SchemaRef, batches: Vec<SourceBatch>) -> (Hotlap, Pipelin
         watermark: None,
         views: vec![(
             "c".into(),
-            Plan::GroupCount {
+            Plan::GroupAggregate {
                 input: Box::new(Plan::Source(InputId(0))),
                 key: vec![0],
+                aggs: vec![AggSpec::count()],
             },
         )],
         sinks: vec![],
@@ -165,9 +166,10 @@ async fn two_splits_merge() {
         watermark: None,
         views: vec![(
             "c".into(),
-            Plan::GroupCount {
+            Plan::GroupAggregate {
                 input: Box::new(Plan::Source(InputId(0))),
                 key: vec![0],
+                aggs: vec![AggSpec::count()],
             },
         )],
         sinks: vec![],

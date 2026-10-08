@@ -7,7 +7,7 @@ use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use hotlap::{InputId, Plan, ZSetBatch};
+use hotlap::{AggSpec, InputId, Plan, ZSetBatch};
 
 use hotlap_connectors::sink::Sink;
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
@@ -151,9 +151,10 @@ fn consolidate(batches: &[ZSetBatch]) -> BTreeMap<Vec<i64>, i64> {
 fn group_count() -> (String, Plan) {
     (
         "c".into(),
-        Plan::GroupCount {
+        Plan::GroupAggregate {
             input: Box::new(Plan::Source(InputId(0))),
             key: vec![0],
+            aggs: vec![AggSpec::count()],
         },
     )
 }

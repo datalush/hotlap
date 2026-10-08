@@ -10,7 +10,7 @@ use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use hotlap_core::{IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
+use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
 use hotlap_engine::EngineCore;
 
 fn schema(names: &[&str]) -> SchemaRef {
@@ -87,9 +87,10 @@ fn core(retention: Option<usize>) -> EngineCore {
 }
 
 fn group() -> Plan {
-    Plan::GroupCount {
+    Plan::GroupAggregate {
         input: Box::new(Plan::Source(InputId(0))),
         key: vec![0],
+        aggs: vec![AggSpec::count()],
     }
 }
 

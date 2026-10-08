@@ -10,7 +10,8 @@ pub mod state;
 
 pub use engine::{Hotlap, HotlapError};
 pub use hotlap_core::plan;
+pub use hotlap_core::plan::aggregate_output_type;
 pub use hotlap_core::{
-    CmpOp, CoreError, IncrementalCore, InputId, Plan, Predicate, Scalar, SplitId, ViewId,
-    WatermarkSpec, ZSetBatch,
+    AggFunc, AggSpec, CmpOp, CoreError, IncrementalCore, InputId, Plan, Predicate, Scalar, SplitId,
+    ViewId, WatermarkSpec, ZSetBatch,
 };

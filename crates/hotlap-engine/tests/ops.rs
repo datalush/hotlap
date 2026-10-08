@@ -6,9 +6,9 @@ use arrow::compute::{concat, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use hotlap_engine::ZSetBatch;
 use hotlap_engine::consolidate;
-use hotlap_engine::ops::{GroupCount, filter, project};
+use hotlap_engine::ops::{GroupAggregate, filter, project};
+use hotlap_engine::{AggSpec, ZSetBatch};
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -131,7 +131,7 @@ fn project_rejects_empty_column_list() {
 
 #[test]
 fn group_count_changelog_consolidates_to_final_counts() {
-    let mut reducer = GroupCount::new(&[0]);
+    let mut reducer = GroupAggregate::new(&[0], vec![AggSpec::count()]);
     let mut history: Vec<(i64, &str, i64)> = Vec::new();
     let mut changelogs: Vec<ZSetBatch> = Vec::new();
 
@@ -157,7 +157,7 @@ fn group_count_changelog_consolidates_to_final_counts() {
 
 #[test]
 fn group_count_delta_retracts_old_and_inserts_new_count() {
-    let mut reducer = GroupCount::new(&[0]);
+    let mut reducer = GroupAggregate::new(&[0], vec![AggSpec::count()]);
 
     let first = reducer.apply(&zset(&[(1, "a", 1)])).unwrap();
     assert_eq!(count_diff_rows(&first), vec![((1, 1), 1)]);
@@ -168,7 +168,7 @@ fn group_count_delta_retracts_old_and_inserts_new_count() {
 
 #[test]
 fn group_count_retracts_key_that_crosses_to_zero() {
-    let mut reducer = GroupCount::new(&[0]);
+    let mut reducer = GroupAggregate::new(&[0], vec![AggSpec::count()]);
     let first = reducer.apply(&zset(&[(1, "a", 1), (1, "b", 1)])).unwrap();
     assert_eq!(count_diff_rows(&first), vec![((1, 2), 1)]);
 
@@ -179,7 +179,7 @@ fn group_count_retracts_key_that_crosses_to_zero() {
 
 #[test]
 fn group_count_empty_input_is_empty() {
-    let mut reducer = GroupCount::new(&[0]);
+    let mut reducer = GroupAggregate::new(&[0], vec![AggSpec::count()]);
     let out = reducer.apply(&zset(&[])).unwrap();
     assert!(out.is_empty());
     assert_eq!(out.schema().field(1).name(), "count");

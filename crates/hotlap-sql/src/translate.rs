@@ -8,11 +8,11 @@ use datafusion::logical_expr::{
     Aggregate, Expr, Join, LogicalPlan, Projection, Volatility, create_udf,
 };
 use datafusion::prelude::SessionContext;
-use hotlap::{InputId, Plan};
+use hotlap::{AggSpec, InputId, Plan};
 
 use crate::error::SqlError;
 use crate::translate_expr::{
-    column_index, ensure_count_only, ensure_identity_projection, is_tumble, parse_tumble,
+    column_index, ensure_identity_projection, is_tumble, parse_aggs, parse_tumble,
     projection_indices,
 };
 use crate::translate_predicate::predicate;
@@ -67,7 +67,6 @@ fn project(p: &Projection, source: InputId) -> Result<Plan, SqlError> {
 }
 
 fn translate_aggregate(a: &Aggregate, source: InputId) -> Result<Plan, SqlError> {
-    ensure_count_only(&a.aggr_expr)?;
     let input = to_kernel_plan(&a.input, source)?;
     let schema = a.input.schema();
     let mut key = Vec::new();
@@ -88,24 +87,33 @@ fn translate_aggregate(a: &Aggregate, source: InputId) -> Result<Plan, SqlError>
             }
         }
     }
-    // A grouping-key-less `count(*)` cannot be represented: both `GroupCount`
-    // and `TumbleCount` require a non-empty key, so reject it here — even with
-    // `tumble` present — while planning the view, not later at ingest.
+    let aggs = parse_aggs(&a.aggr_expr, schema)?;
+    // A grouping-key-less aggregate cannot be represented: every irreducible
+    // kernel group operator requires a non-empty key, so reject it here while
+    // planning the view, not later at ingest.
     if key.is_empty() {
         return Err(SqlError::Unsupported(
-            "global count(*) without a grouping key is not supported".into(),
+            "aggregate without a grouping key is not supported".into(),
         ));
     }
     match tumble {
-        Some((time_col, size)) => Ok(Plan::TumbleCount {
+        Some((time_col, size)) => {
+            if aggs.as_slice() != [AggSpec::count()] {
+                return Err(SqlError::Unsupported(
+                    "windowed aggregates other than count(*) are not supported".into(),
+                ));
+            }
+            Ok(Plan::TumbleCount {
+                input: Box::new(input),
+                key,
+                time_col,
+                size,
+            })
+        }
+        None => Ok(Plan::GroupAggregate {
             input: Box::new(input),
             key,
-            time_col,
-            size,
-        }),
-        None => Ok(Plan::GroupCount {
-            input: Box::new(input),
-            key,
+            aggs,
         }),
     }
 }

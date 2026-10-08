@@ -9,7 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use hotlap::state::{StateBackend, StateEntry, StateError};
-use hotlap::{InputId, Plan};
+use hotlap::{AggSpec, InputId, Plan};
 use hotlap_connectors::source::{
     Offset, Source, SourceBatch, SourceState, SourceStream, Split, SplitId,
 };
@@ -124,9 +124,10 @@ pub fn pipeline(backend: SharedBackend, interval: Duration, retain: usize) -> Pi
         watermark: None,
         views: vec![(
             "c".into(),
-            Plan::GroupCount {
+            Plan::GroupAggregate {
                 input: Box::new(Plan::Source(InputId(0))),
                 key: vec![0],
+                aggs: vec![AggSpec::count()],
             },
         )],
         sinks: vec![],

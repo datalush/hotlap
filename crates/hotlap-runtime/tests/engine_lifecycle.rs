@@ -5,7 +5,7 @@ use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::stream;
-use hotlap::{InputId, Plan};
+use hotlap::{AggSpec, InputId, Plan};
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
 use hotlap_runtime::runtime::handle::EngineHandle;
@@ -125,9 +125,10 @@ fn snapshot_handle_reads_a_built_view() {
         watermark: None,
         views: vec![(
             "c".into(),
-            Plan::GroupCount {
+            Plan::GroupAggregate {
                 input: Box::new(Plan::Source(InputId(0))),
                 key: vec![0],
+                aggs: vec![AggSpec::count()],
             },
         )],
         sinks: vec![],
@@ -197,9 +198,10 @@ fn start_reports_setup_failure() {
         // A view referencing an unknown input fails during setup.
         views: vec![(
             "c".into(),
-            Plan::GroupCount {
+            Plan::GroupAggregate {
                 input: Box::new(Plan::Source(InputId(99))),
                 key: vec![0],
+                aggs: vec![AggSpec::count()],
             },
         )],
         sinks: vec![],

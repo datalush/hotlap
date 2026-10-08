@@ -16,7 +16,7 @@ use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use hotlap_core::{IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
+use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
 use hotlap_engine::{EngineCore, consolidate};
 
 const KEYS: i64 = 500;
@@ -45,9 +45,10 @@ fn text_zset(rows: &[(i64, &str, i64)]) -> ZSetBatch {
 }
 
 fn group_plan() -> Plan {
-    Plan::GroupCount {
+    Plan::GroupAggregate {
         input: Box::new(Plan::Source(InputId(0))),
         key: vec![0],
+        aggs: vec![AggSpec::count()],
     }
 }
 

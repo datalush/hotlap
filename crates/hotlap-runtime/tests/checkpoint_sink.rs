@@ -14,7 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use hotlap::state::{StateBackend, StateEntry, StateError};
-use hotlap::{Hotlap, InputId, Plan, ZSetBatch};
+use hotlap::{AggSpec, Hotlap, InputId, Plan, ZSetBatch};
 use hotlap_connectors::sink::{Sink, SinkCapabilities};
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError};
@@ -148,9 +148,10 @@ async fn engine_with_pending_delta(pump: &SinkPump) -> Hotlap {
     hotlap
         .create_view(
             "c",
-            Plan::GroupCount {
+            Plan::GroupAggregate {
                 input: Box::new(Plan::Source(InputId(0))),
                 key: vec![0],
+                aggs: vec![AggSpec::count()],
             },
         )
         .unwrap();

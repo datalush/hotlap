@@ -6,7 +6,7 @@ use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use hotlap_core::{IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
+use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
 
 use super::EngineCore;
 
@@ -26,9 +26,10 @@ fn zset(rows: &[(i64, i64)]) -> ZSetBatch {
 }
 
 fn group_plan() -> Plan {
-    Plan::GroupCount {
+    Plan::GroupAggregate {
         input: Box::new(Plan::Source(InputId(0))),
         key: vec![0],
+        aggs: vec![AggSpec::count()],
     }
 }
 

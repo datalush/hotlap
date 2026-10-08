@@ -19,6 +19,6 @@ pub use core::IncrementalCore;
 pub use error::CoreError;
 pub use ids::{InputId, SplitId, ViewId};
 pub use metrics::{Metric, MetricsRegistry};
-pub use plan::{CmpOp, Plan, Predicate, Scalar};
+pub use plan::{AggFunc, AggSpec, CmpOp, Plan, Predicate, Scalar};
 pub use snapshot::{ENGINE_SNAPSHOT_FORMAT_VERSION, EngineSnapshot};
 pub use watermark::WatermarkSpec;

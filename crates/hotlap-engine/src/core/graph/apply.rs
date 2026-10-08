@@ -3,7 +3,7 @@
 use arrow::compute::{concat, concat_batches};
 
 use crate::error::EngineError;
-use crate::ops::{GroupCount, Join, TumbleCount, filter, project};
+use crate::ops::{GroupAggregate, Join, TumbleCount, filter, project};
 use hotlap_core::{InputId, Predicate, ZSetBatch};
 
 use super::{EvalCtx, Node};
@@ -122,7 +122,7 @@ fn project_eval(
 /// Feeds the child's delta to the retained, delta-incremental group count.
 fn group_eval(
     input: &mut Node,
-    reducer: &mut GroupCount,
+    reducer: &mut GroupAggregate,
     ctx: &mut EvalCtx,
 ) -> Result<Option<ZSetBatch>, EngineError> {
     match input.eval(ctx)? {

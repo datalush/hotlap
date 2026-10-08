@@ -2,11 +2,11 @@
 //! event-time tumbling windows.
 
 pub mod filter_project;
-pub mod groupcount;
+pub mod group_aggregate;
 pub mod join;
 pub mod window;
 
 pub use filter_project::{filter, project};
-pub use groupcount::GroupCount;
+pub use group_aggregate::GroupAggregate;
 pub use join::Join;
 pub use window::TumbleCount;

@@ -10,6 +10,8 @@ use hotlap::{InputId, Plan};
 
 use super::{register_tumble_udf, to_kernel_plan};
 
+mod aggregates;
+
 fn register_empty_table(ctx: &SessionContext, name: &str) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
@@ -57,15 +59,6 @@ async fn translates_tumble_count() {
 }
 
 #[tokio::test]
-async fn rejects_unsupported() {
-    let ctx = ctx_with_src();
-    assert!(
-        plan_for(&ctx, "SELECT sum(k) FROM src").await.is_err(),
-        "non-count aggregates must be rejected"
-    );
-}
-
-#[tokio::test]
 async fn rejects_non_identity_projection() {
     let ctx = ctx_with_src();
     assert!(
@@ -100,27 +93,6 @@ async fn rejects_tumble_count_without_group_key() {
     assert!(
         matches!(err, crate::SqlError::Unsupported(_)),
         "must be a planning error, got {err:?}"
-    );
-}
-
-#[tokio::test]
-async fn translates_group_count_without_tumble() {
-    let ctx = ctx_with_src();
-    let plan = plan_for(&ctx, "SELECT k, count(*) FROM src GROUP BY k")
-        .await
-        .expect("grouped count must remain supported");
-    match plan {
-        Plan::GroupCount { key, .. } => assert_eq!(key, vec![0]),
-        other => panic!("expected GroupCount, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn rejects_count_of_column() {
-    let ctx = ctx_with_src();
-    assert!(
-        plan_for(&ctx, "SELECT count(k) FROM src").await.is_err(),
-        "only count(*) is supported"
     );
 }
 

@@ -8,7 +8,7 @@ use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::stream;
-use hotlap::{InputId, Plan};
+use hotlap::{AggSpec, InputId, Plan};
 
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::source::{
@@ -106,9 +106,10 @@ fn batch(next_offset: Offset) -> SourceBatch {
 fn pipeline(ledger: Ledger, advance: bool) -> Pipeline {
     let input = Box::new(Plan::Source(InputId(0)));
     let view = if advance {
-        Plan::GroupCount {
+        Plan::GroupAggregate {
             input,
             key: vec![0],
+            aggs: vec![AggSpec::count()],
         }
     } else {
         // A window with no declared watermark fails on the first push.

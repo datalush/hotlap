@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use hotlap::{CmpOp, Hotlap, InputId, Plan, Predicate, Scalar, ZSetBatch};
+use hotlap::{AggSpec, CmpOp, Hotlap, InputId, Plan, Predicate, Scalar, ZSetBatch};
 use hotlap_engine::EngineCore;
 
 /// Build a Z-set whose columns are all Int64 and whose diffs are signed.
@@ -58,9 +58,10 @@ fn recompute(stream: &[((i64, i64), i64)]) -> Vec<(i64, i64)> {
 }
 
 fn by_key(key: usize) -> Plan {
-    Plan::GroupCount {
+    Plan::GroupAggregate {
         input: Box::new(Plan::Source(InputId(0))),
         key: vec![key],
+        aggs: vec![AggSpec::count()],
     }
 }
 
@@ -137,7 +138,7 @@ fn filter_project_group_count_via_api() {
     let mut h = open();
     h.register_input("events").unwrap();
     // keep only key>1, project [key], group by key -> [(2,1),(3,1)]
-    let plan = Plan::GroupCount {
+    let plan = Plan::GroupAggregate {
         input: Box::new(Plan::Project {
             input: Box::new(Plan::Filter {
                 input: Box::new(Plan::Source(InputId(0))),
@@ -150,6 +151,7 @@ fn filter_project_group_count_via_api() {
             cols: vec![0],
         }),
         key: vec![0],
+        aggs: vec![AggSpec::count()],
     };
     h.create_view("v", plan).unwrap();
     h.push(

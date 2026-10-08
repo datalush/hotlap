@@ -7,7 +7,7 @@ use arrow::compute::{concat, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use hotlap_core::{IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
+use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
 use hotlap_engine::{EngineCore, consolidate};
 
 fn text_schema() -> SchemaRef {
@@ -74,9 +74,10 @@ fn consolidated(changelogs: &[ZSetBatch]) -> ZSetBatch {
 }
 
 fn group_plan() -> Plan {
-    Plan::GroupCount {
+    Plan::GroupAggregate {
         input: Box::new(Plan::Source(InputId(0))),
         key: vec![0],
+        aggs: vec![AggSpec::count()],
     }
 }
 

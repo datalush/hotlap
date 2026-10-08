@@ -3,7 +3,7 @@
 use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction};
-use hotlap::Scalar;
+use hotlap::{AggFunc, AggSpec, Scalar};
 
 use crate::error::SqlError;
 use crate::translate_predicate::scalar;
@@ -69,36 +69,83 @@ pub(crate) fn parse_tumble(
     Ok((column_index(ts, schema)?, int_literal(size)?))
 }
 
-/// Require the aggregate list to be a single plain `count(*)`: no `DISTINCT`,
-/// `FILTER`, `ORDER BY`, `NULL TREATMENT`, or per-column argument.
-pub(crate) fn ensure_count_only(aggr: &[Expr]) -> Result<(), SqlError> {
-    let [expr] = aggr else {
+/// Parse a logical aggregate list into kernel `AggSpec`s.
+///
+/// Each entry must be a plain `count`/`sum`/`avg` over `*` or one column. The
+/// `min`/`max` functions are reserved for a later change; unsupported functions
+/// and modifiers (`DISTINCT`, `FILTER`, `ORDER BY`, `NULL TREATMENT`) are
+/// rejected rather than silently dropped.
+pub(crate) fn parse_aggs(aggr: &[Expr], schema: &DFSchema) -> Result<Vec<AggSpec>, SqlError> {
+    if aggr.is_empty() {
+        return Err(SqlError::Unsupported(
+            "at least one aggregate is required".into(),
+        ));
+    }
+    aggr.iter().map(|expr| parse_agg(expr, schema)).collect()
+}
+
+/// Parse one aggregate expression into an `AggSpec`.
+fn parse_agg(expr: &Expr, schema: &DFSchema) -> Result<AggSpec, SqlError> {
+    let expr = match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    };
+    let Expr::AggregateFunction(af) = expr else {
         return Err(SqlError::Unsupported(format!(
-            "expected exactly one aggregate, got {}",
-            aggr.len()
+            "expected an aggregate function, got `{expr}`"
         )));
     };
-    match expr {
-        Expr::AggregateFunction(af) if is_plain_count(af) => Ok(()),
+    ensure_plain(af)?;
+    let name = af.func.name().to_ascii_lowercase();
+    match name.as_str() {
+        "count" => Ok(AggSpec {
+            func: AggFunc::Count,
+            input: count_input(&af.params.args, schema)?,
+        }),
+        "sum" => Ok(AggSpec::sum(column_arg(&af.params.args, schema)?)),
+        "avg" => Ok(AggSpec::avg(column_arg(&af.params.args, schema)?)),
+        "min" | "max" => Err(SqlError::Unsupported(format!(
+            "`{name}` aggregates are not implemented yet"
+        ))),
         other => Err(SqlError::Unsupported(format!(
-            "only `count(*)` is supported, got `{other}`"
+            "aggregate `{other}` is not supported"
         ))),
     }
 }
 
-/// A `count(*)` with no modifiers; anything else would be silently dropped.
-fn is_plain_count(af: &AggregateFunction) -> bool {
-    af.func.name().eq_ignore_ascii_case("count")
-        && !af.params.distinct
-        && af.params.filter.is_none()
-        && af.params.order_by.is_empty()
-        && af.params.null_treatment.is_none()
-        && is_count_star(&af.params.args)
+/// Reject modifiers that would change the aggregate's meaning if dropped.
+fn ensure_plain(af: &AggregateFunction) -> Result<(), SqlError> {
+    let modified = af.params.distinct
+        || af.params.filter.is_some()
+        || !af.params.order_by.is_empty()
+        || af.params.null_treatment.is_some();
+    if modified {
+        return Err(SqlError::Unsupported(
+            "aggregate modifiers (`DISTINCT`, `FILTER`, `ORDER BY`) are not supported".into(),
+        ));
+    }
+    Ok(())
 }
 
-/// `count(*)` is normalized to `count(1)`; bare `count()` is also accepted.
-fn is_count_star(args: &[Expr]) -> bool {
-    matches!(args, [] | [Expr::Literal(ScalarValue::Int64(Some(1)), _)])
+/// `count(*)` is normalized to `count(1)`; a bare column counts non-nulls.
+fn count_input(args: &[Expr], schema: &DFSchema) -> Result<Option<usize>, SqlError> {
+    match args {
+        [] | [Expr::Literal(ScalarValue::Int64(Some(1)), _)] => Ok(None),
+        [Expr::Column(_)] => Ok(Some(column_index(&args[0], schema)?)),
+        _ => Err(SqlError::Unsupported(
+            "`count` expects `*` or exactly one column".into(),
+        )),
+    }
+}
+
+/// The single column argument of `sum`/`avg`/`min`/`max`.
+fn column_arg(args: &[Expr], schema: &DFSchema) -> Result<usize, SqlError> {
+    match args {
+        [Expr::Column(_)] => column_index(&args[0], schema),
+        _ => Err(SqlError::Unsupported(
+            "aggregate expects exactly one column".into(),
+        )),
+    }
 }
 
 fn int_literal(expr: &Expr) -> Result<i64, SqlError> {

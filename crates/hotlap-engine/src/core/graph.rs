@@ -11,7 +11,7 @@ use arrow::datatypes::SchemaRef;
 use hotlap_core::plan::sources;
 use hotlap_core::{InputId, Plan, Predicate, ZSetBatch};
 
-use crate::ops::{GroupCount, Join, TumbleCount};
+use crate::ops::{GroupAggregate, Join, TumbleCount};
 
 pub(super) use apply::accumulate;
 
@@ -28,7 +28,7 @@ enum Node {
     },
     Group {
         input: Box<Node>,
-        reducer: GroupCount,
+        reducer: GroupAggregate,
     },
     Joined {
         left: Box<Node>,
@@ -113,9 +113,9 @@ fn compile(plan: &Plan) -> Node {
             input: Box::new(compile(input)),
             cols: cols.clone(),
         },
-        Plan::GroupCount { input, key } => Node::Group {
+        Plan::GroupAggregate { input, key, aggs } => Node::Group {
             input: Box::new(compile(input)),
-            reducer: GroupCount::new(key),
+            reducer: GroupAggregate::new(key, aggs.clone()),
         },
         Plan::Join {
             left,
