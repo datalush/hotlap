@@ -8,8 +8,8 @@ use crate::batch::ZSetBatch;
 use crate::error::EngineError;
 use crate::keys::KeyConverter;
 
-use super::helpers::{equi_join, joined_schema, subtract};
 use super::Join;
+use super::helpers::{equi_join, joined_schema, subtract};
 
 impl Join {
     /// Cached converter for the left side's join-key columns.
@@ -100,7 +100,10 @@ impl Join {
         if self.right.is_none() {
             self.right = Some(KeyedArrangement::new(right.schema(), &self.right_keys)?);
             self.right_schema = Some(right.schema());
-            self.right_conv = Some(KeyConverter::new(right.schema().as_ref(), &self.right_keys)?);
+            self.right_conv = Some(KeyConverter::new(
+                right.schema().as_ref(),
+                &self.right_keys,
+            )?);
         }
         let left_keys = self
             .left_conv

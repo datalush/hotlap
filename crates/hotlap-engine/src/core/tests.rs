@@ -39,7 +39,8 @@ fn output_rows(core: &EngineCore, view: ViewId) -> usize {
 fn view_output_state_does_not_grow_with_history() {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();
-    core.build_view(ViewId(0), &Plan::Source(InputId(0))).unwrap();
+    core.build_view(ViewId(0), &Plan::Source(InputId(0)))
+        .unwrap();
 
     // Every push is a single non-zero row. Insert each key once, then retract
     // and re-insert as the pattern cycles: the output map never exceeds the

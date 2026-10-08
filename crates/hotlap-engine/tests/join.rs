@@ -359,11 +359,15 @@ fn composite_key_join_matches_full_recompute() {
     for (left_batch, right_batch) in left_epochs.iter().zip(&right_epochs) {
         history_left.extend(left_batch.iter().copied());
         history_right.extend(right_batch.iter().copied());
-        changelogs.push(join.apply(&pair_zset(left_batch), &pair_zset(right_batch)).unwrap());
+        changelogs.push(
+            join.apply(&pair_zset(left_batch), &pair_zset(right_batch))
+                .unwrap(),
+        );
     }
 
-    let expected =
-        recompute_with(&history_left, &history_right, |l, r| l.0 == r.0 && l.1 == r.1);
+    let expected = recompute_with(&history_left, &history_right, |l, r| {
+        l.0 == r.0 && l.1 == r.1
+    });
     assert!(!expected.is_empty());
     assert_eq!(consolidated_pairs(&changelogs), expected);
 }
@@ -389,7 +393,10 @@ fn mismatched_left_right_key_indices_match_recompute() {
     for (left_batch, right_batch) in left_epochs.iter().zip(&right_epochs) {
         history_left.extend(left_batch.iter().copied());
         history_right.extend(right_batch.iter().copied());
-        changelogs.push(join.apply(&pair_zset(left_batch), &pair_zset(right_batch)).unwrap());
+        changelogs.push(
+            join.apply(&pair_zset(left_batch), &pair_zset(right_batch))
+                .unwrap(),
+        );
     }
 
     let expected = recompute_with(&history_left, &history_right, |l, r| l.0 == r.1);

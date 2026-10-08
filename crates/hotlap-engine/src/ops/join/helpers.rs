@@ -173,7 +173,10 @@ fn materialize(
             })?;
         diffs.push(product);
     }
-    consolidate_with(out_conv, &ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs)))?)
+    consolidate_with(
+        out_conv,
+        &ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs)))?,
+    )
 }
 
 /// Applies `indices` to every column of `batch`.
