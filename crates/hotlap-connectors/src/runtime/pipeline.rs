@@ -6,6 +6,7 @@ use hotlap::{Hotlap, HotlapError, Plan};
 
 use crate::convert;
 use crate::error::ConnectorError;
+use crate::runtime::checkpoint::CheckpointConfig;
 use crate::sink::Sink;
 use crate::source::{Source, SourceBatch, SourceStream};
 
@@ -28,6 +29,8 @@ pub struct Pipeline {
     pub watermark: Option<Watermark>,
     pub views: Vec<(String, Plan)>,
     pub sinks: Vec<SinkSpec>,
+    /// Periodic checkpoint settings; `None` disables checkpointing.
+    pub checkpoint: Option<CheckpointConfig>,
 }
 
 /// Register the input, optional watermark and views on `hotlap`.

@@ -21,6 +21,9 @@ pub enum Command {
         input: String,
         reply: oneshot::Sender<Result<u64, ConnectorError>>,
     },
+    Checkpoint {
+        reply: oneshot::Sender<Result<u64, ConnectorError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -102,6 +105,18 @@ impl EngineHandle {
                 input: input.to_string(),
                 reply,
             })
+            .map_err(|_| stopped())?;
+        rx.blocking_recv().map_err(|_| stopped())?
+    }
+
+    /// Take a checkpoint now and return its id.
+    ///
+    /// Blocks on `blocking_recv`, so it must not be called from within an async
+    /// runtime (it would panic or stall the executor).
+    pub fn checkpoint(&self) -> Result<u64, ConnectorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Checkpoint { reply })
             .map_err(|_| stopped())?;
         rx.blocking_recv().map_err(|_| stopped())?
     }

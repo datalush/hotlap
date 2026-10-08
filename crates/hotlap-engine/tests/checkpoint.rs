@@ -12,7 +12,7 @@ use arrow::record_batch::RecordBatch;
 use hotlap_core::{
     EngineSnapshot, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch,
 };
-use hotlap_engine::EngineCore;
+use hotlap_engine::{EngineCore, decode_snapshot, encode_snapshot};
 
 fn schema(names: &[&str]) -> SchemaRef {
     Arc::new(Schema::new(
@@ -157,9 +157,9 @@ fn restore_then_continue_matches_no_restart() {
     phase1(&mut original);
     let snapshot = original.checkpoint().unwrap();
 
-    // Round-trip through bytes must be stable and restore must be idempotent.
-    let bytes = serde_json::to_vec(&snapshot).unwrap();
-    let decoded: EngineSnapshot = serde_json::from_slice(&bytes).unwrap();
+    // Round-trip through the binary codec must be stable and restore idempotent.
+    let bytes = encode_snapshot(&snapshot).unwrap();
+    let decoded: EngineSnapshot = decode_snapshot(&bytes).unwrap();
     assert_eq!(snapshot, decoded, "snapshot bytes are not stable");
 
     let mut restored = EngineCore::new();

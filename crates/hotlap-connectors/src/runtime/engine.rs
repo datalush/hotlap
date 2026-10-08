@@ -7,8 +7,10 @@ use futures::StreamExt;
 use hotlap::Hotlap;
 use hotlap_engine::EngineCore;
 use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
+use tokio::time::{Instant, Interval, interval_at};
 
 use crate::error::ConnectorError;
+use crate::runtime::checkpoint::Checkpointer;
 use crate::runtime::handle::Command;
 use crate::runtime::pipeline::{self, Pipeline};
 use crate::runtime::sink::SinkPump;
@@ -40,7 +42,7 @@ pub(crate) fn run(
 
 /// Open the kernel, wire the pipeline and then serve source data and commands.
 async fn drive(
-    pipeline: Pipeline,
+    mut pipeline: Pipeline,
     rx: &mut UnboundedReceiver<Command>,
     last_error: &Mutex<Option<String>>,
     built: &AtomicBool,
@@ -59,6 +61,13 @@ async fn drive(
         }
     };
     let sinks = SinkPump::start(&pipeline.sinks);
+    let (mut checkpointer, mut ticker) = match pipeline.checkpoint.take() {
+        Some(config) => {
+            let tick = interval_at(Instant::now() + config.interval, config.interval);
+            (Some(Checkpointer::new(config.backend)), Some(tick))
+        }
+        None => (None, None),
+    };
     let _ = ready.send(Ok(()));
     let mut source_done = false;
     loop {
@@ -69,12 +78,28 @@ async fn drive(
                 )
                 .await;
             }
+            _ = tick(&mut ticker) => {
+                if let Some(active) = checkpointer.as_mut()
+                    && let Err(error) = active.take(&hotlap, pipeline.source.as_ref())
+                {
+                    record_error(last_error, error);
+                }
+            }
             cmd = rx.recv() => match cmd {
                 Some(Command::Snapshot { view, reply }) => {
                     let _ = reply.send(hotlap.snapshot(&view).map_err(map_err));
                 }
                 Some(Command::LateDropped { input, reply }) => {
                     let _ = reply.send(hotlap.late_dropped(&input).map_err(map_err));
+                }
+                Some(Command::Checkpoint { reply }) => {
+                    let result = match checkpointer.as_mut() {
+                        Some(active) => active.take(&hotlap, pipeline.source.as_ref()),
+                        None => Err(ConnectorError::Unsupported(
+                            "checkpointing is not configured".into(),
+                        )),
+                    };
+                    let _ = reply.send(result);
                 }
                 Some(Command::Shutdown { reply }) => {
                     close_sinks(sinks, last_error).await;
@@ -87,6 +112,16 @@ async fn drive(
                 }
             },
         }
+    }
+}
+
+/// Await the next periodic tick, or stay pending when checkpointing is off.
+async fn tick(ticker: &mut Option<Interval>) {
+    match ticker {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => futures::future::pending::<()>().await,
     }
 }
 

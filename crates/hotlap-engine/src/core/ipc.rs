@@ -1,4 +1,5 @@
-//! Arrow IPC encoding for the snapshot's rectangular tables and schemas.
+//! Arrow IPC encoding for the snapshot's rectangular tables and schemas, plus
+//! a versioned binary container for whole snapshots.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -8,9 +9,12 @@ use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use bincode::Options;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use hotlap_core::ZSetBatch;
-use hotlap_core::snapshot::SnapshotTable;
+use hotlap_core::snapshot::{ENGINE_SNAPSHOT_FORMAT_VERSION, EngineSnapshot, SnapshotTable};
 
 use crate::error::EngineError;
 use crate::zset::int64_diffs;
@@ -67,4 +71,98 @@ fn decode_table(bytes: &[u8]) -> Result<RecordBatch, EngineError> {
         .into_iter()
         .next()
         .ok_or_else(|| EngineError::Infrastructure("snapshot table has no batch".to_string()))
+}
+
+/// Magic bytes at the start of every binary frame.
+const FRAME_MAGIC: [u8; 4] = *b"HLSP";
+/// Layout version of the frame header; unknown values are rejected.
+const FRAME_VERSION: u32 = 1;
+/// Fixed header length: magic (4) + version (4) + payload length (8).
+const FRAME_HEADER: usize = 16;
+/// Upper bound for a payload length, so a corrupt prefix cannot demand an
+/// unbounded allocation.
+const MAX_FRAME_BYTES: u64 = 1 << 34;
+
+/// Encodes any serializable value as a versioned, length-prefixed binary frame.
+pub fn encode_framed<T: Serialize>(value: &T) -> Result<Vec<u8>, EngineError> {
+    let payload = codec().serialize(value).map_err(codec_err)?;
+    let mut out = Vec::with_capacity(FRAME_HEADER + payload.len());
+    out.extend_from_slice(&FRAME_MAGIC);
+    out.extend_from_slice(&FRAME_VERSION.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+/// Decodes a value from a binary frame, rejecting a bad magic, an unknown
+/// version, a length mismatch or trailing bytes instead of panicking.
+pub fn decode_framed<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, EngineError> {
+    if bytes.len() < FRAME_HEADER {
+        return Err(corrupt(format!("frame is {} bytes", bytes.len())));
+    }
+    if bytes[..4] != FRAME_MAGIC {
+        return Err(corrupt("frame magic does not match".into()));
+    }
+    let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if version != FRAME_VERSION {
+        return Err(EngineError::Unsupported(format!(
+            "unknown frame version {version}"
+        )));
+    }
+    let length = u64::from_le_bytes(bytes[8..16].try_into().unwrap_or_default());
+    if length > MAX_FRAME_BYTES {
+        return Err(corrupt(format!("frame length {length} is too large")));
+    }
+    let payload = &bytes[FRAME_HEADER..];
+    if payload.len() as u64 != length {
+        return Err(corrupt(format!(
+            "frame length {length} does not match payload {}",
+            payload.len()
+        )));
+    }
+    codec()
+        .with_limit(length)
+        .deserialize(payload)
+        .map_err(codec_err)
+}
+
+/// Encodes an [`EngineSnapshot`] after checking its layout version.
+pub fn encode_snapshot(snapshot: &EngineSnapshot) -> Result<Vec<u8>, EngineError> {
+    if snapshot.format_version != ENGINE_SNAPSHOT_FORMAT_VERSION {
+        return Err(EngineError::Unsupported(format!(
+            "cannot encode snapshot format version {}",
+            snapshot.format_version
+        )));
+    }
+    encode_framed(snapshot)
+}
+
+/// Decodes an [`EngineSnapshot`] and rejects an unknown layout version.
+pub fn decode_snapshot(bytes: &[u8]) -> Result<EngineSnapshot, EngineError> {
+    let snapshot: EngineSnapshot = decode_framed(bytes)?;
+    if snapshot.format_version != ENGINE_SNAPSHOT_FORMAT_VERSION {
+        return Err(EngineError::Unsupported(format!(
+            "unknown snapshot format version {}",
+            snapshot.format_version
+        )));
+    }
+    Ok(snapshot)
+}
+
+/// Fixed, deterministic bincode configuration: fixed-width integers and no
+/// trailing bytes, so bytes produced once are read back identically.
+fn codec() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+}
+
+/// Maps any bincode failure to an infrastructure error.
+fn codec_err(error: Box<bincode::ErrorKind>) -> EngineError {
+    EngineError::Infrastructure(format!("snapshot codec: {error}"))
+}
+
+/// Builds an infrastructure error for a structurally invalid frame.
+fn corrupt(message: String) -> EngineError {
+    EngineError::Infrastructure(format!("corrupt snapshot frame: {message}"))
 }

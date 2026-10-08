@@ -168,6 +168,7 @@ fn start(batches: Vec<SourceBatch>, sink: FakeSink) -> (EngineHandle, FakeSink) 
         watermark: None,
         views: vec![group_count()],
         sinks: vec![spec],
+        checkpoint: None,
     })
     .unwrap();
     (handle, sink)

@@ -5,7 +5,9 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 
 use hotlap_core::plan::has_window;
-use hotlap_core::{CoreError, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
+use hotlap_core::{
+    CoreError, EngineSnapshot, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch,
+};
 
 use super::graph::ViewGraph;
 use super::output::ViewOutput;
@@ -134,6 +136,11 @@ impl IncrementalCore for EngineCore {
             }
             None => Err(CoreError::Unsupported(format!("unknown view {view:?}"))),
         }
+    }
+
+    fn checkpoint(&self) -> Result<EngineSnapshot, CoreError> {
+        // Method-call syntax picks the inherent `EngineCore::checkpoint`.
+        self.checkpoint().map_err(CoreError::from)
     }
 }
 

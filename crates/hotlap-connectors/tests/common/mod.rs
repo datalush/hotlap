@@ -1,0 +1,158 @@
+//! Shared fixtures for the runtime checkpoint tests.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use arrow::array::{Array, ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use futures::StreamExt;
+use hotlap::state::{StateBackend, StateEntry, StateError};
+use hotlap::{InputId, Plan};
+use hotlap_connectors::runtime::checkpoint::CheckpointConfig;
+use hotlap_connectors::runtime::handle::EngineHandle;
+use hotlap_connectors::runtime::pipeline::Pipeline;
+use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
+
+/// In-memory backend shared with the test, so writes stay observable.
+#[derive(Clone, Default)]
+pub struct SharedBackend {
+    map: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
+}
+
+impl StateBackend for SharedBackend {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StateError> {
+        Ok(self.map.lock().unwrap().get(key).cloned())
+    }
+    fn put(&mut self, key: &[u8], value: Vec<u8>) -> Result<(), StateError> {
+        self.map.lock().unwrap().insert(key.to_vec(), value);
+        Ok(())
+    }
+    fn scan(&self, prefix: &[u8]) -> Result<Vec<StateEntry>, StateError> {
+        Ok(self
+            .map
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
+    fn list(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, StateError> {
+        Ok(self
+            .map
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+}
+
+/// A source that yields scripted int batches and advances its read offset.
+struct ScriptSource {
+    schema: SchemaRef,
+    batches: Vec<Vec<i64>>,
+    progress: Arc<Mutex<SourceState>>,
+}
+
+impl Source for ScriptSource {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+    fn splits(&self) -> Result<Vec<Split>, hotlap_connectors::ConnectorError> {
+        Ok(vec![Split { id: 0, start: 0 }])
+    }
+    fn read(&self, _split: &Split) -> Result<SourceStream, hotlap_connectors::ConnectorError> {
+        let schema = self.schema.clone();
+        let progress = Arc::clone(&self.progress);
+        let batches = self.batches.clone();
+        let stream =
+            futures::stream::iter(batches.into_iter().enumerate()).then(move |(index, rows)| {
+                let schema = schema.clone();
+                let progress = Arc::clone(&progress);
+                async move {
+                    let array: ArrayRef = Arc::new(Int64Array::from(rows));
+                    let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+                    // The read position becomes the offset after this batch.
+                    if let Ok(mut state) = progress.lock() {
+                        state.offsets.insert(0, index as i64 + 1);
+                    }
+                    let item: Result<SourceBatch, hotlap_connectors::ConnectorError> =
+                        Ok(SourceBatch {
+                            batch,
+                            base_offset: index as i64,
+                        });
+                    item
+                }
+            });
+        Ok(Box::pin(stream))
+    }
+    fn state(&self) -> SourceState {
+        self.progress.lock().unwrap().clone()
+    }
+    fn event_time_column(&self) -> Option<usize> {
+        None
+    }
+}
+
+fn schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
+}
+
+/// A one-view pipeline feeding three int batches through `backend`.
+pub fn pipeline(backend: SharedBackend, interval: Duration) -> Pipeline {
+    Pipeline {
+        input: "in".into(),
+        source: Box::new(ScriptSource {
+            schema: schema(),
+            batches: vec![vec![1], vec![1, 2], vec![2]],
+            progress: Arc::new(Mutex::new(SourceState::default())),
+        }),
+        watermark: None,
+        views: vec![(
+            "c".into(),
+            Plan::GroupCount {
+                input: Box::new(Plan::Source(InputId(0))),
+                key: vec![0],
+            },
+        )],
+        sinks: vec![],
+        checkpoint: Some(CheckpointConfig {
+            interval,
+            backend: Box::new(backend),
+        }),
+    }
+}
+
+/// Read the group-count view as sorted rows until it matches `expected`.
+pub fn wait_rows(handle: &EngineHandle, expected: &[Vec<i64>]) -> bool {
+    let snap = handle.snapshot_handle();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(zset) = snap.snapshot("c")
+            && rows(&zset) == expected
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// Materialize a Z-set of Int64 columns as sorted rows.
+fn rows(zset: &hotlap::ZSetBatch) -> Vec<Vec<i64>> {
+    let columns: Vec<&Int64Array> = zset
+        .batch
+        .columns()
+        .iter()
+        .map(|column| column.as_any().downcast_ref::<Int64Array>().unwrap())
+        .collect();
+    let mut out: Vec<Vec<i64>> = (0..zset.len())
+        .map(|row| columns.iter().map(|column| column.value(row)).collect())
+        .collect();
+    out.sort();
+    out
+}

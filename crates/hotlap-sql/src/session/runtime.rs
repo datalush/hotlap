@@ -57,6 +57,7 @@ impl SqlSession {
             watermark: self.watermark,
             views: self.views.clone(),
             sinks,
+            checkpoint: None,
         })
     }
 

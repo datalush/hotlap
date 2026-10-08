@@ -2,7 +2,7 @@
 
 mod checkpoint;
 mod graph;
-pub(crate) mod ipc;
+pub mod ipc;
 mod output;
 mod restore;
 #[cfg(test)]

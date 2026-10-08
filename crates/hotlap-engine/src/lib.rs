@@ -20,6 +20,7 @@ mod work;
 pub use arrange::KeyedArrangement;
 pub use batch::ZSetBatch;
 pub use core::EngineCore;
+pub use core::ipc::{decode_framed, decode_snapshot, encode_framed, encode_snapshot};
 pub use error::EngineError;
 pub use keys::KeyConverter;
 pub use time::Frontier;

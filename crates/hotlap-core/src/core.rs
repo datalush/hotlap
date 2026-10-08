@@ -10,6 +10,7 @@ use crate::batch::ZSetBatch;
 use crate::error::CoreError;
 use crate::ids::{InputId, ViewId};
 use crate::plan::Plan;
+use crate::snapshot::EngineSnapshot;
 use crate::watermark::WatermarkSpec;
 
 /// The DD-free contract a stateful engine kernel implements.
@@ -41,4 +42,7 @@ pub trait IncrementalCore {
     /// Subscribe `view`'s output changes (`tap`). Pre-freeze: after
     /// [`build_view`](Self::build_view) and before the first push.
     fn tap_view(&mut self, view: ViewId) -> Result<(), CoreError>;
+
+    /// Capture the engine's durable state as a versioned [`EngineSnapshot`].
+    fn checkpoint(&self) -> Result<EngineSnapshot, CoreError>;
 }

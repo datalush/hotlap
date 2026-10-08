@@ -9,7 +9,9 @@
 
 use std::collections::HashMap;
 
-use hotlap_core::{IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
+use hotlap_core::{
+    EngineSnapshot, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch,
+};
 
 /// Error returned by the public [`Hotlap`] API.
 #[derive(Debug)]
@@ -130,6 +132,13 @@ impl Hotlap {
         self.core
             .late_dropped(id)
             .map_err(|e| HotlapError(format!("{e}")))
+    }
+
+    /// Capture the engine's durable state as a versioned snapshot.
+    pub fn checkpoint(&self) -> Result<EngineSnapshot, HotlapError> {
+        self.core
+            .checkpoint()
+            .map_err(|error| HotlapError(format!("{error}")))
     }
 
     /// Shut the engine down. Dropping `Hotlap` also releases the core.
