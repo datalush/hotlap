@@ -2,61 +2,20 @@
 
 #[path = "common/backend.rs"]
 mod backend;
-#[path = "cross_source_support/source.rs"]
-mod source_support;
+#[path = "runtime_cross_source/harness.rs"]
+mod harness;
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{ArrayRef, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::array::Int64Array;
 use hotlap::{InputId, Plan};
-use hotlap_connectors::source::{SourceBatch, Split};
 use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, Checkpointer, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline::Pipeline;
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
-use source_support::ControlledSource;
 
 use backend::SharedBackend;
-
-fn schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
-}
-
-fn split(id: i32) -> Split {
-    Split { id, start: 0 }
-}
-
-fn batch_on(split: i32, key: i64) -> SourceBatch {
-    let array: ArrayRef = Arc::new(Int64Array::from(vec![key]));
-    let batch = RecordBatch::try_new(schema(), vec![array]).unwrap();
-    SourceBatch {
-        batch,
-        base_offset: 0,
-        next_offset: 1,
-        split,
-    }
-}
-
-fn sources(a: Arc<ControlledSource>, b: Arc<ControlledSource>) -> Sources {
-    Sources::new(vec![
-        InputSource {
-            id: InputId(0),
-            name: "a".into(),
-            source: a,
-            watermark: None,
-        },
-        InputSource {
-            id: InputId(1),
-            name: "b".into(),
-            source: b,
-            watermark: None,
-        },
-    ])
-    .unwrap()
-}
+use harness::{ControlledSource, batch_on, schema, sources, split};
 
 /// A join of both inputs on column 0, exposed as view `j`.
 fn pipeline(sources: Sources, backend: SharedBackend) -> Pipeline {
@@ -140,7 +99,6 @@ fn split_zero_of_each_source_commits_independently() {
         "join must produce a match"
     );
 
-    // Each source advances only its own split 0.
     assert!(wait_for(
         || !a.commits().is_empty() && !b.commits().is_empty()
     ));

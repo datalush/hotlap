@@ -1,15 +1,21 @@
-//! Controlled [`Source`] fixture driven by per-split batch channels.
+//! Controlled two-source fixtures for the cross-source runtime tests.
 //!
-//! The test pushes batches (or closes a channel) to sequence a stream without
-//! sleeping: a split stays pending until its channel produces an item.
+//! This module is local to `runtime_cross_source`: it carries the EOF observer
+//! the normal-end test needs, without adding shared-fixture API that other
+//! test crates include but do not use.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::SchemaRef;
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use hotlap::InputId;
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::source::{
     Offset, Source, SourceBatch, SourceState, SourceStream, Split, SplitId,
 };
+use hotlap_runtime::runtime::sources::{InputSource, Sources};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 type BatchItem = Result<SourceBatch, ConnectorError>;
@@ -23,6 +29,7 @@ pub struct ControlledSource {
     splits: Vec<Split>,
     receivers: Mutex<Vec<Option<UnboundedReceiver<BatchItem>>>>,
     fail_read: bool,
+    exhausted: Arc<AtomicBool>,
     commits: Arc<Mutex<Vec<(SplitId, Offset)>>>,
     applied: Arc<Mutex<SourceState>>,
 }
@@ -42,6 +49,7 @@ impl ControlledSource {
             splits,
             receivers: Mutex::new(receivers),
             fail_read: false,
+            exhausted: Arc::new(AtomicBool::new(false)),
             commits: Arc::new(Mutex::new(Vec::new())),
             applied: Arc::new(Mutex::new(SourceState::default())),
         });
@@ -55,6 +63,7 @@ impl ControlledSource {
             splits: vec![Split { id: 0, start: 0 }],
             receivers: Mutex::new(vec![None]),
             fail_read: true,
+            exhausted: Arc::new(AtomicBool::new(false)),
             commits: Arc::new(Mutex::new(Vec::new())),
             applied: Arc::new(Mutex::new(SourceState::default())),
         })
@@ -68,6 +77,11 @@ impl ControlledSource {
     /// The applied state the runtime would persist.
     pub fn applied(&self) -> SourceState {
         self.applied.lock().unwrap().clone()
+    }
+
+    /// Whether the read stream has ended (all senders dropped and drained).
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::SeqCst)
     }
 }
 
@@ -97,8 +111,18 @@ impl Source for ControlledSource {
             .ok_or_else(|| {
                 ConnectorError::Infrastructure(format!("split {} already opened", split.id))
             })?;
-        let stream = futures::stream::unfold(receiver, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
+        let exhausted = Arc::clone(&self.exhausted);
+        let stream = futures::stream::unfold(receiver, move |mut rx| {
+            let exhausted = Arc::clone(&exhausted);
+            async move {
+                match rx.recv().await {
+                    Some(item) => Some((item, rx)),
+                    None => {
+                        exhausted.store(true, Ordering::SeqCst);
+                        None
+                    }
+                }
+            }
         });
         Ok(Box::pin(stream))
     }
@@ -116,4 +140,42 @@ impl Source for ControlledSource {
     fn event_time_column(&self) -> Option<usize> {
         None
     }
+}
+
+pub fn schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
+}
+
+pub fn split(id: i32) -> Split {
+    Split { id, start: 0 }
+}
+
+pub fn batch_on(split: i32, key: i64) -> SourceBatch {
+    let array: ArrayRef = Arc::new(Int64Array::from(vec![key]));
+    let batch = RecordBatch::try_new(schema(), vec![array]).unwrap();
+    SourceBatch {
+        batch,
+        base_offset: 0,
+        next_offset: 1,
+        split,
+    }
+}
+
+/// Both sources as inputs a (id 0) and b (id 1).
+pub fn sources(a: Arc<ControlledSource>, b: Arc<ControlledSource>) -> Sources {
+    Sources::new(vec![
+        InputSource {
+            id: InputId(0),
+            name: "a".into(),
+            source: a,
+            watermark: None,
+        },
+        InputSource {
+            id: InputId(1),
+            name: "b".into(),
+            source: b,
+            watermark: None,
+        },
+    ])
+    .unwrap()
 }
