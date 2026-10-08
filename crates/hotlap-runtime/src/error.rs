@@ -10,8 +10,6 @@ pub enum SessionError {
     Sql(SqlError),
     /// Engine, runtime or connector failure.
     Engine(String),
-    /// The session was used in an invalid state.
-    State(String),
 }
 
 impl std::fmt::Display for SessionError {
@@ -19,7 +17,6 @@ impl std::fmt::Display for SessionError {
         match self {
             Self::Sql(error) => write!(f, "sql: {error}"),
             Self::Engine(message) => write!(f, "engine: {message}"),
-            Self::State(message) => write!(f, "state: {message}"),
         }
     }
 }
@@ -28,7 +25,7 @@ impl std::error::Error for SessionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Sql(error) => Some(error),
-            Self::Engine(_) | Self::State(_) => None,
+            Self::Engine(_) => None,
         }
     }
 }
