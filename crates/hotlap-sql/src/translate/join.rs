@@ -31,27 +31,19 @@ pub(super) fn translate_join(j: &Join, sources: &SourceBindings) -> Result<Plan,
 
 /// The equality keys of the ON condition, in the order they appear.
 ///
-/// DataFusion carries a SQL `ON` predicate in `filter` (with `on` empty);
-/// `on` is read when a plan already normalized the equi-pairs. A condition that
-/// is not a conjunction of column equalities across both sides — a residual
-/// predicate — is rejected rather than dropped.
+/// DataFusion usually carries a SQL `ON` predicate in `filter` (with `on`
+/// empty); a normalized plan may keep equi-pairs in `on`. Both are read, so a
+/// residual predicate in `filter` is rejected even when `on` is populated.
 fn join_keys(j: &Join) -> Result<(Vec<usize>, Vec<usize>), SqlError> {
-    if !j.on.is_empty() {
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        for (l, r) in &j.on {
-            left.push(column_index(l, j.left.schema())?);
-            right.push(column_index(r, j.right.schema())?);
-        }
-        return Ok((left, right));
-    }
-    let filter = j
-        .filter
-        .as_ref()
-        .ok_or_else(|| SqlError::Unsupported("join without an equality condition".into()))?;
     let mut left = Vec::new();
     let mut right = Vec::new();
-    collect_keys(filter, j, &mut left, &mut right)?;
+    for (l, r) in &j.on {
+        left.push(column_index(l, j.left.schema())?);
+        right.push(column_index(r, j.right.schema())?);
+    }
+    if let Some(filter) = &j.filter {
+        collect_keys(filter, j, &mut left, &mut right)?;
+    }
     if left.is_empty() {
         return Err(SqlError::Unsupported(
             "join without an equality condition".into(),

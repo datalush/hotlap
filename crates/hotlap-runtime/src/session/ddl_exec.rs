@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hotlap::InputId;
 use hotlap_connectors::datafusion::provider::SourceTableProvider;
 use hotlap_connectors::source::Source;
-use hotlap_sql::bindings::{InputSchemas, SourceBindings};
+use hotlap_sql::bindings::{InputSchemas, SourceBindings, canonical_relation};
 use hotlap_sql::catalog::{MvDef, SourceDef};
 use hotlap_sql::ddl::{CreateSink, CreateSource, CreateView};
 use hotlap_sql::error::SqlError;
@@ -56,7 +56,7 @@ impl SqlSession {
             .ok_or_else(|| SqlError::Catalog("view declared before its source".into()))?;
         // v1 binds the session's single source to the one input it owns; the
         // maps stay explicit so the multi-source path can extend them.
-        let bindings = SourceBindings::from([(source_name, InputId(0))]);
+        let bindings = SourceBindings::from([(canonical_relation(&source_name), InputId(0))]);
         let schemas = InputSchemas::from([(InputId(0), source.schema())]);
         let query = normalize_tumble_intervals(&cv.query)?;
         let df = self.ctx.sql(&query).await.map_err(to_engine)?;

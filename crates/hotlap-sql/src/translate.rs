@@ -82,24 +82,7 @@ fn project(p: &Projection, sources: &SourceBindings) -> Result<Plan, SqlError> {
 fn translate_aggregate(a: &Aggregate, sources: &SourceBindings) -> Result<Plan, SqlError> {
     let input = to_kernel_plan(&a.input, sources)?;
     let schema = a.input.schema();
-    let mut key = Vec::new();
-    let mut tumble = None;
-    for expr in &a.group_expr {
-        match expr {
-            Expr::Column(_) => key.push(column_index(expr, schema)?),
-            Expr::ScalarFunction(sf) if is_tumble(sf) => {
-                if tumble.is_some() {
-                    return Err(SqlError::Unsupported("multiple `tumble` calls".into()));
-                }
-                tumble = Some(parse_tumble(sf, schema)?);
-            }
-            other => {
-                return Err(SqlError::Unsupported(format!(
-                    "unsupported GROUP BY expression `{other}`"
-                )));
-            }
-        }
-    }
+    let (key, tumble) = group_spec(a)?;
     let aggs = parse_aggs(&a.aggr_expr, schema)?;
     reconcile_output_types(a, &aggs)?;
     // A grouping-key-less aggregate cannot be represented: every irreducible
@@ -130,6 +113,36 @@ fn translate_aggregate(a: &Aggregate, sources: &SourceBindings) -> Result<Plan, 
             aggs,
         }),
     }
+}
+
+/// Decomposed GROUP BY: positional key columns and an optional tumbling
+/// window as `(time_col, size)`.
+type GroupSpec = (Vec<usize>, Option<(usize, i64)>);
+
+/// Split the GROUP BY list into positional key columns and an optional
+/// `tumble(ts, size)` window. Unknown expressions and a second `tumble` call
+/// are rejected rather than dropped.
+fn group_spec(a: &Aggregate) -> Result<GroupSpec, SqlError> {
+    let schema = a.input.schema();
+    let mut key = Vec::new();
+    let mut tumble = None;
+    for expr in &a.group_expr {
+        match expr {
+            Expr::Column(_) => key.push(column_index(expr, schema)?),
+            Expr::ScalarFunction(sf) if is_tumble(sf) => {
+                if tumble.is_some() {
+                    return Err(SqlError::Unsupported("multiple `tumble` calls".into()));
+                }
+                tumble = Some(parse_tumble(sf, schema)?);
+            }
+            other => {
+                return Err(SqlError::Unsupported(format!(
+                    "unsupported GROUP BY expression `{other}`"
+                )));
+            }
+        }
+    }
+    Ok((key, tumble))
 }
 
 /// Fail-stop unless our mirrored aggregate output types match the types

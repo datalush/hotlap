@@ -12,6 +12,7 @@ use super::{register_tumble_udf, to_kernel_plan};
 use crate::bindings::SourceBindings;
 
 mod aggregates;
+mod join_keys;
 mod joins;
 
 fn register_empty_table(ctx: &SessionContext, name: &str) {

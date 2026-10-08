@@ -79,3 +79,21 @@ fn session_end_to_end_matches_recomputation() {
 
     session.shutdown().expect("shutdown");
 }
+
+#[test]
+fn mixed_case_source_name_binds_the_view() {
+    // `Src` is unquoted, so DataFusion canonicalizes it to lowercase. The
+    // DDL-to-binding map must use the same canonical name, otherwise the view
+    // cannot resolve the relation even for a single source.
+    let config = SessionConfig::new().with_source_factory(factory(vec![]));
+    let mut session = Session::open(config).expect("open session");
+    session
+        .sql(
+            "CREATE SOURCE Src WITH (connector='inmem') WATERMARK FOR \
+             _event_time AS _event_time - INTERVAL '1 s';",
+        )
+        .expect("create mixed-case source");
+    session
+        .sql("CREATE MATERIALIZED VIEW mv AS SELECT k, count(*) FROM Src GROUP BY k;")
+        .expect("mixed-case relation must resolve to its source binding");
+}
