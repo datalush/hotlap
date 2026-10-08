@@ -153,10 +153,24 @@ impl Hotlap {
     }
 
     /// Rebuild the engine from a snapshot captured by [`Self::checkpoint`].
+    ///
+    /// Only the core state is restored: the snapshot stores numeric ids, not the
+    /// caller-facing names, so the `inputs`/`views` maps cannot be rebuilt. The
+    /// caller must register the same names through [`Self::register_input`] and
+    /// [`Self::create_view`] before restoring (the runtime does this during
+    /// setup). The id counters are advanced past the restored ids so later
+    /// declarations cannot collide.
     pub fn restore(&mut self, snapshot: &EngineSnapshot) -> Result<(), HotlapError> {
         self.core
             .restore(snapshot)
-            .map_err(|error| HotlapError(format!("{error}")))
+            .map_err(|error| HotlapError(format!("{error}")))?;
+        for input in &snapshot.inputs {
+            self.next_input = self.next_input.max(input.id.0 + 1);
+        }
+        for view in &snapshot.views {
+            self.next_view = self.next_view.max(view.id.0 + 1);
+        }
+        Ok(())
     }
 
     /// Shut the engine down. Dropping `Hotlap` also releases the core.

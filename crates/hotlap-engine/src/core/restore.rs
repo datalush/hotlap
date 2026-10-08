@@ -23,10 +23,6 @@ impl EngineCore {
             )));
         }
         let mut core = EngineCore::new();
-        // Retention settings survive, but the input history behind the restored
-        // state was not persisted, so a post-start build must be rejected.
-        core.retention = std::mem::take(&mut self.retention);
-        core.retention.invalidate();
         core.frozen = snapshot.frozen;
         core.epoch = snapshot.epoch;
         for input in &snapshot.inputs {
@@ -35,6 +31,11 @@ impl EngineCore {
         for view in &snapshot.views {
             core.restore_view(view)?;
         }
+        // Retention settings survive, but the input history behind the restored
+        // state was not persisted, so a post-start build must be rejected. The
+        // take happens once decoding succeeded, keeping restore all-or-nothing.
+        core.retention = std::mem::take(&mut self.retention);
+        core.retention.invalidate();
         *self = core;
         Ok(())
     }

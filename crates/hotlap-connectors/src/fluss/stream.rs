@@ -85,9 +85,10 @@ async fn advance(
                 };
                 let base_offset = records.first().map_or(0, |record| record.offset);
                 let last_offset = records.last().map_or(base_offset, |record| record.offset);
-                // Advance the read position before the batch is pushed. This is
-                // acceptable in SP2 (no persistence): SP4 must move to
-                // ack-after-push so a crash cannot skip unprocessed records.
+                // Advance the read position as the batch is produced. The engine
+                // only snapshots `state()` between polls, after the previous
+                // batch was ingested, so a checkpoint never persists an offset
+                // ahead of the records it has applied.
                 match lock_progress(&progress) {
                     Ok(mut guard) => {
                         guard.offsets.insert(bucket, last_offset + 1);

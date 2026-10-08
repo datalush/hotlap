@@ -59,6 +59,10 @@ pub trait Source: Send + Sync {
     fn read(&self, split: &Split) -> Result<SourceStream, ConnectorError>;
     /// Current resumable state, reflecting the **read position** (not the
     /// consumption position) of each split.
+    ///
+    /// A checkpoint may advance the read position when a batch is produced, but
+    /// the engine only calls `state()` between polls, after the previous batch
+    /// was ingested, so a persisted offset never runs ahead of applied records.
     fn state(&self) -> SourceState;
     /// Column index of the event-time column (ms), if the source has one.
     fn event_time_column(&self) -> Option<usize>;
