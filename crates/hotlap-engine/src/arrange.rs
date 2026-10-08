@@ -157,20 +157,20 @@ impl KeyedArrangement {
         payload_arrays: &[ArrayRef],
     ) -> Result<RecordBatch, EngineError> {
         let columns = (0..self.schema.fields().len())
-            .map(
-                |field| match self.key_indices.iter().position(|&index| index == field) {
-                    Some(position) => key_arrays[position].clone(),
-                    None => {
-                        let position = self
-                            .payload_indices
+            .map(|field| {
+                self.key_indices
+                    .iter()
+                    .position(|&index| index == field)
+                    .map(|position| key_arrays[position].clone())
+                    .or_else(|| {
+                        self.payload_indices
                             .iter()
                             .position(|&index| index == field)
-                            .unwrap_or(0);
-                        payload_arrays[position].clone()
-                    }
-                },
-            )
-            .collect();
+                            .map(|position| payload_arrays[position].clone())
+                    })
+                    .ok_or_else(|| EngineError::Infrastructure(format!("column {field} missing")))
+            })
+            .collect::<Result<Vec<ArrayRef>, EngineError>>()?;
         Ok(RecordBatch::try_new(self.schema.clone(), columns)?)
     }
 
