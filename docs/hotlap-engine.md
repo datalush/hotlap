@@ -135,13 +135,32 @@ declaración. El core concreto se inyecta con `Hotlap::open_with`.
 |---|---|---|
 | `Filter` | `arrow::compute::filter_record_batch` | Filtra columnas de datos y `diff` juntos, de modo que las retracciones sobreviven si su fila pasa el filtro. `Predicate::Cmp`/`And`/`Or`/`Not`/`IsNull` con lógica de tres valores (Kleene). |
 | `Project` | `arrow::compute` (`ArrayRef::clone`) | Selecciona/reordena columnas compartiendo arrays; O(nº de columnas). Conserva `diff`. |
-| `GroupAggregate` | claves `arrow::row` + reduce incremental | Mantiene `clave → acumuladores` para `count`/`sum`/`avg`; actualiza **solo las claves tocadas** por el delta (coste O(delta), no O(keyspace)). El estado es `retraction-aware` (pesos negativos): `count` es `i64`, `sum` entero es `i128` con `checked_add`/`checked_sub` y `sum`/`avg` float son `f64` (el `avg` guarda suma + nº de no nulos). Emite un changelog `(clave..., aggs...)` con `diff` firmado: al cruzar a cero retrae la fila vieja; una clave nueva inserta la suya; una cambiada retrae la vieja e inserta la nueva. |
+| `GroupAggregate` | claves `arrow::row` + reduce incremental | Mantiene `clave → acumuladores` para `count`/`sum`/`min`/`max`/`avg`; actualiza **solo las claves tocadas** por el delta (coste O(delta), no O(keyspace)). El estado es `retraction-aware` (pesos negativos): `count` es `i64`, `sum` entero es `i128` con `checked_add`/`checked_sub` (fail-stop en overflow) y `sum`/`avg` float son `f64` (el `avg` guarda suma + nº de no nulos). `min`/`max` **no son invertibles**, así que por clave guardan un **multiset** `valor→cuenta` (`OrderedMultiset`, `BTreeMap` con `Ord` propio; floats vía `f64::total_cmp`): al retraer el extremo hasta cuenta cero se recalcula el siguiente; retraer más de lo insertado satura en cero. Emite un changelog `(clave..., aggs...)` con `diff` firmado: al cruzar a cero retrae la fila vieja; una clave nueva inserta la suya; una cambiada retrae la vieja e inserta la nueva. La comparación de estado para decidir la emisión ignora la multiplicidad de filas y compara `min`/`max` por el extremo actual (`same_output`). |
 | `Join` (inner equi) | claves `arrow::row` ambos lados | Cada lado acumula en un `KeyedArrangement`; cada `apply` recomputa el join y emite el changelog contra la relación anterior. La fila de salida es `left ‖ right`; las multiplicidades se multiplican. |
 | `TumbleCount` | ventana tumbling sobre event-time | Cubetas abiertas en un `BTreeMap` por `window_start`; `ws = (event_ts / size) * size`. Emite cada ventana **una vez al cerrarse** (append-only) y la libera; las filas por debajo del watermark previo se cuentan como late y se descartan. |
 
 El grafo de vista compone estos nodos; en un `Join` con fuentes que aún no tienen
 esquema conocido, el lado pendiente se **bufferiza** hasta que ambos esquemas
 están disponibles.
+
+### 6.1 Snapshot del estado de agregados
+
+El estado retenido es **serializable** (`crates/hotlap-core/src/snapshot/`): el
+snapshot es un contenedor serde (`EngineSnapshot`, versión de formato
+`ENGINE_SNAPSHOT_FORMAT_VERSION`) que se codifica con **bincode**. El estado de
+un `GroupAggregate` es `GroupState` → `key bytes -> GroupEntry`, y cada
+`GroupEntry` guarda su multiplicidad de filas y un `AggValue` por agregado:
+
+- `count` → `Count(i64)`;
+- `sum` entero → `SumInteger { sum: i128, count: i64 }` (el `count` distingue
+  «suma = 0» de «sin valores no nulos») y `sum` float → `SumFloat { sum, count }`;
+- `avg` → `Avg { sum: f64, count: i64 }` (suma + nº de no nulos);
+- `min`/`max` → `Min`/`Max(OrderedMultiset)` (el multiset `valor→cuenta`).
+
+Los extremos se serializan con su multiset completo, de modo que un restore no
+pierde la capacidad de retraer el extremo actual. Los cambios de significado de
+un campo exigen subir la versión de formato; los lectores rechazan cualquier
+otra.
 
 ## 7. Integración (bordes)
 
@@ -173,6 +192,11 @@ Verificación de ausencia (cero referencias):
 - **Estado sin poda (GC)**: coincide con el estado corriente, sin historia; los
   arrangements, las cubetas de ventana y las salidas acumuladas **no se podan**.
   No hay recolección de basura ni gestión avanzada de late-data.
+- **`min`/`max` guardan todos los valores distintos**: al no ser invertibles, el
+  multiset por clave crece con el nº de valores distintos vivos, no con el
+  resultado. Aceptable para SP6; una poda exigiría otra estructura.
+- **Agregados con ventana**: `TumbleCount` solo computa `count(*)`; `sum`/`min`/
+  `max`/`avg` por ventana quedan para SP7 (hop/sliding).
 - **Single-worker**: v1 sin exchange, sin *spill* y sin persistencia.
 - **IR limitado**: solo los operadores de §6; tipos/agregados fuera del IR se
   rechazan con `Unsupported`. Sin hop/sliding/session.

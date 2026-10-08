@@ -1,10 +1,11 @@
-# Hotlap — capa SQL/DDL y catálogo mínimo (SP3)
+# Hotlap — capa SQL/DDL y catálogo mínimo (SP3, ampliada en SP6)
 
-- Fecha: 2026-10-07
-- Estado: implementado (SP3), tests verdes
+- Fecha: 2026-10-08
+- Estado: implementado (SP3 + SP6), tests verdes
 - Alcance: superficie SQL embebida sobre el kernel + connectors
 - Crate: `hotlap-sql` (el kernel `crates/hotlap` sigue sin Arrow)
-- Plan: SP3 (`2026-10-07-hotlap-sql-ddl-catalog.md`)
+- Plan: SP3 (`2026-10-07-hotlap-sql-ddl-catalog.md`); amplitud SQL en SP6
+  (`2026-10-08-hotlap-sql-breadth-design.md`)
 
 ## 1. Propósito
 
@@ -76,20 +77,41 @@ DataFusion planifica cada `SELECT` y `translate::to_kernel_plan` mapea su
 | `LogicalPlan` | `Plan` del kernel | Condición |
 | --- | --- | --- |
 | `TableScan` | `Source` | — |
-| `Filter` | `Filter` | predicado `col = literal` o `col > literal Int64` |
+| `Filter` | `Filter` | predicado `col <op> literal` (`=,<>,<,<=,>,>=`), `AND`/`OR`/`NOT`, `IS [NOT] NULL`; el literal puede ir a cualquiera de los dos lados |
 | `Projection` | `Project` | proyección de columnas; la proyección identidad sobre un `Aggregate` se desenvuelve |
-| `Aggregate` | `GroupAggregate` / `TumbleCount` | `count`/`sum`/`avg` (con `GROUP BY` de columnas); `count(*)` por ventana con, como mucho, un `tumble(col, size)` |
+| `Aggregate` | `GroupAggregate` / `TumbleCount` | `count`/`sum`/`min`/`max`/`avg` (con `GROUP BY` de columnas); `count(*)` por ventana con, como mucho, un `tumble(col, size)` |
 | `Join` | `Join` | inner equi-join; ambos lados leen **el mismo** source |
 
+Tipos de columna admitidos: `Int32`, `Int64`, `Float64`, `Utf8` y `Boolean`.
+`min`/`max` son **solo numéricos** (`Int32`/`Int64`/`Float64`): sobre `Utf8`
+se rechazan; `sum` es `Int32`/`Int64`/`Float64` y `avg` es numérico. La
+**semántica NULL** es de **tres valores** (Kleene): una comparación con un
+operando nulo da «desconocido» y la fila se excluye del `WHERE` (`NULL AND TRUE`
+es nulo, `NULL OR TRUE` es verdadero, `NOT NULL` es nulo).
+
+La **lectura** (`SELECT ... FROM <mv>`) sigue delegando en **DataFusion**: el
+kernel solo mantiene el estado incremental de las vistas; el subconjunto de
+expresiones de arriba aplica al `WHERE`/agregados de la **view** que se
+mantiene, no al `SELECT` de consulta.
+
 Todo lo demás se **rechaza explícitamente** con `SqlError::Unsupported`, nunca
-con una traducción parcial o silenciosa: agregados fuera de `count`/`sum`/`avg`
-(`min`/`max` quedan para más adelante, igual que `count(DISTINCT ...)`,
-`FILTER`, `ORDER BY`), agregados sin `GROUP BY`, operadores de predicado fuera
-de `Eq`/`Gt`, más de un `tumble`, o un join entre sources distintos. Los tipos de columna que el kernel no representa
-(`Int64`/`Utf8`/`Boolean` son los admitidos) también se rechazan: el esquema de
-salida de la MV se valida con `convert::ensure_kernel_types` en el propio
-`CREATE MATERIALIZED VIEW`, de modo que un tipo no representable falla en DDL y
-no más tarde en el `SELECT`.
+con una traducción parcial o silenciosa:
+
+- **Expresiones calculadas** (`a + 1`) y **funciones/casts** explícitos en la
+  view; tampoco se admiten predicados entre dos columnas.
+- `HAVING`, `DISTINCT` (`count(DISTINCT ...)`), `FILTER`, `ORDER BY`/`LIMIT`
+  dentro de la view, y agregados con modificadores (`DISTINCT`/`FILTER`/
+  `ORDER BY`/`NULL TREATMENT`).
+- Agregados sin `GROUP BY` (toda operación de grupo del kernel exige clave).
+- `min`/`max` sobre `Utf8` (solo numéricos), al igual que `sum`/`avg` sobre
+  tipos no numéricos.
+- Más de un `tumble`, o agregados de ventana distintos de `count(*)`.
+- **Joins no-equi** (o con `filter`), cross-source o entre sources distintos.
+
+Los tipos de columna que el kernel no representa también se rechazan: el
+esquema de salida de la MV se valida con `convert::ensure_kernel_types` en el
+propio `CREATE MATERIALIZED VIEW`, de modo que un tipo no representable falla en
+DDL y no más tarde en el `SELECT`.
 
 ## 5. MV como `TableProvider`
 
@@ -104,10 +126,12 @@ planifica como una tabla normal:
   `convert::rows_to_batch` y lo envuelve en un ejecutor en memoria.
 - El **esquema** de la MV (`mv_schema.rs`) sigue el contrato de salida del
   kernel: `key ++ [window_start, count]` para `TumbleCount` y
-  `key ++ [count, sum, avg, ...]` para `GroupAggregate`. Los nombres de las
-  columnas agregadas son `count`/`sum`/`avg` y sus tipos se derivan del tipo de
-  la columna de entrada; los nombres de las columnas clave se toman del
-  esquema del source en los índices del `key`.
+  `key ++ [count, sum, min, max, avg]` para `GroupAggregate`. Los nombres de las
+  columnas agregadas son `count`/`sum`/`min`/`max`/`avg` y sus tipos se derivan
+  del tipo de la columna de entrada (`count` → `Int64`; `sum` entero → `Int64`;
+  `sum` float → `Float64`; `avg` → `Float64`; `min`/`max` conservan el tipo
+  numérico de entrada); los nombres de las columnas clave se toman del esquema
+  del source en los índices del `key`.
 - Si el dataflow aún no se ha construido (ningún batch ingerido), el snapshot
   se sirve como **vacío** en vez de error (`SnapshotHandle::is_built`), de forma
   que una MV recién arrancada responde 0 filas sin colgarse.
@@ -174,10 +198,8 @@ un requisito registrado para **SP4**.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy -p hotlap-sql --all-targets -- -D warnings
-cargo test -p hotlap-sql
-cargo test -p hotlap
-cargo test -p hotlap-connectors
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 Cobertura: unit (`ddl`, `watermark`, `convert`, `translate`, `mv_schema`,
@@ -186,7 +208,18 @@ recomputación completa de las ventanas tumbling, MV vacía → 0 filas, DDL tra
 `START` rechazado, y drop de la sesión sin pánico en el executor;
 `tests/session_guards.rs` — segundo `CREATE SOURCE` rechazado, tipo de salida
 de MV no representable rechazado en DDL, y nombre de vista no envenenado por un
-`CREATE MATERIALIZED VIEW` fallido).
+`CREATE MATERIALIZED VIEW` fallido). SP6 añade:
+
+- `tests/predicate_translate.rs` — traducción de cada comparación, combinadores
+  booleanos, `IS [NOT] NULL`, literal a la izquierda (inversión) y rechazos.
+- `tests/predicate_differential.rs` — paridad de la semántica de predicados
+  (NULL/casts) contra `PhysicalExpr` de DataFusion.
+- `hotlap-runtime/tests/sql_group_aggregate.rs` — E2E de `sum`/`min`/`max`/`avg`
+  con retracciones contra recomputación completa.
+- `hotlap-engine` (`ops/group_aggregate/tests.rs`, `minmax_tests/`) — cada
+  agregado y sus retracciones, incluida la retracción del extremo actual.
+- `hotlap-core` (`predicate/eval.rs`, `snapshot/minmax.rs`) — evaluación
+  Kleene y multiset de `min`/`max` (`total_cmp` para floats).
 
 La ruta Fluss por defecto (`FlussSourceFactory`) requiere un clúster vivo; en
 este entorno **no** hay uno, así que se verifica en compilación y los tests
