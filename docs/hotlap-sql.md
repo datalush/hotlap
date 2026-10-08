@@ -18,22 +18,24 @@ kernel.
 
 ## 2. Crate y módulos
 
-`crates/hotlap-sql`, biblioteca pública mínima:
+`crates/hotlap-sql` es la capa SQL pura (parseo DDL, catálogo y traducción de
+plan). La **sesión embebida** (`SqlSession`, `FlussSourceFactory`, MV como
+`TableProvider`) vive ahora en `hotlap-runtime` (`session.rs` + `session/`), que
+compone esta crate con el runtime y las métricas.
 
 | Módulo | Rol |
 | --- | --- |
-| `session/` (`mod.rs`, `runtime.rs`, `fluss_factory.rs`) | `SqlSession`: dispatch de sentencias, ciclo de vida del motor, registro de MVs, y `FlussSourceFactory` (fuente por defecto) |
-| `ddl.rs` (+ `ddl_scan.rs`) | parser mínimo de `CREATE SOURCE` / `CREATE MATERIALIZED VIEW` / `START` |
+| `ddl/mod.rs` (+ `ddl/sink.rs`, `ddl_scan.rs`) | parser mínimo de `CREATE SOURCE` / `CREATE SINK` / `CREATE MATERIALIZED VIEW` / `START` |
 | `translate.rs` (+ `translate_expr.rs`, `tumble.rs`) | `LogicalPlan` de DataFusion → `Plan` del kernel |
 | `convert.rs` | filas del kernel (`Row`/`Scalar`) → `RecordBatch` Arrow |
-| `mv_provider.rs` (+ `mv_schema.rs`, `session_source.rs`) | MV como `TableProvider` DataFusion |
+| `mv_schema.rs` | esquema de salida de una MV según el contrato del kernel |
 | `watermark.rs` | parseo de `INTERVAL` y resolución de la columna event-time |
 | `catalog.rs` | registro de sources y MVs declarados |
 | `error.rs` | `SqlError` (`Parse` / `Unsupported` / `Catalog` / `Engine`) |
 
-Tipos re-exportados en `lib.rs`: `Catalog`, `MvDef`, `SourceDef`, `SqlError`,
-`MvTableProvider`, `SqlSession`, `QueryResult`, `Snapshotter`, `SourceFactory`,
-`FlussSourceFactory`.
+Tipos re-exportados en `lib.rs`: `Catalog`, `MvDef`, `SourceDef`, `CreateSink`,
+`SqlError`. La sesión y sus tipos (`SqlSession`, `QueryResult`, `Snapshotter`,
+`SourceFactory`, `FlussSourceFactory`) se re-exportan desde `hotlap-runtime`.
 
 ## 3. Gramática DDL mínima
 

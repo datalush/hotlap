@@ -126,7 +126,10 @@ desde `hotlap-sql`, por lo que no hay una variante `State` propia. Las consultas
 ## 6. Métricas in-process
 
 `hotlap-core::MetricsRegistry` guarda contadores y gauges con nombre en celdas
-`AtomicU64`; se comparte con `Arc` y se actualiza con `&self`:
+`AtomicU64`; se comparte con `Arc` y se actualiza con `&self`. `metric(nombre)`
+resuelve una celda una sola vez y devuelve un handle (`Metric`) cuyas
+operaciones son lock-free: engine/runtime cachean sus handles para no tomar el
+lock del registro en cada actualización.
 
 ```rust
 use hotlap_core::MetricsRegistry;
@@ -135,6 +138,8 @@ let metrics = MetricsRegistry::new();
 metrics.inc("rows_ingested");        // +1
 metrics.add("rows_ingested", 4);     // +n (contador)
 metrics.set("windows_open", 3);      // =n (gauge)
+let rows = metrics.metric("rows_ingested"); // handle cacheado, lock-free
+rows.add(1);
 let snap = metrics.snapshot();       // BTreeMap<String, u64> ordenado por nombre
 ```
 
@@ -153,10 +158,11 @@ Métricas que engine/runtime **emiten** en v1 (nombres estables):
 | `checkpoints_taken` | contador | Checkpoints tomados (periódicos o a demanda). |
 | `checkpoints_restored` | contador | Checkpoints restaurados en el arranque/recuperación. |
 | `sinks_committed` | contador | Commits de sink coordinados (2PC) confirmados. |
+| `windows_open` | gauge | Ventanas tumbling abiertas (aún no emitidas), recalculado en cada push. |
 
-El registro también expone `set` para **gauges**, pero en v1 **ningún** gauge se
-emite en producción: las métricas reales son los contadores anteriores (el
-ejemplo `windows_open` del diseño quedó fuera del alcance).
+Además de los contadores, el motor publica el gauge `windows_open` en cada push
+y tras un `restore`; el registro expone `set` para gauges y `metric` para
+handles lock-free.
 
 ## 7. Límites (no-goals v1)
 
