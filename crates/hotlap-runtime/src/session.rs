@@ -16,7 +16,7 @@ pub use sink_factory::{FlussSinkFactory, SinkFactory};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use hotlap::ZSetBatch;
@@ -61,13 +61,9 @@ pub enum QueryResult {
 
 impl Snapshotter for SnapshotHandle {
     fn snapshot(&self, view: &str) -> Result<ZSetBatch, SqlError> {
-        // Before the first push the kernel has no built dataflow, so a declared
-        // view reads as empty rather than erroring. `is_built` is set by the
-        // engine after the first successful push, avoiding any dependence on
-        // the kernel's error text.
-        if !self.is_built() {
-            return Ok(ZSetBatch::empty(Arc::new(Schema::empty())));
-        }
+        // A view with no push yet materializes as an empty batch with the MV's
+        // own schema, and a recovered view returns its restored state, so no
+        // separate "built" gate is needed here.
         SnapshotHandle::snapshot(self, view).map_err(to_engine)
     }
 }
