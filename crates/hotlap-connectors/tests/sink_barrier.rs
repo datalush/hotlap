@@ -8,7 +8,7 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use hotlap::Hotlap;
 use hotlap::state::{StateBackend, StateEntry, StateError};
 use hotlap_connectors::runtime::checkpoint::Checkpointer;
-use hotlap_connectors::runtime::sink::SharedSink;
+use hotlap_connectors::runtime::sink::{SharedSink, SinkSync};
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError, Sink, SinkCapabilities};
 
@@ -25,6 +25,7 @@ struct FakeSink {
     capabilities: SinkCapabilities,
     events: Arc<Mutex<Vec<Event>>>,
     fail_prepare: bool,
+    fail_commit: bool,
 }
 
 impl FakeSink {
@@ -33,6 +34,7 @@ impl FakeSink {
             capabilities,
             events,
             fail_prepare: false,
+            fail_commit: false,
         }
     }
 
@@ -41,6 +43,16 @@ impl FakeSink {
             capabilities: SinkCapabilities::Transactional,
             events,
             fail_prepare: true,
+            fail_commit: false,
+        }
+    }
+
+    fn failing_commit(capabilities: SinkCapabilities, events: Arc<Mutex<Vec<Event>>>) -> Self {
+        Self {
+            capabilities,
+            events,
+            fail_prepare: false,
+            fail_commit: true,
         }
     }
 
@@ -69,6 +81,9 @@ impl Sink for FakeSink {
 
     async fn commit(&self) -> Result<(), ConnectorError> {
         self.record(Event::Commit);
+        if self.fail_commit {
+            return Err(ConnectorError::Infrastructure("commit failed".into()));
+        }
         Ok(())
     }
 
@@ -171,7 +186,8 @@ async fn transactional_sink_prepares_then_commits_before_valid() {
         log.clone(),
     )));
     let backend = MemBackend::default();
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![sink]);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
 
     let id = checkpointer
         .take(&engine(), &EmptySource)
@@ -200,7 +216,8 @@ async fn capture_failure_aborts_and_discards_the_checkpoint() {
         log.clone(),
     )));
     let backend = MemBackend::failing();
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![sink]);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
 
     let result = checkpointer.take(&engine(), &EmptySource).await;
     assert!(result.is_err(), "a failing write must surface the error");
@@ -228,8 +245,10 @@ async fn prepare_failure_aborts_the_already_prepared_sinks() {
     let second_log = Arc::new(Mutex::new(Vec::new()));
     let second = SharedSink::new(Arc::new(FakeSink::failing_prepare(second_log.clone())));
     let backend = MemBackend::default();
-    let mut checkpointer =
-        Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![first, second]);
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![
+        SinkSync::sink_only(first),
+        SinkSync::sink_only(second),
+    ]);
 
     let result = checkpointer.take(&engine(), &EmptySource).await;
     assert!(result.is_err());
@@ -247,7 +266,8 @@ async fn idempotent_sink_is_flushed_but_not_prepared() {
         log.clone(),
     )));
     let backend = MemBackend::default();
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![sink]);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
 
     checkpointer.take(&engine(), &EmptySource).await.unwrap();
     assert_eq!(
@@ -265,11 +285,73 @@ async fn at_least_once_sink_is_not_coordinated() {
         log.clone(),
     )));
     let backend = MemBackend::default();
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![sink]);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
 
     checkpointer.take(&engine(), &EmptySource).await.unwrap();
     assert!(
         log.lock().unwrap().is_empty(),
         "at-least-once sinks are already visible and must not be coordinated"
     );
+}
+
+#[tokio::test]
+async fn commit_failure_aborts_the_failed_and_remaining_prepared_sinks() {
+    let log = events();
+    let first = SharedSink::new(Arc::new(FakeSink::new(
+        SinkCapabilities::Transactional,
+        log.clone(),
+    )));
+    // The second fails its commit; it must be aborted along with the first.
+    let second_log = events();
+    let second = SharedSink::new(Arc::new(FakeSink::failing_commit(
+        SinkCapabilities::Transactional,
+        second_log.clone(),
+    )));
+    let backend = MemBackend::default();
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![
+        SinkSync::sink_only(first),
+        SinkSync::sink_only(second),
+    ]);
+
+    let result = checkpointer.take(&engine(), &EmptySource).await;
+    assert!(result.is_err());
+    assert_eq!(*log.lock().unwrap(), vec![Event::Prepare, Event::Commit]);
+    assert_eq!(
+        *second_log.lock().unwrap(),
+        vec![Event::Prepare, Event::Commit, Event::Abort],
+        "the sink whose commit failed must still be aborted"
+    );
+    let reader = Checkpointer::new(Box::new(backend), 3);
+    assert_eq!(reader.latest().unwrap(), None);
+}
+
+#[tokio::test]
+async fn idempotent_flush_failure_aborts_prepared_transactional_sinks() {
+    let transactional_log = events();
+    let transactional = SharedSink::new(Arc::new(FakeSink::new(
+        SinkCapabilities::Transactional,
+        transactional_log.clone(),
+    )));
+    let idempotent_log = events();
+    let idempotent = SharedSink::new(Arc::new(FakeSink::failing_commit(
+        SinkCapabilities::Idempotent,
+        idempotent_log.clone(),
+    )));
+    let backend = MemBackend::default();
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![
+        SinkSync::sink_only(transactional),
+        SinkSync::sink_only(idempotent),
+    ]);
+
+    let result = checkpointer.take(&engine(), &EmptySource).await;
+    assert!(result.is_err());
+    assert_eq!(
+        *transactional_log.lock().unwrap(),
+        vec![Event::Prepare, Event::Abort],
+        "an idempotent flush failure must abort the prepared transactional sink"
+    );
+    assert_eq!(*idempotent_log.lock().unwrap(), vec![Event::Commit]);
+    let reader = Checkpointer::new(Box::new(backend), 3);
+    assert_eq!(reader.latest().unwrap(), None);
 }

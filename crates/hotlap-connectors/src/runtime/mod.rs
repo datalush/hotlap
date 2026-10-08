@@ -11,6 +11,7 @@ pub(crate) mod retention;
 mod shared_sink;
 pub mod sink;
 pub mod sink_barrier;
+mod sink_sync;
 mod snapshot_handle;
 
 pub use snapshot_handle::SnapshotHandle;

@@ -3,22 +3,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hotlap::{Hotlap, HotlapError, ZSetBatch};
+use hotlap::{Hotlap, HotlapError};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::error::ConnectorError;
 use crate::runtime::pipeline::SinkSpec;
 pub use crate::runtime::shared_sink::SharedSink;
+pub use crate::runtime::sink_sync::{ChangelogSender, SinkMessage, SinkSync};
 
 /// Bound on how far a sink may lag the engine before backpressure bites.
 const CHANNEL_CAPACITY: usize = 64;
 
 /// How long `SinkPump::close` waits for one sink task before giving up.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Sender side of a sink's bounded changelog channel.
-pub type ChangelogSender = mpsc::Sender<Result<ZSetBatch, ConnectorError>>;
 
 /// Spawn a sink task that writes every received batch through `shared`.
 ///
@@ -46,10 +44,16 @@ pub fn spawn_sink(
 /// Write every batch until the channel closes.
 async fn drive(
     shared: &SharedSink,
-    rx: &mut mpsc::Receiver<Result<ZSetBatch, ConnectorError>>,
+    rx: &mut mpsc::Receiver<SinkMessage>,
 ) -> Result<(), ConnectorError> {
-    while let Some(item) = rx.recv().await {
-        shared.write_batch(item?).await?;
+    while let Some(message) = rx.recv().await {
+        match message {
+            SinkMessage::Batch(item) => shared.write_batch(item?).await?,
+            // In-order processing means every earlier batch is already written.
+            SinkMessage::Flush(reply) => {
+                let _ = reply.send(());
+            }
+        }
     }
     Ok(())
 }
@@ -87,10 +91,13 @@ impl SinkPump {
     }
 
     /// The sinks the checkpoint barrier coordinates, sharing this pump's state.
-    pub fn coordinated(&self) -> Vec<Arc<SharedSink>> {
+    ///
+    /// Each entry pairs the sink with the sender of its channel, so the barrier
+    /// can drain queued deltas before it prepares and commits.
+    pub fn coordinated(&self) -> Vec<SinkSync> {
         self.entries
             .iter()
-            .map(|entry| Arc::clone(&entry.shared))
+            .map(|entry| SinkSync::new(entry.tx.clone(), Arc::clone(&entry.shared)))
             .collect()
     }
 
@@ -104,7 +111,11 @@ impl SinkPump {
             if changes.is_empty() {
                 continue;
             }
-            entry.tx.send(Ok(changes)).await.map_err(|_| stopped())?;
+            entry
+                .tx
+                .send(SinkMessage::Batch(Ok(changes)))
+                .await
+                .map_err(|_| stopped())?;
         }
         Ok(())
     }

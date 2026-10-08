@@ -6,7 +6,6 @@
 //! checkpoint as the current one. Older checkpoints are pruned, keeping at
 //! most `retain` of the newest.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hotlap::Hotlap;
@@ -17,7 +16,7 @@ use crate::error::ConnectorError;
 use crate::runtime::checkpoint_body::{
     LATEST_KEY, checkpoint_prefix, engine_err, invalid, mark_valid, parse_id, state_err, write,
 };
-use crate::runtime::sink::SharedSink;
+use crate::runtime::sink::SinkSync;
 use crate::runtime::sink_barrier::SinkBarrier;
 use crate::source::{Source, SourceState};
 
@@ -67,7 +66,10 @@ impl Checkpointer {
     }
 
     /// Coordinate the given sinks with the two-phase-commit protocol.
-    pub fn with_sinks(mut self, sinks: Vec<Arc<SharedSink>>) -> Self {
+    ///
+    /// Each [`SinkSync`] also carries its changelog channel, so a checkpoint
+    /// drains queued deltas before committing the sink.
+    pub fn with_sinks(mut self, sinks: Vec<SinkSync>) -> Self {
         self.sinks = SinkBarrier::new(sinks);
         self
     }
@@ -81,8 +83,8 @@ impl Checkpointer {
     /// Capture `engine` and `source` and persist a new valid checkpoint,
     /// coordinating the sinks in two-phase-commit order.
     ///
-    /// The order is prepare -> snapshot + write body -> commit -> mark valid.
-    /// A failure before the commit finishes aborts the prepared sinks and
+    /// The order is drain -> prepare -> snapshot + write body -> commit -> mark
+    /// valid. A failure before the commit finishes aborts the prepared sinks and
     /// discards the checkpoint, so the engine keeps its last valid one.
     ///
     /// Returns the id of the checkpoint; later reads must use [`Self::read`].
