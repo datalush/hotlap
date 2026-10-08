@@ -62,6 +62,27 @@ impl SinkBarrier {
         }
     }
 
+    /// Whether every coordinated sink can re-drive `commit` after a restart.
+    ///
+    /// `Transactional` and `Idempotent` sinks qualify; an `AtLeastOnce` sink
+    /// cannot, so an interrupted commit over one must be discarded and replayed.
+    pub fn redriable(&self) -> bool {
+        self.sinks
+            .iter()
+            .all(|sync| sync.sink().capabilities() != SinkCapabilities::AtLeastOnce)
+    }
+
+    /// Re-drive `commit` for every sink after an interrupted commit.
+    ///
+    /// Only valid when [`Self::redriable`] holds: `Sink::commit` must tolerate
+    /// running more than once, which the sink contract already requires.
+    pub async fn redrive_commit(&self) -> Result<(), ConnectorError> {
+        for sync in &self.sinks {
+            sync.sink().commit().await?;
+        }
+        Ok(())
+    }
+
     /// Drain every channel so all queued deltas have reached their sink.
     ///
     /// A `Flush` is sent behind the queued batches and awaited; the sink task

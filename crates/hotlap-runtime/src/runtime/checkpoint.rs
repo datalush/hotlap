@@ -13,7 +13,8 @@ use hotlap::state::StateBackend;
 use hotlap_engine::{EngineSnapshot, decode_framed, decode_snapshot};
 
 use crate::runtime::checkpoint_body::{
-    LATEST_KEY, checkpoint_prefix, engine_err, invalid, mark_valid, parse_id, state_err, write,
+    LATEST_KEY, checkpoint_prefix, clear_commit, engine_err, invalid, mark_valid, parse_id,
+    read_body as decode_body, state_err, write,
 };
 use crate::runtime::sink::SinkSync;
 use crate::runtime::sink_barrier::SinkBarrier;
@@ -83,9 +84,11 @@ impl Checkpointer {
     /// Capture `engine` and `source` and persist a new valid checkpoint,
     /// coordinating the sinks in two-phase-commit order.
     ///
-    /// The order is drain -> prepare -> snapshot + write body -> commit -> mark
-    /// valid. A failure before the commit finishes aborts the prepared sinks and
-    /// discards the checkpoint, so the engine keeps its last valid one.
+    /// The order is drain -> prepare -> snapshot + write body + durable commit
+    /// marker -> commit -> mark valid -> clear marker. A failure aborts the
+    /// prepared sinks and clears the marker, so the engine keeps its last valid
+    /// checkpoint. A crash between the marker and validity leaves the marker for
+    /// recovery to resolve.
     ///
     /// Returns the id of the checkpoint; later reads must use [`Self::read`].
     pub async fn take(
@@ -94,12 +97,57 @@ impl Checkpointer {
         source: &dyn Source,
     ) -> Result<u64, ConnectorError> {
         let id = self.next_id;
-        self.sinks
+        let result = self
+            .sinks
             .around(|| write(self.backend.as_mut(), id, engine, source))
-            .await?;
+            .await;
+        if let Err(error) = result {
+            let _ = clear_commit(self.backend.as_mut(), id);
+            return Err(error);
+        }
         mark_valid(self.backend.as_mut(), id, self.retain)?;
+        let _ = clear_commit(self.backend.as_mut(), id);
         self.next_id = self.next_id.saturating_add(1);
         Ok(id)
+    }
+
+    /// Finish an interrupted commit detected by recovery: re-drive the sinks'
+    /// `commit` (idempotent, only valid when every sink is re-drivable), publish
+    /// `valid` and clear the marker.
+    pub async fn promote(&mut self, id: u64) -> Result<(), ConnectorError> {
+        self.sinks.redrive_commit().await?;
+        mark_valid(self.backend.as_mut(), id, self.retain)?;
+        let _ = clear_commit(self.backend.as_mut(), id);
+        Ok(())
+    }
+
+    /// Delete an interrupted checkpoint that recovery cannot promote.
+    pub fn discard_commit(&mut self, id: u64) -> Result<(), ConnectorError> {
+        let prefix = format!("{}/", checkpoint_prefix(id));
+        for key in self.backend.list(prefix.as_bytes()).map_err(state_err)? {
+            self.backend.delete(&key).map_err(state_err)?;
+        }
+        Ok(())
+    }
+
+    /// Whether every coordinated sink declares a re-drivable `commit`.
+    pub(crate) fn redriable(&self) -> bool {
+        self.sinks.redriable()
+    }
+
+    /// Decode the body of `id` without requiring the `valid` marker.
+    pub(crate) fn read_body(&self, id: u64) -> Result<Option<Checkpoint>, ConnectorError> {
+        let body = decode_body(self.backend.as_ref(), id)?;
+        Ok(body.map(|(engine, sources)| Checkpoint {
+            id,
+            engine,
+            sources,
+        }))
+    }
+
+    /// Whether `key` is present in the store.
+    pub(crate) fn has_key(&self, key: &str) -> Result<bool, ConnectorError> {
+        Ok(self.get(key)?.is_some())
     }
 
     /// Id of the newest complete checkpoint, or `None` when none exists.

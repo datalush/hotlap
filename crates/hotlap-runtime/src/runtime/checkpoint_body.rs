@@ -2,13 +2,17 @@
 
 use hotlap::Hotlap;
 use hotlap::state::{StateBackend, StateError};
-use hotlap_engine::{EngineError, encode_framed, encode_snapshot};
+use hotlap_engine::{
+    EngineError, EngineSnapshot, decode_framed, decode_snapshot, encode_framed, encode_snapshot,
+};
 
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::Source;
+use hotlap_connectors::source::{Source, SourceState};
 
 /// Value stored under `checkpoint/<id>/valid` once a checkpoint is complete.
 pub(crate) const VALID_MARKER: &[u8] = b"1";
+/// Value stored under `checkpoint/<id>/commit` once a commit is intended.
+pub(crate) const COMMIT_MARKER: &[u8] = b"1";
 /// Key holding the id of the newest fully written checkpoint.
 pub(crate) const LATEST_KEY: &[u8] = b"checkpoint/latest";
 
@@ -18,8 +22,10 @@ pub(crate) fn checkpoint_prefix(id: u64) -> String {
 
 /// Encode the engine snapshot and source offsets under `checkpoint/<id>/`.
 ///
-/// Only the body is written here; [`mark_valid`] publishes it afterwards, so an
-/// interrupted body never becomes the current checkpoint.
+/// The body is written first and the durable commit marker last, before the
+/// sinks commit; [`mark_valid`] publishes the checkpoint afterwards. An
+/// interrupted body never becomes the current checkpoint, and a marker left by
+/// a crash tells recovery that the current checkpoint was mid-commit.
 pub(crate) async fn write(
     backend: &mut (dyn StateBackend + Send),
     id: u64,
@@ -35,7 +41,44 @@ pub(crate) async fn write(
         .map_err(state_err)?;
     backend
         .put(format!("{base}/sources").as_bytes(), source_bytes)
+        .map_err(state_err)?;
+    backend
+        .put(format!("{base}/commit").as_bytes(), COMMIT_MARKER.to_vec())
         .map_err(state_err)
+}
+
+/// Remove the durable commit marker of `id`; a no-op when it is absent.
+pub(crate) fn clear_commit(
+    backend: &mut (dyn StateBackend + Send),
+    id: u64,
+) -> Result<(), StateError> {
+    backend.delete(format!("{}/commit", checkpoint_prefix(id)).as_bytes())
+}
+
+/// Decode the body of `id` without requiring the `valid` marker.
+///
+/// Returns `None` when either part is missing, so a marker over an incomplete
+/// body is not mistaken for a committed checkpoint.
+pub(crate) fn read_body(
+    backend: &dyn StateBackend,
+    id: u64,
+) -> Result<Option<(EngineSnapshot, SourceState)>, ConnectorError> {
+    let base = checkpoint_prefix(id);
+    let Some(engine_bytes) = backend
+        .get(format!("{base}/engine").as_bytes())
+        .map_err(state_err)?
+    else {
+        return Ok(None);
+    };
+    let engine = decode_snapshot(&engine_bytes).map_err(engine_err)?;
+    let Some(source_bytes) = backend
+        .get(format!("{base}/sources").as_bytes())
+        .map_err(state_err)?
+    else {
+        return Ok(None);
+    };
+    let sources = decode_framed(&source_bytes).map_err(engine_err)?;
+    Ok(Some((engine, sources)))
 }
 
 /// Write the `valid` marker and `latest` pointer, then prune older checkpoints.
