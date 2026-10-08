@@ -114,11 +114,12 @@ session.shutdown()?;
 pub enum SessionError {
     Sql(hotlap_sql::SqlError),   // parseo/planificación/catálogo
     Engine(String),              // motor/runtime/conectores
-    State(String),               // uso en un estado inválido
 }
 ```
 
-`Display` antepone `sql:` / `engine:` / `state:` respectivamente. Las consultas
+`Display` antepone `sql:` / `engine:` respectivamente. Los usos en estado
+inválido (p. ej. `DDL after START`) ya se reportan como `SqlError::Unsupported`
+desde `hotlap-sql`, por lo que no hay una variante `State` propia. Las consultas
 (`Rows`) **no** abortan la sesión; el consumidor decide qué hacer con el error.
 
 ## 6. Métricas in-process
@@ -145,15 +146,16 @@ Métricas que engine/runtime **emiten** en v1 (nombres estables):
 | Nombre | Tipo | Significado |
 | --- | --- | --- |
 | `rows_ingested` | contador | Filas recibidas por el motor (suma por push). |
-| `rows_emitted` | contador | Filas emitidas al consolidar las salidas de las vistas. |
+| `rows_emitted` | contador | Filas de los deltas propagados por los grafos de las vistas, **incluidas las retracciones** (suma por push, sin consolidar). |
 | `late_dropped` | contador | Filas descartadas por llegar por debajo del watermark. |
 | `late_closed_dropped` | contador | Filas descartadas por caer en ventanas tumbling ya cerradas. |
 | `checkpoints_taken` | contador | Checkpoints tomados (periódicos o a demanda). |
 | `checkpoints_restored` | contador | Checkpoints restaurados en el arranque/recuperación. |
 | `sinks_committed` | contador | Commits de sink coordinados (2PC) confirmados. |
 
-El registro también admite **gauges** vía `set` (p. ej. `windows_open` en el
-diseño); en v1 el único uso productivo son los contadores anteriores.
+El registro también expone `set` para **gauges**, pero en v1 **ningún** gauge se
+emite en producción: las métricas reales son los contadores anteriores (el
+ejemplo `windows_open` del diseño quedó fuera del alcance).
 
 ## 7. Límites (no-goals v1)
 
