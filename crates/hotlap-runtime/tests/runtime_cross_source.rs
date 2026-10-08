@@ -58,7 +58,7 @@ fn sources(a: Arc<ControlledSource>, b: Arc<ControlledSource>) -> Sources {
     .unwrap()
 }
 
-/// A join of the two inputs on column 0, exposed as view `j`.
+/// A join of both inputs on column 0, exposed as view `j`.
 fn pipeline(sources: Sources, backend: SharedBackend) -> Pipeline {
     Pipeline {
         sources,
@@ -130,7 +130,6 @@ fn split_zero_of_each_source_commits_independently() {
     ))
     .unwrap();
 
-    // Nothing is acked before a push is applied to the engine.
     assert!(a.commits().is_empty());
     assert!(b.commits().is_empty());
 
@@ -141,7 +140,7 @@ fn split_zero_of_each_source_commits_independently() {
         "join must produce a match"
     );
 
-    // Each source advances only its own split 0, keyed by its own InputId.
+    // Each source advances only its own split 0.
     assert!(wait_for(
         || !a.commits().is_empty() && !b.commits().is_empty()
     ));
@@ -184,8 +183,6 @@ fn checkpoint_after_a_normal_end_still_works() {
     b_tx[0].send(Ok(batch_on(0, 1))).unwrap();
     assert!(wait_rows(&handle, "j", &[vec![1, 1]]));
 
-    // Closing both sources ends ingestion without a failure; checkpointing and
-    // shutdown stay available.
     drop(a_tx);
     drop(b_tx);
     assert!(wait_for(|| handle.last_error().unwrap().is_none()));

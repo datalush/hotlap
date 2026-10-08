@@ -1,11 +1,3 @@
-//! The checkpoint barrier must drain a sink's channel before it becomes valid.
-//!
-//! The engine drains each tapped view into a bounded channel that the sink task
-//! consumes asynchronously. A checkpoint taken between a push and the task's
-//! write would otherwise persist engine state whose output deltas are still
-//! queued, losing them on a crash. This test pins the write and the `valid`
-//! marker into one journal and proves the write lands first.
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
