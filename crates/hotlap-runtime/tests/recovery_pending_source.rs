@@ -71,22 +71,17 @@ fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
 }
 
+fn input(id: u32, name: &str) -> InputSource {
+    InputSource {
+        id: InputId(id),
+        name: name.to_string(),
+        source: Arc::new(StaticSource { schema: schema() }),
+        watermark: None,
+    }
+}
+
 fn declared() -> Sources {
-    Sources::new(vec![
-        InputSource {
-            id: InputId(0),
-            name: "a".into(),
-            source: Arc::new(StaticSource { schema: schema() }),
-            watermark: None,
-        },
-        InputSource {
-            id: InputId(1),
-            name: "b".into(),
-            source: Arc::new(StaticSource { schema: schema() }),
-            watermark: None,
-        },
-    ])
-    .unwrap()
+    Sources::new(vec![input(0, "a"), input(1, "b")]).unwrap()
 }
 
 fn engine() -> Hotlap {
@@ -96,16 +91,15 @@ fn engine() -> Hotlap {
     hotlap
 }
 
-#[test]
-fn an_incompatible_pending_commit_errors_without_committing() {
-    let backend = SharedBackend::default();
-    let sources = declared();
-    let mut seeder = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    let valid = futures::executor::block_on(seeder.take(&engine(), &sources)).unwrap();
-    let pending = valid + 1;
+/// Persist a valid checkpoint and return its id.
+fn seed(backend: &SharedBackend, sources: &Sources) -> u64 {
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    futures::executor::block_on(checkpointer.take(&engine(), sources)).unwrap()
+}
 
-    // Copy the valid body to `pending`, renaming one source so it validates
-    // only against a different declaration, then mark the pending commit.
+/// Copy the valid body to `pending`, rename one source and mark the commit.
+fn rename_pending(backend: &SharedBackend, valid: u64) -> u64 {
+    let pending = valid + 1;
     let mut writer = backend.clone();
     let engine_bytes = writer
         .get(format!("checkpoint/{valid}/engine").as_bytes())
@@ -135,17 +129,31 @@ fn an_incompatible_pending_commit_errors_without_committing() {
             b"1".to_vec(),
         )
         .unwrap();
+    pending
+}
 
+/// A checkpointer whose single sink counts re-driven commits.
+fn counting(backend: &SharedBackend) -> (Checkpointer, Arc<AtomicU32>) {
     let commits = Arc::new(AtomicU32::new(0));
     let sink = Arc::new(CountingSink {
         commits: Arc::clone(&commits),
     });
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+    let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
         .with_sinks(vec![SinkSync::sink_only(SharedSink::new(sink))]);
+    (checkpointer, commits)
+}
+
+#[test]
+fn an_incompatible_pending_commit_errors_without_committing() {
+    let backend = SharedBackend::default();
+    let sources = declared();
+    let valid = seed(&backend, &sources);
+    let pending = rename_pending(&backend, valid);
+
+    let (mut checkpointer, commits) = counting(&backend);
     let mut hotlap = engine();
     let signal = Mutex::new(None);
     let metrics = MetricsRegistry::new();
-
     let result = futures::executor::block_on(Recovery::start(
         &mut hotlap,
         &sources,
@@ -153,6 +161,7 @@ fn an_incompatible_pending_commit_errors_without_committing() {
         &signal,
         &metrics,
     ));
+
     assert!(matches!(result, Err(ConnectorError::Unsupported(_))));
     assert_eq!(commits.load(Ordering::SeqCst), 0, "must not re-drive");
     assert!(
