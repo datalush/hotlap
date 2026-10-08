@@ -45,9 +45,13 @@ impl SqlSession {
     }
 
     /// Read the consolidated output of `view` from the running engine.
+    ///
+    /// Routed through the same [`Snapshotter`] guard as the MV table providers,
+    /// so a declared view reads as empty before the dataflow is built instead of
+    /// erroring from the kernel.
     pub fn snapshot(&self, view: &str) -> Result<ZSetBatch, SqlError> {
         let engine = self.engine.as_ref().ok_or_else(not_started)?;
-        engine.snapshot(view).map_err(to_engine)
+        Snapshotter::snapshot(&engine.snapshot_handle(), view)
     }
 
     /// Take a checkpoint now and return its id.
