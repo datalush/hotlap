@@ -159,6 +159,14 @@ partes están escritas: primero el cuerpo (`engine` + `sources`), luego el
 marcador `valid`, y solo entonces el puntero `latest`. Una escritura
 interrumpida **nunca** expone un checkpoint parcial como el actual.
 
+**Cobertura del sink.** El pump del motor drena los deltas de cada vista a un
+canal acotado que la tarea del sink consume de forma asíncrona. Antes de
+preparar y confirmar, la barrera **drena ese canal**: envía una marca de flush
+detrás de los lotes encolados y espera la confirmación de la tarea, que responde
+solo tras escribirlos. Por tanto, al escribir `valid` **todos** los deltas de
+salida hasta ese punto ya llegaron al sink; un checkpoint no puede quedar válido
+con salida aún encolada (que un crash no volvería a entregar).
+
 **Retención** (`runtime/retention.rs`): tras publicar, se **podan** los
 checkpoints más antiguos para conservar los `retain` más nuevos. El borrado solo
 toca claves `checkpoint/<id>/...` (nunca `latest`) y es **idempotente**, así que
@@ -190,10 +198,22 @@ y la forma 2PC: `prepare()` (por defecto no-op), `commit()`, `abort()`.
   dos. Reenviar tras un crash es seguro.
 - **`AtLeastOnce`**: no se coordina; sus escrituras ya son visibles.
 
-`SinkBarrier::around(capture)` ejecuta el orden **prepare → capture → commit**.
-Si `capture` (snapshot + escritura del cuerpo) falla, o el `commit` posterior
-falla, los sinks preparados se **abortan** y el error se propaga: ningún
-checkpoint puede llegar a ser válido.
+`SinkBarrier::around(capture)` ejecuta el orden **drain → prepare → capture →
+commit**. Si `capture` (snapshot + escritura del cuerpo) falla, o un `commit` /
+flush de la fase de confirmación falla, se **abortan todos los sinks preparados
+que aún no se hayan confirmado** (incluido el que falló) y el error se propaga:
+ningún checkpoint puede llegar a ser válido.
+
+**Garantía exacta de `Transactional`.** El commit de los sinks ocurre **antes**
+de escribir `valid` / `latest`. Si el proceso no se interrumpe, la secuencia es
+exactly-once. Si el proceso **cae entre el commit de los sinks y la publicación
+de `valid`**, el recovery carga el checkpoint válido **anterior** y vuelve a
+replayar y a confirmar esos deltas: un sink `Transactional` podría **duplicar**
+(no hay un registro durable de la decisión de commit). Cerrar esa ventana
+requiere persistir un **marker de intención de commit** antes de `Sink::commit`
+y **re-conducir el commit de forma idempotente** en recovery; queda como
+follow-up y hoy la garantía se limita a "sin crash en esa ventana" (para
+`Idempotent`/`AtLeastOnce` el replay es tolerado por definición).
 
 Detalles de corrección (`SharedSink`, `runtime/shared_sink.rs`):
 
@@ -265,10 +285,12 @@ el estado como si la vista hubiera existido desde el principio. El motor
 
 **Aún en memoria.** La retención vive **solo en memoria** y **no sobrevive a un
 restart**: la historia de inputs **no** se persiste en el checkpoint. Por eso
-`restore` **invalida** la retención (§4): tras un recovery, el estado restaurado
-es correcto pero un `build_view` post-start se rechaza hasta que la retención
-vuelva a cubrir el run. La persistencia de la historia de inputs (o el replay
-desde el source) es un follow-up fuera de SP4.
+`restore` **invalida** la retención (§4). La invalidación es **permanente**
+(marca el log como truncado y lo vacía, y no se revierte al seguir registrando
+deltas nuevos): tras un recovery, el estado restaurado es correcto pero un
+`build_view` post-start se rechaza **para siempre** en esa sesión. La
+persistencia de la historia de inputs (o el replay desde el source) es un
+follow-up fuera de SP4.
 
 ## 9. Testing
 
@@ -287,7 +309,11 @@ desde el source) es un follow-up fuera de SP4.
   rechazo sin config).
 - **2PC** (`tests/sink_barrier.rs`): transaccional prepara→commit→valid;
   fallo de capture aborta y descarta; fallo de prepare aborta los ya preparados;
+  fallo de commit aborta el sink que falló y el resto de preparados sin
+  confirmar; fallo de flush idempotente aborta los transaccionales preparados;
   idempotente se flushea sin prepare; at-least-once no se coordina.
+- **Checkpoint + sink** (`tests/checkpoint_sink.rs`): la barrera drena el canal
+  del sink antes de `valid`, de modo que un delta encolado nunca se pierde.
 - **Recovery** (`tests/recovery.rs`, `tests/recovery_startup.rs`):
   crash + recovery ≡ sin crash; sin pérdida ni duplicado en la frontera;
   checkpoint ausente = arranque limpio; `latest` corrupto cae a uno anterior;
