@@ -63,10 +63,11 @@ let config = SessionConfig::new()
 
 ## 4. `Session`
 
-Un `Session` **posee un runtime Tokio de un solo hilo** (`current_thread`,
-con temporizador), de modo que el llamante no necesita estar dentro de un
-runtime de Tokio: los métodos **bloquean** internamente y nunca se invoca el
-handle del motor desde un executor ajeno.
+Un `Session` **posee un runtime Tokio multi-hilo de un worker**
+(`new_multi_thread().worker_threads(1)`) con **drivers de IO y tiempo**
+(`enable_all`, necesarios para los conectores), de modo que el llamante no
+necesita estar dentro de un runtime de Tokio: los métodos **bloquean**
+internamente y nunca se invoca el handle del motor desde un executor ajeno.
 
 | Método | Firma | Descripción |
 | --- | --- | --- |
