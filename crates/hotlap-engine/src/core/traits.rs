@@ -8,6 +8,7 @@ use hotlap_core::plan::has_window;
 use hotlap_core::{CoreError, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
 
 use super::graph::ViewGraph;
+use super::output::ViewOutput;
 use super::{EngineCore, ViewState};
 use crate::zset::consolidate;
 
@@ -45,7 +46,7 @@ impl IncrementalCore for EngineCore {
                 graph,
                 windowed: has_window(plan),
                 tapped: false,
-                output: None,
+                output: ViewOutput::default(),
                 pending: None,
             },
         );
@@ -97,13 +98,9 @@ impl IncrementalCore for EngineCore {
             .views
             .get(&view)
             .ok_or_else(|| CoreError::Unsupported(format!("unknown view {view:?}")))?;
-        match &state.output {
-            // The output is consolidated per push, so a snapshot is a clone of
-            // the current state: neither its size nor its cost grows with
-            // accumulated history.
-            Some(output) => Ok(output.clone()),
-            None => Ok(ZSetBatch::empty(Arc::new(Schema::empty()))),
-        }
+        // The output map holds the consolidated current state, so a snapshot
+        // materializes it once: its cost tracks state, not accumulated history.
+        state.output.snapshot().map_err(CoreError::from)
     }
 
     fn late_dropped(&self, input: InputId) -> Result<u64, CoreError> {

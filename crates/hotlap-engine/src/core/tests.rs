@@ -30,9 +30,9 @@ fn group_plan() -> Plan {
     }
 }
 
-/// Number of raw (unconsolidated) rows retained by a view's output state.
+/// Number of consolidated rows retained by a view's output map.
 fn output_rows(core: &EngineCore, view: ViewId) -> usize {
-    core.views[&view].output.as_ref().map_or(0, |z| z.len())
+    core.views[&view].output.len()
 }
 
 #[test]
@@ -70,4 +70,29 @@ fn view_output_state_tracks_current_state_not_history() {
 
     assert_eq!(output_rows(&core, ViewId(0)), 1);
     assert_eq!(core.snapshot(ViewId(0)).unwrap().len(), 1);
+}
+
+/// A one-row push must encode only its delta, not the resident state.
+///
+/// With a large resident state this fails as soon as push falls back to
+/// consolidating the whole state (which re-encodes every retained row).
+#[test]
+fn push_encodes_only_the_delta() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
+
+    // Seed a large resident state with distinct keys.
+    let seed: Vec<(i64, i64)> = (0..2_000).map(|key| (key, 1)).collect();
+    core.push(InputId(0), &zset(&seed)).unwrap();
+    assert_eq!(output_rows(&core, ViewId(0)), 2_000);
+
+    // A push of one new key must encode only its delta, not the resident state.
+    crate::work::reset();
+    core.push(InputId(0), &zset(&[(10_000, 1)])).unwrap();
+    assert_eq!(output_rows(&core, ViewId(0)), 2_001);
+    assert!(
+        crate::work::encoded_rows() <= 2,
+        "1-row push re-encoded the resident state"
+    );
 }

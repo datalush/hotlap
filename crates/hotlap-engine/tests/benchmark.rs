@@ -3,6 +3,10 @@
 //! Seeds a large view state, then drives a long history of compensated updates
 //! (each nets to zero, so the current state stays bounded) and reports the
 //! per-push cost against a full `consolidate` over the whole history.
+//!
+//! The push is timed alone: snapshots are not part of the per-push cost, so the
+//! two operations are no longer conflated. The timing assertion uses a
+//! deliberately wide margin because wall-clock is environment-sensitive.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -57,9 +61,8 @@ fn incremental_push_beats_full_recompute_on_large_state() {
     core.push(InputId(0), &text_zset(&seed)).unwrap();
     let mut history: Vec<(i64, &str, i64)> = seed.clone();
 
-    // Long history of compensated updates: state size stays `KEYS`, history
-    // grows by two rows per epoch.
-    let mut incremental_ns = 0u128;
+    // Time the pushes alone: the per-push cost excludes snapshots.
+    let mut push_ns = 0u128;
     for epoch in 0..EPOCHS {
         let key = epoch % KEYS;
         let batch = text_zset(&[(key, "v", 1), (key, "v", -1)]);
@@ -68,27 +71,32 @@ fn incremental_push_beats_full_recompute_on_large_state() {
 
         let start = Instant::now();
         core.push(InputId(0), &batch).unwrap();
-        let snapshot = core.snapshot(ViewId(0)).unwrap();
-        incremental_ns += start.elapsed().as_nanos();
-        std::hint::black_box(snapshot.len());
+        push_ns += start.elapsed().as_nanos();
     }
-    let per_push = incremental_ns / EPOCHS as u128;
+    let per_push = push_ns / EPOCHS as u128;
 
-    // Full recomputation over the entire input history.
-    let historic = text_zset(&history);
+    // Materialize once (outside the push loop) and compare to recomputation.
     let start = Instant::now();
-    let recomputed = consolidate(&historic).unwrap();
+    let snapshot = core.snapshot(ViewId(0)).unwrap();
+    let snapshot_ns = start.elapsed().as_nanos();
+
+    let start = Instant::now();
+    let recomputed = consolidate(&text_zset(&history)).unwrap();
     let recompute_ns = start.elapsed().as_nanos();
     std::hint::black_box(recomputed.len());
+    assert_eq!(snapshot.len(), recomputed.len());
 
     eprintln!(
-        "incremental push: {per_push} ns/push; full recompute: {recompute_ns} ns \
-         over {} history rows ({:.1}x)",
+        "incremental push: {per_push} ns/push (snapshot {snapshot_ns} ns); full recompute: \
+         {recompute_ns} ns over {} history rows ({:.1}x)",
         history.len(),
         recompute_ns as f64 / per_push.max(1) as f64
     );
+    // Wide margin: a delta-scoped push should beat recomputing the whole
+    // history by orders of magnitude, not merely by a few percent.
     assert!(
-        per_push < recompute_ns,
-        "incremental push ({per_push} ns) should beat full recompute ({recompute_ns} ns)"
+        per_push.saturating_mul(4) < recompute_ns,
+        "incremental push ({per_push} ns) should beat full recompute ({recompute_ns} ns) \
+         by a wide margin"
     );
 }

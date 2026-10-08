@@ -12,7 +12,7 @@ use hotlap_core::{InputId, Plan, Predicate, ZSetBatch};
 
 use crate::ops::{GroupCount, Join, TumbleCount};
 
-pub(super) use apply::{accumulate, consolidate_into};
+pub(super) use apply::accumulate;
 
 /// One operator in a view's graph.
 enum Node {

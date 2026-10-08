@@ -40,7 +40,8 @@ pub fn consolidate(zset: &ZSetBatch) -> Result<ZSetBatch, EngineError> {
 }
 
 /// Encodes every column of `batch` into byte-comparable rows.
-fn full_rows(batch: &RecordBatch) -> Result<Rows, EngineError> {
+pub(crate) fn full_rows(batch: &RecordBatch) -> Result<Rows, EngineError> {
+    crate::work::record(batch.num_rows());
     let fields = batch
         .schema()
         .fields()

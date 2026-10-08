@@ -15,6 +15,8 @@ pub mod ops;
 pub mod time;
 pub mod zset;
 
+mod work;
+
 pub use arrange::KeyedArrangement;
 pub use batch::ZSetBatch;
 pub use core::EngineCore;

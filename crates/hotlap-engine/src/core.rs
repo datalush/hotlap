@@ -1,6 +1,7 @@
 //! Arrow-native [`IncrementalCore`]: persistent per-view operator graphs.
 
 mod graph;
+mod output;
 #[cfg(test)]
 mod tests;
 mod traits;
@@ -17,13 +18,14 @@ use crate::ops::filter;
 use crate::zset::int64_diffs;
 
 use graph::ViewGraph;
+use output::ViewOutput;
 
-/// A view's persistent graph plus its accumulated output and pending changes.
+/// A view's persistent graph plus its incremental output and pending changes.
 pub(super) struct ViewState {
     pub(super) graph: ViewGraph,
     pub(super) windowed: bool,
     pub(super) tapped: bool,
-    pub(super) output: Option<ZSetBatch>,
+    pub(in crate::core) output: ViewOutput,
     pub(super) pending: Option<ZSetBatch>,
 }
 
@@ -32,7 +34,8 @@ pub(super) struct ViewState {
 /// Each view compiles to a persistent [`ViewGraph`] at `build_view`. A push
 /// propagates only the pushed delta through the graphs that read the input;
 /// stateful operators retain their state, so per-push work does not grow with
-/// accumulated history. Snapshots consolidate the accumulated output deltas.
+/// accumulated history. A view's output is an incremental map updated only for
+/// the push delta (O(delta)); snapshots materialize and sort it once (O(state)).
 pub struct EngineCore {
     pub(super) views: HashMap<ViewId, ViewState>,
     pub(super) registered: HashSet<InputId>,
@@ -132,8 +135,7 @@ impl EngineCore {
             .eval(input, delta, &self.schemas, watermark)
             .map_err(CoreError::from)?;
         if let Some(output) = output {
-            view.output =
-                graph::consolidate_into(view.output.take(), &output).map_err(CoreError::from)?;
+            view.output.update(&output).map_err(CoreError::from)?;
             if view.tapped {
                 view.pending =
                     graph::accumulate(view.pending.take(), &output).map_err(CoreError::from)?;
