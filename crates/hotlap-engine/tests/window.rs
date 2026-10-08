@@ -246,3 +246,11 @@ fn rejects_non_positive_size_and_out_of_range_columns() {
     assert!(TumbleCount::new(&[0], 9, 10).apply(&zset(&[]), 0).is_err());
     assert!(TumbleCount::new(&[], 1, 10).apply(&zset(&[]), 0).is_err());
 }
+
+#[test]
+fn count_overflow_is_an_error_not_a_wrap() {
+    let mut window = TumbleCount::new(&[0], 1, 10);
+    window.apply(&zset(&[(5, 1, i64::MAX)]), 0).unwrap();
+    let result = window.apply(&zset(&[(5, 2, 1)]), 0);
+    assert!(result.is_err());
+}

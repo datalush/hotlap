@@ -55,7 +55,9 @@ impl GroupCount {
                 continue;
             }
             let old = self.counts.get(&bytes).copied().unwrap_or(0);
-            let new = old + delta;
+            let new = old
+                .checked_add(delta)
+                .ok_or_else(|| EngineError::Infrastructure("group count overflow".to_string()))?;
             if new == 0 {
                 self.counts.remove(&bytes);
             } else {
@@ -119,7 +121,11 @@ impl GroupCount {
             let bytes = key_rows.row(index).as_ref().to_vec();
             let diff = diffs.value(index);
             match positions.get(&bytes) {
-                Some(&slot) => deltas[slot].1 += diff,
+                Some(&slot) => {
+                    deltas[slot].1 = deltas[slot].1.checked_add(diff).ok_or_else(|| {
+                        EngineError::Infrastructure("group delta overflow".to_string())
+                    })?;
+                }
                 None => {
                     positions.insert(bytes.clone(), deltas.len());
                     deltas.push((bytes, diff));

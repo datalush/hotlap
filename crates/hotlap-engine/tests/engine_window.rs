@@ -84,6 +84,42 @@ fn tumbling_window_closes_and_drops_late_records() {
 }
 
 #[test]
+fn window_late_closed_metric_counts_closed_window_deltas() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.declare_watermark(
+        InputId(0),
+        hotlap_core::WatermarkSpec {
+            time_col: 1,
+            lag: 0,
+        },
+    )
+    .unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::TumbleCount {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![0],
+            time_col: 1,
+            size: 10,
+        },
+    )
+    .unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+
+    // Close [0, 10) by advancing the watermark past it.
+    core.push(InputId(0), &time_zset(&[(1, 1, 1), (1, 2, 1)]))
+        .unwrap();
+    core.push(InputId(0), &time_zset(&[(1, 12, 1)])).unwrap();
+    assert_eq!(core.window_late_closed(ViewId(0)).unwrap(), 0);
+
+    // A retraction for the already-emitted window is kept by filter_late (only
+    // insertions are late-dropped) but dropped by the window as already closed.
+    core.push(InputId(0), &time_zset(&[(1, 3, -1)])).unwrap();
+    assert_eq!(core.window_late_closed(ViewId(0)).unwrap(), 1);
+}
+
+#[test]
 fn below_watermark_retraction_is_applied_not_dropped() {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();

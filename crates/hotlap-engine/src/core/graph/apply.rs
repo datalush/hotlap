@@ -49,6 +49,22 @@ impl Node {
             Node::Window { input, reducer } => window_eval(input, reducer, ctx),
         }
     }
+
+    /// Sums `late_closed_dropped` over every window operator in this subtree.
+    pub(super) fn window_late_closed_dropped(&self) -> u64 {
+        match self {
+            Node::Source(_) => 0,
+            Node::Window { input, reducer } => {
+                input.window_late_closed_dropped() + reducer.late_closed_dropped()
+            }
+            Node::Filter { input, .. }
+            | Node::Project { input, .. }
+            | Node::Group { input, .. } => input.window_late_closed_dropped(),
+            Node::Joined { left, right, .. } => {
+                left.window_late_closed_dropped() + right.window_late_closed_dropped()
+            }
+        }
+    }
 }
 
 /// Emits the pushed delta at its source, or an empty delta once its schema is

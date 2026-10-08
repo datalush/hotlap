@@ -61,6 +61,14 @@ fn work_is_proportional_to_touched_keys_not_keyspace() {
 }
 
 #[test]
+fn count_overflow_is_an_error_not_a_wrap() {
+    let mut reducer = GroupCount::new(&[0]);
+    reducer.apply(&zset(&[(1, "a", i64::MAX)])).unwrap();
+    let result = reducer.apply(&zset(&[(1, "a", 1)]));
+    assert!(result.is_err());
+}
+
+#[test]
 fn retraction_to_zero_emits_old_count_only() {
     let mut reducer = GroupCount::new(&[0]);
     reducer.apply(&zset(&[(1, "a", 1), (1, "b", 1)])).unwrap();

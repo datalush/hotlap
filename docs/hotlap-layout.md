@@ -1,10 +1,13 @@
 # Hotlap: native Rust project layout
 
-Hotlap is the project/engine identity. DataFusion is the SQL/planning/operator/
-runtime foundation; `fluss-datafusion` is its Fluss provider integration and
-`fluss-rs` is the native protocol/client implementation. Component names and
-public API versions remained stable across the Rust-only migration; at that time
-no placeholder engine crate was introduced.
+Hotlap is the project/engine identity. It ships its own Arrow-native incremental
+engine (`hotlap-engine`) behind the `hotlap-core` contract, with `hotlap` as the
+public facade; `hotlap-sql` and `hotlap-connectors` are the SQL-plan and runtime
+boundaries. DataFusion remains the SQL/planning/operator/runtime foundation for
+the Fluss provider integration in `fluss-datafusion`, and `fluss-rs` is the
+native protocol/client implementation. The earlier `differential-dataflow` spike
+has been removed. Component names and public API versions remained stable across
+the Rust-only migration.
 
 > **Superseded (2026-10-06):** Hotlap is now an explicit **engine** layer built on
 > DataFusion. Its incremental core is the Arrow-native `hotlap-engine` kernel
@@ -18,7 +21,12 @@ no placeholder engine crate was introduced.
 ```text
 hotlap/
   Cargo.toml / Cargo.lock
-  crates/fluss-datafusion/
+  crates/hotlap/            # public facade over IncrementalCore
+  crates/hotlap-core/       # engine contract (Plan, IncrementalCore, ZSetBatch)
+  crates/hotlap-engine/     # Arrow-native incremental engine kernel
+  crates/hotlap-sql/        # SQL to Plan boundary
+  crates/hotlap-connectors/ # runtime/connector integration
+  crates/fluss-datafusion/  # DataFusion Fluss provider integration
   clients/rust/
   vendor/datafusion-55.1.0/
   docs/

@@ -13,13 +13,7 @@ use crate::error::EngineError;
 use crate::keys::converter_for;
 use crate::zset::int64_diffs;
 
-use helpers::{decode, event_times};
-
-/// A single closed window: `(key row, window_start, count)`.
-type Closed = (OwnedRow, i64, i64);
-
-/// Open buckets grouped by window start: `ws -> (key bytes -> (key, count))`.
-type Windows = BTreeMap<i64, BTreeMap<Vec<u8>, (OwnedRow, i64)>>;
+use helpers::{Closed, Windows, decode, event_times};
 
 /// Stateful tumbling-window count over event-time.
 ///
@@ -134,12 +128,16 @@ impl TumbleCount {
             }
             let key = key_rows.row(index).owned();
             let bytes = key.as_ref().to_vec();
-            self.windows
+            let bucket = self
+                .windows
                 .entry(window_start)
                 .or_default()
                 .entry(bytes)
-                .or_insert((key, 0))
-                .1 += diff;
+                .or_insert((key, 0));
+            bucket.1 = bucket
+                .1
+                .checked_add(diff)
+                .ok_or_else(|| EngineError::Infrastructure("window count overflow".to_string()))?;
         }
         Ok(())
     }

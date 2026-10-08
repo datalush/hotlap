@@ -134,3 +134,17 @@ impl IncrementalCore for EngineCore {
         }
     }
 }
+
+/// Engine-specific metrics that stay off the [`IncrementalCore`] contract.
+impl EngineCore {
+    /// Deltas dropped by `view`'s window operators because their window had
+    /// already closed when the delta arrived (append-only output cannot retract
+    /// an emitted window).
+    pub fn window_late_closed(&self, view: ViewId) -> Result<u64, CoreError> {
+        let state = self
+            .views
+            .get(&view)
+            .ok_or_else(|| CoreError::Unsupported(format!("unknown view {view:?}")))?;
+        Ok(state.graph.window_late_closed_dropped())
+    }
+}

@@ -70,6 +70,12 @@ impl ViewGraph {
         &self.sources
     }
 
+    /// Total deltas dropped by this graph's window operators because their
+    /// window had already closed.
+    pub(super) fn window_late_closed_dropped(&self) -> u64 {
+        self.root.window_late_closed_dropped()
+    }
+
     /// Evaluates the graph over the pushed `delta`, returning the view's output
     /// delta (if any).
     pub(super) fn eval(
