@@ -32,6 +32,11 @@ impl Catalog {
         Ok(())
     }
 
+    /// Remove a registered source, undoing a failed `CREATE SOURCE`.
+    pub fn remove_source(&mut self, name: &str) -> Option<SourceDef> {
+        self.sources.remove(name)
+    }
+
     pub fn add_view(&mut self, name: &str, def: MvDef) -> Result<(), SqlError> {
         if self.views.contains_key(name) {
             return Err(SqlError::Catalog(format!("view already exists: {name}")));
@@ -71,5 +76,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn removing_a_source_frees_its_name() {
+        let mut c = Catalog::default();
+        c.add_source(
+            "s",
+            SourceDef {
+                connector: "fluss".into(),
+            },
+        )
+        .unwrap();
+        assert!(c.remove_source("s").is_some());
+        assert!(c.source("s").is_none());
+        // The name is free again after the failed registration is undone.
+        c.add_source(
+            "s",
+            SourceDef {
+                connector: "inmem".into(),
+            },
+        )
+        .unwrap();
     }
 }
