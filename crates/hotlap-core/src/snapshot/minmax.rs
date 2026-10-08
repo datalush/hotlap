@@ -12,15 +12,35 @@ use serde::{Deserialize, Serialize};
 /// A non-null aggregate value ordered with a total order.
 ///
 /// Integers are widened to `i128` and floats compare with [`f64::total_cmp`],
-/// so the multiset stays totally ordered even in the presence of `NaN`. A
-/// multiset only ever holds one variant, but the cross-variant ordering is
+/// so the multiset stays totally ordered and `-0.0` stays distinct from `0.0`.
+/// A multiset only ever holds one variant, but the cross-variant ordering is
 /// defined to keep `Ord` total.
+///
+/// `NaN` is deliberately excluded from the multiset: it is not comparable to
+/// any value, so `min`/`max` ignore `NaN` inputs and a group whose only
+/// non-null values are `NaN` renders null. Use [`ExtremeValue::float`] to build
+/// a float variant and enforce that invariant.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum ExtremeValue {
     /// An integer value.
     Int(i128),
-    /// A floating-point value.
+    /// A floating-point value; never `NaN`.
     Float(f64),
+}
+
+impl ExtremeValue {
+    /// Builds a float extreme, dropping `NaN`.
+    ///
+    /// `NaN` carries no ordering, so letting it into the multiset would either
+    /// hide the real extreme or emit a `NaN` result. Treating it like a null
+    /// input keeps `min`/`max` deterministic and order-independent.
+    pub fn float(value: f64) -> Option<Self> {
+        if value.is_nan() {
+            None
+        } else {
+            Some(ExtremeValue::Float(value))
+        }
+    }
 }
 
 impl PartialEq for ExtremeValue {
@@ -112,6 +132,21 @@ mod tests {
         m.add(ExtremeValue::Float(0.0), 1);
         assert_eq!(m.min(), Some(ExtremeValue::Float(-2.0)));
         assert_eq!(m.max(), Some(ExtremeValue::Float(1.5)));
+    }
+
+    #[test]
+    fn float_constructor_drops_nan() {
+        assert_eq!(ExtremeValue::float(f64::NAN), None);
+        assert_eq!(ExtremeValue::float(1.5), Some(ExtremeValue::Float(1.5)));
+    }
+
+    #[test]
+    fn signed_zero_stays_distinct_in_total_order() {
+        // total_cmp keeps `-0.0` below `0.0`, unlike IEEE `==`.
+        assert_eq!(
+            ExtremeValue::Float(-0.0).cmp(&ExtremeValue::Float(0.0)),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]

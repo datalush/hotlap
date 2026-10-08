@@ -55,9 +55,12 @@ pub(crate) fn extreme_at(
         DataType::Int64 => Ok(option(column, row, |a: &Int64Array| {
             ExtremeValue::Int(a.value(row) as i128)
         })),
-        DataType::Float64 => Ok(option(column, row, |a: &Float64Array| {
-            ExtremeValue::Float(a.value(row))
-        })),
+        DataType::Float64 => {
+            let value = option(column, row, |a: &Float64Array| {
+                ExtremeValue::float(a.value(row))
+            });
+            Ok(value.flatten())
+        }
         other => Err(EngineError::Infrastructure(format!(
             "expected an integer or float column, found {other:?}"
         ))),
