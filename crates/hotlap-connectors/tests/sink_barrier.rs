@@ -8,6 +8,7 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use hotlap::Hotlap;
 use hotlap::state::{StateBackend, StateEntry, StateError};
 use hotlap_connectors::runtime::checkpoint::Checkpointer;
+use hotlap_connectors::runtime::sink::SharedSink;
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError, Sink, SinkCapabilities};
 
@@ -165,7 +166,10 @@ fn events() -> Arc<Mutex<Vec<Event>>> {
 #[tokio::test]
 async fn transactional_sink_prepares_then_commits_before_valid() {
     let log = events();
-    let sink = Arc::new(FakeSink::new(SinkCapabilities::Transactional, log.clone()));
+    let sink = SharedSink::new(Arc::new(FakeSink::new(
+        SinkCapabilities::Transactional,
+        log.clone(),
+    )));
     let backend = MemBackend::default();
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![sink]);
 
@@ -191,7 +195,10 @@ async fn transactional_sink_prepares_then_commits_before_valid() {
 #[tokio::test]
 async fn capture_failure_aborts_and_discards_the_checkpoint() {
     let log = events();
-    let sink = Arc::new(FakeSink::new(SinkCapabilities::Transactional, log.clone()));
+    let sink = SharedSink::new(Arc::new(FakeSink::new(
+        SinkCapabilities::Transactional,
+        log.clone(),
+    )));
     let backend = MemBackend::failing();
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![sink]);
 
@@ -213,10 +220,13 @@ async fn capture_failure_aborts_and_discards_the_checkpoint() {
 #[tokio::test]
 async fn prepare_failure_aborts_the_already_prepared_sinks() {
     let log = events();
-    let first = Arc::new(FakeSink::new(SinkCapabilities::Transactional, log.clone()));
+    let first = SharedSink::new(Arc::new(FakeSink::new(
+        SinkCapabilities::Transactional,
+        log.clone(),
+    )));
     // The second sink fails prepare; the first, already prepared, is aborted.
     let second_log = Arc::new(Mutex::new(Vec::new()));
-    let second = Arc::new(FakeSink::failing_prepare(second_log.clone()));
+    let second = SharedSink::new(Arc::new(FakeSink::failing_prepare(second_log.clone())));
     let backend = MemBackend::default();
     let mut checkpointer =
         Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![first, second]);
@@ -232,7 +242,10 @@ async fn prepare_failure_aborts_the_already_prepared_sinks() {
 #[tokio::test]
 async fn idempotent_sink_is_flushed_but_not_prepared() {
     let log = events();
-    let sink = Arc::new(FakeSink::new(SinkCapabilities::Idempotent, log.clone()));
+    let sink = SharedSink::new(Arc::new(FakeSink::new(
+        SinkCapabilities::Idempotent,
+        log.clone(),
+    )));
     let backend = MemBackend::default();
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![sink]);
 
@@ -247,7 +260,10 @@ async fn idempotent_sink_is_flushed_but_not_prepared() {
 #[tokio::test]
 async fn at_least_once_sink_is_not_coordinated() {
     let log = events();
-    let sink = Arc::new(FakeSink::new(SinkCapabilities::AtLeastOnce, log.clone()));
+    let sink = SharedSink::new(Arc::new(FakeSink::new(
+        SinkCapabilities::AtLeastOnce,
+        log.clone(),
+    )));
     let backend = MemBackend::default();
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![sink]);
 

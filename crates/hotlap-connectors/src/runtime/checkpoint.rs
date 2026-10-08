@@ -10,20 +10,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hotlap::Hotlap;
-use hotlap::state::{StateBackend, StateError};
-use hotlap_engine::{
-    EngineError, EngineSnapshot, decode_framed, decode_snapshot, encode_framed, encode_snapshot,
-};
+use hotlap::state::StateBackend;
+use hotlap_engine::{EngineSnapshot, decode_framed, decode_snapshot};
 
 use crate::error::ConnectorError;
+use crate::runtime::checkpoint_body::{
+    LATEST_KEY, checkpoint_prefix, engine_err, invalid, mark_valid, parse_id, state_err, write,
+};
+use crate::runtime::sink::SharedSink;
 use crate::runtime::sink_barrier::SinkBarrier;
-use crate::sink::Sink;
 use crate::source::{Source, SourceState};
 
-/// Value stored under `checkpoint/<id>/valid` once a checkpoint is complete.
-const VALID_MARKER: &[u8] = b"1";
-/// Key holding the id of the newest fully written checkpoint.
-const LATEST_KEY: &[u8] = b"checkpoint/latest";
 /// How many checkpoints [`CheckpointConfig`] keeps by default.
 pub const DEFAULT_RETAIN: usize = 3;
 
@@ -70,7 +67,7 @@ impl Checkpointer {
     }
 
     /// Coordinate the given sinks with the two-phase-commit protocol.
-    pub fn with_sinks(mut self, sinks: Vec<Arc<dyn Sink>>) -> Self {
+    pub fn with_sinks(mut self, sinks: Vec<Arc<SharedSink>>) -> Self {
         self.sinks = SinkBarrier::new(sinks);
         self
     }
@@ -89,34 +86,12 @@ impl Checkpointer {
         source: &dyn Source,
     ) -> Result<u64, ConnectorError> {
         let id = self.next_id;
-        let backend = &mut self.backend;
-        let result = self
-            .sinks
-            .around(|| async {
-                let snapshot = engine.checkpoint().map_err(hotlap_err)?;
-                let engine_bytes = encode_snapshot(&snapshot).map_err(engine_err)?;
-                let source_bytes = encode_framed(&source.state()).map_err(engine_err)?;
-                let base = checkpoint_prefix(id);
-                backend
-                    .put(format!("{base}/engine").as_bytes(), engine_bytes)
-                    .map_err(state_err)?;
-                backend
-                    .put(format!("{base}/sources").as_bytes(), source_bytes)
-                    .map_err(state_err)
-            })
-            .await;
-        result?;
-        self.mark_valid(id)?;
+        self.sinks
+            .around(|| write(self.backend.as_mut(), id, engine, source))
+            .await?;
+        mark_valid(self.backend.as_mut(), id, self.retain)?;
         self.next_id = self.next_id.saturating_add(1);
         Ok(id)
-    }
-
-    fn mark_valid(&mut self, id: u64) -> Result<(), ConnectorError> {
-        let base = checkpoint_prefix(id);
-        self.put(&format!("{base}/valid"), VALID_MARKER.to_vec())?;
-        self.put_bytes(LATEST_KEY, id.to_le_bytes().to_vec())?;
-        // The checkpoint is committed; pruning only trims older ones.
-        crate::runtime::retention::prune(self.backend.as_mut(), self.retain).map_err(state_err)
     }
 
     /// Id of the newest complete checkpoint, or `None` when none exists.
@@ -148,15 +123,6 @@ impl Checkpointer {
         })
     }
 
-    /// Store `value` under the UTF-8 key `key`.
-    fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), ConnectorError> {
-        self.put_bytes(key.as_bytes(), value)
-    }
-
-    fn put_bytes(&mut self, key: &[u8], value: Vec<u8>) -> Result<(), ConnectorError> {
-        self.backend.put(key, value).map_err(state_err)
-    }
-
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, ConnectorError> {
         self.get_bytes(key.as_bytes())
     }
@@ -164,36 +130,4 @@ impl Checkpointer {
     fn get_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ConnectorError> {
         self.backend.get(key).map_err(state_err)
     }
-}
-
-fn checkpoint_prefix(id: u64) -> String {
-    format!("checkpoint/{id}")
-}
-
-/// Decode an 8-byte little-endian checkpoint id.
-fn parse_id(bytes: &[u8]) -> Result<u64, ConnectorError> {
-    let array: [u8; 8] = bytes
-        .try_into()
-        .map_err(|_| ConnectorError::Infrastructure("checkpoint id is not 8 bytes".into()))?;
-    Ok(u64::from_le_bytes(array))
-}
-
-/// Error for an unknown or incomplete checkpoint.
-fn invalid(id: u64) -> ConnectorError {
-    ConnectorError::Infrastructure(format!("checkpoint {id} is missing or not valid"))
-}
-
-/// Map a hotlap facade error onto the connector error type.
-fn hotlap_err(error: hotlap::HotlapError) -> ConnectorError {
-    ConnectorError::Infrastructure(error.0)
-}
-
-/// Map an engine codec error onto the connector error type.
-fn engine_err(error: EngineError) -> ConnectorError {
-    ConnectorError::Infrastructure(error.to_string())
-}
-
-/// Map a state backend error onto the connector error type.
-fn state_err(error: StateError) -> ConnectorError {
-    ConnectorError::Infrastructure(error.to_string())
 }

@@ -14,7 +14,6 @@ use crate::runtime::checkpoint::Checkpointer;
 use crate::runtime::command::{self, Command};
 use crate::runtime::pipeline::{self, Pipeline, feed_source, record_error};
 use crate::runtime::sink::SinkPump;
-use crate::sink::Sink;
 use crate::source::SourceStream;
 
 /// Run the engine loop until shutdown or channel close.
@@ -84,11 +83,7 @@ fn prepare(pipeline: &mut Pipeline) -> Result<Engine, ConnectorError> {
     pipeline::setup(&mut hotlap, pipeline)?;
     let source = pipeline::merged_stream(pipeline.source.as_ref())?;
     let sinks = SinkPump::start(&pipeline.sinks);
-    let coordinated: Vec<Arc<dyn Sink>> = pipeline
-        .sinks
-        .iter()
-        .map(|spec| Arc::clone(&spec.sink))
-        .collect();
+    let coordinated = sinks.coordinated();
     let (checkpointer, ticker) = match pipeline.checkpoint.take() {
         Some(config) => {
             let tick = interval_at(Instant::now() + config.interval, config.interval);

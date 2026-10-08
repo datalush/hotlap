@@ -1,18 +1,15 @@
-//! Sink task: bounded changelog channel, stream adapter and engine-side pump.
+//! Sink task: bounded changelog channel, serialized control and engine-side pump.
 
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures::Stream;
 use hotlap::{Hotlap, HotlapError, ZSetBatch};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::error::ConnectorError;
 use crate::runtime::pipeline::SinkSpec;
-use crate::sink::Sink;
+pub use crate::runtime::shared_sink::SharedSink;
 
 /// Bound on how far a sink may lag the engine before backpressure bites.
 const CHANNEL_CAPACITY: usize = 64;
@@ -20,38 +17,25 @@ const CHANNEL_CAPACITY: usize = 64;
 /// How long `SinkPump::close` waits for one sink task before giving up.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Receiver end of a sink's bounded changelog channel.
-pub struct ChangelogStream {
-    rx: mpsc::Receiver<Result<ZSetBatch, ConnectorError>>,
-}
-
-impl Stream for ChangelogStream {
-    type Item = Result<ZSetBatch, ConnectorError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
-    }
-}
-
 /// Sender side of a sink's bounded changelog channel.
 pub type ChangelogSender = mpsc::Sender<Result<ZSetBatch, ConnectorError>>;
 
-/// Spawn the sink task; returns the bounded sender the engine pumps into.
+/// Spawn a sink task that writes every received batch through `shared`.
 ///
-/// Dropping the returned sender ends the changelog and lets the task finish,
-/// which is what makes shutdown deliver the last batches. The task drives the
-/// full sink lifecycle: `write` until the stream ends, then `commit` on success
-/// (delivery for fire-and-forget sinks such as Fluss) or `abort` on failure.
+/// Dropping the returned sender ends the changelog and lets the task finish.
+/// The task ends with a final `commit` (delivery for the last batch), or an
+/// `abort` on write failure. A coordinated sink may also be committed by the
+/// checkpoint barrier, so `Sink::commit` must tolerate running more than once.
 pub fn spawn_sink(
-    sink: Arc<dyn Sink>,
+    shared: Arc<SharedSink>,
     capacity: usize,
 ) -> (ChangelogSender, JoinHandle<Result<(), ConnectorError>>) {
-    let (tx, rx) = mpsc::channel(capacity);
+    let (tx, mut rx) = mpsc::channel(capacity);
     let handle = tokio::spawn(async move {
-        match sink.write(Box::pin(ChangelogStream { rx })).await {
-            Ok(()) => sink.commit().await,
+        match drive(&shared, &mut rx).await {
+            Ok(()) => shared.commit().await,
             Err(error) => {
-                let _ = sink.abort().await;
+                let _ = shared.abort().await;
                 Err(error)
             }
         }
@@ -59,10 +43,22 @@ pub fn spawn_sink(
     (tx, handle)
 }
 
+/// Write every batch until the channel closes.
+async fn drive(
+    shared: &SharedSink,
+    rx: &mut mpsc::Receiver<Result<ZSetBatch, ConnectorError>>,
+) -> Result<(), ConnectorError> {
+    while let Some(item) = rx.recv().await {
+        shared.write_batch(item?).await?;
+    }
+    Ok(())
+}
+
 /// One running sink plus the view it is fed from.
 struct SinkEntry {
     view: String,
     tx: ChangelogSender,
+    shared: Arc<SharedSink>,
     handle: JoinHandle<Result<(), ConnectorError>>,
 }
 
@@ -77,15 +73,25 @@ impl SinkPump {
         let entries = specs
             .iter()
             .map(|spec| {
-                let (tx, handle) = spawn_sink(Arc::clone(&spec.sink), CHANNEL_CAPACITY);
+                let shared = SharedSink::new(Arc::clone(&spec.sink));
+                let (tx, handle) = spawn_sink(Arc::clone(&shared), CHANNEL_CAPACITY);
                 SinkEntry {
                     view: spec.view.clone(),
                     tx,
+                    shared,
                     handle,
                 }
             })
             .collect();
         Self { entries }
+    }
+
+    /// The sinks the checkpoint barrier coordinates, sharing this pump's state.
+    pub fn coordinated(&self) -> Vec<Arc<SharedSink>> {
+        self.entries
+            .iter()
+            .map(|entry| Arc::clone(&entry.shared))
+            .collect()
     }
 
     /// Drain each tapped view's deltas and push them to its sink.

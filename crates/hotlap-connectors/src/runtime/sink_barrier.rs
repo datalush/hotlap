@@ -9,19 +9,19 @@
 //! flushed on commit (safe to replay after a crash), `AtLeastOnce` sinks are
 //! not coordinated at all (their writes are already visible).
 //!
-//! The barrier calls `prepare`/`commit`/`abort` directly on the sink objects,
-//! so a `Transactional` sink must serialize those calls against a concurrent
-//! [`Sink::write`](crate::sink::Sink::write).
+//! Each sink is a [`SharedSink`], whose mutex serializes these control calls
+//! against the concurrent `write` in the sink task, so the 2PC contract holds.
 
 use std::future::Future;
 use std::sync::Arc;
 
 use crate::error::ConnectorError;
-use crate::sink::{Sink, SinkCapabilities};
+use crate::runtime::sink::SharedSink;
+use crate::sink::SinkCapabilities;
 
 /// The sinks a checkpoint barrier coordinates.
 pub struct SinkBarrier {
-    sinks: Vec<Arc<dyn Sink>>,
+    sinks: Vec<Arc<SharedSink>>,
 }
 
 /// Indices of the transactional sinks that reached the prepared state.
@@ -31,7 +31,7 @@ pub struct Prepared {
 
 impl SinkBarrier {
     /// Build a barrier over `sinks`; an empty list is a no-op.
-    pub fn new(sinks: Vec<Arc<dyn Sink>>) -> Self {
+    pub fn new(sinks: Vec<Arc<SharedSink>>) -> Self {
         Self { sinks }
     }
 
@@ -74,21 +74,23 @@ impl SinkBarrier {
         Ok(Prepared { indices })
     }
 
-    /// Phase two: commit prepared transactional sinks and flush idempotent
-    /// ones. At-least-once sinks are already visible, so they are skipped.
+    /// Phase two: flush idempotent sinks first, then commit the prepared
+    /// transactional ones. At-least-once sinks are already visible and skipped.
     ///
-    /// On failure, the prepared sinks that have not committed yet are aborted.
+    /// Flushing first means an idempotent failure cannot strand a checkpoint
+    /// whose transactional sinks already committed (which would replay and
+    /// duplicate); on any failure the prepared-but-uncommitted sinks abort.
     async fn commit(&self, prepared: &Prepared) -> Result<(), ConnectorError> {
-        for (position, &index) in prepared.indices.iter().enumerate() {
-            if let Err(error) = self.sinks[index].commit().await {
-                self.abort_indices(&prepared.indices[position + 1..]).await;
-                return Err(error);
-            }
-        }
         for sink in &self.sinks {
             if sink.capabilities() == SinkCapabilities::Idempotent {
                 // No prepare to abort: an idempotent replay is always safe.
                 sink.commit().await?;
+            }
+        }
+        for (position, &index) in prepared.indices.iter().enumerate() {
+            if let Err(error) = self.sinks[index].commit().await {
+                self.abort_indices(&prepared.indices[position + 1..]).await;
+                return Err(error);
             }
         }
         Ok(())
