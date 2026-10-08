@@ -68,8 +68,9 @@ async fn translates_every_comparison_operator() {
 #[tokio::test]
 async fn translates_int32_column_and_float64_literal() {
     let ctx = ctx();
-    // The Int32 column is accepted; DataFusion keeps `3` as an Int64 literal,
-    // which the kernel casts to the column type at evaluation time.
+    // DataFusion keeps `3` as an Int64 literal and leaves the Int32 column
+    // uncast in the logical plan; at evaluation the kernel promotes both to the
+    // common Int64 type rather than truncating the literal into the column.
     let int = predicate_for(&ctx, "i = 3").await.unwrap();
     assert!(
         matches!(

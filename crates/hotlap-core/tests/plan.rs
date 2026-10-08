@@ -90,6 +90,34 @@ fn cmp_gt_compares_float64_without_truncating() {
 }
 
 #[test]
+fn cmp_promotes_int_column_with_float_literal() {
+    // `k > -1.5` must compare as Float64: -1 > -1.5 is true. Coercing the
+    // literal down to Int64(-1) would make `-1 > -1` false instead.
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![Some(-1), Some(-2), None]))],
+    )
+    .unwrap();
+    let mask = Predicate::Cmp {
+        op: CmpOp::Gt,
+        col: 0,
+        scalar: Scalar::F64(-1.5),
+    }
+    .eval(&batch)
+    .unwrap();
+    assert_eq!(values(&mask), vec![Some(true), Some(false), None]);
+}
+
+#[test]
+fn cmp_eq_float_literal_does_not_truncate_to_int() {
+    // `k = 1.5` must be false for integer k = 1; truncating the literal to
+    // Int64(1) would wrongly match.
+    let mask = cmp(CmpOp::Eq, 2, Scalar::F64(1.5)).eval(&batch()).unwrap();
+    assert_eq!(values(&mask), vec![Some(false), Some(false), None]);
+}
+
+#[test]
 fn cmp_eq_compares_strings() {
     let mask = cmp(CmpOp::Eq, 3, Scalar::Str("a".into()))
         .eval(&batch())

@@ -12,7 +12,13 @@ use arrow::datatypes::DataType;
 use crate::error::CoreError;
 use crate::predicate::{CmpOp, Scalar};
 
-/// Applies `column <op> scalar`, casting the literal to the column's type.
+/// Applies `column <op> scalar`, promoting both operands to a common type.
+///
+/// DataFusion leaves mixed-typed comparisons (an `Int64` column against a
+/// `Float64` literal, say) uncast in the logical plan and resolves them during
+/// physical planning by promoting both sides to a common supertype. Mirroring
+/// that here avoids silently truncating a floating literal into an integer
+/// column: `k > -1.5` compares as `Float64`, not as `k > -1`.
 ///
 /// Arrow's comparison kernels return null for null inputs, which is exactly
 /// SQL's three-valued comparison. A null literal therefore yields an all-null
@@ -22,7 +28,15 @@ pub(super) fn cmp(
     op: CmpOp,
     scalar: &Scalar,
 ) -> Result<BooleanArray, CoreError> {
-    let literal = ArrowScalar::new(literal(scalar, column.data_type())?);
+    let data_type = common_type(column.data_type(), scalar);
+    let promoted;
+    let column: &ArrayRef = if column.data_type() == &data_type {
+        column
+    } else {
+        promoted = cast(column.as_ref(), &data_type)?;
+        &promoted
+    };
+    let literal = ArrowScalar::new(literal(scalar, &data_type)?);
     let out = match op {
         CmpOp::Eq => cmp::eq(column, &literal),
         CmpOp::Ne => cmp::neq(column, &literal),
@@ -32,6 +46,48 @@ pub(super) fn cmp(
         CmpOp::Ge => cmp::gt_eq(column, &literal),
     }?;
     Ok(out)
+}
+
+/// The common comparison type of a column and a literal.
+///
+/// Numeric operands widen to the wider of the two (`Int32` < `Int64` <
+/// `Float64`), matching DataFusion's coercion. Everything else keeps the column
+/// type and lets the literal cast fail if the pairing is incompatible; a null
+/// literal likewise takes the column type since the result is null regardless.
+fn common_type(column: &DataType, scalar: &Scalar) -> DataType {
+    if let Scalar::Null = scalar {
+        return column.clone();
+    }
+    match (numeric_rank(column), numeric_rank(&scalar_type(scalar))) {
+        (Some(a), Some(b)) => match a.max(b) {
+            3 => DataType::Float64,
+            2 => DataType::Int64,
+            _ => DataType::Int32,
+        },
+        _ => column.clone(),
+    }
+}
+
+/// Widening rank of a numeric type: `Int32` < `Int64` < `Float64`.
+fn numeric_rank(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::Int32 => Some(1),
+        DataType::Int64 => Some(2),
+        DataType::Float64 => Some(3),
+        _ => None,
+    }
+}
+
+/// The Arrow type of a scalar literal.
+fn scalar_type(scalar: &Scalar) -> DataType {
+    match scalar {
+        Scalar::Null => DataType::Null,
+        Scalar::I32(_) => DataType::Int32,
+        Scalar::I64(_) => DataType::Int64,
+        Scalar::F64(_) => DataType::Float64,
+        Scalar::Str(_) => DataType::Utf8,
+        Scalar::Bool(_) => DataType::Boolean,
+    }
 }
 
 /// Builds a length-one array holding `value`, cast to `data_type`.

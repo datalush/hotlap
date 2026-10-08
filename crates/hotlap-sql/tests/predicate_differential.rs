@@ -91,6 +91,14 @@ const CASES: &[&str] = &[
     "i > 1 AND s = 'a'",
     "NOT (i IS NULL)",
     "i > 1 OR f < 2.0",
+    // Mixed-type comparisons: DataFusion promotes both sides to a common
+    // supertype at execution; the kernel must not truncate the literal.
+    "k > -1.5",
+    "k < 2.5",
+    "k = 1.5",
+    "i > -1.5",
+    "f > 1",
+    "f = 1",
 ];
 
 #[tokio::test]
