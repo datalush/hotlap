@@ -2139,9 +2139,7 @@ dependencies = [
  "futures",
  "hotlap",
  "hotlap-connectors",
- "hotlap-runtime",
  "serde",
- "serde_json",
  "tokio",
 ]
 
