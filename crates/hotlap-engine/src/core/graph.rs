@@ -77,6 +77,11 @@ impl ViewGraph {
         self.root.window_late_closed_dropped()
     }
 
+    /// Number of tumbling windows still open across this graph's operators.
+    pub(super) fn windows_open(&self) -> u64 {
+        self.root.windows_open()
+    }
+
     /// Evaluates the graph over the pushed `delta`, returning the view's output
     /// delta (if any).
     pub(super) fn eval(

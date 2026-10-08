@@ -8,15 +8,49 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+/// A lock-free handle to one metric cell.
+///
+/// Resolving a name through [`MetricsRegistry::metric`] takes the registry lock
+/// once and caches the underlying atomic; afterwards [`inc`](Metric::inc),
+/// [`add`](Metric::add) and [`set`](Metric::set) touch only that atomic. A hot
+/// loop should resolve its handles once and reuse them, so updates never take
+/// the registry lock.
+#[derive(Clone, Debug)]
+pub struct Metric {
+    cell: Arc<AtomicU64>,
+}
+
+impl Metric {
+    /// Increments the counter by one.
+    pub fn inc(&self) {
+        self.add(1);
+    }
+
+    /// Adds `n` to the counter.
+    pub fn add(&self, n: u64) {
+        self.cell.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Sets the gauge to `value`, replacing any previous value.
+    pub fn set(&self, value: u64) {
+        self.cell.store(value, Ordering::Relaxed);
+    }
+
+    /// Current value of the cell.
+    pub fn get(&self) -> u64 {
+        self.cell.load(Ordering::Relaxed)
+    }
+}
+
 /// A registry of named counters and gauges.
 ///
 /// Counters are advanced with [`inc`](MetricsRegistry::inc) and
 /// [`add`](MetricsRegistry::add); gauges are overwritten with
 /// [`set`](MetricsRegistry::set). Each metric lives in its own atomic cell, but
-/// the name-to-cell map is behind a [`Mutex`]: every update takes that short
-/// lock to resolve the cell and then updates the atomic. Callers must therefore
-/// publish values at coarse granularity — once per batch, never once per row.
-/// [`snapshot`](MetricsRegistry::snapshot) also takes the lock to read a
+/// the name-to-cell map is behind a [`Mutex`]: every name lookup takes that
+/// short lock to resolve the cell. Callers in a hot path should resolve a
+/// [`Metric`] handle once via [`metric`](MetricsRegistry::metric) and update it
+/// lock-free. [`snapshot`](MetricsRegistry::snapshot) takes the lock to read a
 /// consistent view.
 ///
 /// ```
@@ -27,8 +61,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// metrics.add("rows_ingested", 4);
 /// metrics.set("windows_open", 3);
 ///
+/// // A cached handle skips the registry lock on every update.
+/// let rows = metrics.metric("rows_ingested");
+/// rows.add(1);
+///
 /// let snap = metrics.snapshot();
-/// assert_eq!(snap["rows_ingested"], 5);
+/// assert_eq!(snap["rows_ingested"], 6);
 /// assert_eq!(snap["windows_open"], 3);
 /// ```
 #[derive(Debug, Default)]
@@ -40,6 +78,14 @@ impl MetricsRegistry {
     /// Creates an empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Resolves `name` to a lock-free [`Metric`] handle, creating the cell if
+    /// absent. Cache the handle to update without taking the registry lock.
+    pub fn metric(&self, name: &str) -> Metric {
+        Metric {
+            cell: self.cell(name),
+        }
     }
 
     /// Returns the atomic cell for `name`, creating it if absent.
@@ -57,12 +103,12 @@ impl MetricsRegistry {
 
     /// Adds `n` to the counter `name`.
     pub fn add(&self, name: &str, n: u64) {
-        self.cell(name).fetch_add(n, Ordering::Relaxed);
+        self.metric(name).add(n);
     }
 
     /// Sets the gauge `name` to `value`, replacing any previous value.
     pub fn set(&self, name: &str, value: u64) {
-        self.cell(name).store(value, Ordering::Relaxed);
+        self.metric(name).set(value);
     }
 
     /// Returns a point-in-time copy of every metric, ordered by name.
@@ -96,6 +142,18 @@ mod tests {
         m.inc("alpha");
         let names: Vec<_> = m.snapshot().into_keys().collect();
         assert_eq!(names, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn cached_metric_handle_updates_the_snapshot() {
+        let m = MetricsRegistry::new();
+        let handle = m.metric("hits");
+        handle.add(2);
+        handle.inc();
+        handle.set(9);
+        assert_eq!(handle.get(), 9);
+        // The handle resolves and registers the cell in the same registry.
+        assert_eq!(m.snapshot().get("hits"), Some(&9));
     }
 
     #[test]

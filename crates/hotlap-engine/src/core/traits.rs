@@ -42,6 +42,7 @@ impl IncrementalCore for EngineCore {
         let output = self.replay_or_empty(&mut graph)?;
         self.views
             .insert(view, ViewState::new(graph, plan.clone(), output));
+        self.refresh_windows_open();
         Ok(())
     }
 
@@ -133,6 +134,7 @@ impl IncrementalCore for EngineCore {
             }
         }
         self.refresh_late_closed();
+        self.refresh_windows_open();
         self.epoch = self.epoch.wrapping_add(1);
         Ok(())
     }

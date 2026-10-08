@@ -70,6 +70,11 @@ impl TumbleCount {
         self.dropped_closed
     }
 
+    /// Number of tumbling windows still open (not yet emitted).
+    pub fn open_windows(&self) -> u64 {
+        self.windows.len() as u64
+    }
+
     /// Validates the window against the input schema, learning it on first use.
     fn ensure_schema(&mut self, z: &ZSetBatch) -> Result<(), EngineError> {
         if self.size <= 0 {

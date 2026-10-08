@@ -65,6 +65,18 @@ impl Node {
             }
         }
     }
+
+    /// Sums `open_windows` over every window operator in this subtree.
+    pub(super) fn windows_open(&self) -> u64 {
+        match self {
+            Node::Source(_) => 0,
+            Node::Window { input, reducer } => input.windows_open() + reducer.open_windows(),
+            Node::Filter { input, .. }
+            | Node::Project { input, .. }
+            | Node::Group { input, .. } => input.windows_open(),
+            Node::Joined { left, right, .. } => left.windows_open() + right.windows_open(),
+        }
+    }
 }
 
 /// Emits the pushed delta at its source, or an empty delta once its schema is

@@ -1,9 +1,8 @@
 //! Engine-side metric increments.
 //!
 //! The counters live in the shared [`MetricsRegistry`], so the runtime that
-//! drives this core observes the same snapshot. Updates resolve a cell under the
-//! registry lock, so they happen once per batch: the per-row loops accumulate
-//! locally and publish a single total.
+//! drives this core observes the same snapshot. Updates go through handles
+//! resolved once at construction, so a push never takes the registry lock.
 
 use std::sync::Arc;
 
@@ -17,10 +16,7 @@ impl EngineCore {
     /// The runtime builds the core this way so the same registry can also be
     /// handed to the sink tasks and the outer handle.
     pub fn with_metrics(metrics: Arc<MetricsRegistry>) -> Self {
-        Self {
-            metrics,
-            ..Self::new()
-        }
+        Self::with_registry(metrics)
     }
 
     /// The registry this core reports into.
@@ -30,7 +26,18 @@ impl EngineCore {
 
     /// Counts the rows received by one push (`rows_ingested`).
     pub(super) fn count_ingested(&self, rows: usize) {
-        self.metrics.add("rows_ingested", rows as u64);
+        self.rows_ingested.add(rows as u64);
+    }
+
+    /// Publishes the open tumbling windows across every built view
+    /// (`windows_open`).
+    pub(super) fn refresh_windows_open(&self) {
+        let total: u64 = self
+            .views
+            .values()
+            .map(|view| view.graph.windows_open())
+            .sum();
+        self.windows_open.set(total);
     }
 
     /// Publishes window drops newly observed since the last push.
@@ -41,7 +48,7 @@ impl EngineCore {
         let total = self.late_closed_total();
         let delta = total.saturating_sub(self.late_closed_seen);
         self.late_closed_seen = total;
-        self.metrics.add("late_closed_dropped", delta);
+        self.late_closed_dropped.add(delta);
     }
 
     /// Sum of `late_closed_dropped` over every built view.

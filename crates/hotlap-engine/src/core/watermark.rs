@@ -57,10 +57,9 @@ impl EngineCore {
             }
             mask.push(!late);
         }
-        // Publish the batch's drops at once: the registry takes a lock to
-        // resolve the cell, so the per-row loop must not touch it.
+        // Publish the batch's drops at once through the cached counter handle.
         if late_rows > 0 {
-            self.metrics.add("late_dropped", late_rows);
+            self.late_dropped.add(late_rows);
         }
         self.advance_split(input, split, max_ts, spec.lag);
         filter(batch, &BooleanArray::from(mask))

@@ -88,6 +88,22 @@ fn counters_track_ingest_emit_late_and_checkpoints() {
 }
 
 #[test]
+fn windows_open_gauge_tracks_open_windows() {
+    let metrics = Arc::new(MetricsRegistry::new());
+    let mut core = window_core(Arc::clone(&metrics));
+
+    // One event opens window [0, 10).
+    core.push(InputId(0), &time_zset(&[(1, 1, 1)])).unwrap();
+    assert_eq!(metrics.snapshot().get("windows_open"), Some(&1));
+    // A second key in the same window start does not open another window.
+    core.push(InputId(0), &time_zset(&[(2, 2, 1)])).unwrap();
+    assert_eq!(metrics.snapshot().get("windows_open"), Some(&1));
+    // ts 12 closes [0, 10) and opens [10, 20), so one window stays open.
+    core.push(InputId(0), &time_zset(&[(1, 12, 1)])).unwrap();
+    assert_eq!(metrics.snapshot().get("windows_open"), Some(&1));
+}
+
+#[test]
 fn cores_without_injection_get_their_own_registry() {
     let mut core = window_core(Arc::new(MetricsRegistry::new()));
     core.push(InputId(0), &time_zset(&[(1, 1, 1)])).unwrap();
