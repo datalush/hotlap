@@ -1,4 +1,5 @@
-//! Aggregate translation: `count`/`sum`/`avg` accepted, the rest rejected.
+//! Aggregate translation: `count`/`sum`/`avg`/`min`/`max` accepted, the rest
+//! rejected.
 
 use hotlap::{AggFunc, AggSpec, Plan};
 
@@ -78,13 +79,15 @@ async fn translates_count_of_column() {
 }
 
 #[tokio::test]
-async fn rejects_min_and_max_until_implemented() {
+async fn translates_min_and_max() {
     let ctx = ctx_with_src();
-    let err = plan_for(&ctx, "SELECT k, min(ts) FROM src GROUP BY k")
+    let plan = plan_for(&ctx, "SELECT k, min(ts), max(ts) FROM src GROUP BY k")
         .await
-        .expect_err("min is reserved for a later change");
-    assert!(
-        matches!(err, crate::SqlError::Unsupported(_)),
-        "must be a planning error, got {err:?}"
-    );
+        .unwrap();
+    match plan {
+        Plan::GroupAggregate { aggs, .. } => {
+            assert_eq!(aggs, vec![AggSpec::min(1), AggSpec::max(1)]);
+        }
+        other => panic!("expected GroupAggregate, got {other:?}"),
+    }
 }

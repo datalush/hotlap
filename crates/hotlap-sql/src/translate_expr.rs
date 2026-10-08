@@ -71,10 +71,9 @@ pub(crate) fn parse_tumble(
 
 /// Parse a logical aggregate list into kernel `AggSpec`s.
 ///
-/// Each entry must be a plain `count`/`sum`/`avg` over `*` or one column. The
-/// `min`/`max` functions are reserved for a later change; unsupported functions
-/// and modifiers (`DISTINCT`, `FILTER`, `ORDER BY`, `NULL TREATMENT`) are
-/// rejected rather than silently dropped.
+/// Each entry must be a plain `count`/`sum`/`avg`/`min`/`max` over `*` or one
+/// column. Unsupported functions and modifiers (`DISTINCT`, `FILTER`,
+/// `ORDER BY`, `NULL TREATMENT`) are rejected rather than silently dropped.
 pub(crate) fn parse_aggs(aggr: &[Expr], schema: &DFSchema) -> Result<Vec<AggSpec>, SqlError> {
     if aggr.is_empty() {
         return Err(SqlError::Unsupported(
@@ -104,9 +103,8 @@ fn parse_agg(expr: &Expr, schema: &DFSchema) -> Result<AggSpec, SqlError> {
         }),
         "sum" => Ok(AggSpec::sum(column_arg(&af.params.args, schema)?)),
         "avg" => Ok(AggSpec::avg(column_arg(&af.params.args, schema)?)),
-        "min" | "max" => Err(SqlError::Unsupported(format!(
-            "`{name}` aggregates are not implemented yet"
-        ))),
+        "min" => Ok(AggSpec::min(column_arg(&af.params.args, schema)?)),
+        "max" => Ok(AggSpec::max(column_arg(&af.params.args, schema)?)),
         other => Err(SqlError::Unsupported(format!(
             "aggregate `{other}` is not supported"
         ))),

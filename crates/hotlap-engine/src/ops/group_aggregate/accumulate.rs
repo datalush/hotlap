@@ -1,13 +1,14 @@
 //! Accumulator initialization, validation and retraction-aware folding.
 
-use arrow::array::{Array, Float64Array, Int32Array, Int64Array};
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use hotlap_core::plan::{AggFunc, AggSpec, aggregate_output_type};
-use hotlap_core::snapshot::{AggValue, GroupEntry};
+use hotlap_core::snapshot::{AggValue, GroupEntry, OrderedMultiset};
 
 use crate::error::EngineError;
+
+use super::read::{extreme_at, float_at, int_at};
 
 /// Validates every aggregate against the reducer's input `schema`.
 pub(crate) fn validate_aggs(aggs: &[AggSpec], schema: &Schema) -> Result<(), EngineError> {
@@ -23,17 +24,12 @@ pub(crate) fn validate_aggs(aggs: &[AggSpec], schema: &Schema) -> Result<(), Eng
                     field(schema, index)?;
                 }
             }
-            AggFunc::Sum | AggFunc::Avg => {
+            AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => {
                 let index = agg
                     .input
                     .ok_or_else(|| unsupported(agg, "requires an input column"))?;
                 let ty = field(schema, index)?;
                 aggregate_output_type(agg.func, Some(ty.data_type()))?;
-            }
-            AggFunc::Min | AggFunc::Max => {
-                return Err(EngineError::Unsupported(
-                    "min/max aggregates are not implemented yet".to_string(),
-                ));
             }
         }
     }
@@ -96,6 +92,12 @@ pub(crate) fn fold_row(
                     *count = add(*count, diff, "group avg count")?;
                 }
             }
+            AggValue::Min(multiset) | AggValue::Max(multiset) => {
+                let col = input(agg)?;
+                if let Some(value) = extreme_at(batch, col, row)? {
+                    multiset.add(value, diff);
+                }
+            }
         }
     }
     Ok(())
@@ -111,47 +113,9 @@ fn zeroed(agg: &AggSpec, schema: &SchemaRef) -> Result<AggValue, EngineError> {
             other => Err(unsupported(agg, &format!("input type {other:?}"))),
         },
         AggFunc::Avg => Ok(AggValue::Avg { sum: 0.0, count: 0 }),
-        AggFunc::Min | AggFunc::Max => Err(EngineError::Unsupported(
-            "min/max aggregates are not implemented yet".to_string(),
-        )),
+        AggFunc::Min => Ok(AggValue::Min(OrderedMultiset::default())),
+        AggFunc::Max => Ok(AggValue::Max(OrderedMultiset::default())),
     }
-}
-
-/// Reads an integer cell as `i128`, or `None` when it is null.
-fn int_at(batch: &RecordBatch, col: usize, row: usize) -> Result<Option<i128>, EngineError> {
-    let column = batch.column(col);
-    match column.data_type() {
-        DataType::Int32 => Ok(option(column, row, |a: &Int32Array| a.value(row) as i128)),
-        DataType::Int64 => Ok(option(column, row, |a: &Int64Array| a.value(row) as i128)),
-        other => Err(EngineError::Infrastructure(format!(
-            "expected an integer column, found {other:?}"
-        ))),
-    }
-}
-
-/// Reads a numeric cell as `f64`, or `None` when it is null.
-fn float_at(batch: &RecordBatch, col: usize, row: usize) -> Result<Option<f64>, EngineError> {
-    let column = batch.column(col);
-    match column.data_type() {
-        DataType::Int32 => Ok(option(column, row, |a: &Int32Array| a.value(row) as f64)),
-        DataType::Int64 => Ok(option(column, row, |a: &Int64Array| a.value(row) as f64)),
-        DataType::Float64 => Ok(option(column, row, |a: &Float64Array| a.value(row))),
-        other => Err(EngineError::Infrastructure(format!(
-            "expected a numeric column, found {other:?}"
-        ))),
-    }
-}
-
-/// Downcasts `column` and reads `row`, mapping null to `None`.
-fn option<T: Array + 'static, V>(
-    column: &std::sync::Arc<dyn Array>,
-    row: usize,
-    read: impl FnOnce(&T) -> V,
-) -> Option<V> {
-    if column.is_null(row) {
-        return None;
-    }
-    column.as_any().downcast_ref::<T>().map(read)
 }
 
 /// The declared data type of the aggregate's input column.

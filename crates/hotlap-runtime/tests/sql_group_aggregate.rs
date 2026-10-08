@@ -1,4 +1,5 @@
-//! End-to-end `GROUP BY` aggregates: count/sum/avg must match recomputation.
+//! End-to-end `GROUP BY` aggregates: count/sum/avg/min/max must match
+//! recomputation.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,8 +16,8 @@ use hotlap_sql::SqlError;
 
 const SOURCE: &str = "CREATE SOURCE src WITH (connector='inmem') WATERMARK FOR \
      _event_time AS _event_time - INTERVAL '1 s';";
-const VIEW: &str = "CREATE MATERIALIZED VIEW mv AS SELECT k, count(*), sum(v), avg(v) \
-     FROM src GROUP BY k;";
+const VIEW: &str = "CREATE MATERIALIZED VIEW mv AS SELECT k, count(*), sum(v), avg(v), \
+     min(v), max(v) FROM src GROUP BY k;";
 
 struct FakeSource {
     schema: SchemaRef,
@@ -113,7 +114,7 @@ fn floats(batch: &RecordBatch, index: usize) -> Vec<f64> {
     (0..array.len()).map(|i| array.value(i)).collect()
 }
 
-fn rows(result: QueryResult) -> Vec<(i64, i64, i64, f64)> {
+fn rows(result: QueryResult) -> Vec<(i64, i64, i64, f64, i64, i64)> {
     let QueryResult::Rows(batches) = result else {
         panic!("expected a result set");
     };
@@ -121,28 +122,32 @@ fn rows(result: QueryResult) -> Vec<(i64, i64, i64, f64)> {
     for batch in batches {
         let (keys, counts, sums) = (ints(&batch, 0), ints(&batch, 1), ints(&batch, 2));
         let avgs = floats(&batch, 3);
+        let (mins, maxs) = (ints(&batch, 4), ints(&batch, 5));
         for i in 0..batch.num_rows() {
-            out.push((keys[i], counts[i], sums[i], avgs[i]));
+            out.push((keys[i], counts[i], sums[i], avgs[i], mins[i], maxs[i]));
         }
     }
     out
 }
 
-/// Full recomputation of count/sum/avg per key from the raw events.
-fn recompute(batches: &[SourceBatch]) -> Vec<(i64, i64, i64, f64)> {
-    let mut groups: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+/// Full recomputation of `count`/`sum`/`avg`/`min`/`max` per key.
+fn recompute(batches: &[SourceBatch]) -> Vec<(i64, i64, i64, f64, i64, i64)> {
+    let mut groups: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     for batch in batches {
-        let keys = ints(&batch.batch, 0);
-        let values = ints(&batch.batch, 1);
+        let (keys, values) = (ints(&batch.batch, 0), ints(&batch.batch, 1));
         for (key, value) in keys.into_iter().zip(values) {
-            let entry = groups.entry(key).or_insert((0, 0));
-            entry.0 += 1;
-            entry.1 += value;
+            groups.entry(key).or_default().push(value);
         }
     }
     groups
         .into_iter()
-        .map(|(key, (count, sum))| (key, count, sum, sum as f64 / count as f64))
+        .map(|(key, values)| {
+            let count = values.len() as i64;
+            let sum: i64 = values.iter().sum();
+            let avg = sum as f64 / count as f64;
+            let (min, max) = (*values.iter().min().unwrap(), *values.iter().max().unwrap());
+            (key, count, sum, avg, min, max)
+        })
         .collect()
 }
 
@@ -156,9 +161,9 @@ async fn started(batches: Vec<SourceBatch>) -> SqlSession {
 
 async fn wait_for_rows(
     session: &mut SqlSession,
-    want: &[(i64, i64, i64, f64)],
-) -> Vec<(i64, i64, i64, f64)> {
-    let query = "SELECT k, count, sum, avg FROM mv ORDER BY k";
+    want: &[(i64, i64, i64, f64, i64, i64)],
+) -> Vec<(i64, i64, i64, f64, i64, i64)> {
+    let query = "SELECT k, count, sum, avg, min, max FROM mv ORDER BY k";
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let got = rows(session.sql(query).await.expect("mv query failed"));
@@ -185,7 +190,7 @@ async fn grouped_aggregates_match_full_recomputation() {
 #[tokio::test]
 async fn empty_grouped_aggregate_select() {
     let mut session = started(vec![]).await;
-    let query = session.sql("SELECT k, count, sum, avg FROM mv");
+    let query = session.sql("SELECT k, count, sum, avg, min, max FROM mv");
     let result = tokio::time::timeout(Duration::from_secs(5), query)
         .await
         .expect("empty MV query hung");

@@ -25,8 +25,7 @@ pub enum AggFunc {
 /// One aggregate: the function plus the input column it reads, if any.
 ///
 /// `Count` with no input counts every row; every other function requires a
-/// column. `Min`/`Max` are reserved for a later change and are rejected by the
-/// SQL front-end today.
+/// column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggSpec {
     /// The function to apply.
@@ -56,6 +55,22 @@ impl AggSpec {
     pub fn avg(input: usize) -> Self {
         Self {
             func: AggFunc::Avg,
+            input: Some(input),
+        }
+    }
+
+    /// A `min` over column `input`.
+    pub fn min(input: usize) -> Self {
+        Self {
+            func: AggFunc::Min,
+            input: Some(input),
+        }
+    }
+
+    /// A `max` over column `input`.
+    pub fn max(input: usize) -> Self {
+        Self {
+            func: AggFunc::Max,
             input: Some(input),
         }
     }
@@ -94,9 +109,10 @@ pub fn aggregate_output_type(
             Some(DataType::Float64) => Ok(DataType::Float64),
             _ => Err(unsupported_type("sum", input)),
         },
-        AggFunc::Min | AggFunc::Max => Err(CoreError::Unsupported(
-            "min/max aggregates are not implemented yet".into(),
-        )),
+        AggFunc::Min | AggFunc::Max => match input {
+            Some(ty @ (DataType::Int32 | DataType::Int64 | DataType::Float64)) => Ok(ty.clone()),
+            _ => Err(unsupported_type(func.output_name(), input)),
+        },
     }
 }
 

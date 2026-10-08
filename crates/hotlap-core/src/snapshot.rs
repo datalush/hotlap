@@ -7,6 +7,7 @@
 //! this representation; [`ENGINE_SNAPSHOT_FORMAT_VERSION`] guards against
 //! reading bytes produced by an incompatible layout.
 
+mod minmax;
 mod operator;
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use crate::ids::{InputId, SplitId, ViewId};
 use crate::plan::Plan;
 use crate::watermark::WatermarkSpec;
 
+pub use minmax::{ExtremeValue, OrderedMultiset};
 pub use operator::{
     AggValue, GroupEntry, GroupState, JoinState, OperatorState, WindowBucket, WindowState,
 };
@@ -23,7 +25,7 @@ pub use operator::{
 ///
 /// Bump this whenever the meaning of an existing field changes; readers reject
 /// any other version instead of guessing.
-pub const ENGINE_SNAPSHOT_FORMAT_VERSION: u32 = 3;
+pub const ENGINE_SNAPSHOT_FORMAT_VERSION: u32 = 4;
 
 /// An Arrow IPC table plus its signed multiplicity column.
 ///

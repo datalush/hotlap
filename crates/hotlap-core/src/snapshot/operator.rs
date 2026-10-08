@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::SnapshotTable;
+use super::minmax::OrderedMultiset;
 
 /// Retained state of one node, in plan pre-order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,9 +18,12 @@ pub enum OperatorState {
 
 /// Accumulated value of one aggregate for one group.
 ///
-/// Floats are compared by `f64` equality; `Eq` is implemented manually to keep
-/// the snapshot container usable as an `Eq` type, mirroring `Scalar`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Floats are compared by `f64` equality. `PartialEq` is implemented manually:
+/// `min`/`max` compare by their current extreme rather than by their whole
+/// multiset, so two states that render the same output row are equal and no
+/// redundant upsert is emitted. `Eq` is implemented to keep the snapshot
+/// container usable as an `Eq` type, mirroring `Scalar`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AggValue {
     /// A `count` accumulator.
     Count(i64),
@@ -44,6 +48,31 @@ pub enum AggValue {
         /// Number of non-null values folded in.
         count: i64,
     },
+    /// A retraction-aware `min` over the group's non-null values.
+    Min(OrderedMultiset),
+    /// A retraction-aware `max` over the group's non-null values.
+    Max(OrderedMultiset),
+}
+
+impl PartialEq for AggValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (AggValue::Count(a), AggValue::Count(b)) => a == b,
+            (
+                AggValue::SumInteger { sum: a, count: b },
+                AggValue::SumInteger { sum: c, count: d },
+            ) => a == c && b == d,
+            (AggValue::SumFloat { sum: a, count: b }, AggValue::SumFloat { sum: c, count: d }) => {
+                a == c && b == d
+            }
+            (AggValue::Avg { sum: a, count: b }, AggValue::Avg { sum: c, count: d }) => {
+                a == c && b == d
+            }
+            (AggValue::Min(a), AggValue::Min(b)) => a.min() == b.min(),
+            (AggValue::Max(a), AggValue::Max(b)) => a.max() == b.max(),
+            _ => false,
+        }
+    }
 }
 
 impl Eq for AggValue {}
@@ -55,6 +84,17 @@ pub struct GroupEntry {
     pub rows: i64,
     /// One accumulated value per aggregate, in plan order.
     pub values: Vec<AggValue>,
+}
+
+impl GroupEntry {
+    /// Whether two entries render the same output aggregate row.
+    ///
+    /// The row multiplicity is internal bookkeeping: `min`/`max` can change it
+    /// (retracting a null or a non-extreme value) without changing any emitted
+    /// cell, so comparisons that gate emission must ignore it.
+    pub fn same_output(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
 }
 
 /// `groupaggregate` retained state: encoded key bytes to accumulator values.

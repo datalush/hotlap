@@ -2,14 +2,15 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array, Int64Array, new_empty_array};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{ArrayRef, Int64Array, new_empty_array};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{Row, RowConverter};
 
 use hotlap_core::plan::{AggSpec, aggregate_output_type};
-use hotlap_core::snapshot::{AggValue, GroupEntry};
+use hotlap_core::snapshot::GroupEntry;
 
+use super::columns::ColumnBuilder;
 use crate::batch::ZSetBatch;
 use crate::error::EngineError;
 
@@ -112,68 +113,4 @@ fn empty_output(
     let batch = RecordBatch::try_new(fields.clone(), columns)?;
     let diff: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
     Ok(ZSetBatch::new(batch, diff)?)
-}
-
-/// Accumulates one output column, fixing its Arrow type up front.
-enum ColumnBuilder {
-    Int(Vec<Option<i64>>),
-    Float(Vec<Option<f64>>),
-}
-
-impl ColumnBuilder {
-    /// Picks the builder matching `agg`'s resolved output type.
-    fn new(agg: &AggSpec, schema: &SchemaRef) -> Result<Self, EngineError> {
-        let input = agg.input.map(|i| schema.field(i).data_type());
-        match aggregate_output_type(agg.func, input)? {
-            DataType::Int64 => Ok(ColumnBuilder::Int(Vec::new())),
-            DataType::Float64 => Ok(ColumnBuilder::Float(Vec::new())),
-            other => Err(EngineError::Unsupported(format!(
-                "aggregate output type {other:?} is not supported"
-            ))),
-        }
-    }
-
-    /// Appends one accumulated value, mapping empty sums/averages to null.
-    fn push(&mut self, value: &AggValue) -> Result<(), EngineError> {
-        match (self, value) {
-            (ColumnBuilder::Int(out), AggValue::Count(count)) => out.push(Some(*count)),
-            (ColumnBuilder::Int(out), AggValue::SumInteger { sum, count }) => {
-                out.push(sum_cell(*count, *sum)?);
-            }
-            (ColumnBuilder::Float(out), AggValue::SumFloat { sum, count }) => {
-                out.push(if *count == 0 { None } else { Some(*sum) });
-            }
-            (ColumnBuilder::Float(out), AggValue::Avg { sum, count }) => {
-                out.push(if *count == 0 {
-                    None
-                } else {
-                    Some(*sum / *count as f64)
-                });
-            }
-            _ => {
-                return Err(EngineError::Infrastructure(
-                    "aggregate output type mismatch".to_string(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Freezes the column into an Arrow array.
-    fn finish(self) -> ArrayRef {
-        match self {
-            ColumnBuilder::Int(values) => Arc::new(Int64Array::from(values)),
-            ColumnBuilder::Float(values) => Arc::new(Float64Array::from(values)),
-        }
-    }
-}
-
-/// The `Int64` sum cell: null when empty, checked for range otherwise.
-fn sum_cell(count: i64, sum: i128) -> Result<Option<i64>, EngineError> {
-    if count == 0 {
-        return Ok(None);
-    }
-    let value = i64::try_from(sum)
-        .map_err(|_| EngineError::Infrastructure("group sum out of range for Int64".to_string()))?;
-    Ok(Some(value))
 }

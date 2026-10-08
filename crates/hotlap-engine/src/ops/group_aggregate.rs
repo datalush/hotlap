@@ -8,7 +8,9 @@
 //! diff `+1`, for every key whose values changed.
 
 mod accumulate;
+mod columns;
 mod materialize;
+mod read;
 mod snapshot;
 
 use std::collections::HashMap;
@@ -160,7 +162,12 @@ impl GroupAggregate {
         if current.is_none() {
             self.groups.remove(key);
         }
-        if previous == current {
+        let unchanged = match (&previous, &current) {
+            (Some(previous), Some(current)) => previous.same_output(current),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
             return None;
         }
         Some(Change {
@@ -184,3 +191,6 @@ impl GroupAggregate {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod minmax_tests;
