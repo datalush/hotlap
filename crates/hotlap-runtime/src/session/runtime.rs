@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use hotlap::{Plan, ZSetBatch};
+use hotlap_sql::bindings::SourceBindings;
 use hotlap_sql::catalog::MvDef;
 use hotlap_sql::mv_schema::mv_schema;
 
@@ -22,7 +23,11 @@ impl SqlSession {
         if self.started {
             return Err(SqlError::Unsupported("session already started".into()));
         }
-        let pipeline = self.build_pipeline().await?;
+        let bindings = self.source_bindings()?;
+        if bindings.is_empty() {
+            return Err(SqlError::Catalog("START before CREATE SOURCE".into()));
+        }
+        let pipeline = self.build_pipeline(&bindings).await?;
         let engine = tokio::task::spawn_blocking(move || EngineHandle::start(pipeline))
             .await
             .map_err(to_engine)?
@@ -30,6 +35,9 @@ impl SqlSession {
         self.register_mv_providers(&engine)?;
         self.engine = Some(engine);
         self.started = true;
+        // Freeze only once `START` has succeeded, so a failed startup never
+        // leaves stale bindings that would hide a source declared afterwards.
+        self.frozen = Some(bindings);
         Ok(QueryResult::Ack("START".into()))
     }
 
@@ -70,25 +78,20 @@ impl SqlSession {
 
     /// Build the pipeline, recompiling every view against the final bindings.
     ///
-    /// Input ids are fixed here, in canonical name order, and then frozen for
-    /// any view declared after `START`. Every view is recompiled from its
+    /// Input ids are fixed by `bindings`, in canonical name order, and frozen
+    /// by `start` only once the engine is up. Every view is recompiled from its
     /// logical plan so an early declaration cannot pin a stale id, and each
     /// sink opens against the schema validated for its view.
-    async fn build_pipeline(&mut self) -> Result<Pipeline, SqlError> {
-        if self.sources.is_empty() {
-            return Err(SqlError::Catalog("START before CREATE SOURCE".into()));
-        }
-        let bindings = self.source_bindings()?;
-        let schemas = self.input_schemas(&bindings)?;
-        let views = self.compile_views(&bindings)?;
+    async fn build_pipeline(&mut self, bindings: &SourceBindings) -> Result<Pipeline, SqlError> {
+        let schemas = self.input_schemas(bindings)?;
+        let views = self.compile_views(bindings)?;
         for (name, plan) in &views {
             let schema = mv_schema(plan, &schemas)?;
             hotlap_sql::convert::ensure_kernel_types(&schema)?;
             self.mv_schemas.insert(name.clone(), schema);
         }
         let sinks = self.build_sinks().await?;
-        let sources = self.build_sources(&bindings)?;
-        self.frozen = Some(bindings);
+        let sources = self.build_sources(bindings)?;
         Ok(Pipeline {
             sources,
             views,
