@@ -3,6 +3,8 @@
 //! `checkpoint/<id>/commit` is written after the body, before `Sink::commit`,
 //! and removed after `mark_valid`, so a crash leaves a marker without `valid`.
 
+#[path = "recovery_commit_marker/harness.rs"]
+mod harness;
 #[path = "common/recovery.rs"]
 mod recovery;
 
@@ -10,106 +12,17 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hotlap::state::StateBackend;
-use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
+use hotlap_connectors::sink::SinkCapabilities;
 use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::recovery::{Recovery, RecoveryDecision};
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
-use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, rows, sources, take};
 
-fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]]).with_retention(0)
-}
-
-/// A sink that counts commits and, when probing, reports whether the commit
-/// marker was visible (and `valid` absent) while `commit` ran.
-struct FakeSink {
-    capabilities: SinkCapabilities,
-    commits: Arc<AtomicU32>,
-    probe: Option<(SharedBackend, u64, Arc<Mutex<bool>>)>,
-}
-
-#[async_trait::async_trait]
-impl Sink for FakeSink {
-    async fn write(&self, _changes: ChangeStream) -> Result<(), ConnectorError> {
-        Ok(())
-    }
-
-    fn capabilities(&self) -> SinkCapabilities {
-        self.capabilities
-    }
-
-    async fn commit(&self) -> Result<(), ConnectorError> {
-        self.commits.fetch_add(1, Ordering::SeqCst);
-        if let Some((backend, id, observed)) = &self.probe {
-            let marker = backend
-                .get(format!("checkpoint/{id}/commit").as_bytes())
-                .unwrap()
-                .is_some();
-            let valid = backend
-                .get(format!("checkpoint/{id}/valid").as_bytes())
-                .unwrap()
-                .is_some();
-            *observed.lock().unwrap() = marker && !valid;
-        }
-        Ok(())
-    }
-
-    async fn abort(&self) -> Result<(), ConnectorError> {
-        Ok(())
-    }
-}
-
-/// A shared fake sink with the given capability plus its commit counter.
-fn sink(capabilities: SinkCapabilities) -> (Arc<SharedSink>, Arc<AtomicU32>) {
-    let commits = Arc::new(AtomicU32::new(0));
-    let sink = Arc::new(FakeSink {
-        capabilities,
-        commits: Arc::clone(&commits),
-        probe: None,
-    });
-    (SharedSink::new(sink), commits)
-}
-
-/// Persist a valid checkpoint 1 over the shared backend.
-fn seed_valid_one() -> SharedBackend {
-    let backend = SharedBackend::default();
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
-    let mut stream = pipe.sources.stream().unwrap();
-    drain(&mut engine, &pipe.sources, &mut stream, 3);
-    take(&mut checkpointer, &engine, &pipe.sources);
-    assert_eq!(
-        rows(&engine.snapshot("c").unwrap()),
-        vec![vec![1, 2], vec![2, 2]]
-    );
-    backend
-}
-
-/// Simulate a crash mid-commit: copy the valid body to `pending` and add the
-/// durable commit marker, leaving `valid` absent.
-fn seed_pending(backend: &SharedBackend, valid: u64, pending: u64) {
-    let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
-        let value = writer
-            .get(format!("checkpoint/{valid}/{part}").as_bytes())
-            .unwrap()
-            .unwrap();
-        writer
-            .put(format!("checkpoint/{pending}/{part}").as_bytes(), value)
-            .unwrap();
-    }
-    writer
-        .put(
-            format!("checkpoint/{pending}/commit").as_bytes(),
-            b"1".to_vec(),
-        )
-        .unwrap();
-}
+use harness::{FakeSink, log, matching, seed_pending, seed_valid_one, sink};
+use recovery::{ResumableSource, engine_with};
 
 #[test]
 fn commit_marker_is_durable_before_commit_and_removed_after_valid() {
-    let backend = SharedBackend::default();
+    let backend = recovery::SharedBackend::default();
     let commits = Arc::new(AtomicU32::new(0));
     let observed = Arc::new(Mutex::new(false));
     let probe = Arc::new(FakeSink {
@@ -125,8 +38,10 @@ fn commit_marker_is_durable_before_commit_and_removed_after_valid() {
 
     assert_eq!(id, 1);
     assert_eq!(commits.load(Ordering::SeqCst), 1);
-    let durable = *observed.lock().unwrap();
-    assert!(durable, "the marker must be durable before Sink::commit");
+    assert!(
+        *observed.lock().unwrap(),
+        "the marker must be durable before Sink::commit"
+    );
     assert_eq!(backend.get(b"checkpoint/1/commit").unwrap(), None);
     assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
 }
@@ -139,11 +54,10 @@ fn recovery_promotes_a_redrivable_interrupted_commit() {
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
         .with_sinks(vec![SinkSync::sink_only(sink)]);
 
-    let checkpoint =
-        match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
-            RecoveryDecision::Promote(checkpoint) => checkpoint,
-            other => panic!("expected Promote, got {other:?}"),
-        };
+    let checkpoint = match Recovery::inspect(&checkpointer, &matching()).unwrap() {
+        RecoveryDecision::Promote(checkpoint) => checkpoint,
+        other => panic!("expected Promote, got {other:?}"),
+    };
     assert_eq!(checkpoint.id, 2);
     assert_eq!(commits.load(Ordering::SeqCst), 0, "inspect must not commit");
 
@@ -157,7 +71,7 @@ fn recovery_promotes_a_redrivable_interrupted_commit() {
     assert!(backend.get(b"checkpoint/2/valid").unwrap().is_some());
     assert_eq!(backend.get(b"checkpoint/2/commit").unwrap(), None);
     assert!(matches!(
-        Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap(),
+        Recovery::inspect(&checkpointer, &matching()).unwrap(),
         RecoveryDecision::Resume(c) if c.id == 2
     ));
 }
@@ -170,7 +84,7 @@ fn recovery_discards_a_non_redrivable_interrupted_commit() {
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
         .with_sinks(vec![SinkSync::sink_only(sink)]);
 
-    match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
+    match Recovery::inspect(&checkpointer, &matching()).unwrap() {
         RecoveryDecision::Discard {
             pending, fallback, ..
         } => {
@@ -187,7 +101,7 @@ fn recovery_discards_a_non_redrivable_interrupted_commit() {
         "the discarded checkpoint must be removed"
     );
     assert_eq!(
-        Recovery::load(&checkpointer, &sources(ResumableSource::new(log())))
+        Recovery::load(&checkpointer, &matching())
             .unwrap()
             .unwrap()
             .id,
@@ -200,7 +114,7 @@ fn recovery_without_a_marker_matches_the_newest_valid() {
     let backend = seed_valid_one();
     let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
 
-    match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
+    match Recovery::inspect(&checkpointer, &matching()).unwrap() {
         RecoveryDecision::Resume(checkpoint) => assert_eq!(checkpoint.id, 1),
         other => panic!("expected Resume, got {other:?}"),
     }
