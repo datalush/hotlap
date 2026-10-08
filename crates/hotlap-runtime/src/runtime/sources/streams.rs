@@ -41,6 +41,14 @@ pub(super) fn tagged_from(
     entries: &[InputSource],
     splits: &[Vec<Split>],
 ) -> Result<InputStream, ConnectorError> {
+    if entries.len() != splits.len() {
+        return Err(ConnectorError::Unsupported(format!(
+            "expected {} split lists for {} sources, got {}",
+            entries.len(),
+            entries.len(),
+            splits.len()
+        )));
+    }
     let mut streams = Vec::new();
     for (entry, splits) in entries.iter().zip(splits) {
         let input = entry.id;
