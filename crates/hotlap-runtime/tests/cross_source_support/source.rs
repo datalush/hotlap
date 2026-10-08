@@ -1,7 +1,7 @@
-//! Controlled [`Source`] fixture driven by an external batch channel.
+//! Controlled [`Source`] fixture driven by per-split batch channels.
 //!
-//! The test pushes batches (or closes the channel) to sequence a stream without
-//! sleeping: until a batch arrives, [`Source::read`] stays pending.
+//! The test pushes batches (or closes a channel) to sequence a stream without
+//! sleeping: a split stays pending until its channel produces an item.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,32 +12,40 @@ use hotlap_connectors::source::{
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-/// The producer half the test uses to feed one controlled source.
-pub type BatchSender = UnboundedSender<Result<SourceBatch, ConnectorError>>;
+type BatchItem = Result<SourceBatch, ConnectorError>;
 
-/// A source whose batches are injected through a channel.
+/// The producer half the test uses to feed one split of a controlled source.
+pub type BatchSender = UnboundedSender<BatchItem>;
+
+/// A source whose batches are injected through one channel per split.
 pub struct ControlledSource {
     schema: SchemaRef,
     splits: Vec<Split>,
-    receiver: Mutex<Option<UnboundedReceiver<Result<SourceBatch, ConnectorError>>>>,
+    receivers: Mutex<Vec<Option<UnboundedReceiver<BatchItem>>>>,
     fail_read: bool,
     commits: Arc<Mutex<Vec<(SplitId, Offset)>>>,
     applied: Arc<Mutex<SourceState>>,
 }
 
 impl ControlledSource {
-    /// Build a source over `splits` and return it with its batch sender.
-    pub fn new(schema: SchemaRef, splits: Vec<Split>) -> (Arc<Self>, BatchSender) {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    /// Build a source over `splits`; returns it with one sender per split.
+    pub fn new(schema: SchemaRef, splits: Vec<Split>) -> (Arc<Self>, Vec<BatchSender>) {
+        let mut senders = Vec::with_capacity(splits.len());
+        let mut receivers = Vec::with_capacity(splits.len());
+        for _ in &splits {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            senders.push(sender);
+            receivers.push(Some(receiver));
+        }
         let source = Arc::new(Self {
             schema,
             splits,
-            receiver: Mutex::new(Some(receiver)),
+            receivers: Mutex::new(receivers),
             fail_read: false,
             commits: Arc::new(Mutex::new(Vec::new())),
             applied: Arc::new(Mutex::new(SourceState::default())),
         });
-        (source, sender)
+        (source, senders)
     }
 
     /// Build a source whose `read` always fails, for open-failure tests.
@@ -45,7 +53,7 @@ impl ControlledSource {
         Arc::new(Self {
             schema,
             splits: vec![Split { id: 0, start: 0 }],
-            receiver: Mutex::new(None),
+            receivers: Mutex::new(vec![None]),
             fail_read: true,
             commits: Arc::new(Mutex::new(Vec::new())),
             applied: Arc::new(Mutex::new(SourceState::default())),
@@ -79,12 +87,16 @@ impl Source for ControlledSource {
                 split.id
             )));
         }
-        let receiver = self
-            .receiver
-            .lock()
-            .unwrap()
+        let index = self
+            .splits
+            .iter()
+            .position(|candidate| candidate.id == split.id)
+            .ok_or_else(|| ConnectorError::Unsupported(format!("unknown split {}", split.id)))?;
+        let receiver = self.receivers.lock().unwrap()[index]
             .take()
-            .ok_or_else(|| ConnectorError::Infrastructure("split already opened".into()))?;
+            .ok_or_else(|| {
+                ConnectorError::Infrastructure(format!("split {} already opened", split.id))
+            })?;
         let stream = futures::stream::unfold(receiver, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
         });
