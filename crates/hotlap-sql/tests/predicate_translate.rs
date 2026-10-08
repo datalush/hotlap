@@ -7,6 +7,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::datasource::memory::MemTable;
 use datafusion::prelude::SessionContext;
 use hotlap::{CmpOp, InputId, Plan, Predicate, Scalar};
+use hotlap_sql::bindings::SourceBindings;
 use hotlap_sql::translate::to_kernel_plan;
 
 /// A nullable table with one column per supported scalar type.
@@ -33,7 +34,10 @@ async fn predicate_for(
         .sql(&format!("SELECT * FROM src WHERE {where_sql}"))
         .await
         .unwrap();
-    let plan = to_kernel_plan(df.logical_plan(), InputId(0))?;
+    let plan = to_kernel_plan(
+        df.logical_plan(),
+        &SourceBindings::from([("src".into(), InputId(0))]),
+    )?;
     Ok(kernel_predicate(&plan).clone())
 }
 

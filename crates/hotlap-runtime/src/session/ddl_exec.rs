@@ -5,6 +5,7 @@ use std::sync::Arc;
 use hotlap::InputId;
 use hotlap_connectors::datafusion::provider::SourceTableProvider;
 use hotlap_connectors::source::Source;
+use hotlap_sql::bindings::{InputSchemas, SourceBindings};
 use hotlap_sql::catalog::{MvDef, SourceDef};
 use hotlap_sql::ddl::{CreateSink, CreateSource, CreateView};
 use hotlap_sql::error::SqlError;
@@ -45,15 +46,22 @@ impl SqlSession {
     }
 
     pub(super) async fn create_view(&mut self, cv: CreateView) -> Result<QueryResult, SqlError> {
-        let source_schema = self
+        let source_name = self
+            .source_name
+            .clone()
+            .ok_or_else(|| SqlError::Catalog("view declared before its source".into()))?;
+        let source = self
             .source
             .as_ref()
-            .ok_or_else(|| SqlError::Catalog("view declared before its source".into()))?
-            .schema();
+            .ok_or_else(|| SqlError::Catalog("view declared before its source".into()))?;
+        // v1 binds the session's single source to the one input it owns; the
+        // maps stay explicit so the multi-source path can extend them.
+        let bindings = SourceBindings::from([(source_name, InputId(0))]);
+        let schemas = InputSchemas::from([(InputId(0), source.schema())]);
         let query = normalize_tumble_intervals(&cv.query)?;
         let df = self.ctx.sql(&query).await.map_err(to_engine)?;
-        let plan = to_kernel_plan(df.logical_plan(), InputId(0))?;
-        let schema = mv_schema(&plan, source_schema.as_ref())?;
+        let plan = to_kernel_plan(df.logical_plan(), &bindings)?;
+        let schema = mv_schema(&plan, &schemas)?;
         // Reject unrepresentable output types here so the view fails at DDL
         // time rather than later, when a `SELECT` reads the consolidated rows.
         hotlap_sql::convert::ensure_kernel_types(&schema)?;

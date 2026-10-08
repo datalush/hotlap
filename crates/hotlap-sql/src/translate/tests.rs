@@ -9,8 +9,10 @@ use datafusion::prelude::SessionContext;
 use hotlap::{InputId, Plan};
 
 use super::{register_tumble_udf, to_kernel_plan};
+use crate::bindings::SourceBindings;
 
 mod aggregates;
+mod joins;
 
 fn register_empty_table(ctx: &SessionContext, name: &str) {
     let schema = Arc::new(Schema::new(vec![
@@ -30,9 +32,14 @@ fn ctx_with_src() -> SessionContext {
     ctx
 }
 
+/// The default single-source binding used by the non-join tests.
+fn src_bindings() -> SourceBindings {
+    SourceBindings::from([("src".into(), InputId(0))])
+}
+
 async fn plan_for(ctx: &SessionContext, sql: &str) -> Result<Plan, crate::SqlError> {
     let df = ctx.sql(sql).await.unwrap();
-    to_kernel_plan(df.logical_plan(), InputId(0))
+    to_kernel_plan(df.logical_plan(), &src_bindings())
 }
 
 #[tokio::test]
@@ -108,17 +115,5 @@ async fn rejects_count_filter_clause() {
         .await
         .is_err(),
         "a FILTER clause would be silently dropped"
-    );
-}
-
-#[tokio::test]
-async fn rejects_join_of_distinct_sources() {
-    let ctx = ctx_with_src();
-    register_empty_table(&ctx, "other");
-    assert!(
-        plan_for(&ctx, "SELECT a.k FROM src a JOIN other b ON a.k = b.k")
-            .await
-            .is_err(),
-        "single-source interface must reject a two-table join"
     );
 }

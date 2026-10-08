@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bindings;
 pub mod catalog;
 pub mod convert;
 pub mod ddl;
@@ -17,6 +18,7 @@ mod translate_predicate;
 pub mod tumble;
 pub mod watermark;
 
+pub use bindings::{InputSchemas, SourceBindings};
 pub use catalog::{Catalog, MvDef, SourceDef};
 pub use ddl::CreateSink;
 pub use error::SqlError;

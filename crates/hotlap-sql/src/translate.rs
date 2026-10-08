@@ -3,19 +3,21 @@
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
-use datafusion::common::JoinType;
-use datafusion::logical_expr::{
-    Aggregate, Expr, Join, LogicalPlan, Projection, Volatility, create_udf,
-};
+use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan, Projection, Volatility, create_udf};
 use datafusion::prelude::SessionContext;
-use hotlap::{AggSpec, InputId, Plan, aggregate_output_type};
+use hotlap::{AggSpec, Plan, aggregate_output_type};
 
+use crate::bindings::SourceBindings;
 use crate::error::SqlError;
 use crate::translate_expr::{
     column_index, ensure_identity_projection, is_tumble, parse_aggs, parse_tumble,
     projection_indices,
 };
 use crate::translate_predicate::predicate;
+
+mod join;
+
+use join::translate_join;
 
 /// Register the planning-only `tumble(ts, size)` scalar function.
 pub fn register_tumble_udf(ctx: &SessionContext) {
@@ -29,20 +31,31 @@ pub fn register_tumble_udf(ctx: &SessionContext) {
 }
 
 /// Translate a supported `SELECT` plan into the kernel IR.
-pub fn to_kernel_plan(plan: &LogicalPlan, source: InputId) -> Result<Plan, SqlError> {
+///
+/// Every relation is resolved through `sources`; an alias recurses to its
+/// underlying scan so the bound input is preserved while the parent schema
+/// still resolves the qualified columns.
+pub fn to_kernel_plan(plan: &LogicalPlan, sources: &SourceBindings) -> Result<Plan, SqlError> {
     match plan {
-        LogicalPlan::Projection(p) => project(p, source),
+        LogicalPlan::Projection(p) => project(p, sources),
         LogicalPlan::Filter(f) => {
-            let input = to_kernel_plan(&f.input, source)?;
+            let input = to_kernel_plan(&f.input, sources)?;
             let pred = predicate(&f.predicate, f.input.schema())?;
             Ok(Plan::Filter {
                 input: Box::new(input),
                 pred,
             })
         }
-        LogicalPlan::Aggregate(a) => translate_aggregate(a, source),
-        LogicalPlan::TableScan(_) => Ok(Plan::Source(source)),
-        LogicalPlan::Join(j) => translate_join(j, source),
+        LogicalPlan::Aggregate(a) => translate_aggregate(a, sources),
+        LogicalPlan::TableScan(t) => {
+            let name = t.table_name.to_string();
+            let id = sources
+                .get(&name)
+                .ok_or_else(|| SqlError::Catalog(format!("unknown source relation: {name}")))?;
+            Ok(Plan::Source(*id))
+        }
+        LogicalPlan::SubqueryAlias(a) => to_kernel_plan(&a.input, sources),
+        LogicalPlan::Join(j) => translate_join(j, sources),
         other => Err(SqlError::Unsupported(format!(
             "unsupported logical plan node: {other:?}"
         ))),
@@ -53,12 +66,12 @@ pub fn to_kernel_plan(plan: &LogicalPlan, source: InputId) -> Result<Plan, SqlEr
 /// kernel normalizes aggregate output itself. Unwrap that wrapper only when it
 /// is an identity selection, so lossy transforms are rejected rather than
 /// silently dropped.
-fn project(p: &Projection, source: InputId) -> Result<Plan, SqlError> {
+fn project(p: &Projection, sources: &SourceBindings) -> Result<Plan, SqlError> {
     if let LogicalPlan::Aggregate(a) = p.input.as_ref() {
         ensure_identity_projection(&p.expr, &a.schema)?;
-        return to_kernel_plan(&p.input, source);
+        return to_kernel_plan(&p.input, sources);
     }
-    let input = to_kernel_plan(&p.input, source)?;
+    let input = to_kernel_plan(&p.input, sources)?;
     let cols = projection_indices(&p.expr, p.input.schema())?;
     Ok(Plan::Project {
         input: Box::new(input),
@@ -66,8 +79,8 @@ fn project(p: &Projection, source: InputId) -> Result<Plan, SqlError> {
     })
 }
 
-fn translate_aggregate(a: &Aggregate, source: InputId) -> Result<Plan, SqlError> {
-    let input = to_kernel_plan(&a.input, source)?;
+fn translate_aggregate(a: &Aggregate, sources: &SourceBindings) -> Result<Plan, SqlError> {
+    let input = to_kernel_plan(&a.input, sources)?;
     let schema = a.input.schema();
     let mut key = Vec::new();
     let mut tumble = None;
@@ -143,49 +156,6 @@ fn reconcile_output_types(a: &Aggregate, aggs: &[AggSpec]) -> Result<(), SqlErro
         }
     }
     Ok(())
-}
-
-fn translate_join(j: &Join, source: InputId) -> Result<Plan, SqlError> {
-    if j.join_type != JoinType::Inner || j.filter.is_some() {
-        return Err(SqlError::Unsupported(
-            "only inner equi-joins are supported".into(),
-        ));
-    }
-    let left_tables = base_tables(&j.left)?;
-    if left_tables.is_empty() || left_tables != base_tables(&j.right)? {
-        return Err(SqlError::Unsupported(
-            "both join sides must read the same single source".into(),
-        ));
-    }
-    let left = to_kernel_plan(&j.left, source)?;
-    let right = to_kernel_plan(&j.right, source)?;
-    let mut left_key = Vec::new();
-    let mut right_key = Vec::new();
-    for (l, r) in &j.on {
-        left_key.push(column_index(l, j.left.schema())?);
-        right_key.push(column_index(r, j.right.schema())?);
-    }
-    Ok(Plan::Join {
-        left: Box::new(left),
-        right: Box::new(right),
-        left_key,
-        right_key,
-    })
-}
-
-/// Collect the base-table names under `plan`, rejecting non-scan leaves. The
-/// current `to_kernel_plan` interface has a single `InputId`, so both join
-/// sides must be the same table; otherwise two tables would collapse silently.
-fn base_tables(plan: &LogicalPlan) -> Result<Vec<String>, SqlError> {
-    match plan {
-        LogicalPlan::TableScan(t) => Ok(vec![t.table_name.to_string()]),
-        LogicalPlan::SubqueryAlias(a) => base_tables(&a.input),
-        LogicalPlan::Projection(p) => base_tables(&p.input),
-        LogicalPlan::Filter(f) => base_tables(&f.input),
-        other => Err(SqlError::Unsupported(format!(
-            "unsupported join input: {other:?}"
-        ))),
-    }
 }
 
 #[cfg(test)]

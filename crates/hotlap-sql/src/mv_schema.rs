@@ -8,26 +8,29 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use hotlap::{Plan, aggregate_output_type};
+use hotlap::{InputId, Plan, aggregate_output_type};
 
+use crate::bindings::InputSchemas;
 use crate::error::SqlError;
 
-/// Build the view schema for `plan` by resolving key indices against `source`.
-pub fn mv_schema(plan: &Plan, source: &Schema) -> Result<SchemaRef, SqlError> {
-    Ok(Arc::new(Schema::new(output_fields(plan, source)?)))
+/// Build the view schema for `plan` by resolving each `Source` through
+/// `sources`. A source with no bound schema is an error, never another
+/// source's schema.
+pub fn mv_schema(plan: &Plan, sources: &InputSchemas) -> Result<SchemaRef, SqlError> {
+    Ok(Arc::new(Schema::new(output_fields(plan, sources)?)))
 }
 
 /// The output fields of `plan`, following the kernel's column order.
-fn output_fields(plan: &Plan, source: &Schema) -> Result<Vec<Field>, SqlError> {
+fn output_fields(plan: &Plan, sources: &InputSchemas) -> Result<Vec<Field>, SqlError> {
     match plan {
-        Plan::Source(_) => Ok(source.fields().iter().map(|f| f.as_ref().clone()).collect()),
-        Plan::Filter { input, .. } => output_fields(input, source),
+        Plan::Source(id) => Ok(resolve_fields(id, sources)?),
+        Plan::Filter { input, .. } => output_fields(input, sources),
         Plan::Project { input, cols } => {
-            let input = output_fields(input, source)?;
+            let input = output_fields(input, sources)?;
             cols.iter().map(|&i| field_at(&input, i)).collect()
         }
         Plan::GroupAggregate { input, key, aggs } => {
-            let input = output_fields(input, source)?;
+            let input = output_fields(input, sources)?;
             let mut fields = key_fields(&input, key)?;
             for agg in aggs {
                 let input_ty = match agg.input {
@@ -41,18 +44,26 @@ fn output_fields(plan: &Plan, source: &Schema) -> Result<Vec<Field>, SqlError> {
             Ok(fields)
         }
         Plan::TumbleCount { input, key, .. } => {
-            let input = output_fields(input, source)?;
+            let input = output_fields(input, sources)?;
             let mut fields = key_fields(&input, key)?;
             fields.push(int_field("window_start"));
             fields.push(int_field("count"));
             Ok(fields)
         }
         Plan::Join { left, right, .. } => {
-            let mut fields = output_fields(left, source)?;
-            fields.extend(output_fields(right, source)?);
+            let mut fields = output_fields(left, sources)?;
+            fields.extend(output_fields(right, sources)?);
             Ok(fields)
         }
     }
+}
+
+/// The schema fields of the bound source `id`; an unbound input is rejected.
+fn resolve_fields(id: &InputId, sources: &InputSchemas) -> Result<Vec<Field>, SqlError> {
+    let schema = sources
+        .get(id)
+        .ok_or_else(|| SqlError::Unsupported(format!("no schema bound to input {id:?}")))?;
+    Ok(schema.fields().iter().map(|f| f.as_ref().clone()).collect())
 }
 
 fn key_fields(input: &[Field], key: &[usize]) -> Result<Vec<Field>, SqlError> {
@@ -83,6 +94,10 @@ mod tests {
         ])
     }
 
+    fn schemas() -> InputSchemas {
+        InputSchemas::from([(InputId(0), Arc::new(source()))])
+    }
+
     fn names(schema: &Schema) -> Vec<&str> {
         schema.fields().iter().map(|f| f.name().as_str()).collect()
     }
@@ -95,7 +110,7 @@ mod tests {
             time_col: 1,
             size: 10_000,
         };
-        let schema = mv_schema(&plan, &source()).unwrap();
+        let schema = mv_schema(&plan, &schemas()).unwrap();
         assert_eq!(names(&schema), vec!["k", "window_start", "count"]);
     }
 
@@ -106,7 +121,7 @@ mod tests {
             key: vec![0],
             aggs: vec![AggSpec::count(), AggSpec::sum(0), AggSpec::avg(0)],
         };
-        let schema = mv_schema(&plan, &source()).unwrap();
+        let schema = mv_schema(&plan, &schemas()).unwrap();
         assert_eq!(names(&schema), vec!["k", "count", "sum", "avg"]);
         assert_eq!(schema.field(2).data_type(), &DataType::Int64);
         assert_eq!(schema.field(3).data_type(), &DataType::Float64);
@@ -118,7 +133,16 @@ mod tests {
             input: Box::new(Plan::Source(InputId(0))),
             cols: vec![1, 0],
         };
-        let schema = mv_schema(&plan, &source()).unwrap();
+        let schema = mv_schema(&plan, &schemas()).unwrap();
         assert_eq!(names(&schema), vec!["_event_time", "k"]);
+    }
+
+    #[test]
+    fn unbound_source_is_rejected() {
+        let plan = Plan::Source(InputId(0));
+        assert!(
+            mv_schema(&plan, &InputSchemas::new()).is_err(),
+            "an input with no bound schema must not borrow another's"
+        );
     }
 }

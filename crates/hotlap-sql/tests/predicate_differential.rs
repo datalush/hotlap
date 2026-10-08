@@ -14,6 +14,7 @@ use datafusion::logical_expr::{ColumnarValue, Filter, LogicalPlan};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use hotlap::{InputId, Plan, Predicate};
+use hotlap_sql::bindings::SourceBindings;
 use hotlap_sql::translate::to_kernel_plan;
 
 /// Three rows across every scalar type, each with a null somewhere.
@@ -120,7 +121,8 @@ async fn matches_datafusion_physical_expr() {
             .unwrap();
         let expected = physical_mask(physical, &batch);
 
-        let plan = to_kernel_plan(logical, InputId(0)).unwrap();
+        let plan =
+            to_kernel_plan(logical, &SourceBindings::from([("src".into(), InputId(0))])).unwrap();
         let pred = find_kernel_predicate(&plan).expect("a kernel filter");
         let got = options(&pred.eval(&batch).unwrap());
 
