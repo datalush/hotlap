@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-differential-dataflow = "=0.25.1"
-timely = "=0.31"
-serde = { version = "1", features = ["derive"] }
+hotlap-core = { path = "../hotlap-core" }
+
+[dev-dependencies]
+arrow = "59.2"
+hotlap-engine = { path = "../hotlap-engine" }

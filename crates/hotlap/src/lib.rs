@@ -1,13 +1,15 @@
-//! Hotlap engine kernel: incremental core behind an engine-owned boundary.
-pub mod core;
+//! Hotlap engine kernel: an engine-owned facade over a stateful core.
+//!
+//! The shared contract types ([`Plan`], [`ZSetBatch`], ids, watermark spec and
+//! the [`IncrementalCore`] trait) live in `hotlap-core` and are re-exported here
+//! so callers only depend on this crate.
 pub mod engine;
 #[cfg(test)]
 pub mod harness;
-pub mod plan;
-pub mod row;
 pub mod state;
 
-pub use core::InputId;
 pub use engine::{Hotlap, HotlapError};
-pub use plan::Plan;
-pub use row::{ChangeBatch, Row, Scalar};
+pub use hotlap_core::plan;
+pub use hotlap_core::{
+    CoreError, IncrementalCore, InputId, Plan, Predicate, Scalar, ViewId, WatermarkSpec, ZSetBatch,
+};

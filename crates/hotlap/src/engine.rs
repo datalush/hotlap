@@ -3,13 +3,13 @@
 //! `Hotlap` owns a boxed [`IncrementalCore`] plus registries mapping caller names
 //! to core handles: input names -> [`InputId`], view names -> [`ViewId`]. Ids are
 //! assigned monotonically and only advance once the core accepts the declaration.
+//!
+//! The concrete core is injected with [`Hotlap::open_with`]; this crate only
+//! depends on the `hotlap-core` contract, never on a specific kernel.
 
 use std::collections::HashMap;
 
-use crate::core::differential_dataflow::DifferentialCore;
-use crate::core::{IncrementalCore, InputId, ViewId};
-use crate::plan::Plan;
-use crate::row::{ChangeBatch, Row};
+use hotlap_core::{IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
 
 /// Error returned by the public [`Hotlap`] API.
 #[derive(Debug)]
@@ -25,15 +25,15 @@ pub struct Hotlap {
 }
 
 impl Hotlap {
-    /// Open an engine and start its backing worker.
-    pub fn open() -> Result<Self, HotlapError> {
-        Ok(Self {
-            core: Box::new(DifferentialCore::new().map_err(|e| HotlapError(format!("{e:?}")))?),
+    /// Open an engine over the injected `core`.
+    pub fn open_with(core: Box<dyn IncrementalCore>) -> Self {
+        Self {
+            core,
             next_input: 0,
             next_view: 0,
             inputs: Default::default(),
             views: Default::default(),
-        })
+        }
     }
 
     /// Declare a source under `name`; plans reference it as `Plan::Source(id)`.
@@ -44,7 +44,7 @@ impl Hotlap {
         let id = InputId(self.next_input);
         self.core
             .register_input(id)
-            .map_err(|e| HotlapError(format!("{e:?}")))?;
+            .map_err(|e| HotlapError(format!("{e}")))?;
         self.next_input += 1;
         self.inputs.insert(name.to_string(), id);
         Ok(())
@@ -62,8 +62,8 @@ impl Hotlap {
             .get(input)
             .ok_or_else(|| HotlapError("no such input".into()))?;
         self.core
-            .declare_watermark(id, crate::core::WatermarkSpec { time_col, lag })
-            .map_err(|e| HotlapError(format!("{e:?}")))
+            .declare_watermark(id, WatermarkSpec { time_col, lag })
+            .map_err(|e| HotlapError(format!("{e}")))
     }
 
     /// Compile `plan` into a new view registered under `name`.
@@ -78,7 +78,7 @@ impl Hotlap {
         // not burn an id or shadow an existing name with a dangling mapping.
         self.core
             .build_view(id, &plan)
-            .map_err(|e| HotlapError(format!("{e:?}")))?;
+            .map_err(|e| HotlapError(format!("{e}")))?;
         self.next_view += 1;
         self.views.insert(name.to_string(), id);
         Ok(())
@@ -87,47 +87,38 @@ impl Hotlap {
     /// Subscribe the view registered as `name` to its output changelog. Only
     /// before the first push; read the buffered deltas with [`take_changes`].
     pub fn tap_view(&mut self, name: &str) -> Result<(), HotlapError> {
-        let id = *self
-            .views
-            .get(name)
-            .ok_or_else(|| HotlapError("no such view".into()))?;
+        let id = self.view_id(name)?;
         self.core
             .tap_view(id)
-            .map_err(|e| HotlapError(format!("{e:?}")))
+            .map_err(|e| HotlapError(format!("{e}")))
     }
 
-    /// Drain `(row, diff)` changes of the tapped view registered as `name`,
+    /// Drain the `ZSetBatch` changes of the tapped view registered as `name`,
     /// accumulated by the last push. Empty for an untapped view.
-    pub fn take_changes(&mut self, name: &str) -> Result<Vec<(Row, i64)>, HotlapError> {
-        let id = *self
-            .views
-            .get(name)
-            .ok_or_else(|| HotlapError("no such view".into()))?;
+    pub fn take_changes(&mut self, name: &str) -> Result<ZSetBatch, HotlapError> {
+        let id = self.view_id(name)?;
         self.core
             .take_changes(id)
-            .map_err(|e| HotlapError(format!("{e:?}")))
+            .map_err(|e| HotlapError(format!("{e}")))
     }
 
     /// Feed `batch` into the input registered as `name`.
-    pub fn push(&mut self, input: &str, batch: &ChangeBatch) -> Result<(), HotlapError> {
+    pub fn push(&mut self, input: &str, batch: &ZSetBatch) -> Result<(), HotlapError> {
         let id = *self
             .inputs
             .get(input)
             .ok_or_else(|| HotlapError("no such input".into()))?;
         self.core
             .push(id, batch)
-            .map_err(|e| HotlapError(format!("{e:?}")))
+            .map_err(|e| HotlapError(format!("{e}")))
     }
 
     /// Read the consolidated output of the view registered as `name`.
-    pub fn snapshot(&mut self, name: &str) -> Result<Vec<Row>, HotlapError> {
-        let id = *self
-            .views
-            .get(name)
-            .ok_or_else(|| HotlapError("no such view".into()))?;
+    pub fn snapshot(&mut self, name: &str) -> Result<ZSetBatch, HotlapError> {
+        let id = self.view_id(name)?;
         self.core
             .snapshot(id)
-            .map_err(|e| HotlapError(format!("{e:?}")))
+            .map_err(|e| HotlapError(format!("{e}")))
     }
 
     /// Events dropped as late in `input` (event-time mode).
@@ -138,12 +129,20 @@ impl Hotlap {
             .ok_or_else(|| HotlapError("no such input".into()))?;
         self.core
             .late_dropped(id)
-            .map_err(|e| HotlapError(format!("{e:?}")))
+            .map_err(|e| HotlapError(format!("{e}")))
     }
 
-    /// Shut the engine down. Dropping `Hotlap` also stops the worker.
+    /// Shut the engine down. Dropping `Hotlap` also releases the core.
     pub fn shutdown(self) -> Result<(), HotlapError> {
         Ok(())
+    }
+
+    /// Resolve a registered view name to its core handle.
+    fn view_id(&self, name: &str) -> Result<ViewId, HotlapError> {
+        self.views
+            .get(name)
+            .copied()
+            .ok_or_else(|| HotlapError("no such view".into()))
     }
 }
 

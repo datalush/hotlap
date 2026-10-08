@@ -2,15 +2,51 @@
 //! full recomputation from the same changelog. Exercised through the public API only.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use hotlap::{ChangeBatch, Hotlap, InputId, Plan, Row, Scalar};
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use hotlap::{Hotlap, InputId, Plan, Predicate, ZSetBatch};
+use hotlap_engine::EngineCore;
 
-fn batch(pairs: &[((i64, i64), i64)]) -> ChangeBatch {
-    let mut b = ChangeBatch::default();
-    for ((k, v), d) in pairs {
-        b.push(Row(vec![Scalar::I64(*k), Scalar::I64(*v)]), *d);
-    }
-    b
+/// Build a Z-set whose columns are all Int64 and whose diffs are signed.
+fn zset(columns: &[Vec<i64>], diffs: &[i64]) -> ZSetBatch {
+    let fields: Vec<Field> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, _)| Field::new(format!("c{i}"), DataType::Int64, true))
+        .collect();
+    let arrays: Vec<ArrayRef> = columns
+        .iter()
+        .map(|c| Arc::new(Int64Array::from(c.clone())) as ArrayRef)
+        .collect();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+    ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs.to_vec()))).unwrap()
+}
+
+/// Read a consolidated Z-set of Int64 columns as plain integer rows.
+fn rows(z: &ZSetBatch) -> Vec<Vec<i64>> {
+    let columns: Vec<&Int64Array> = z
+        .batch
+        .columns()
+        .iter()
+        .map(|c| c.as_any().downcast_ref::<Int64Array>().unwrap())
+        .collect();
+    (0..z.len())
+        .map(|row| columns.iter().map(|c| c.value(row)).collect())
+        .collect()
+}
+
+fn open() -> Hotlap {
+    Hotlap::open_with(Box::new(EngineCore::new()))
+}
+
+fn batch(pairs: &[((i64, i64), i64)]) -> ZSetBatch {
+    let keys: Vec<i64> = pairs.iter().map(|((k, _), _)| *k).collect();
+    let values: Vec<i64> = pairs.iter().map(|((_, v), _)| *v).collect();
+    let diffs: Vec<i64> = pairs.iter().map(|(_, d)| *d).collect();
+    zset(&[keys, values], &diffs)
 }
 
 fn recompute(stream: &[((i64, i64), i64)]) -> Vec<(i64, i64)> {
@@ -28,16 +64,11 @@ fn by_key(key: usize) -> Plan {
     }
 }
 
-/// Snapshot `view` as sorted `(key, count)` pairs, asserting the `[key, count]` shape.
+/// Snapshot `view` as sorted `(key, count)` pairs.
 fn pairs(h: &mut Hotlap, view: &str) -> Vec<(i64, i64)> {
-    let mut got: Vec<(i64, i64)> = h
-        .snapshot(view)
-        .unwrap()
+    let mut got: Vec<(i64, i64)> = rows(&h.snapshot(view).unwrap())
         .into_iter()
-        .map(|r| match (&r.0[0], &r.0[1]) {
-            (Scalar::I64(k), Scalar::I64(c)) => (*k, *c),
-            _ => panic!("shape"),
-        })
+        .map(|r| (r[0], r[1]))
         .collect();
     got.sort();
     got
@@ -45,7 +76,7 @@ fn pairs(h: &mut Hotlap, view: &str) -> Vec<(i64, i64)> {
 
 #[test]
 fn incremental_equals_recompute_across_many_batches() {
-    let mut h = Hotlap::open().unwrap();
+    let mut h = open();
     h.register_input("events").unwrap();
     h.create_view("c", by_key(0)).unwrap();
 
@@ -54,9 +85,7 @@ fn incremental_equals_recompute_across_many_batches() {
         let pair = (i % 7, i % 3);
         let diff = if i % 5 == 0 { -1 } else { 1 };
         stream.push((pair, diff));
-        let mut b = ChangeBatch::default();
-        b.push(Row(vec![Scalar::I64(pair.0), Scalar::I64(pair.1)]), diff);
-        h.push("events", &b).unwrap();
+        h.push("events", &batch(&[(pair, diff)])).unwrap();
     }
 
     assert_eq!(pairs(&mut h, "c"), recompute(&stream));
@@ -65,7 +94,7 @@ fn incremental_equals_recompute_across_many_batches() {
 
 #[test]
 fn one_input_feeds_two_views() {
-    let mut h = Hotlap::open().unwrap();
+    let mut h = open();
     h.register_input("events").unwrap();
     h.create_view("by_key", by_key(0)).unwrap();
     h.create_view("by_value", by_key(1)).unwrap();
@@ -88,16 +117,14 @@ fn one_input_feeds_two_views() {
 
 #[test]
 fn key_retracted_to_zero_disappears() {
-    let mut h = Hotlap::open().unwrap();
+    let mut h = open();
     h.register_input("events").unwrap();
     h.create_view("c", by_key(0)).unwrap();
 
-    let mut b = ChangeBatch::default();
-    b.push(Row(vec![Scalar::I64(1), Scalar::I64(1)]), 1);
-    b.push(Row(vec![Scalar::I64(1), Scalar::I64(1)]), -1);
+    let b = zset(&[vec![1, 1], vec![1, 1]], &[1, -1]);
     h.push("events", &b).unwrap();
 
-    let got = h.snapshot("c").unwrap();
+    let got = rows(&h.snapshot("c").unwrap());
     assert!(
         got.is_empty(),
         "key retracted to zero must disappear, got {got:?}"
@@ -107,30 +134,31 @@ fn key_retracted_to_zero_disappears() {
 
 #[test]
 fn filter_project_group_count_via_api() {
-    let mut h = Hotlap::open().unwrap();
+    let mut h = open();
     h.register_input("events").unwrap();
     // keep only key>1, project [key], group by key -> [(2,1),(3,1)]
     let plan = Plan::GroupCount {
         input: Box::new(Plan::Project {
             input: Box::new(Plan::Filter {
                 input: Box::new(Plan::Source(InputId(0))),
-                pred: hotlap::plan::Predicate::Gt(0, 1),
+                pred: Predicate::Gt(0, 1),
             }),
             cols: vec![0],
         }),
         key: vec![0],
     };
     h.create_view("v", plan).unwrap();
-    let mut b = ChangeBatch::default();
-    for (k, v) in [(1i64, 10i64), (1, 20), (2, 30), (3, 30)] {
-        b.push(Row(vec![Scalar::I64(k), Scalar::I64(v)]), 1);
-    }
-    h.push("events", &b).unwrap();
+    h.push(
+        "events",
+        &zset(&[vec![1, 1, 2, 3], vec![10, 20, 30, 30]], &[1, 1, 1, 1]),
+    )
+    .unwrap();
     assert_eq!(pairs(&mut h, "v"), vec![(2, 1), (3, 1)]); // key1 filtered out (key>1)
     h.shutdown().unwrap();
 }
 
 type Stream = Vec<((i64, i64), i64)>;
+
 fn join_plan() -> Plan {
     Plan::Join {
         left: Box::new(Plan::Source(InputId(0))),
@@ -140,12 +168,8 @@ fn join_plan() -> Plan {
     }
 }
 
-fn row4(v: [i64; 4]) -> Row {
-    Row(v.into_iter().map(Scalar::I64).collect())
-}
-
-fn join_rows(h: &mut Hotlap, view: &str) -> Vec<Row> {
-    let mut got = h.snapshot(view).unwrap();
+fn join_rows(h: &mut Hotlap, view: &str) -> Vec<Vec<i64>> {
+    let mut got = rows(&h.snapshot(view).unwrap());
     got.sort();
     got
 }
@@ -158,13 +182,13 @@ fn consolidate(s: &Stream) -> BTreeMap<(i64, i64), i64> {
     m
 }
 
-fn recompute_join(users: &Stream, orders: &Stream) -> Vec<Row> {
+fn recompute_join(users: &Stream, orders: &Stream) -> Vec<Vec<i64>> {
     let (nu, no) = (consolidate(users), consolidate(orders));
-    let mut out: BTreeMap<Row, i64> = BTreeMap::new();
+    let mut out: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
     for ((id, name), d1) in &nu {
         for ((uid, amt), d2) in &no {
             if id == uid {
-                *out.entry(row4([*id, *name, *uid, *amt])).or_default() += d1 * d2;
+                *out.entry(vec![*id, *name, *uid, *amt]).or_default() += d1 * d2;
             }
         }
     }
@@ -174,7 +198,7 @@ fn recompute_join(users: &Stream, orders: &Stream) -> Vec<Row> {
 
 #[test]
 fn join_equals_recompute_across_batches() {
-    let mut h = Hotlap::open().unwrap();
+    let mut h = open();
     h.register_input("users").unwrap();
     h.register_input("orders").unwrap();
     h.create_view("joined", join_plan()).unwrap();
@@ -184,7 +208,7 @@ fn join_equals_recompute_across_batches() {
     orders.push(((1, 7), 1));
     h.push("users", &batch(&[((1, 100), 1)])).unwrap();
     h.push("orders", &batch(&[((1, 7), 1)])).unwrap();
-    assert_eq!(join_rows(&mut h, "joined"), vec![row4([1, 100, 1, 7])]);
+    assert_eq!(join_rows(&mut h, "joined"), vec![vec![1, 100, 1, 7]]);
     users.push(((1, 100), -1));
     h.push("users", &batch(&[((1, 100), -1)])).unwrap();
     assert!(join_rows(&mut h, "joined").is_empty());
