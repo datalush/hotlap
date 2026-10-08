@@ -1,17 +1,30 @@
 # Hotlap
 
-Hotlap is a native Rust query engine built on DataFusion/Arrow and the Fluss Rust
-client. Its Fluss integration supports finite/continuous log reads, KV snapshots,
-SQL DML, bounded observations and cooperative resource ownership.
-`fluss-rs` and `fluss-datafusion` retain their component names and responsibilities;
-Hotlap does not introduce another SQL engine, allocator or scheduler.
+Hotlap is a native Rust streaming engine with an Arrow-native incremental core
+(`hotlap-engine`) and an embedded SQL/DDL surface (`hotlap-sql`). The
+DataFusion-based Fluss provider integration (`fluss-datafusion`) and the Fluss
+Rust client (`fluss-rs`) retain their component names and responsibilities; the
+earlier `differential-dataflow` spike has been removed.
 
 ```text
-clients/rust/crates/fluss/  Native protocol, metadata, routing, Arrow codecs and writers
-crates/fluss-datafusion/   Native providers, planning adapters, observations and tests
+crates/hotlap/             Public facade over the incremental core
+crates/hotlap-core/        Engine contract (Plan IR, IncrementalCore, ZSetBatch)
+crates/hotlap-engine/      Arrow-native incremental engine (no differential-dataflow)
+crates/hotlap-connectors/  Source/Sink SPI, Fluss source/sink and runtime
+crates/hotlap-sql/         Embedded SQL/DDL surface and catalog
+crates/fluss-datafusion/   DataFusion Fluss provider integration
+clients/rust/crates/fluss/ Native protocol, metadata, routing, Arrow codecs and writers
 vendor/datafusion-55.1.0/  Published core with documented generic DELETE/UPDATE backport
-docs/                     Contracts, ownership boundaries and verification evidence
+docs/                      Contracts, ownership boundaries and verification evidence
 ```
+
+The incremental engine owns Arrow-native Z-set batches and row-format key
+encoding behind the `hotlap-core` `IncrementalCore` contract, so the
+`differential-dataflow`/`timely` dependency is gone. `hotlap-connectors` carries
+the Source/Sink SPI, the Fluss source/sink and the driver runtime; `hotlap-sql`
+translates embedded SQL/DDL into engine plans. Durability is engine-owned:
+checkpoints and recovery, capacity-gated sink 2PC coordination and materialized
+views created after `START` (see [durability](docs/hotlap-durability.md)).
 
 The imported Rust client originates at `dc427e1290847b4a569b6745fcb87b256292bf6a`.
 Its Apache licenses/notices remain intact. Java/reference and non-Rust bindings
