@@ -28,6 +28,7 @@ impl IncrementalCore for EngineCore {
     }
 
     fn build_view(&mut self, view: ViewId, plan: &Plan) -> Result<(), CoreError> {
+        self.ensure_healthy()?;
         if self.views.contains_key(&view) {
             return Err(CoreError::Unsupported(format!(
                 "view {view:?} already built"
@@ -74,6 +75,23 @@ impl IncrementalCore for EngineCore {
             )));
         }
         self.specs.insert(input, spec);
+        Ok(())
+    }
+
+    fn declare_splits(&mut self, input: InputId, splits: &[SplitId]) -> Result<(), CoreError> {
+        self.ensure_healthy()?;
+        if self.frozen {
+            return Err(CoreError::Unsupported("engine already running".into()));
+        }
+        if !self.registered.contains(&input) {
+            return Err(CoreError::Unsupported(format!("unknown input {input:?}")));
+        }
+        // A declared split joins the map at its initial zero watermark so the
+        // input minimum accounts for it before its first batch arrives.
+        for &split in splits {
+            self.split_watermarks.entry((input, split)).or_insert(0);
+        }
+        self.refresh_watermark(input);
         Ok(())
     }
 

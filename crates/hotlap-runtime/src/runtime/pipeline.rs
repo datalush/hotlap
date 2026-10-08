@@ -10,7 +10,7 @@ use crate::runtime::sink::SinkPump;
 use hotlap_connectors::convert;
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::Sink;
-use hotlap_connectors::source::{Source, SourceBatch, SourceStream, Split};
+use hotlap_connectors::source::{Source, SourceBatch, SourceStream, Split, SplitId};
 
 /// Event-time declaration for the pipeline's input.
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +51,13 @@ pub fn setup(hotlap: &mut Hotlap, pipeline: &Pipeline) -> Result<(), ConnectorEr
             .ok_or_else(|| ConnectorError::Unsupported("source has no event-time column".into()))?;
         hotlap
             .declare_watermark(&pipeline.input, time_col, w.lag)
+            .map_err(hotlap_err)?;
+        // Register every declared split before the first push so the input
+        // watermark cannot advance past a split that has not produced a batch.
+        let splits = pipeline.source.splits()?;
+        let ids: Vec<SplitId> = splits.iter().map(|split| split.id).collect();
+        hotlap
+            .declare_splits(&pipeline.input, &ids)
             .map_err(hotlap_err)?;
     }
     for (name, plan) in &pipeline.views {

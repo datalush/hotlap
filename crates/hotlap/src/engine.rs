@@ -68,6 +68,19 @@ impl Hotlap {
             .map_err(|e| HotlapError(format!("{e}")))
     }
 
+    /// Declare the splits (read units) `input` may produce, before the first
+    /// push. Keeps the input watermark from advancing past a split that has not
+    /// produced its first batch yet; see [`IncrementalCore::declare_splits`].
+    pub fn declare_splits(&mut self, input: &str, splits: &[SplitId]) -> Result<(), HotlapError> {
+        let id = *self
+            .inputs
+            .get(input)
+            .ok_or_else(|| HotlapError("no such input".into()))?;
+        self.core
+            .declare_splits(id, splits)
+            .map_err(|e| HotlapError(format!("{e}")))
+    }
+
     /// Retain the last `events` input deltas so a view can be created after the
     /// first push. Only before the first push; off by default.
     pub fn set_input_retention(&mut self, events: usize) -> Result<(), HotlapError> {

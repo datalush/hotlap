@@ -11,7 +11,12 @@ use crate::error::EngineError;
 
 impl EngineCore {
     /// Captures every registered input and built view into a versioned snapshot.
+    ///
+    /// Fails once a push may have applied partially: a snapshot of that state
+    /// would capture a mix of applied and unapplied views, and recovery would
+    /// faithfully restore the corruption.
     pub fn checkpoint(&self) -> Result<EngineSnapshot, EngineError> {
+        self.ensure_healthy()?;
         Ok(EngineSnapshot {
             format_version: ENGINE_SNAPSHOT_FORMAT_VERSION,
             epoch: self.epoch,

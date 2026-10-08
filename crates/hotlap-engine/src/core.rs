@@ -76,8 +76,9 @@ pub struct EngineCore {
     /// lowered minimum never reopens a closed window.
     pub(super) watermarks: HashMap<InputId, i64>,
     /// Monotonic watermark per `(input, split)`: `max(event_ts) - lag`, clamped
-    /// at zero. A split joins this map on its first batch ("not yet started"
-    /// splits do not hold the input back).
+    /// at zero. Declared splits are seeded at zero before the first push so a
+    /// not-yet-seen split holds the input minimum back; a split never declared
+    /// joins the map on its first batch instead.
     pub(super) split_watermarks: HashMap<(InputId, SplitId), i64>,
     pub(super) schemas: HashMap<InputId, SchemaRef>,
     pub(super) late: HashMap<InputId, u64>,

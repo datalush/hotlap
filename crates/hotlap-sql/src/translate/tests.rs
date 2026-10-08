@@ -92,6 +92,18 @@ async fn rejects_global_count_without_group_key() {
 }
 
 #[tokio::test]
+async fn rejects_tumble_count_without_group_key() {
+    let ctx = ctx_with_src();
+    let err = plan_for(&ctx, "SELECT count(*) FROM src GROUP BY tumble(ts, 10000)")
+        .await
+        .expect_err("tumble without a column key has no representable group key");
+    assert!(
+        matches!(err, crate::SqlError::Unsupported(_)),
+        "must be a planning error, got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn translates_group_count_without_tumble() {
     let ctx = ctx_with_src();
     let plan = plan_for(&ctx, "SELECT k, count(*) FROM src GROUP BY k")

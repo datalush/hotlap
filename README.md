@@ -25,7 +25,7 @@ encoding behind the `hotlap-core` `IncrementalCore` contract, so the
 the Source/Sink SPI and the Fluss source/sink; `hotlap-runtime` is the
 composition root that selects a kernel and drives the engine thread, so the
 connector crate never depends on a concrete engine. `hotlap-sql` translates
-embedded SQL/DDL into engine plans. Durability is engine-owned:
+embedded SQL/DDL into engine plans. Durability lives in `hotlap-runtime`:
 checkpoints and recovery, capacity-gated sink 2PC coordination and materialized
 views created after `START` (see [durability](docs/hotlap-durability.md)).
 

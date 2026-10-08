@@ -167,6 +167,13 @@ fn failed_push_poisons_snapshot_push_and_take_changes() {
     assert!(core.snapshot(ViewId(1)).is_err());
     assert!(core.push(InputId(0), &zset(&[(2, 1)])).is_err());
     assert!(core.take_changes(ViewId(0)).is_err());
+    // Checkpointing partial state and building a view over it are barred too:
+    // recovery would otherwise restore the corruption.
+    assert!(core.checkpoint().is_err());
+    assert!(
+        core.build_view(ViewId(2), &Plan::Source(InputId(0)))
+            .is_err()
+    );
 }
 
 /// The multi-view path without a failure is unchanged (differential).

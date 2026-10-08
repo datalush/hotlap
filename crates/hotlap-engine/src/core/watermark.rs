@@ -69,6 +69,13 @@ impl EngineCore {
         let candidate = max_ts.saturating_sub(lag).max(0);
         let entry = self.split_watermarks.entry((input, split)).or_insert(0);
         *entry = (*entry).max(candidate);
+        self.refresh_watermark(input);
+    }
+
+    /// Recomputes `input`'s effective watermark as the minimum across its
+    /// splits. The map is non-empty for a declared or seen split, so a
+    /// not-yet-seen declared split pins the minimum at its initial value.
+    pub(super) fn refresh_watermark(&mut self, input: InputId) {
         let minimum = self
             .split_watermarks
             .iter()

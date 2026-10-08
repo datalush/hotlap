@@ -184,6 +184,16 @@ impl Source for FlussSource {
             }
             split.start = offset;
         }
+        // Seed the applied position with the captured offsets. Otherwise a
+        // checkpoint taken before the first post-recovery commit captures
+        // EARLIEST, and a later restart replays the whole log over the restored
+        // snapshot (double-apply).
+        let mut progress = lock_progress(&self.progress)?;
+        for split in &splits {
+            if let Some(offset) = state.offsets.get(&split.id) {
+                progress.offsets.insert(split.id, *offset);
+            }
+        }
         Ok(splits)
     }
 }

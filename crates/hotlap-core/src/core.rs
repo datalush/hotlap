@@ -39,6 +39,20 @@ pub trait IncrementalCore {
     /// [`register_input`](Self::register_input) of that source.
     fn declare_watermark(&mut self, input: InputId, spec: WatermarkSpec) -> Result<(), CoreError>;
 
+    /// Declare the splits (read units) an input may produce. Only before the
+    /// first push.
+    ///
+    /// Engines tracking per-split watermarks initialize each declared split so
+    /// the input watermark — the minimum across its splits — accounts for
+    /// splits that have not produced a batch yet. Without this a fast split's
+    /// first batch can advance the minimum past a slower split's start and
+    /// close a window before its records arrive. The default ignores the
+    /// declaration, preserving single-stream behaviour.
+    fn declare_splits(&mut self, input: InputId, splits: &[SplitId]) -> Result<(), CoreError> {
+        let _ = (input, splits);
+        Ok(())
+    }
+
     /// Feed a Z-set to the given source, consolidating every consuming view.
     ///
     /// Equivalent to [`push_split`](Self::push_split) with the implicit split
