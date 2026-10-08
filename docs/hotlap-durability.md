@@ -195,11 +195,14 @@ y la forma 2PC: `prepare()` (por defecto no-op), `commit()`, `abort()`.
 `capabilities()` por defecto es `AtLeastOnce`.
 
 El sink también **declara** si su `commit` es **re-conducible** tras un
-reinicio (`commit_redriable()`, por defecto `!AtLeastOnce`): `Transactional` e
-`Idempotent` califican por defecto; un sink puede **sobreescribirlo** cuando la
-capacidad subestima o sobreestima la garantía real (p.ej. un sink
-aparentemente idempotente cuyos efectos externos no son repetibles). Recovery
-usa esta declaración para **promover** o **descartar** la ventana de crash.
+reinicio (`commit_redriable()`, por defecto sólo `Idempotent`): un sink
+`Transactional` debe **sobreescribirlo** para optar explícitamente, porque sus
+escrituras preparadas pueden no haber sobrevivido al crash y promover un commit
+sin confirmar perdería datos en silencio. Un sink puede sobreescribir la
+declaración cuando la capacidad subestima o sobreestima la garantía real (p.ej.
+un sink aparentemente idempotente cuyos efectos externos no son repetibles).
+Recovery usa esta declaración para **promover** o **descartar** la ventana de
+crash.
 
 `SinkBarrier` (`runtime/sink_barrier.rs`) adapta el protocolo por capacidad:
 
@@ -236,21 +239,22 @@ checkpoint sin publicar. Para cerrarla, `take` sigue el orden
 **Contrato del sink.** `Sink::commit` **debe tolerar ejecutarse más de una
 vez**: la barrera puede confirmar el mismo sink más de una vez y recovery
 re-conduce el commit tras un reinicio. Un sink que no pueda repetir su commit
-debe declarar `commit_redriable() == false` (p.ej. `AtLeastOnce` lo hace por
-defecto); recovery entonces descarta C y replaya.
+debe declarar `commit_redriable() == false` (p.ej. `AtLeastOnce` y
+`Transactional` lo hacen por defecto); recovery entonces descarta C y replaya.
 
 **Garantías por capacidad.**
 
 | Capacidad | Antes (replay a ciegas) | Con el marker |
 | --- | --- | --- |
 | `Idempotent` | replay (dedup por clave) → effectively-once | promover C sin replay → effectively-once |
-| `Transactional` | replay → **duplicado** | re-conducir commit + promover → exactly-once\* |
+| `Transactional` | replay → **duplicado** | re-conducir commit + promover → exactly-once\* (requiere opt-in) |
 | `AtLeastOnce` | replay → at-least-once | replay + **señal explícita** → at-least-once |
 
 \* Requiere que `Sink::commit` sea re-conducible tras reinicio (contrato de
-arriba). Si un sink transaccional necesitara un **handle de transacción
-durable** para re-conducir su commit, eso es la opción **B** (2PC real), un
-follow-up: Fluss no ofrece 2PC y hoy no hay ningún sink `Transactional`.
+arriba): un sink `Transactional` debe declararlo explícitamente con
+`commit_redriable() == true`. Si un sink transaccional necesitara un **handle de
+transacción durable** para re-conducir su commit, eso es la opción **B** (2PC
+real), un follow-up: Fluss no ofrece 2PC y hoy no hay ningún sink `Transactional`.
 
 Sin marker, recovery es **idéntico** al comportamiento anterior (válido más
 nuevo, o arranque limpio).

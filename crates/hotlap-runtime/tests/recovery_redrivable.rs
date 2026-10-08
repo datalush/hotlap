@@ -1,7 +1,7 @@
 //! A sink declares whether its `commit` may be re-driven after a restart.
 //!
-//! Recovery uses `Sink::commit_redriable` (defaulting to the delivery
-//! capability) to promote or discard an interrupted commit.
+//! Recovery uses `Sink::commit_redriable` (only `Idempotent` by default; other
+//! capabilities must opt in) to promote or discard an interrupted commit.
 
 #[path = "common/recovery.rs"]
 mod recovery;

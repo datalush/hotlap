@@ -136,7 +136,7 @@ fn commit_marker_is_durable_before_commit_and_removed_after_valid() {
 fn recovery_promotes_a_redrivable_interrupted_commit() {
     let backend = seed_valid_one();
     seed_pending(&backend, 1, 2);
-    let (sink, commits) = sink(SinkCapabilities::Transactional);
+    let (sink, commits) = sink(SinkCapabilities::Idempotent);
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
         .with_sinks(vec![SinkSync::sink_only(sink)]);
 

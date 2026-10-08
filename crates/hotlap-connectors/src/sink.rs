@@ -40,16 +40,19 @@ pub trait Sink: Send + Sync {
     /// marker never landed (the process stopped mid-commit). When every sink
     /// declares its commit re-drivable, recovery re-drives `commit` and
     /// publishes the checkpoint without replay. Running `commit` twice must
-    /// therefore not duplicate output: [`SinkCapabilities::Transactional`] and
-    /// [`SinkCapabilities::Idempotent`] sinks qualify by default, while an
+    /// therefore not duplicate output: only [`SinkCapabilities::Idempotent`]
+    /// sinks qualify by default, because replaying their keyed upserts is safe.
+    /// A [`SinkCapabilities::Transactional`] sink must opt in with an explicit
+    /// override: its staged writes may not have survived the crash, so
+    /// promoting an uncommitted checkpoint would silently lose them. An
     /// [`SinkCapabilities::AtLeastOnce`] sink may already have exposed its
-    /// writes and must be discarded and replayed instead.
+    /// writes and is discarded and replayed instead.
     ///
     /// Override this when a capability understates or overstates the guarantee,
-    /// e.g. an idempotent-looking sink whose external side effects cannot
-    /// actually be repeated.
+    /// e.g. a transactional sink with durable commit recovery, or an
+    /// idempotent-looking sink whose external side effects cannot be repeated.
     fn commit_redriable(&self) -> bool {
-        !matches!(self.capabilities(), SinkCapabilities::AtLeastOnce)
+        matches!(self.capabilities(), SinkCapabilities::Idempotent)
     }
     /// First phase of two-phase commit.
     ///
@@ -99,7 +102,10 @@ mod tests {
     #[test]
     fn default_redrivability_follows_the_delivery_capability() {
         let sink = |capabilities| Fake { capabilities };
-        assert!(sink(SinkCapabilities::Transactional).commit_redriable());
+        assert!(
+            !sink(SinkCapabilities::Transactional).commit_redriable(),
+            "transactional sinks must opt in explicitly"
+        );
         assert!(sink(SinkCapabilities::Idempotent).commit_redriable());
         assert!(!sink(SinkCapabilities::AtLeastOnce).commit_redriable());
     }
