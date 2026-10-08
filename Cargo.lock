@@ -2068,6 +2068,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotlap-cli"
+version = "0.0.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "futures",
+ "hotlap",
+ "hotlap-connectors",
+ "hotlap-runtime",
+ "hotlap-sql",
+]
+
+[[package]]
 name = "hotlap-connectors"
 version = "0.0.0"
 dependencies = [

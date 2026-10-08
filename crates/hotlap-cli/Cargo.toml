@@ -1,0 +1,26 @@
+[package]
+name = "hotlap-cli"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+autobins = false
+
+[lib]
+name = "hotlap_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hotlap"
+path = "src/main.rs"
+
+[dependencies]
+hotlap = { path = "../hotlap" }
+hotlap-connectors = { path = "../hotlap-connectors" }
+hotlap-runtime = { path = "../hotlap-runtime" }
+hotlap-sql = { path = "../hotlap-sql" }
+arrow = { version = "59.2", features = ["prettyprint"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+futures = "0.3"
