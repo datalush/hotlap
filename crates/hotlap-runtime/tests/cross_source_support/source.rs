@@ -25,7 +25,6 @@ pub struct ControlledSource {
     fail_read: bool,
     commits: Arc<Mutex<Vec<(SplitId, Offset)>>>,
     applied: Arc<Mutex<SourceState>>,
-    event_time_column: Mutex<Option<usize>>,
 }
 
 impl ControlledSource {
@@ -45,7 +44,6 @@ impl ControlledSource {
             fail_read: false,
             commits: Arc::new(Mutex::new(Vec::new())),
             applied: Arc::new(Mutex::new(SourceState::default())),
-            event_time_column: Mutex::new(None),
         });
         (source, senders)
     }
@@ -59,7 +57,6 @@ impl ControlledSource {
             fail_read: true,
             commits: Arc::new(Mutex::new(Vec::new())),
             applied: Arc::new(Mutex::new(SourceState::default())),
-            event_time_column: Mutex::new(None),
         })
     }
 
@@ -71,11 +68,6 @@ impl ControlledSource {
     /// The applied state the runtime would persist.
     pub fn applied(&self) -> SourceState {
         self.applied.lock().unwrap().clone()
-    }
-
-    /// Override the event-time column reported by [`Source::event_time_column`].
-    pub fn set_event_time_column(&self, column: Option<usize>) {
-        *self.event_time_column.lock().unwrap() = column;
     }
 }
 
@@ -122,6 +114,6 @@ impl Source for ControlledSource {
     }
 
     fn event_time_column(&self) -> Option<usize> {
-        *self.event_time_column.lock().unwrap()
+        None
     }
 }

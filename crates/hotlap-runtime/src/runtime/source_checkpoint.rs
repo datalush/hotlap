@@ -11,7 +11,7 @@ mod validate;
 use hotlap::InputId;
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::source::SourceState;
-use hotlap_engine::EngineSnapshot;
+use hotlap_engine::{EngineSnapshot, encode_schema};
 
 use crate::runtime::sources::Sources;
 
@@ -43,17 +43,32 @@ pub struct SourcesCheckpoint {
 
 impl SourcesCheckpoint {
     /// Capture the applied state, schema and time configuration of `sources`.
-    pub fn capture(_sources: &Sources) -> Result<Self, ConnectorError> {
-        todo!("red phase")
+    ///
+    /// Entries follow the id order of [`Sources`], so two sources that both
+    /// use split 0 keep separate applied maps and never merge their offsets.
+    pub fn capture(sources: &Sources) -> Result<Self, ConnectorError> {
+        let mut entries = Vec::with_capacity(sources.entries().len());
+        for input in sources.entries() {
+            let schema = encode_schema(&input.source.schema()).map_err(codec_err)?;
+            entries.push(SavedSource {
+                id: input.id,
+                name: input.name.clone(),
+                schema,
+                watermark_lag: input.watermark.map(|watermark| watermark.lag),
+                event_time_column: input.source.event_time_column(),
+                state: input.source.state(),
+            });
+        }
+        Ok(Self { entries })
     }
 
     /// Validate this checkpoint against the declared `sources` and `engine`.
     pub fn validate(
         &self,
-        _sources: &Sources,
-        _engine: &EngineSnapshot,
+        sources: &Sources,
+        engine: &EngineSnapshot,
     ) -> Result<(), ConnectorError> {
-        todo!("red phase")
+        validate::validate(self, sources, engine)
     }
 }
 

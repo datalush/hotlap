@@ -17,7 +17,11 @@ use hotlap_runtime::runtime::sources::{InputSource, Sources};
 use source_support::ControlledSource;
 
 fn schema(nullable: bool) -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, nullable)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "k",
+        DataType::Int64,
+        nullable,
+    )]))
 }
 
 fn split(id: i32) -> Split {
@@ -30,7 +34,12 @@ fn input(
     source: Arc<ControlledSource>,
     watermark: Option<Watermark>,
 ) -> InputSource {
-    InputSource { id: InputId(id), name: name.to_string(), source, watermark }
+    InputSource {
+        id: InputId(id),
+        name: name.to_string(),
+        source,
+        watermark,
+    }
 }
 
 /// A set of two sources, ids 0 and 1, with distinct applied offsets.
@@ -40,40 +49,36 @@ fn two_sources() -> (Sources, Arc<ControlledSource>, Arc<ControlledSource>) {
     let (b, _tb) = ControlledSource::new(s, vec![split(0)]);
     a.commit(0, 5).unwrap();
     b.commit(0, 9).unwrap();
-    let sources = Sources::new(vec![input(1, "b", b.clone(), None), input(0, "a", a.clone(), None)])
-        .unwrap();
+    assert_eq!(a.applied().offsets.get(&0), Some(&5));
+    assert_eq!(b.commits(), vec![(0, 9)]);
+    let sources = Sources::new(vec![
+        input(1, "b", b.clone(), None),
+        input(0, "a", a.clone(), None),
+    ])
+    .unwrap();
     (sources, a, b)
 }
 
 /// A snapshot whose inputs mirror the checkpoint, as a first push would leave it.
 fn snapshot_matching(checkpoint: &SourcesCheckpoint, sources: &Sources) -> EngineSnapshot {
-    let inputs = checkpoint
-        .entries
-        .iter()
-        .map(|entry| {
-            let splits = sources
-                .get(entry.id)
-                .unwrap()
-                .source
-                .splits()
-                .unwrap()
-                .into_iter()
-                .map(|split| (split.id, 0))
-                .collect();
-            let spec = entry.watermark_lag.map(|lag| WatermarkSpec {
-                time_col: entry.event_time_column.unwrap_or(0),
-                lag,
-            });
-            InputSnapshot {
-                id: entry.id,
-                schema: Some(entry.schema.clone()),
-                spec,
-                watermark: 0,
-                splits,
-                late: 0,
-            }
-        })
-        .collect();
+    let mut inputs = Vec::new();
+    for entry in &checkpoint.entries {
+        let input = sources.get(entry.id).unwrap();
+        let declared = input.source.splits().unwrap();
+        let splits: Vec<_> = declared.iter().map(|s| (s.id, 0)).collect();
+        let spec = entry.watermark_lag.map(|lag| WatermarkSpec {
+            time_col: entry.event_time_column.unwrap_or(0),
+            lag,
+        });
+        inputs.push(InputSnapshot {
+            id: entry.id,
+            schema: Some(entry.schema.clone()),
+            spec,
+            watermark: 0,
+            splits,
+            late: 0,
+        });
+    }
     EngineSnapshot {
         format_version: ENGINE_SNAPSHOT_FORMAT_VERSION,
         epoch: 0,
@@ -84,20 +89,22 @@ fn snapshot_matching(checkpoint: &SourcesCheckpoint, sources: &Sources) -> Engin
 }
 
 #[test]
-fn matching_checkpoint_validates() {
-    let (sources, _a, _b) = two_sources();
-    let checkpoint = SourcesCheckpoint::capture(&sources).unwrap();
-    let snapshot = snapshot_matching(&checkpoint, &sources);
-    checkpoint.validate(&sources, &snapshot).unwrap();
-}
-
-#[test]
-fn reordered_declaration_validates() {
+fn matching_and_reordered_declarations_validate() {
     let (sources, a, b) = two_sources();
     let checkpoint = SourcesCheckpoint::capture(&sources).unwrap();
     let snapshot = snapshot_matching(&checkpoint, &sources);
+    checkpoint.validate(&sources, &snapshot).unwrap();
     let reordered = Sources::new(vec![input(0, "a", a, None), input(1, "b", b, None)]).unwrap();
     checkpoint.validate(&reordered, &snapshot).unwrap();
+}
+
+#[test]
+fn validation_does_not_open_source_streams() {
+    let bad = ControlledSource::failing_read(schema(false));
+    let sources = Sources::new(vec![input(0, "bad", bad, None)]).unwrap();
+    let checkpoint = SourcesCheckpoint::capture(&sources).unwrap();
+    let snapshot = snapshot_matching(&checkpoint, &sources);
+    checkpoint.validate(&sources, &snapshot).unwrap();
 }
 
 #[test]
@@ -125,7 +132,6 @@ fn changed_schema_does_not_validate() {
 fn changed_lag_or_event_time_column_does_not_validate() {
     let s = schema(false);
     let (a, _ta) = ControlledSource::new(s.clone(), vec![split(0)]);
-    a.set_event_time_column(Some(0));
     let (b, _tb) = ControlledSource::new(s, vec![split(0)]);
     let declared = Sources::new(vec![
         input(0, "a", a.clone(), Some(Watermark { lag: 5 })),
@@ -142,13 +148,9 @@ fn changed_lag_or_event_time_column_does_not_validate() {
     .unwrap();
     assert!(checkpoint.validate(&wrong_lag, &snapshot).is_err());
 
-    a.set_event_time_column(Some(2));
-    let wrong_column = Sources::new(vec![
-        input(0, "a", a, Some(Watermark { lag: 5 })),
-        input(1, "b", b, None),
-    ])
-    .unwrap();
-    assert!(checkpoint.validate(&wrong_column, &snapshot).is_err());
+    let mut wrong_column = checkpoint.clone();
+    wrong_column.entries[0].event_time_column = Some(0);
+    assert!(wrong_column.validate(&declared, &snapshot).is_err());
 }
 
 #[test]

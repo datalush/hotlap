@@ -10,7 +10,9 @@ use hotlap::InputId;
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::source::{Source, SourceState, Split};
 use hotlap_engine::{decode_schema, encode_framed};
-use hotlap_runtime::runtime::source_checkpoint::{SourcesCheckpoint, decode_sources, encode_sources};
+use hotlap_runtime::runtime::source_checkpoint::{
+    SourcesCheckpoint, decode_sources, encode_sources,
+};
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
 use source_support::ControlledSource;
 
@@ -38,8 +40,18 @@ fn two_split_zero_sources() -> (Sources, Arc<ControlledSource>, Arc<ControlledSo
     let (b, _tb) = ControlledSource::new(s, vec![split(0)]);
     a.commit(0, 5).unwrap();
     b.commit(0, 9).unwrap();
+    assert_eq!(a.applied().offsets.get(&0), Some(&5));
+    assert_eq!(b.commits(), vec![(0, 9)]);
     let sources = Sources::new(vec![input(1, "b", b.clone()), input(0, "a", a.clone())]).unwrap();
     (sources, a, b)
+}
+
+#[test]
+fn capture_does_not_open_the_source_stream() {
+    let bad = ControlledSource::failing_read(schema());
+    let sources = Sources::new(vec![input(0, "bad", bad)]).unwrap();
+    let checkpoint = SourcesCheckpoint::capture(&sources).unwrap();
+    assert_eq!(checkpoint.entries[0].name, "bad");
 }
 
 #[test]

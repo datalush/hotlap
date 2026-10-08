@@ -29,8 +29,8 @@ pub use time::Frontier;
 pub use time::Watermark;
 pub use zset::{consolidate, sort_rows};
 
+pub use hotlap_core::snapshot::InputSnapshot;
 pub use hotlap_core::{
     AggFunc, AggSpec, CoreError, ENGINE_SNAPSHOT_FORMAT_VERSION, EngineSnapshot, IncrementalCore,
     InputId, MetricsRegistry, Plan, Predicate, Scalar, ViewId, WatermarkSpec,
 };
-pub use hotlap_core::snapshot::InputSnapshot;
