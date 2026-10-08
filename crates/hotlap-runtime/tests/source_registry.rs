@@ -190,15 +190,10 @@ fn fixture_records_commits_and_applied_state() {
 
 #[test]
 fn stream_with_rejects_a_split_count_mismatch_before_opening() {
-    let s = schema();
-    let (a, _ta) = ControlledSource::new(s.clone(), vec![split(0)]);
-    let (b, _tb) = ControlledSource::new(s, vec![split(0)]);
+    let (a, _ta) = ControlledSource::new(schema(), vec![split(0)]);
+    let (b, _tb) = ControlledSource::new(schema(), vec![split(0)]);
     let sources = Sources::new(vec![input(0, "a", a), input(1, "b", b)]).unwrap();
-    // One list for two sources is rejected; a matching call then opens both.
     assert!(sources.stream_with(&[vec![split(0)]]).is_err());
-    assert!(
-        sources
-            .stream_with(&[vec![split(0)], vec![split(0)]])
-            .is_ok()
-    );
+    let both = [vec![split(0)], vec![split(0)]];
+    assert!(sources.stream_with(&both).is_ok());
 }

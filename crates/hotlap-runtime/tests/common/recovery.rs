@@ -8,10 +8,10 @@ use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, Checkpointer};
 use hotlap_runtime::runtime::pipeline::{self, Pipeline};
 use hotlap_runtime::runtime::sources::{InputSource, InputStream, Sources};
 
-#[path = "recovery/resumable.rs"]
-mod resumable;
 #[path = "backend.rs"]
 mod backend;
+#[path = "recovery/resumable.rs"]
+mod resumable;
 
 pub use backend::SharedBackend;
 pub use resumable::{Dataset, ResumableSource};
