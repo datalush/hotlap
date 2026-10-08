@@ -80,6 +80,30 @@ async fn rejects_non_identity_projection() {
 }
 
 #[tokio::test]
+async fn rejects_global_count_without_group_key() {
+    let ctx = ctx_with_src();
+    let err = plan_for(&ctx, "SELECT count(*) FROM src")
+        .await
+        .expect_err("global count(*) has no representable group key");
+    assert!(
+        matches!(err, crate::SqlError::Unsupported(_)),
+        "must be a planning error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn translates_group_count_without_tumble() {
+    let ctx = ctx_with_src();
+    let plan = plan_for(&ctx, "SELECT k, count(*) FROM src GROUP BY k")
+        .await
+        .expect("grouped count must remain supported");
+    match plan {
+        Plan::GroupCount { key, .. } => assert_eq!(key, vec![0]),
+        other => panic!("expected GroupCount, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn rejects_count_of_column() {
     let ctx = ctx_with_src();
     assert!(

@@ -96,6 +96,24 @@ async fn unrepresentable_mv_output_rejected() {
 }
 
 #[tokio::test]
+async fn global_count_rejected_at_planning() {
+    let mut session = session(kv_schema());
+    session.sql(SOURCE).await.unwrap();
+    // No grouping key: must fail while planning the DDL, before any ingest.
+    let view = "CREATE MATERIALIZED VIEW mv AS SELECT count(*) FROM src;";
+    assert!(matches!(
+        session.sql(view).await,
+        Err(SqlError::Unsupported(_))
+    ));
+    // A grouped count stays supported.
+    let grouped = "CREATE MATERIALIZED VIEW mv AS SELECT k, count(*) FROM src GROUP BY k;";
+    assert!(matches!(
+        session.sql(grouped).await,
+        Ok(QueryResult::Ack(_))
+    ));
+}
+
+#[tokio::test]
 async fn rejected_view_does_not_poison_its_name() {
     let mut session = session(float_schema());
     session.sql(SOURCE).await.unwrap();

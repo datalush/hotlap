@@ -87,6 +87,14 @@ fn translate_aggregate(a: &Aggregate, source: InputId) -> Result<Plan, SqlError>
             }
         }
     }
+    // A grouping-key-less `count(*)` cannot be represented: `GroupCount`
+    // requires a non-empty key. Reject it here so the failure surfaces while
+    // planning the view, not later at ingest.
+    if tumble.is_none() && key.is_empty() {
+        return Err(SqlError::Unsupported(
+            "global count(*) without a grouping key is not supported".into(),
+        ));
+    }
     match tumble {
         Some((time_col, size)) => Ok(Plan::TumbleCount {
             input: Box::new(input),
