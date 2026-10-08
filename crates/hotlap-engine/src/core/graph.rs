@@ -10,9 +10,7 @@ use arrow::datatypes::SchemaRef;
 use hotlap_core::plan::sources;
 use hotlap_core::{InputId, Plan, Predicate, ZSetBatch};
 
-use crate::ops::{Join, TumbleCount};
-
-use apply::GroupState;
+use crate::ops::{GroupCount, Join, TumbleCount};
 
 pub(super) use apply::accumulate;
 
@@ -29,8 +27,7 @@ enum Node {
     },
     Group {
         input: Box<Node>,
-        key: Vec<usize>,
-        state: Option<Box<GroupState>>,
+        reducer: GroupCount,
     },
     Joined {
         left: Box<Node>,
@@ -45,13 +42,12 @@ enum Node {
     },
 }
 
-/// Per-evaluation context: the pushed delta, known schemas, watermark, work.
+/// Per-evaluation context: the pushed delta, known schemas, watermark.
 struct EvalCtx<'a> {
     pushed: InputId,
     delta: &'a ZSetBatch,
     schemas: &'a HashMap<InputId, SchemaRef>,
     watermark: i64,
-    rows: u64,
 }
 
 /// A persistent plan compiled to stateful nodes for one view.
@@ -75,23 +71,21 @@ impl ViewGraph {
     }
 
     /// Evaluates the graph over the pushed `delta`, returning the view's output
-    /// delta (if any) and the number of rows fed to operators.
+    /// delta (if any).
     pub(super) fn eval(
         &mut self,
         pushed: InputId,
         delta: &ZSetBatch,
         schemas: &HashMap<InputId, SchemaRef>,
         watermark: i64,
-    ) -> Result<(Option<ZSetBatch>, u64), crate::error::EngineError> {
+    ) -> Result<Option<ZSetBatch>, crate::error::EngineError> {
         let mut ctx = EvalCtx {
             pushed,
             delta,
             schemas,
             watermark,
-            rows: 0,
         };
-        let output = self.root.eval(&mut ctx)?;
-        Ok((output, ctx.rows))
+        self.root.eval(&mut ctx)
     }
 }
 
@@ -109,8 +103,7 @@ fn compile(plan: &Plan) -> Node {
         },
         Plan::GroupCount { input, key } => Node::Group {
             input: Box::new(compile(input)),
-            key: key.clone(),
-            state: None,
+            reducer: GroupCount::new(key),
         },
         Plan::Join {
             left,

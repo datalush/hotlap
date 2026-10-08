@@ -2,10 +2,8 @@
 
 use arrow::compute::{concat, concat_batches};
 
-use crate::arrange::KeyedArrangement;
 use crate::error::EngineError;
-use crate::keys::KeyConverter;
-use crate::ops::{GroupCount, Join, filter, project};
+use crate::ops::{GroupCount, Join, TumbleCount, filter, project};
 use hotlap_core::{InputId, Predicate, ZSetBatch};
 
 use super::{EvalCtx, Node};
@@ -43,7 +41,7 @@ impl Node {
             Node::Source(id) => source_eval(*id, ctx),
             Node::Filter { input, pred } => filter_eval(input, pred, ctx),
             Node::Project { input, cols } => project_eval(input, cols, ctx),
-            Node::Group { input, key, state } => group_eval(input, key, state, ctx),
+            Node::Group { input, reducer } => group_eval(input, reducer, ctx),
             Node::Joined {
                 left,
                 right,
@@ -60,7 +58,6 @@ impl Node {
 /// known; `None` while a sibling source's schema is still unknown.
 fn source_eval(id: InputId, ctx: &mut EvalCtx) -> Result<Option<ZSetBatch>, EngineError> {
     if id == ctx.pushed {
-        ctx.rows += ctx.delta.len() as u64;
         Ok(Some(ctx.delta.clone()))
     } else {
         Ok(ctx
@@ -79,7 +76,6 @@ fn filter_eval(
     match input.eval(ctx)? {
         None => Ok(None),
         Some(z) => {
-            ctx.rows += z.len() as u64;
             let mask = pred.eval(&z.batch)?;
             Ok(Some(filter(&z, &mask)?))
         }
@@ -94,71 +90,32 @@ fn project_eval(
 ) -> Result<Option<ZSetBatch>, EngineError> {
     match input.eval(ctx)? {
         None => Ok(None),
-        Some(z) => {
-            ctx.rows += z.len() as u64;
-            Ok(Some(project(&z, cols)?))
-        }
+        Some(z) => Ok(Some(project(&z, cols)?)),
     }
 }
 
-/// Applies the child's delta to the retained group-count arrangement.
+/// Feeds the child's delta to the retained, delta-incremental group count.
 fn group_eval(
     input: &mut Node,
-    key: &[usize],
-    state: &mut Option<Box<GroupState>>,
+    reducer: &mut GroupCount,
     ctx: &mut EvalCtx,
 ) -> Result<Option<ZSetBatch>, EngineError> {
     match input.eval(ctx)? {
         None => Ok(None),
-        Some(z) => {
-            ctx.rows += z.len() as u64;
-            group_apply(state, key, z)
-        }
+        Some(z) => Ok(Some(reducer.apply(&z)?)),
     }
 }
 
 /// Feeds the child's delta to the retained tumbling-window reducer.
 fn window_eval(
     input: &mut Node,
-    reducer: &mut crate::ops::TumbleCount,
+    reducer: &mut TumbleCount,
     ctx: &mut EvalCtx,
 ) -> Result<Option<ZSetBatch>, EngineError> {
     match input.eval(ctx)? {
         None => Ok(None),
-        Some(z) => {
-            ctx.rows += z.len() as u64;
-            Ok(Some(reducer.apply(&z, ctx.watermark)?))
-        }
+        Some(z) => Ok(Some(reducer.apply(&z, ctx.watermark)?)),
     }
-}
-
-/// State feeding one group-count node once its input schema is known.
-pub(super) struct GroupState {
-    arrangement: KeyedArrangement,
-    keys: KeyConverter,
-    reducer: GroupCount,
-}
-
-/// Applies the group-count delta to its retained arrangement.
-fn group_apply(
-    state: &mut Option<Box<GroupState>>,
-    key: &[usize],
-    z: ZSetBatch,
-) -> Result<Option<ZSetBatch>, EngineError> {
-    if state.is_none() {
-        let arrangement = KeyedArrangement::new(z.schema(), key)?;
-        let keys = KeyConverter::new(z.schema().as_ref(), key)?;
-        *state = Some(Box::new(GroupState {
-            arrangement,
-            keys,
-            reducer: GroupCount::new(),
-        }));
-    }
-    let group = state
-        .as_mut()
-        .ok_or_else(|| EngineError::Infrastructure("group state missing".to_string()))?;
-    group.arrangement.apply(&z, &group.keys)?;
-    Ok(Some(group.reducer.apply(&group.arrangement)?))
 }
 
 /// Applies both sides' deltas to the retained join, buffering a side whose
@@ -172,11 +129,9 @@ fn join_apply(
     ctx: &mut EvalCtx,
 ) -> Result<Option<ZSetBatch>, EngineError> {
     if let Some(z) = left.eval(ctx)? {
-        ctx.rows += z.len() as u64;
         *left_pending = accumulate(left_pending.take(), &z)?;
     }
     if let Some(z) = right.eval(ctx)? {
-        ctx.rows += z.len() as u64;
         *right_pending = accumulate(right_pending.take(), &z)?;
     }
     match (left_pending.as_ref(), right_pending.as_ref()) {

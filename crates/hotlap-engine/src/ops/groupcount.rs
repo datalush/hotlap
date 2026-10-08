@@ -1,109 +1,174 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, UInt32Array};
-use arrow::compute::{concat, concat_batches, take};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{ArrayRef, Int64Array, new_empty_array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use arrow::row::{Row, RowConverter};
 
-use crate::arrange::KeyedArrangement;
 use crate::batch::ZSetBatch;
 use crate::error::EngineError;
-use crate::keys::KeyConverter;
-use crate::zset::{consolidate, int64_diffs};
+use crate::keys::converter_for;
+use crate::zset::int64_diffs;
 
-/// Stateful incremental `groupcount` over a keyed arrangement.
+/// Stateful incremental `groupcount` over a keyed delta.
 ///
-/// The reducer sums the diffs of every `(key, payload)` entry per key and turns
-/// that relation into a per-epoch changelog. Each `apply` emits one row per key
-/// whose count changed: `(key..., count)` with a signed diff. A key that leaves
-/// the arrangement (crosses to zero) emits its old count with a `-1` diff only;
-/// a new key emits its count with a `+1`; a changed key emits the old count with
-/// `-1` and the new count with `+1`.
-#[derive(Default)]
+/// The reducer maintains `key -> count`, updating only the keys touched by the
+/// incoming delta, so a push costs O(delta), not O(accumulated keyspace). Each
+/// `apply` emits one `(key..., count)` row with a signed diff per key whose count
+/// changed: a key that crosses to zero emits its old count with `-1`; a new key
+/// emits its count with `+1`; a changed key emits the old count with `-1` and the
+/// new count with `+1`.
 pub struct GroupCount {
-    previous: Option<ZSetBatch>,
+    key: Vec<usize>,
+    schema: Option<SchemaRef>,
+    converter: Option<RowConverter>,
+    counts: HashMap<Vec<u8>, i64>,
+    #[cfg(test)]
+    work: u64,
 }
 
 impl GroupCount {
-    /// Creates a reducer with no prior state; the first `apply` emits the full
-    /// snapshot of the current relation.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Reduces `arrangement` and returns the changelog since the previous call.
-    pub fn apply(&mut self, arrangement: &KeyedArrangement) -> Result<ZSetBatch, EngineError> {
-        let current = snapshot(arrangement)?;
-        let delta = match &self.previous {
-            None => current.clone(),
-            Some(previous) => subtract(&current, previous)?,
-        };
-        self.previous = Some(current);
-        Ok(delta)
-    }
-}
-
-/// Reduces the arrangement's current state to one `(key..., count)` row per key.
-fn snapshot(arrangement: &KeyedArrangement) -> Result<ZSetBatch, EngineError> {
-    let materialized = arrangement.to_zset()?;
-    let key_indices = arrangement.key_indices();
-    let converter = KeyConverter::new(materialized.schema().as_ref(), key_indices)?;
-    let key_rows = converter.convert(materialized.batch.columns())?;
-    let diffs = int64_diffs(&materialized.diff)?;
-
-    // `to_zset` orders rows by key bytes then payload bytes, so equal keys are
-    // adjacent and one scan suffices to group them.
-    let mut groups: Vec<(usize, i64)> = Vec::new();
-    for index in 0..key_rows.num_rows() {
-        let diff = diffs.value(index);
-        match groups.last_mut() {
-            Some(group) if key_rows.row(group.0) == key_rows.row(index) => group.1 += diff,
-            _ => groups.push((index, diff)),
+    /// Creates a reducer over the key columns named by `key`.
+    pub fn new(key: &[usize]) -> Self {
+        Self {
+            key: key.to_vec(),
+            schema: None,
+            converter: None,
+            counts: HashMap::new(),
+            #[cfg(test)]
+            work: 0,
         }
     }
-    groups.retain(|(_, sum)| *sum != 0);
-    build_counts(&materialized, key_indices, &groups)
-}
 
-/// Returns `current - previous` as a consolidated Z-set of `(key, count)` rows.
-fn subtract(current: &ZSetBatch, previous: &ZSetBatch) -> Result<ZSetBatch, EngineError> {
-    let batch = concat_batches(&current.schema(), [&current.batch, &previous.batch])?;
-    let retracted = negate(previous.diff())?;
-    let diff = concat(&[current.diff().as_ref(), retracted.as_ref()])?;
-    consolidate(&ZSetBatch::new(batch, diff)?)
-}
-
-/// Negates an integer diff column, preserving its length.
-fn negate(diff: &ArrayRef) -> Result<ArrayRef, EngineError> {
-    let ints = int64_diffs(diff)?;
-    let negated: Int64Array = ints.iter().map(|value| value.map(|v| -v)).collect();
-    Ok(Arc::new(negated))
-}
-
-/// Builds `(key columns, count)` rows plus a `+1` diff for every kept group.
-fn build_counts(
-    source: &ZSetBatch,
-    key_indices: &[usize],
-    groups: &[(usize, i64)],
-) -> Result<ZSetBatch, EngineError> {
-    let positions: UInt32Array = UInt32Array::from(
-        groups
-            .iter()
-            .map(|(index, _)| *index as u32)
-            .collect::<Vec<u32>>(),
-    );
-
-    let mut fields: Vec<Field> = Vec::new();
-    let mut columns: Vec<ArrayRef> = Vec::new();
-    for &index in key_indices {
-        fields.push(source.schema().field(index).clone());
-        columns.push(take(source.batch.column(index).as_ref(), &positions, None)?);
+    /// Applies one input delta and returns only the changed `(key, count)` rows.
+    pub fn apply(&mut self, z: &ZSetBatch) -> Result<ZSetBatch, EngineError> {
+        self.ensure_schema(z)?;
+        let constants = self.touched(z)?;
+        #[cfg(test)]
+        {
+            self.work = constants.len() as u64;
+        }
+        let mut rows: Vec<(Vec<u8>, i64, i64)> = Vec::new();
+        for (bytes, delta) in constants {
+            if delta == 0 {
+                continue;
+            }
+            let old = self.counts.get(&bytes).copied().unwrap_or(0);
+            let new = old + delta;
+            if new == 0 {
+                self.counts.remove(&bytes);
+            } else {
+                self.counts.insert(bytes.clone(), new);
+            }
+            if old != 0 {
+                rows.push((bytes.clone(), old, -1));
+            }
+            if new != 0 {
+                rows.push((bytes, new, 1));
+            }
+        }
+        self.materialize(&rows)
     }
-    fields.push(Field::new("count", DataType::Int64, false));
-    let counts: Vec<i64> = groups.iter().map(|(_, sum)| *sum).collect();
-    columns.push(Arc::new(Int64Array::from(counts)));
 
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-    let diff: ArrayRef = Arc::new(Int64Array::from(vec![1i64; groups.len()]));
-    Ok(ZSetBatch::new(batch, diff)?)
+    /// Number of keys touched by the last `apply` (test instrumentation only).
+    #[cfg(test)]
+    pub fn work(&self) -> u64 {
+        self.work
+    }
+
+    /// Validates the key columns and learns the schema on first use.
+    fn ensure_schema(&mut self, z: &ZSetBatch) -> Result<(), EngineError> {
+        let schema = z.schema();
+        let width = schema.fields().len();
+        if self.key.is_empty() || self.key.iter().any(|&index| index >= width) {
+            return Err(EngineError::Unsupported(
+                "group key out of range".to_string(),
+            ));
+        }
+        match &self.schema {
+            Some(existing) if existing != &schema => Err(EngineError::Unsupported(
+                "group input schema changed".to_string(),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.converter = Some(converter_for(&schema, &self.key)?);
+                self.schema = Some(schema);
+                Ok(())
+            }
+        }
+    }
+
+    /// Sums the delta's diffs per key, returning one `(key bytes, delta)` each.
+    fn touched(&self, z: &ZSetBatch) -> Result<Vec<(Vec<u8>, i64)>, EngineError> {
+        let converter = self
+            .converter
+            .as_ref()
+            .ok_or_else(|| EngineError::Infrastructure("group converter missing".to_string()))?;
+        let key_columns: Vec<ArrayRef> = self
+            .key
+            .iter()
+            .map(|&index| z.batch.column(index).clone())
+            .collect();
+        let key_rows = converter.convert_columns(&key_columns)?;
+        let diffs = int64_diffs(z.diff())?;
+
+        let mut deltas: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut positions: HashMap<Vec<u8>, usize> = HashMap::new();
+        for index in 0..z.len() {
+            let bytes = key_rows.row(index).as_ref().to_vec();
+            let diff = diffs.value(index);
+            match positions.get(&bytes) {
+                Some(&slot) => deltas[slot].1 += diff,
+                None => {
+                    positions.insert(bytes.clone(), deltas.len());
+                    deltas.push((bytes, diff));
+                }
+            }
+        }
+        Ok(deltas)
+    }
+
+    /// Builds the `(key columns, count)` changelog rows with signed diffs.
+    fn materialize(&self, rows: &[(Vec<u8>, i64, i64)]) -> Result<ZSetBatch, EngineError> {
+        let schema = self
+            .schema
+            .as_ref()
+            .ok_or_else(|| EngineError::Infrastructure("group schema missing".to_string()))?;
+        let mut fields: Vec<Field> = self.key.iter().map(|&i| schema.field(i).clone()).collect();
+        fields.push(Field::new("count", DataType::Int64, false));
+        let fields = Arc::new(Schema::new(fields));
+        if rows.is_empty() {
+            let mut columns: Vec<ArrayRef> = self
+                .key
+                .iter()
+                .map(|&i| new_empty_array(schema.field(i).data_type()))
+                .collect();
+            columns.push(Arc::new(Int64Array::from(Vec::<i64>::new())));
+            let batch = RecordBatch::try_new(fields, columns)?;
+            return Ok(ZSetBatch::new(
+                batch,
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
+            )?);
+        }
+        let converter = self
+            .converter
+            .as_ref()
+            .ok_or_else(|| EngineError::Infrastructure("group converter missing".to_string()))?;
+        let parser = converter.parser();
+        let parsed: Vec<Row<'_>> = rows.iter().map(|(bytes, _, _)| parser.parse(bytes)).collect();
+        let mut columns = converter.convert_rows(parsed)?;
+        columns.push(Arc::new(Int64Array::from(
+            rows.iter().map(|(_, count, _)| *count).collect::<Vec<_>>(),
+        )));
+        let batch = RecordBatch::try_new(fields, columns)?;
+        let diff: ArrayRef = Arc::new(Int64Array::from(
+            rows.iter().map(|(_, _, diff)| *diff).collect::<Vec<_>>(),
+        ));
+        Ok(ZSetBatch::new(batch, diff)?)
+    }
 }
+
+#[cfg(test)]
+mod tests;
+

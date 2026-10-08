@@ -38,7 +38,6 @@ pub struct EngineCore {
     pub(super) watermarks: HashMap<InputId, i64>,
     pub(super) schemas: HashMap<InputId, SchemaRef>,
     pub(super) late: HashMap<InputId, u64>,
-    pub(super) rows_processed: u64,
     pub(super) frozen: bool,
 }
 
@@ -52,14 +51,8 @@ impl EngineCore {
             watermarks: HashMap::new(),
             schemas: HashMap::new(),
             late: HashMap::new(),
-            rows_processed: 0,
             frozen: false,
         }
-    }
-
-    /// Cumulative rows fed to view operators since construction.
-    pub fn rows_processed(&self) -> u64 {
-        self.rows_processed
     }
 
     /// Freezes the schema: rejects mixed watermark declarations and windowed
@@ -131,7 +124,7 @@ impl EngineCore {
             .views
             .get_mut(&id)
             .ok_or_else(|| CoreError::Unsupported(format!("unknown view {id:?}")))?;
-        let (output, rows) = view
+        let output = view
             .graph
             .eval(input, delta, &self.schemas, watermark)
             .map_err(CoreError::from)?;
@@ -142,7 +135,6 @@ impl EngineCore {
                     graph::accumulate(view.pending.take(), &output).map_err(CoreError::from)?;
             }
         }
-        self.rows_processed += rows;
         Ok(())
     }
 

@@ -8,7 +8,7 @@ use arrow::record_batch::RecordBatch;
 
 use hotlap_engine::consolidate;
 use hotlap_engine::ops::{GroupCount, filter, project};
-use hotlap_engine::{KeyConverter, KeyedArrangement, ZSetBatch};
+use hotlap_engine::ZSetBatch;
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -30,10 +30,6 @@ fn zset(rows: &[(i64, &str, i64)]) -> ZSetBatch {
     let diffs: Vec<i64> = rows.iter().map(|r| r.2).collect();
     let batch = RecordBatch::try_new(schema(), columns).unwrap();
     ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs))).unwrap()
-}
-
-fn keys() -> KeyConverter {
-    KeyConverter::new(schema().as_ref(), &[0]).unwrap()
 }
 
 fn ints(z: &ZSetBatch, column: usize) -> Vec<i64> {
@@ -130,8 +126,7 @@ fn project_rejects_out_of_range_column() {
 
 #[test]
 fn group_count_changelog_consolidates_to_final_counts() {
-    let mut arrangement = KeyedArrangement::new(schema(), &[0]).unwrap();
-    let mut reducer = GroupCount::new();
+    let mut reducer = GroupCount::new(&[0]);
     let mut history: Vec<(i64, &str, i64)> = Vec::new();
     let mut changelogs: Vec<ZSetBatch> = Vec::new();
 
@@ -141,9 +136,8 @@ fn group_count_changelog_consolidates_to_final_counts() {
         vec![(1, "a", -1)],
     ];
     for epoch in &epochs {
-        arrangement.apply(&zset(epoch), &keys()).unwrap();
         history.extend(epoch.iter().copied());
-        changelogs.push(reducer.apply(&arrangement).unwrap());
+        changelogs.push(reducer.apply(&zset(epoch)).unwrap());
     }
 
     // The concatenated changelog consolidates to exactly the final relation.
@@ -158,42 +152,34 @@ fn group_count_changelog_consolidates_to_final_counts() {
 
 #[test]
 fn group_count_delta_retracts_old_and_inserts_new_count() {
-    let mut arrangement = KeyedArrangement::new(schema(), &[0]).unwrap();
-    let mut reducer = GroupCount::new();
+    let mut reducer = GroupCount::new(&[0]);
 
-    arrangement.apply(&zset(&[(1, "a", 1)]), &keys()).unwrap();
-    let first = reducer.apply(&arrangement).unwrap();
+    let first = reducer.apply(&zset(&[(1, "a", 1)])).unwrap();
     assert_eq!(count_diff_rows(&first), vec![((1, 1), 1)]);
 
-    arrangement.apply(&zset(&[(1, "b", 1)]), &keys()).unwrap();
-    let second = reducer.apply(&arrangement).unwrap();
+    let second = reducer.apply(&zset(&[(1, "b", 1)])).unwrap();
     assert_eq!(count_diff_rows(&second), vec![((1, 1), -1), ((1, 2), 1)]);
 }
 
 #[test]
 fn group_count_retracts_key_that_crosses_to_zero() {
-    let mut arrangement = KeyedArrangement::new(schema(), &[0]).unwrap();
-    arrangement
-        .apply(&zset(&[(1, "a", 1), (1, "b", 1)]), &keys())
+    let mut reducer = GroupCount::new(&[0]);
+    let first = reducer
+        .apply(&zset(&[(1, "a", 1), (1, "b", 1)]))
         .unwrap();
-    let mut reducer = GroupCount::new();
-    let first = reducer.apply(&arrangement).unwrap();
     assert_eq!(count_diff_rows(&first), vec![((1, 2), 1)]);
 
-    arrangement
-        .retract(&zset(&[(1, "a", 1), (1, "b", 1)]), &keys())
+    let second = reducer
+        .apply(&zset(&[(1, "a", -1), (1, "b", -1)]))
         .unwrap();
-    let second = reducer.apply(&arrangement).unwrap();
     assert_eq!(count_diff_rows(&second), vec![((1, 2), -1)]);
     assert!(consolidated(&[first, second]).is_empty());
 }
 
 #[test]
-fn group_count_empty_arrangement_is_empty() {
-    let mut reducer = GroupCount::new();
-    let out = reducer
-        .apply(&KeyedArrangement::new(schema(), &[0]).unwrap())
-        .unwrap();
+fn group_count_empty_input_is_empty() {
+    let mut reducer = GroupCount::new(&[0]);
+    let out = reducer.apply(&zset(&[])).unwrap();
     assert!(out.is_empty());
     assert_eq!(out.schema().field(1).name(), "count");
 }

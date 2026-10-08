@@ -16,11 +16,11 @@ use crate::zset::{consolidate, int64_diffs};
 ///
 /// Both sides accumulate in [`KeyedArrangement`]s keyed by their join columns,
 /// so retractions update the stored state. Each `apply` feeds one delta per side,
-/// recomputes the join, and emits the changelog against the previous relation
-/// (disappeared tuples retracted, new ones inserted).
+/// recomputes the join, and emits the changelog against the previous relation.
 ///
-/// The output schema is `left || right` followed by the signed `diff` column,
-/// whose value is the product of the two sides' diffs.
+/// Output is `left || right` plus the signed `diff` (the product of both diffs).
+/// Complexity: `apply` recomputes from both arrangements, `O(|L| * |R|)` per
+/// delta. TODO: incremental per-key join (out of 7c scope).
 pub struct Join {
     left_keys: Vec<usize>,
     right_keys: Vec<usize>,

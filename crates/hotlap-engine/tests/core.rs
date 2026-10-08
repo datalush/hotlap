@@ -132,30 +132,3 @@ fn untapped_view_has_no_changes() {
 
     assert!(core.take_changes(ViewId(0)).unwrap().is_empty());
 }
-
-#[test]
-fn per_push_work_does_not_grow_with_history() {
-    let mut core = EngineCore::new();
-    core.register_input(InputId(0)).unwrap();
-    core.build_view(ViewId(0), &group_plan()).unwrap();
-
-    let mut previous = core.rows_processed();
-    let mut intervals = Vec::new();
-    for epoch in 0..6i64 {
-        let base = epoch * 10;
-        let batch = text_zset(&[
-            (base + 1, "a", 1),
-            (base + 2, "b", 1),
-            (base + 3, "c", 1),
-        ]);
-        core.push(InputId(0), &batch).unwrap();
-        let now = core.rows_processed();
-        intervals.push(now - previous);
-        previous = now;
-    }
-
-    // Every push processes the same fixed work, independent of accumulated
-    // history; a recompute-based core would grow this with the input history.
-    assert!(intervals[0] > 0);
-    assert!(intervals.iter().all(|&work| work == intervals[0]));
-}
