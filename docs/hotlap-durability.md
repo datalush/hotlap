@@ -1,7 +1,7 @@
 # Hotlap — durabilidad: checkpoints, recovery, 2PC y vistas dinámicas
 
 - Fecha: 2026-10-08
-- Estado: implementado (SP4), tests verdes
+- Estado: implementado (SP4; commit recuperable en SP8), tests verdes
 - Alcance: durabilidad end-to-end del motor (estado, checkpoints, recuperación),
   coordinación 2PC de sinks con capacidades, y vistas materializadas creadas
   después de `START`.
@@ -151,13 +151,17 @@ con un **frame binario versionado** (`crates/hotlap-engine/src/core/ipc.rs`):
 | --- | --- |
 | `checkpoint/<id>/engine` | snapshot del motor (frame binario) |
 | `checkpoint/<id>/sources` | `SourceState` (offsets, frame binario) |
+| `checkpoint/<id>/commit` | marcador `1`: intención de commit durable (se borra tras `valid`) |
 | `checkpoint/<id>/valid` | marcador `1`: el checkpoint está completo |
 | `checkpoint/latest` | id (8 bytes LE) del checkpoint nuevo más reciente |
 
 **Publicación coherente.** Un checkpoint solo es visible cuando **todas** sus
 partes están escritas: primero el cuerpo (`engine` + `sources`), luego el
-marcador `valid`, y solo entonces el puntero `latest`. Una escritura
-interrumpida **nunca** expone un checkpoint parcial como el actual.
+marcador durable `commit`, después el marcador `valid`, y solo entonces el
+puntero `latest`. Una escritura interrumpida **nunca** expone un checkpoint
+parcial como el actual. El marcador `commit` se borra tras publicar `valid`: un
+`commit` presente **sin** `valid` señala a recovery que el proceso cayó en la
+ventana de commit (ver §6).
 
 **Cobertura del sink.** El pump del motor drena los deltas de cada vista a un
 canal acotado que la tarea del sink consume de forma asíncrona. Antes de
@@ -190,6 +194,13 @@ pub enum SinkCapabilities {
 y la forma 2PC: `prepare()` (por defecto no-op), `commit()`, `abort()`.
 `capabilities()` por defecto es `AtLeastOnce`.
 
+El sink también **declara** si su `commit` es **re-conducible** tras un
+reinicio (`commit_redriable()`, por defecto `!AtLeastOnce`): `Transactional` e
+`Idempotent` califican por defecto; un sink puede **sobreescribirlo** cuando la
+capacidad subestima o sobreestima la garantía real (p.ej. un sink
+aparentemente idempotente cuyos efectos externos no son repetibles). Recovery
+usa esta declaración para **promover** o **descartar** la ventana de crash.
+
 `SinkBarrier` (`runtime/sink_barrier.rs`) adapta el protocolo por capacidad:
 
 - **`Transactional`**: `prepare` en la fase uno; `commit` en la fase dos; ante
@@ -201,19 +212,48 @@ y la forma 2PC: `prepare()` (por defecto no-op), `commit()`, `abort()`.
 `SinkBarrier::around(capture)` ejecuta el orden **drain → prepare → capture →
 commit**. Si `capture` (snapshot + escritura del cuerpo) falla, o un `commit` /
 flush de la fase de confirmación falla, se **abortan todos los sinks preparados
-que aún no se hayan confirmado** (incluido el que falló) y el error se propaga:
+que aún no se hayan confirmado** (incluido el que falló), y el error se propaga:
 ningún checkpoint puede llegar a ser válido.
 
-**Garantía exacta de `Transactional`.** El commit de los sinks ocurre **antes**
-de escribir `valid` / `latest`. Si el proceso no se interrumpe, la secuencia es
-exactly-once. Si el proceso **cae entre el commit de los sinks y la publicación
-de `valid`**, el recovery carga el checkpoint válido **anterior** y vuelve a
-replayar y a confirmar esos deltas: un sink `Transactional` podría **duplicar**
-(no hay un registro durable de la decisión de commit). Cerrar esa ventana
-requiere persistir un **marker de intención de commit** antes de `Sink::commit`
-y **re-conducir el commit de forma idempotente** en recovery; queda como
-follow-up y hoy la garantía se limita a "sin crash en esa ventana" (para
-`Idempotent`/`AtLeastOnce` el replay es tolerado por definición).
+**Protocolo de commit recuperable.** El commit de los sinks ocurre **antes** de
+escribir `valid`; un crash en esa ventana dejaría el commit hecho pero el
+checkpoint sin publicar. Para cerrarla, `take` sigue el orden
+**drain → prepare → snapshot + escritura del cuerpo → escribir marker `commit`
+→ commit sinks → `mark_valid` → borrar marker → retain**:
+
+- el **marker durable** `checkpoint/<id>/commit` se escribe **antes** de
+  `Sink::commit` y se borra **después** de publicar `valid`. Si el proceso cae
+  después del marker pero antes de `valid`, recovery ve `commit` sin `valid` con
+  el cuerpo completo (`engine` + `sources`) y sabe que el checkpoint C estaba
+  **en curso de commit**; no re-replaya a ciegas.
+- **Promover**: si **todos** los sinks declaran su commit **re-conducible**,
+  recovery **re-conduce** `Sink::commit` (idempotente, ya exigido por el
+  contrato), publica `valid` y **resume desde C** sin replay.
+- **Descartar + señal**: si algún sink no es re-conducible, recovery **borra C**,
+  replaya desde el válido anterior y emite una **señal explícita** (warning en el
+  canal de errores + métrica `checkpoints_discarded`), nunca en silencio.
+
+**Contrato del sink.** `Sink::commit` **debe tolerar ejecutarse más de una
+vez**: la barrera puede confirmar el mismo sink más de una vez y recovery
+re-conduce el commit tras un reinicio. Un sink que no pueda repetir su commit
+debe declarar `commit_redriable() == false` (p.ej. `AtLeastOnce` lo hace por
+defecto); recovery entonces descarta C y replaya.
+
+**Garantías por capacidad.**
+
+| Capacidad | Antes (replay a ciegas) | Con el marker |
+| --- | --- | --- |
+| `Idempotent` | replay (dedup por clave) → effectively-once | promover C sin replay → effectively-once |
+| `Transactional` | replay → **duplicado** | re-conducir commit + promover → exactly-once\* |
+| `AtLeastOnce` | replay → at-least-once | replay + **señal explícita** → at-least-once |
+
+\* Requiere que `Sink::commit` sea re-conducible tras reinicio (contrato de
+arriba). Si un sink transaccional necesitara un **handle de transacción
+durable** para re-conducir su commit, eso es la opción **B** (2PC real), un
+follow-up: Fluss no ofrece 2PC y hoy no hay ningún sink `Transactional`.
+
+Sin marker, recovery es **idéntico** al comportamiento anterior (válido más
+nuevo, o arranque limpio).
 
 Detalles de corrección (`SharedSink`, `runtime/shared_sink.rs`):
 
@@ -241,14 +281,19 @@ Por tanto, **con Fluss el techo es effectively-once (PK) o at-least-once
 
 `Recovery` (`runtime/recovery.rs`):
 
-1. **Cargar el último checkpoint válido**: se intenta `latest` primero; si su
+1. **Resolver un commit interrumpido** (`Recovery::inspect` / `start`): si hay
+   un marker `commit` sin `valid` con el cuerpo completo, C estaba en curso de
+   commit; se **promueve** (re-conducir commit + publicar `valid`) si todos los
+   sinks son re-conducibles, o se **descarta C con señal explícita** y se
+   replaya desde el anterior (ver §6). Sin marker, este paso no hace nada.
+2. **Cargar el último checkpoint válido**: se intenta `latest` primero; si su
    checkpoint no decodifica o no valida, se prueban los anteriores de más nuevo a
    más viejo. Como un checkpoint solo es visible cuando todas sus partes están
    escritas, uno legible es siempre **coherente**; un tip corrupto no aborta el
    arranque mientras quede un predecesor válido. Sin ningún checkpoint válido, es
    un **arranque limpio** (`None`).
-2. **Restaurar** el motor con `EngineSnapshot` (`hotlap.restore`).
-3. **Reabrir cada source** en los offsets capturados (`Source::resume`) y
+3. **Restaurar** el motor con `EngineSnapshot` (`hotlap.restore`).
+4. **Reabrir cada source** en los offsets capturados (`Source::resume`) y
    **replayar** desde ahí, alimentando el mismo circuito.
 
 Invariante de replay: `SourceState` guarda el offset del **siguiente** registro a
@@ -318,6 +363,13 @@ follow-up fuera de SP4.
   crash + recovery ≡ sin crash; sin pérdida ni duplicado en la frontera;
   checkpoint ausente = arranque limpio; `latest` corrupto cae a uno anterior;
   retención insuficiente = error explícito.
+- **Commit recuperable** (`tests/recovery_commit_marker.rs`,
+  `tests/recovery_redrivable.rs`): el marker `commit` es durable antes de
+  `Sink::commit` y se borra tras `valid`; un commit interrumpido se **promueve**
+  (re-conduce commit, sin replay) o se **descarta** con señal explícita
+  (warning + `checkpoints_discarded`); `commit_redriable` se puede sobreescribir
+  por encima/debajo de la capacidad; sin marker, recovery coincide con el
+  válido más nuevo.
 - **Dynamic views** (`crates/hotlap-engine/tests/dynamic_view.rs`):
   `late_views_match_full_recomputation_and_keep_updating`,
   `late_view_without_retention_is_rejected`,
