@@ -4,14 +4,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use hotlap::{InputId, Plan, ZSetBatch};
+use hotlap::{Plan, ZSetBatch};
 use hotlap_sql::catalog::MvDef;
+use hotlap_sql::mv_schema::mv_schema;
 
 use super::mv_provider::MvTableProvider;
 use super::{QueryResult, Snapshotter, SqlError, SqlSession, to_engine};
 use crate::runtime::handle::EngineHandle;
 use crate::runtime::pipeline::{Pipeline, SinkSpec};
-use crate::runtime::sources::{InputSource, Sources};
 
 impl SqlSession {
     /// Start the engine with the declared source and views.
@@ -68,31 +68,30 @@ impl SqlSession {
             .unwrap_or_default()
     }
 
-    /// Build the pipeline, opening each declared sink against its view schema.
+    /// Build the pipeline, recompiling every view against the final bindings.
     ///
-    /// Until the multi-source session lands (T5), the session declares a single
-    /// input with the stable id `InputId(0)`; the pipeline already consumes the
-    /// generic [`Sources`] set, so no mono-source runtime path is kept.
+    /// Input ids are fixed here, in canonical name order, and then frozen for
+    /// any view declared after `START`. Every view is recompiled from its
+    /// logical plan so an early declaration cannot pin a stale id, and each
+    /// sink opens against the schema validated for its view.
     async fn build_pipeline(&mut self) -> Result<Pipeline, SqlError> {
-        let name = self
-            .source_name
-            .clone()
-            .ok_or_else(|| SqlError::Catalog("START before CREATE SOURCE".into()))?;
-        let source = self
-            .source
-            .clone()
-            .ok_or_else(|| SqlError::Catalog("START before CREATE SOURCE".into()))?;
+        if self.sources.is_empty() {
+            return Err(SqlError::Catalog("START before CREATE SOURCE".into()));
+        }
+        let bindings = self.source_bindings()?;
+        let schemas = self.input_schemas(&bindings)?;
+        let views = self.compile_views(&bindings)?;
+        for (name, plan) in &views {
+            let schema = mv_schema(plan, &schemas)?;
+            hotlap_sql::convert::ensure_kernel_types(&schema)?;
+            self.mv_schemas.insert(name.clone(), schema);
+        }
         let sinks = self.build_sinks().await?;
-        let sources = Sources::new(vec![InputSource {
-            id: InputId(0),
-            name,
-            source,
-            watermark: self.watermark,
-        }])
-        .map_err(to_engine)?;
+        let sources = self.build_sources(&bindings)?;
+        self.frozen = Some(bindings);
         Ok(Pipeline {
             sources,
-            views: self.views.clone(),
+            views,
             sinks,
             checkpoint: self.checkpoint.take(),
             retention: self.retention,

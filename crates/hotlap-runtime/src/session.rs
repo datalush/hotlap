@@ -6,6 +6,8 @@ mod fluss_factory;
 mod mv_provider;
 mod runtime;
 mod sink_factory;
+mod sources;
+mod view_plans;
 
 pub use api::{MetricsSnapshot, Session};
 pub use fluss_factory::FlussSourceFactory;
@@ -17,8 +19,9 @@ use std::sync::Arc;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
-use hotlap::{Plan, ZSetBatch};
+use hotlap::ZSetBatch;
 use hotlap_connectors::source::Source;
+use hotlap_sql::bindings::SourceBindings;
 use hotlap_sql::catalog::Catalog;
 use hotlap_sql::ddl::{self, Statement};
 use hotlap_sql::error::SqlError;
@@ -27,7 +30,9 @@ use hotlap_sql::translate::register_tumble_udf;
 use crate::runtime::SnapshotHandle;
 use crate::runtime::checkpoint::CheckpointConfig;
 use crate::runtime::handle::EngineHandle;
-use crate::runtime::pipeline::Watermark;
+
+use sources::SessionSource;
+use view_plans::ViewPlan;
 
 /// Builds engine sources from `CREATE SOURCE` options.
 #[async_trait::async_trait]
@@ -74,20 +79,23 @@ struct SinkDef {
     view: String,
 }
 
-/// A single embedded session over one source and its materialized views.
+/// A single embedded session over one or more sources and its materialized
+/// views.
 pub struct SqlSession {
     ctx: SessionContext,
     catalog: Catalog,
     factory: Arc<dyn SourceFactory>,
     sink_factory: Arc<dyn SinkFactory>,
-    source: Option<Arc<dyn Source>>,
-    source_name: Option<String>,
-    watermark: Option<Watermark>,
-    views: Vec<(String, Plan)>,
+    /// Declared sources keyed by canonical relation name.
+    sources: BTreeMap<String, SessionSource>,
+    /// Views declared before `START`, kept as logical plans for recompilation.
+    view_plans: Vec<ViewPlan>,
     mv_schemas: HashMap<String, SchemaRef>,
     sinks: Vec<SinkDef>,
     engine: Option<EngineHandle>,
     started: bool,
+    /// Input id assignment frozen at `START`.
+    frozen: Option<SourceBindings>,
     /// Input deltas to retain for views created after `START`; `None` disables
     /// retention, so those views are rejected.
     retention: Option<usize>,
@@ -115,14 +123,13 @@ impl SqlSession {
             catalog: Catalog::default(),
             factory: source_factory,
             sink_factory,
-            source: None,
-            source_name: None,
-            watermark: None,
-            views: Vec::new(),
+            sources: BTreeMap::new(),
+            view_plans: Vec::new(),
             mv_schemas: HashMap::new(),
             sinks: Vec::new(),
             engine: None,
             started: false,
+            frozen: None,
             retention: None,
             checkpoint: None,
         }

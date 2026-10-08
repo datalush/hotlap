@@ -76,15 +76,52 @@ fn unsupported_schema() -> SchemaRef {
 }
 
 #[tokio::test]
-async fn second_source_rejected() {
+async fn duplicate_source_rejected_without_replacing_it() {
     let mut session = session(kv_schema());
     session.sql(SOURCE).await.unwrap();
+    // The second declaration of `src` must be rejected before it can replace
+    // the live source/provider.
+    assert!(matches!(
+        session.sql(SOURCE).await,
+        Err(SqlError::Catalog(_))
+    ));
+    // The original binding still resolves, so the name was not poisoned.
+    let view = "CREATE MATERIALIZED VIEW mv AS SELECT k, count(*) FROM src GROUP BY k;";
+    assert!(matches!(session.sql(view).await, Ok(QueryResult::Ack(_))));
+}
+
+#[tokio::test]
+async fn source_after_start_rejected() {
+    let mut session = session(kv_schema());
+    session.sql(SOURCE).await.unwrap();
+    session.sql("START;").await.unwrap();
     let other = "CREATE SOURCE src2 WITH (connector='inmem') \
          WATERMARK FOR _event_time AS _event_time - INTERVAL '1 s';";
     assert!(matches!(
         session.sql(other).await,
         Err(SqlError::Unsupported(_))
     ));
+}
+
+#[tokio::test]
+async fn quoted_source_name_binds_its_view() {
+    let mut session = session(kv_schema());
+    // An embedded doubled quote must survive into the DataFusion registration
+    // and the canonical binding in the same path.
+    session
+        .sql(
+            "CREATE SOURCE \"Src\"\"X\" WITH (connector='inmem') \
+             WATERMARK FOR _event_time AS _event_time - INTERVAL '1 s';",
+        )
+        .await
+        .unwrap();
+    session
+        .sql(
+            "CREATE MATERIALIZED VIEW mv AS SELECT k, count(*) \
+             FROM \"Src\"\"X\" GROUP BY k;",
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

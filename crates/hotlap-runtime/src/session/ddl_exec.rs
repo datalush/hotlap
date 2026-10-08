@@ -2,10 +2,9 @@
 
 use std::sync::Arc;
 
-use hotlap::InputId;
 use hotlap_connectors::datafusion::provider::SourceTableProvider;
 use hotlap_connectors::source::Source;
-use hotlap_sql::bindings::{InputSchemas, SourceBindings, canonical_relation};
+use hotlap_sql::bindings::canonical_relation;
 use hotlap_sql::catalog::{MvDef, SourceDef};
 use hotlap_sql::ddl::{CreateSink, CreateSource, CreateView};
 use hotlap_sql::error::SqlError;
@@ -13,6 +12,8 @@ use hotlap_sql::mv_schema::mv_schema;
 use hotlap_sql::translate::to_kernel_plan;
 use hotlap_sql::tumble::normalize_tumble_intervals;
 
+use super::sources::SessionSource;
+use super::view_plans::ViewPlan;
 use super::{QueryResult, SinkDef, SqlSession, to_engine};
 use crate::runtime::pipeline::Watermark;
 
@@ -22,45 +23,43 @@ impl SqlSession {
         cs: CreateSource,
     ) -> Result<QueryResult, SqlError> {
         self.reject_after_start("CREATE SOURCE")?;
-        // v1 owns a single source; a second declaration would overwrite the live
-        // source/watermark while the first name stays registered.
-        if self.source.is_some() {
-            return Err(SqlError::Unsupported(
-                "only one source is supported in v1".into(),
-            ));
+        // Bind by the name DataFusion reports in a plan, so `Src` and `"Src"`
+        // land on the same key the translator will look up.
+        let name = canonical_relation(&cs.name);
+        if self.sources.contains_key(&name) {
+            return Err(SqlError::Catalog(format!("source already exists: {name}")));
         }
         let source: Arc<dyn Source> = self.factory.create(&cs.name, &cs.options).await?.into();
+        // The declared watermark column must exist before any state is published.
         hotlap_sql::watermark::column_index(&source.schema(), &cs.time_col)?;
         let connector = cs.options.get("connector").cloned().unwrap_or_default();
-        self.catalog.add_source(&cs.name, SourceDef { connector })?;
-        self.ctx
-            .register_table(
-                &cs.name,
-                Arc::new(SourceTableProvider::new(Arc::clone(&source))),
-            )
-            .map_err(to_engine)?;
-        self.source = Some(source);
-        self.source_name = Some(cs.name);
-        self.watermark = Some(Watermark { lag: cs.lag_ms });
+        self.catalog.add_source(&name, SourceDef { connector })?;
+        self.sources.insert(
+            name.clone(),
+            SessionSource {
+                source: Arc::clone(&source),
+                watermark: Some(Watermark { lag: cs.lag_ms }),
+            },
+        );
+        // Register the DataFusion table last: a failure undoes only this
+        // operation and never leaves a live provider without its registry.
+        let provider = Arc::new(SourceTableProvider::new(source));
+        if let Err(error) = self.ctx.register_table(name.as_str(), provider) {
+            self.sources.remove(&name);
+            self.catalog.remove_source(&name);
+            return Err(to_engine(error));
+        }
         Ok(QueryResult::Ack("CREATE SOURCE".into()))
     }
 
     pub(super) async fn create_view(&mut self, cv: CreateView) -> Result<QueryResult, SqlError> {
-        let source_name = self
-            .source_name
-            .clone()
-            .ok_or_else(|| SqlError::Catalog("view declared before its source".into()))?;
-        let source = self
-            .source
-            .as_ref()
-            .ok_or_else(|| SqlError::Catalog("view declared before its source".into()))?;
-        // v1 binds the session's single source to the one input it owns; the
-        // maps stay explicit so the multi-source path can extend them.
-        let bindings = SourceBindings::from([(canonical_relation(&source_name), InputId(0))]);
-        let schemas = InputSchemas::from([(InputId(0), source.schema())]);
+        // The frozen map after START, or the current one while declaring.
+        let bindings = self.active_bindings()?;
+        let schemas = self.input_schemas(&bindings)?;
         let query = normalize_tumble_intervals(&cv.query)?;
         let df = self.ctx.sql(&query).await.map_err(to_engine)?;
-        let plan = to_kernel_plan(df.logical_plan(), &bindings)?;
+        let logical = df.logical_plan().clone();
+        let plan = to_kernel_plan(&logical, &bindings)?;
         let schema = mv_schema(&plan, &schemas)?;
         // Reject unrepresentable output types here so the view fails at DDL
         // time rather than later, when a `SELECT` reads the consolidated rows.
@@ -71,7 +70,8 @@ impl SqlSession {
             self.build_view_late(&cv.name, plan, schema, cv.query)
                 .await?;
         } else {
-            // Register after validation; a rejected view must not poison its name.
+            // Register after validation; a rejected view must not poison its
+            // name, and the logical plan is kept for the START recompilation.
             self.catalog.add_view(
                 &cv.name,
                 MvDef {
@@ -79,7 +79,10 @@ impl SqlSession {
                 },
             )?;
             self.mv_schemas.insert(cv.name.clone(), schema);
-            self.views.push((cv.name, plan));
+            self.view_plans.push(ViewPlan {
+                name: cv.name,
+                logical,
+            });
         }
         Ok(QueryResult::Ack("CREATE MATERIALIZED VIEW".into()))
     }
