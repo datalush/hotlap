@@ -2,6 +2,7 @@
 //!
 //! Defines the plan IR, ids, watermark spec, Z-set batch and the
 //! [`IncrementalCore`] trait implemented by concrete engine kernels.
+#![forbid(unsafe_code)]
 
 pub mod batch;
 pub mod core;

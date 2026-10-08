@@ -31,6 +31,11 @@ pub fn filter(zset: &ZSetBatch, predicate: &BooleanArray) -> Result<ZSetBatch, E
 /// are preserved, so the output is the projected Z-set. Columns are shared by
 /// `ArrayRef::clone`, so projection is O(number of selected columns).
 pub fn project(zset: &ZSetBatch, cols: &[usize]) -> Result<ZSetBatch, EngineError> {
+    if cols.is_empty() {
+        return Err(EngineError::Unsupported(
+            "project requires at least one column".to_string(),
+        ));
+    }
     let width = zset.schema().fields().len();
     if let Some(&bad) = cols.iter().find(|&&index| index >= width) {
         return Err(EngineError::Unsupported(format!(

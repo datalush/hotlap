@@ -125,6 +125,11 @@ fn project_rejects_out_of_range_column() {
 }
 
 #[test]
+fn project_rejects_empty_column_list() {
+    assert!(project(&zset(&[(1, "a", 1)]), &[]).is_err());
+}
+
+#[test]
 fn group_count_changelog_consolidates_to_final_counts() {
     let mut reducer = GroupCount::new(&[0]);
     let mut history: Vec<(i64, &str, i64)> = Vec::new();

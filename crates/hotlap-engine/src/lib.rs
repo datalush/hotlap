@@ -4,6 +4,7 @@
 //! ([`KeyConverter`]) without depending on differential dataflow. The shared
 //! contract types (plan IR, ids, watermark spec) live in `hotlap-core` and are
 //! re-exported here for convenience.
+#![forbid(unsafe_code)]
 
 pub mod arrange;
 pub mod batch;
