@@ -1,56 +1,47 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
-use futures::stream;
+use arrow::datatypes::{DataType, Field, Schema};
 use hotlap::{AggSpec, InputId, Plan};
-use hotlap_connectors::ConnectorError;
-use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
 use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline::Pipeline;
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
-struct PendingSource {
-    schema: SchemaRef,
+#[path = "engine_lifecycle/harness.rs"]
+mod harness;
+
+use harness::{FailingSource, OneBatchSource, PendingSource, zset_rows};
+
+/// A single input pipeline over `source` with the given views.
+fn pipeline(
+    source: Arc<dyn hotlap_connectors::source::Source>,
+    views: Vec<(String, Plan)>,
+) -> Pipeline {
+    Pipeline {
+        sources: Sources::new(vec![InputSource {
+            id: InputId(0),
+            name: "in".into(),
+            source,
+            watermark: None,
+        }])
+        .unwrap(),
+        views,
+        sinks: vec![],
+        checkpoint: None,
+        retention: None,
+    }
 }
 
-impl Source for PendingSource {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-    fn splits(&self) -> Result<Vec<Split>, hotlap_connectors::ConnectorError> {
-        Ok(vec![Split { id: 0, start: 0 }])
-    }
-    fn read(&self, _split: &Split) -> Result<SourceStream, hotlap_connectors::ConnectorError> {
-        // Never yields: keeps the engine alive while we exercise the handle.
-        Ok(Box::pin(stream::pending()))
-    }
-    fn state(&self) -> SourceState {
-        SourceState::default()
-    }
-    fn event_time_column(&self) -> Option<usize> {
-        None
-    }
+fn schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
 }
 
 #[test]
 fn start_snapshot_shutdown() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let handle = EngineHandle::start(Pipeline {
-        sources: Sources::new(vec![InputSource {
-            id: InputId(0),
-            name: "in".into(),
-            source: Arc::new(PendingSource { schema }),
-            watermark: None,
-        }])
-        .unwrap(),
-        views: vec![],
-        sinks: vec![],
-        checkpoint: None,
-        retention: None,
-    })
+    let handle = EngineHandle::start(pipeline(
+        Arc::new(PendingSource { schema: schema() }),
+        vec![],
+    ))
     .unwrap();
     // No view registered: snapshot of an unknown view errors, but the handle must respond.
     assert!(handle.snapshot("nope").is_err());
@@ -61,78 +52,11 @@ fn start_snapshot_shutdown() {
     handle.shutdown().unwrap();
 }
 
-struct FailingSource {
-    schema: SchemaRef,
-}
-
-impl Source for FailingSource {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-    fn splits(&self) -> Result<Vec<Split>, ConnectorError> {
-        Ok(vec![Split { id: 0, start: 0 }])
-    }
-    fn read(&self, _split: &Split) -> Result<SourceStream, ConnectorError> {
-        let items: Vec<Result<SourceBatch, ConnectorError>> =
-            vec![Err(ConnectorError::Fluss("boom".into()))];
-        Ok(Box::pin(stream::iter(items)))
-    }
-    fn state(&self) -> SourceState {
-        SourceState::default()
-    }
-    fn event_time_column(&self) -> Option<usize> {
-        None
-    }
-}
-
-struct OneBatchSource {
-    schema: SchemaRef,
-}
-
-impl Source for OneBatchSource {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-    fn splits(&self) -> Result<Vec<Split>, ConnectorError> {
-        Ok(vec![Split { id: 0, start: 0 }])
-    }
-    fn read(&self, _split: &Split) -> Result<SourceStream, ConnectorError> {
-        let schema = self.schema.clone();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![1, 1, 2]))],
-        )
-        .unwrap();
-        let item = Ok(SourceBatch {
-            batch,
-            base_offset: 0,
-            next_offset: 3,
-            split: 0,
-        });
-        Ok(Box::pin(stream::iter(vec![item])))
-    }
-    fn state(&self) -> SourceState {
-        SourceState::default()
-    }
-    fn event_time_column(&self) -> Option<usize> {
-        None
-    }
-}
-
 #[test]
 fn snapshot_handle_reads_a_built_view() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let handle = EngineHandle::start(Pipeline {
-        sources: Sources::new(vec![InputSource {
-            id: InputId(0),
-            name: "in".into(),
-            source: Arc::new(OneBatchSource {
-                schema: schema.clone(),
-            }),
-            watermark: None,
-        }])
-        .unwrap(),
-        views: vec![(
+    let handle = EngineHandle::start(pipeline(
+        Arc::new(OneBatchSource { schema: schema() }),
+        vec![(
             "c".into(),
             Plan::GroupAggregate {
                 input: Box::new(Plan::Source(InputId(0))),
@@ -140,10 +64,7 @@ fn snapshot_handle_reads_a_built_view() {
                 aggs: vec![AggSpec::count()],
             },
         )],
-        sinks: vec![],
-        checkpoint: None,
-        retention: None,
-    })
+    ))
     .unwrap();
     let snap = handle.snapshot_handle();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -151,42 +72,19 @@ fn snapshot_handle_reads_a_built_view() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(snap.is_built(), "engine never built the dataflow");
-    let rows = zset_rows(&snap.snapshot("c").unwrap());
-    assert_eq!(rows, vec![vec![1, 2], vec![2, 1]]);
+    assert_eq!(
+        zset_rows(&snap.snapshot("c").unwrap()),
+        vec![vec![1, 2], vec![2, 1]]
+    );
     handle.shutdown().unwrap();
-}
-
-/// Read a consolidated Z-set of Int64 columns as sorted integer rows.
-fn zset_rows(z: &hotlap::ZSetBatch) -> Vec<Vec<i64>> {
-    let columns: Vec<&Int64Array> = z
-        .batch
-        .columns()
-        .iter()
-        .map(|c| c.as_any().downcast_ref::<Int64Array>().unwrap())
-        .collect();
-    let mut rows: Vec<Vec<i64>> = (0..z.len())
-        .map(|row| columns.iter().map(|c| c.value(row)).collect())
-        .collect();
-    rows.sort();
-    rows
 }
 
 #[test]
 fn source_error_is_surfaced() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let handle = EngineHandle::start(Pipeline {
-        sources: Sources::new(vec![InputSource {
-            id: InputId(0),
-            name: "in".into(),
-            source: Arc::new(FailingSource { schema }),
-            watermark: None,
-        }])
-        .unwrap(),
-        views: vec![],
-        sinks: vec![],
-        checkpoint: None,
-        retention: None,
-    })
+    let handle = EngineHandle::start(pipeline(
+        Arc::new(FailingSource { schema: schema() }),
+        vec![],
+    ))
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut raised = false;
@@ -203,17 +101,10 @@ fn source_error_is_surfaced() {
 
 #[test]
 fn start_reports_setup_failure() {
-    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let result = EngineHandle::start(Pipeline {
-        sources: Sources::new(vec![InputSource {
-            id: InputId(0),
-            name: "in".into(),
-            source: Arc::new(PendingSource { schema }),
-            watermark: None,
-        }])
-        .unwrap(),
-        // A view referencing an unknown input fails during setup.
-        views: vec![(
+    // A view referencing an unknown input fails during setup.
+    let result = EngineHandle::start(pipeline(
+        Arc::new(PendingSource { schema: schema() }),
+        vec![(
             "c".into(),
             Plan::GroupAggregate {
                 input: Box::new(Plan::Source(InputId(99))),
@@ -221,9 +112,6 @@ fn start_reports_setup_failure() {
                 aggs: vec![AggSpec::count()],
             },
         )],
-        sinks: vec![],
-        checkpoint: None,
-        retention: None,
-    });
+    ));
     assert!(result.is_err());
 }
