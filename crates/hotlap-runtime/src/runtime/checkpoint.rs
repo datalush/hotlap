@@ -90,6 +90,10 @@ impl Checkpointer {
     /// checkpoint. A crash between the marker and validity leaves the marker for
     /// recovery to resolve.
     ///
+    /// The marker is cleared *before* the abort on a commit failure: otherwise a
+    /// crash between the abort and the clear would leave a complete body with a
+    /// marker over rolled-back sinks, which recovery might promote.
+    ///
     /// Returns the id of the checkpoint; later reads must use [`Self::read`].
     pub async fn take(
         &mut self,
@@ -97,12 +101,16 @@ impl Checkpointer {
         source: &dyn Source,
     ) -> Result<u64, ConnectorError> {
         let id = self.next_id;
-        let result = self
-            .sinks
-            .around(|| write(self.backend.as_mut(), id, engine, source))
-            .await;
-        if let Err(error) = result {
+        self.sinks.drain().await?;
+        let prepared = self.sinks.prepare().await?;
+        if let Err(error) = write(self.backend.as_mut(), id, engine, source).await {
             let _ = clear_commit(self.backend.as_mut(), id);
+            self.sinks.abort(&prepared).await;
+            return Err(error);
+        }
+        if let Err((error, remaining)) = self.sinks.commit(&prepared).await {
+            let _ = clear_commit(self.backend.as_mut(), id);
+            self.sinks.abort(&remaining).await;
             return Err(error);
         }
         mark_valid(self.backend.as_mut(), id, self.retain)?;

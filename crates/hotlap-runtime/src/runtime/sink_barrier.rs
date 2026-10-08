@@ -1,13 +1,15 @@
 //! Two-phase-commit coordination of a pipeline's sinks.
 //!
-//! The checkpoint barrier runs [`SinkBarrier::around`]: drain every sink's
-//! channel so all queued deltas are applied, prepare every transactional sink,
-//! capture and persist the checkpoint body, then commit. Draining first closes
-//! the gap between the engine-side pump and the sink task, so a checkpoint can
-//! never be marked valid while output deltas are still queued in its channel.
+//! The checkpoint barrier runs the phases in order: drain every sink's channel
+//! so all queued deltas are applied, prepare every transactional sink, capture
+//! and persist the checkpoint body, then commit. Draining first closes the gap
+//! between the engine-side pump and the sink task, so a checkpoint can never be
+//! marked valid while output deltas are still queued in its channel.
 //!
 //! Any failure before the commit completes aborts the prepared sinks, so the
-//! checkpoint is discarded and the engine keeps its last valid one.
+//! checkpoint is discarded and the engine keeps its last valid one. The caller
+//! clears the durable commit intent before it aborts, so recovery can never
+//! promote sinks that were rolled back.
 //!
 //! Non-transactional sinks adapt the protocol: `Idempotent` sinks are only
 //! flushed on commit (safe to replay after a crash), `AtLeastOnce` sinks are
@@ -16,8 +18,6 @@
 //! Each sink is a [`SharedSink`](crate::runtime::sink::SharedSink), whose mutex
 //! serializes these control calls against the concurrent `write` in the sink
 //! task, so the 2PC contract holds.
-
-use std::future::Future;
 
 use tokio::sync::oneshot;
 
@@ -35,60 +35,34 @@ pub struct Prepared {
     indices: Vec<usize>,
 }
 
+impl Prepared {
+    /// The full set of prepared sinks, used when no participant committed.
+    fn all(prepared: &Self) -> Self {
+        Self {
+            indices: prepared.indices.clone(),
+        }
+    }
+
+    /// The prepared sinks from `slice` onward, used to abort the failed and
+    /// still-uncommitted participants.
+    fn from(indices: &[usize]) -> Self {
+        Self {
+            indices: indices.to_vec(),
+        }
+    }
+}
+
 impl SinkBarrier {
     /// Build a barrier over `sinks`; an empty list is a no-op.
     pub fn new(sinks: Vec<SinkSync>) -> Self {
         Self { sinks }
     }
 
-    /// Run the barrier order around `capture`: drain, prepare, `capture`, commit.
-    ///
-    /// `capture` snapshots the engine and writes the checkpoint body. When it
-    /// fails, or when the later commit fails, the prepared sinks are aborted
-    /// and the error is returned, so no checkpoint can become valid.
-    pub async fn around<F, Fut, T>(&self, capture: F) -> Result<T, ConnectorError>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T, ConnectorError>>,
-    {
-        self.drain().await?;
-        let prepared = self.prepare().await?;
-        match capture().await {
-            Ok(value) => self.commit(&prepared).await.map(|()| value),
-            Err(error) => {
-                self.abort(&prepared).await;
-                Err(error)
-            }
-        }
-    }
-
-    /// Whether every coordinated sink declares its `commit` re-drivable.
-    ///
-    /// The barrier trusts each sink's
-    /// [`commit_redriable`](hotlap_connectors::sink::Sink::commit_redriable)
-    /// declaration: `Transactional` and `Idempotent` sinks qualify by default,
-    /// but a sink may opt out when its effects are not actually repeatable, and
-    /// an `AtLeastOnce` sink must be discarded and replayed.
-    pub fn redriable(&self) -> bool {
-        self.sinks.iter().all(|sync| sync.sink().commit_redriable())
-    }
-
-    /// Re-drive `commit` for every sink after an interrupted commit.
-    ///
-    /// Only valid when [`Self::redriable`] holds: `Sink::commit` must tolerate
-    /// running more than once, which the sink contract already requires.
-    pub async fn redrive_commit(&self) -> Result<(), ConnectorError> {
-        for sync in &self.sinks {
-            sync.sink().commit().await?;
-        }
-        Ok(())
-    }
-
     /// Drain every channel so all queued deltas have reached their sink.
     ///
     /// A `Flush` is sent behind the queued batches and awaited; the sink task
     /// replies only after writing them, so its state covers the checkpoint.
-    async fn drain(&self) -> Result<(), ConnectorError> {
+    pub(crate) async fn drain(&self) -> Result<(), ConnectorError> {
         let mut replies = Vec::new();
         for sync in &self.sinks {
             let Some(sender) = sync.sender() else {
@@ -111,7 +85,7 @@ impl SinkBarrier {
     ///
     /// A failure aborts the sinks that already prepared, so no sink keeps a
     /// half-open transaction.
-    async fn prepare(&self) -> Result<Prepared, ConnectorError> {
+    pub(crate) async fn prepare(&self) -> Result<Prepared, ConnectorError> {
         let mut indices = Vec::new();
         for (index, sync) in self.sinks.iter().enumerate() {
             let sink = sync.sink();
@@ -132,31 +106,58 @@ impl SinkBarrier {
     ///
     /// Flushing first means an idempotent failure cannot strand a checkpoint
     /// whose transactional sinks already committed (which would replay and
-    /// duplicate). On any commit or flush error every still-uncommitted
-    /// prepared sink is aborted, matching the documented contract.
-    async fn commit(&self, prepared: &Prepared) -> Result<(), ConnectorError> {
+    /// duplicate). On failure the error carries the prepared sinks still to
+    /// abort: all of them when an idempotent flush fails, otherwise the failed
+    /// transactional sink and those after it. The caller aborts them after
+    /// clearing the durable commit intent, so no sink keeps a half-open
+    /// transaction and no rolled-back commit stays promotable.
+    pub(crate) async fn commit(
+        &self,
+        prepared: &Prepared,
+    ) -> Result<(), (ConnectorError, Prepared)> {
         for sync in &self.sinks {
             let sink = sync.sink();
             if sink.capabilities() == SinkCapabilities::Idempotent
                 && let Err(error) = sink.commit().await
             {
-                self.abort(prepared).await;
-                return Err(error);
+                return Err((error, Prepared::all(prepared)));
             }
         }
         for (position, &index) in prepared.indices.iter().enumerate() {
             if let Err(error) = self.sinks[index].sink().commit().await {
                 // The failed sink may not have committed, so abort it too.
-                self.abort_indices(&prepared.indices[position..]).await;
-                return Err(error);
+                return Err((error, Prepared::from(&prepared.indices[position..])));
             }
         }
         Ok(())
     }
 
     /// Abort every prepared transactional sink.
-    async fn abort(&self, prepared: &Prepared) {
+    pub(crate) async fn abort(&self, prepared: &Prepared) {
         self.abort_indices(&prepared.indices).await;
+    }
+
+    /// Whether every coordinated sink declares its `commit` re-drivable.
+    ///
+    /// The barrier trusts each sink's
+    /// [`commit_redriable`](hotlap_connectors::sink::Sink::commit_redriable)
+    /// declaration: `Idempotent` sinks qualify by default, but any sink may opt
+    /// in or out when its effects are not repeatable, and an `AtLeastOnce` sink
+    /// must be discarded and replayed. A `Transactional` sink is not re-drivable
+    /// unless it opts in explicitly.
+    pub fn redriable(&self) -> bool {
+        self.sinks.iter().all(|sync| sync.sink().commit_redriable())
+    }
+
+    /// Re-drive `commit` for every sink after an interrupted commit.
+    ///
+    /// Only valid when [`Self::redriable`] holds: `Sink::commit` must tolerate
+    /// running more than once, which the sink contract already requires.
+    pub async fn redrive_commit(&self) -> Result<(), ConnectorError> {
+        for sync in &self.sinks {
+            sync.sink().commit().await?;
+        }
+        Ok(())
     }
 
     /// Best-effort abort of the given sink indices.
