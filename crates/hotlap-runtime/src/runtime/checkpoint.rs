@@ -11,7 +11,7 @@ mod commit;
 use std::time::Duration;
 
 use hotlap::state::StateBackend;
-use hotlap_engine::{EngineSnapshot, decode_framed, decode_snapshot};
+use hotlap_engine::{EngineSnapshot, decode_snapshot};
 
 use crate::runtime::checkpoint_body::{
     LATEST_KEY, checkpoint_prefix, engine_err, invalid, parse_id, read_body as decode_body,
@@ -19,8 +19,8 @@ use crate::runtime::checkpoint_body::{
 };
 use crate::runtime::sink::SinkSync;
 use crate::runtime::sink_barrier::SinkBarrier;
+use crate::runtime::source_checkpoint::{SourcesCheckpoint, decode_sources};
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::SourceState;
 
 /// How many checkpoints [`CheckpointConfig`] keeps by default.
 pub const DEFAULT_RETAIN: usize = 3;
@@ -44,8 +44,8 @@ pub struct Checkpoint {
     pub id: u64,
     /// Engine state captured at the barrier.
     pub engine: EngineSnapshot,
-    /// Source read positions captured at the barrier.
-    pub sources: SourceState,
+    /// Source read positions and identity captured at the barrier.
+    pub sources: SourcesCheckpoint,
 }
 
 /// Writes coherent, versioned checkpoints to a [`StateBackend`].
@@ -133,7 +133,7 @@ impl Checkpointer {
         let source_bytes = self
             .get(&format!("{base}/sources"))?
             .ok_or_else(|| invalid(id))?;
-        let sources = decode_framed(&source_bytes).map_err(engine_err)?;
+        let sources = decode_sources(&source_bytes)?;
         Ok(Checkpoint {
             id,
             engine,

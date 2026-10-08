@@ -35,7 +35,7 @@ fn on_demand_checkpoint_is_coherent_and_readable() {
     );
     assert_eq!(checkpoint.engine.views.len(), 1);
     assert_eq!(
-        checkpoint.sources.offsets.get(&0),
+        checkpoint.sources.entries[0].state.offsets.get(&0),
         Some(&3),
         "source offsets must match the ingested batches"
     );

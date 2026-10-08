@@ -6,6 +6,7 @@ use hotlap_engine::EngineCore;
 
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_runtime::runtime::pipeline::{self, Pipeline, Watermark};
+use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
 struct FakeSource {
     schema: SchemaRef,
@@ -40,12 +41,16 @@ fn schema() -> SchemaRef {
 #[tokio::test]
 async fn watermark_uses_the_source_event_time_column() {
     let pipeline = Pipeline {
-        input: "in".into(),
-        source: Box::new(FakeSource {
-            schema: schema(),
-            event_time: Some(1),
-        }),
-        watermark: Some(Watermark { lag: 0 }),
+        sources: Sources::new(vec![InputSource {
+            id: hotlap::InputId(0),
+            name: "in".into(),
+            source: Arc::new(FakeSource {
+                schema: schema(),
+                event_time: Some(1),
+            }),
+            watermark: Some(Watermark { lag: 0 }),
+        }])
+        .unwrap(),
         views: vec![],
         sinks: vec![],
         checkpoint: None,
@@ -58,12 +63,16 @@ async fn watermark_uses_the_source_event_time_column() {
 #[tokio::test]
 async fn watermark_without_source_event_time_errors() {
     let pipeline = Pipeline {
-        input: "in".into(),
-        source: Box::new(FakeSource {
-            schema: schema(),
-            event_time: None,
-        }),
-        watermark: Some(Watermark { lag: 0 }),
+        sources: Sources::new(vec![InputSource {
+            id: hotlap::InputId(0),
+            name: "in".into(),
+            source: Arc::new(FakeSource {
+                schema: schema(),
+                event_time: None,
+            }),
+            watermark: Some(Watermark { lag: 0 }),
+        }])
+        .unwrap(),
         views: vec![],
         sinks: vec![],
         checkpoint: None,

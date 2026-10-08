@@ -3,19 +3,20 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use futures::StreamExt;
 use hotlap::Hotlap;
 use hotlap_engine::{EngineCore, MetricsRegistry};
 use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 use tokio::time::{Instant, Interval, interval_at};
 
 use crate::runtime::checkpoint::Checkpointer;
-use crate::runtime::command::{self, Command};
-use crate::runtime::pipeline::{self, Pipeline, feed_source, record_error};
+use crate::runtime::command::Command;
+use crate::runtime::pipeline::{self, Pipeline};
 use crate::runtime::recovery::Recovery;
 use crate::runtime::sink::SinkPump;
+use crate::runtime::sources::InputStream;
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::SourceStream;
+
+mod serve;
 
 /// Run the engine loop until shutdown or channel close.
 ///
@@ -54,7 +55,7 @@ pub(crate) fn run(
 /// Live state owned by the serving loop after startup.
 struct Engine {
     hotlap: Hotlap,
-    source: SourceStream,
+    source: InputStream,
     sinks: SinkPump,
     checkpointer: Option<Checkpointer>,
     ticker: Option<Interval>,
@@ -78,7 +79,7 @@ async fn drive(
         }
     };
     let _ = ready.send(Ok(()));
-    serve(engine, pipeline, rx, last_error, checkpoint_error, built).await;
+    serve::serve(engine, pipeline, rx, last_error, checkpoint_error, built).await;
 }
 
 /// Open the kernel, merge the source streams and read the checkpoint config.
@@ -103,7 +104,7 @@ async fn prepare(
                 Checkpointer::new(config.backend, config.retain).with_sinks(coordinated);
             let source = Recovery::start(
                 &mut hotlap,
-                pipeline.source.as_ref(),
+                &pipeline.sources,
                 &mut checkpointer,
                 checkpoint_error,
                 &metrics,
@@ -112,11 +113,7 @@ async fn prepare(
             let tick = interval_at(Instant::now() + config.interval, config.interval);
             (source, Some(checkpointer), Some(tick))
         }
-        None => (
-            pipeline::merged_stream(pipeline.source.as_ref())?,
-            None,
-            None,
-        ),
+        None => (pipeline.sources.stream()?, None, None),
     };
     Ok(Engine {
         hotlap,
@@ -125,57 +122,4 @@ async fn prepare(
         checkpointer,
         ticker,
     })
-}
-
-/// Serve the source stream and the command channel until shutdown.
-async fn serve(
-    mut engine: Engine,
-    pipeline: Pipeline,
-    rx: &mut UnboundedReceiver<Command>,
-    last_error: &Mutex<Option<String>>,
-    checkpoint_error: &Mutex<Option<String>>,
-    built: &AtomicBool,
-) {
-    let mut source_done = false;
-    loop {
-        tokio::select! {
-            maybe = engine.source.next(), if !source_done => {
-                source_done = feed_source(
-                    &mut engine.hotlap, &pipeline, &engine.sinks, maybe, last_error, built,
-                )
-                .await;
-            }
-            _ = tick(&mut engine.ticker) => {
-                command::run_periodic(
-                    &mut engine.checkpointer, &engine.hotlap, &pipeline, checkpoint_error,
-                )
-                .await;
-            }
-            cmd = rx.recv() => {
-                if command::handle(cmd, &mut engine.hotlap, &pipeline, &mut engine.checkpointer)
-                    .await
-                {
-                    close_sinks(engine.sinks, last_error).await;
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// Await the next periodic tick, or stay pending when checkpointing is off.
-async fn tick(ticker: &mut Option<Interval>) {
-    match ticker {
-        Some(interval) => {
-            interval.tick().await;
-        }
-        None => futures::future::pending::<()>().await,
-    }
-}
-
-/// Drop the sink senders and wait for the tasks, so the last changelog lands.
-async fn close_sinks(sinks: SinkPump, last_error: &Mutex<Option<String>>) {
-    if let Err(error) = sinks.close().await {
-        record_error(last_error, error);
-    }
 }

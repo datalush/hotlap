@@ -1,13 +1,15 @@
 //! Recovery: restore the newest valid checkpoint, reopen sources and replay.
 //!
 //! A restart loads the last valid checkpoint (engine snapshot plus captured
-//! source offsets), restores the engine, reopens each source split at its
-//! captured offset and feeds the resulting stream back in. Because the engine
-//! is restored to the checkpoint before the offset is replayed, replaying the
-//! log from that offset yields exactly the state the crashed run had reached.
+//! per-source offsets), validates it against the declared sources, restores the
+//! engine, reopens each source split at its captured offset and feeds the
+//! resulting streams back in. Because the engine is restored to the checkpoint
+//! before the offsets are replayed, replaying the log from those offsets yields
+//! exactly the state the crashed run had reached.
 
 mod pending;
 mod restore;
+mod sources;
 
 use std::sync::Mutex;
 
@@ -15,11 +17,11 @@ use hotlap::Hotlap;
 use hotlap_engine::MetricsRegistry;
 
 use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
-use crate::runtime::pipeline;
+use crate::runtime::sources::{InputStream, Sources};
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::{Source, SourceStream};
 use pending::{discard, pending_commit};
-use restore::{restore, seed_applied};
+use restore::restore;
+use sources::{read_body, read_valid};
 
 /// The last valid checkpoint, if the store holds one.
 pub struct Recovery;
@@ -54,23 +56,25 @@ impl Recovery {
     /// Decide how to recover, detecting a checkpoint that was mid-commit when
     /// the process stopped.
     ///
-    /// Without a commit marker this is exactly [`Self::load`]: the newest valid
-    /// checkpoint, or a clean start. With a marker and a complete body, an
-    /// interrupted commit is either promoted (every sink declares its commit
-    /// re-drivable) or explicitly discarded and replayed from the previous valid
-    /// checkpoint.
-    pub fn inspect(checkpointer: &Checkpointer) -> Result<RecoveryDecision, ConnectorError> {
-        let fallback = Self::load(checkpointer)?;
+    /// The newest valid checkpoint and any pending commit body are validated
+    /// against `sources` before a decision is returned, so a promotion or a
+    /// resume never runs against an incompatible declaration. An undecodable
+    /// current-format body keeps the SP8 discard path; a foreign or
+    /// incompatible format is a fatal `Unsupported`.
+    pub fn inspect(
+        checkpointer: &Checkpointer,
+        sources: &Sources,
+    ) -> Result<RecoveryDecision, ConnectorError> {
+        let fallback = Self::load(checkpointer, sources)?;
         if let Some(pending) = pending_commit(checkpointer, fallback.as_ref().map(|c| c.id))? {
-            // A pending body that fails to decode is not promotable: fall
-            // through to Discard so the tolerant newest-first fallback wins.
-            // The reason distinguishes an undecodable body from a body whose
-            // sinks simply cannot re-drive the commit.
-            let reason = match checkpointer.read_body(pending).ok().flatten() {
-                Some(checkpoint) if checkpointer.redriable() => {
-                    return Ok(RecoveryDecision::Promote(checkpoint));
+            let reason = match read_body(checkpointer, pending)? {
+                Some(checkpoint) => {
+                    sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
+                    if checkpointer.redriable() {
+                        return Ok(RecoveryDecision::Promote(checkpoint));
+                    }
+                    "a sink is not re-drivable"
                 }
-                Some(_) => "a sink is not re-drivable",
                 None => "the pending commit body is corrupt or incomplete",
             };
             return Ok(RecoveryDecision::Discard {
@@ -94,20 +98,20 @@ impl Recovery {
     /// startup, so a hostile marker cannot wedge every restart in a retry loop.
     pub async fn start(
         hotlap: &mut Hotlap,
-        source: &dyn Source,
+        sources: &Sources,
         checkpointer: &mut Checkpointer,
         signal: &Mutex<Option<String>>,
         metrics: &MetricsRegistry,
-    ) -> Result<SourceStream, ConnectorError> {
+    ) -> Result<InputStream, ConnectorError> {
         checkpointer.sweep_stale_commits()?;
-        let checkpoint = match Self::inspect(checkpointer)? {
-            RecoveryDecision::Clean => return pipeline::merged_stream(source),
+        let checkpoint = match Self::inspect(checkpointer, sources)? {
+            RecoveryDecision::Clean => return sources.stream(),
             RecoveryDecision::Resume(checkpoint) => checkpoint,
             RecoveryDecision::Promote(checkpoint) => {
                 match checkpointer.promote(checkpoint.id).await {
                     Ok(()) => checkpoint,
                     Err(error) => {
-                        let fallback = Self::load(checkpointer)?;
+                        let fallback = Self::load(checkpointer, sources)?;
                         let reason = format!("commit re-drive failed ({error})");
                         match discard(
                             checkpointer,
@@ -118,7 +122,7 @@ impl Recovery {
                             &reason,
                         )? {
                             Some(fallback) => fallback,
-                            None => return pipeline::merged_stream(source),
+                            None => return sources.stream(),
                         }
                     }
                 }
@@ -129,35 +133,40 @@ impl Recovery {
                 reason,
             } => match discard(checkpointer, metrics, signal, pending, fallback, reason)? {
                 Some(checkpoint) => checkpoint,
-                None => return pipeline::merged_stream(source),
+                None => return sources.stream(),
             },
         };
         checkpointer.resume_after(checkpoint.id);
-        Self::resume(hotlap, source, &checkpoint)
+        Self::resume(hotlap, sources, &checkpoint)
     }
 
     /// Newest valid checkpoint, or `None` for a clean start.
     ///
     /// The `latest` pointer is tried first. If its checkpoint fails to decode
-    /// or validate, older checkpoints are tried newest-first, so a corrupt tip
-    /// does not abort startup while a valid predecessor remains. A checkpoint
-    /// is only visible once every part (engine, sources, `valid` marker) is
-    /// written, so a readable one is always coherent.
-    pub fn load(checkpointer: &Checkpointer) -> Result<Option<Checkpoint>, ConnectorError> {
+    /// as the current format, older checkpoints are tried newest-first, so a
+    /// corrupt tip does not abort startup while a valid predecessor remains. A
+    /// checkpoint that validates against the declared sources is returned; an
+    /// incompatible one is a fatal `Unsupported` rather than a silent skip.
+    pub fn load(
+        checkpointer: &Checkpointer,
+        sources: &Sources,
+    ) -> Result<Option<Checkpoint>, ConnectorError> {
         if let Some(id) = checkpointer.latest()?
-            && let Ok(checkpoint) = checkpointer.read(id)
+            && let Some(checkpoint) = read_valid(checkpointer, id)?
         {
+            sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
             return Ok(Some(checkpoint));
         }
         for id in checkpointer.ids_descending()? {
-            if let Ok(checkpoint) = checkpointer.read(id) {
+            if let Some(checkpoint) = read_valid(checkpointer, id)? {
+                sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
                 return Ok(Some(checkpoint));
             }
         }
         Ok(None)
     }
 
-    /// Restore `checkpoint` into `hotlap` and reopen `source` at the captured
+    /// Restore `checkpoint` into `hotlap` and reopen `sources` at the captured
     /// offsets, yielding a stream that replays from the checkpoint.
     ///
     /// [`SourceState`](hotlap_connectors::source::SourceState) holds the offset of the
@@ -167,16 +176,17 @@ impl Recovery {
     /// one later loses. The runtime commits offsets after ingestion, so no
     /// in-flight batch can break the invariant.
     ///
-    /// Errors when the source can no longer serve a captured offset, so
-    /// insufficient retention fails loudly instead of losing records.
+    /// The checkpoint is validated before the engine is restored or any source
+    /// is reopened. Errors when a source can no longer serve a captured offset,
+    /// so insufficient retention fails loudly instead of losing records.
     pub fn resume(
         hotlap: &mut Hotlap,
-        source: &dyn Source,
+        sources: &Sources,
         checkpoint: &Checkpoint,
-    ) -> Result<SourceStream, ConnectorError> {
+    ) -> Result<InputStream, ConnectorError> {
+        sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
         restore(hotlap, &checkpoint.engine)?;
-        let splits = source.resume(&checkpoint.sources)?;
-        seed_applied(source, &checkpoint.sources)?;
-        pipeline::merged_stream_from(source, &splits)
+        let splits = sources::resume(sources, &checkpoint.sources)?;
+        sources.stream_with(&splits)
     }
 }

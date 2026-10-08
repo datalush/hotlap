@@ -16,6 +16,7 @@ use hotlap_connectors::source::{
 use hotlap_runtime::runtime::checkpoint::CheckpointConfig;
 use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline::Pipeline;
+use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
 /// In-memory backend shared with the test, so writes stay observable.
 #[derive(Clone, Default)]
@@ -114,14 +115,19 @@ fn schema() -> SchemaRef {
 
 /// A one-view pipeline feeding three int batches through `backend`.
 pub fn pipeline(backend: SharedBackend, interval: Duration, retain: usize) -> Pipeline {
+    let source = Arc::new(ScriptSource {
+        schema: schema(),
+        batches: vec![vec![1], vec![1, 2], vec![2]],
+        progress: Arc::new(Mutex::new(SourceState::default())),
+    });
     Pipeline {
-        input: "in".into(),
-        source: Box::new(ScriptSource {
-            schema: schema(),
-            batches: vec![vec![1], vec![1, 2], vec![2]],
-            progress: Arc::new(Mutex::new(SourceState::default())),
-        }),
-        watermark: None,
+        sources: Sources::new(vec![InputSource {
+            id: InputId(0),
+            name: "in".into(),
+            source,
+            watermark: None,
+        }])
+        .unwrap(),
         views: vec![(
             "c".into(),
             Plan::GroupAggregate {

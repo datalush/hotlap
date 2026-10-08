@@ -7,12 +7,13 @@ use hotlap::{Hotlap, HotlapError, Plan};
 
 use crate::runtime::checkpoint::CheckpointConfig;
 use crate::runtime::sink::SinkPump;
+use crate::runtime::sources::{SourceEvent, Sources};
 use hotlap_connectors::convert;
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::Sink;
-use hotlap_connectors::source::{Source, SourceBatch, SourceStream, Split, SplitId};
+use hotlap_connectors::source::SplitId;
 
-/// Event-time declaration for the pipeline's input.
+/// Event-time declaration for one input source.
 #[derive(Clone, Copy, Debug)]
 pub struct Watermark {
     pub lag: i64,
@@ -24,11 +25,9 @@ pub struct SinkSpec {
     pub sink: Arc<dyn Sink>,
 }
 
-/// Everything needed to run a source into the kernel.
+/// Everything needed to run a set of sources into the kernel.
 pub struct Pipeline {
-    pub input: String,
-    pub source: Box<dyn Source>,
-    pub watermark: Option<Watermark>,
+    pub sources: Sources,
     pub views: Vec<(String, Plan)>,
     pub sinks: Vec<SinkSpec>,
     /// Periodic checkpoint settings; `None` disables checkpointing.
@@ -38,27 +37,43 @@ pub struct Pipeline {
     pub retention: Option<usize>,
 }
 
-/// Register the input, optional watermark and views on `hotlap`.
+/// Outcome of feeding one source item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedStatus {
+    /// The item was applied; the loop can keep serving.
+    Continue,
+    /// The source produced no more items; ingestion ends without error.
+    Exhausted,
+    /// A read, ingest or ack failure stopped the runtime.
+    Failed,
+}
+
+/// Register every input, optional watermark and views on `hotlap`.
 ///
-/// The event-time column index is owned by the source, so it is derived from
-/// `Source::event_time_column` rather than supplied by the caller.
+/// The event-time column index is owned by each source, so it is derived from
+/// `Source::event_time_column` rather than supplied by the caller. The inputs
+/// are all registered before any view or tap is built, so every `Plan::Source`
+/// is resolvable regardless of declaration order.
 pub fn setup(hotlap: &mut Hotlap, pipeline: &Pipeline) -> Result<(), ConnectorError> {
-    hotlap.register_input(&pipeline.input).map_err(hotlap_err)?;
-    if let Some(w) = pipeline.watermark {
-        let time_col = pipeline
-            .source
-            .event_time_column()
-            .ok_or_else(|| ConnectorError::Unsupported("source has no event-time column".into()))?;
+    for entry in pipeline.sources.entries() {
         hotlap
-            .declare_watermark(&pipeline.input, time_col, w.lag)
+            .register_input_with_id(&entry.name, entry.id)
             .map_err(hotlap_err)?;
-        // Register every declared split before the first push so the input
-        // watermark cannot advance past a split that has not produced a batch.
-        let splits = pipeline.source.splits()?;
-        let ids: Vec<SplitId> = splits.iter().map(|split| split.id).collect();
-        hotlap
-            .declare_splits(&pipeline.input, &ids)
-            .map_err(hotlap_err)?;
+        if let Some(w) = entry.watermark {
+            let time_col = entry.source.event_time_column().ok_or_else(|| {
+                ConnectorError::Unsupported("source has no event-time column".into())
+            })?;
+            hotlap
+                .declare_watermark(&entry.name, time_col, w.lag)
+                .map_err(hotlap_err)?;
+            // Register every declared split before the first push so the input
+            // watermark cannot advance past a split that has not produced a batch.
+            let splits = entry.source.splits()?;
+            let ids: Vec<SplitId> = splits.iter().map(|split| split.id).collect();
+            hotlap
+                .declare_splits(&entry.name, &ids)
+                .map_err(hotlap_err)?;
+        }
     }
     for (name, plan) in &pipeline.views {
         hotlap.create_view(name, plan.clone()).map_err(hotlap_err)?;
@@ -70,52 +85,42 @@ pub fn setup(hotlap: &mut Hotlap, pipeline: &Pipeline) -> Result<(), ConnectorEr
     Ok(())
 }
 
-/// Merge the per-split streams into a single stream.
-pub fn merged_stream(source: &dyn Source) -> Result<SourceStream, ConnectorError> {
-    merged_stream_from(source, &source.splits()?)
-}
-
-/// Merge `splits` into a single stream, reading each one from its `start`.
-pub fn merged_stream_from(
-    source: &dyn Source,
-    splits: &[Split],
-) -> Result<SourceStream, ConnectorError> {
-    let mut streams = Vec::with_capacity(splits.len());
-    for split in splits {
-        streams.push(source.read(split)?);
-    }
-    Ok(Box::pin(futures::stream::select_all(streams)))
-}
-
-/// Convert one source batch and push it, tagged with its source split, into the
-/// input.
-pub fn ingest(hotlap: &mut Hotlap, input: &str, sb: &SourceBatch) -> Result<(), ConnectorError> {
-    let zset = convert::to_zset(&sb.batch)?;
+/// Convert one tagged event and push it into the input that produced it.
+pub fn ingest_event(
+    hotlap: &mut Hotlap,
+    sources: &Sources,
+    event: &SourceEvent,
+) -> Result<(), ConnectorError> {
+    let entry = sources.get(event.input)?;
+    let zset = convert::to_zset(&event.batch.batch)?;
     hotlap
-        .push_split(input, sb.split, &zset)
+        .push_split(&entry.name, event.batch.split, &zset)
         .map_err(hotlap_err)
 }
 
 /// Ingest one source item and, if it succeeded, pump its deltas into the sinks.
 ///
-/// Returns whether the source branch is finished (exhausted, errored or the
-/// sink channel broke), which disables that branch of the select loop.
+/// A read or ingest error becomes [`FeedStatus::Failed`]; a closed source
+/// becomes [`FeedStatus::Exhausted`]. Both stop the failing branch, but only a
+/// failure forbids later checkpoints and view builds.
 pub(crate) async fn feed_source(
     hotlap: &mut Hotlap,
-    pipeline: &Pipeline,
+    sources: &Sources,
     sinks: &SinkPump,
-    item: Option<Result<SourceBatch, ConnectorError>>,
+    item: Option<Result<SourceEvent, ConnectorError>>,
     last_error: &Mutex<Option<String>>,
     built: &AtomicBool,
-) -> bool {
-    if on_source_item(hotlap, pipeline, item, last_error, built) {
-        return true;
+) -> FeedStatus {
+    match on_source_item(hotlap, sources, item, last_error, built) {
+        FeedStatus::Failed => return FeedStatus::Failed,
+        FeedStatus::Exhausted => return FeedStatus::Exhausted,
+        FeedStatus::Continue => {}
     }
     match sinks.pump(hotlap).await {
-        Ok(()) => false,
+        Ok(()) => FeedStatus::Continue,
         Err(error) => {
             record_error(last_error, error);
-            true
+            FeedStatus::Failed
         }
     }
 }
@@ -123,37 +128,42 @@ pub(crate) async fn feed_source(
 /// Ingest one source item, recording any error and reporting source completion.
 fn on_source_item(
     hotlap: &mut Hotlap,
-    pipeline: &Pipeline,
-    item: Option<Result<SourceBatch, ConnectorError>>,
+    sources: &Sources,
+    item: Option<Result<SourceEvent, ConnectorError>>,
     last_error: &Mutex<Option<String>>,
     built: &AtomicBool,
-) -> bool {
+) -> FeedStatus {
     match item {
-        Some(Ok(sb)) => match ingest(hotlap, &pipeline.input, &sb) {
+        Some(Ok(event)) => match ingest_event(hotlap, sources, &event) {
             Ok(()) => {
                 // The first successful push builds the dataflow, so views become
                 // readable even if later pushes add no rows.
                 built.store(true, Ordering::SeqCst);
                 // Ack only now, so the source never reports a batch as applied
-                // before the engine has actually ingested it.
-                match pipeline.source.commit(sb.split, sb.next_offset) {
-                    Ok(()) => false,
+                // before the engine has actually ingested it, and only on the
+                // source that produced it.
+                match sources.get(event.input).and_then(|entry| {
+                    entry
+                        .source
+                        .commit(event.batch.split, event.batch.next_offset)
+                }) {
+                    Ok(()) => FeedStatus::Continue,
                     Err(error) => {
                         record_error(last_error, error);
-                        true
+                        FeedStatus::Failed
                     }
                 }
             }
             Err(error) => {
                 record_error(last_error, error);
-                true
+                FeedStatus::Failed
             }
         },
         Some(Err(error)) => {
             record_error(last_error, error);
-            true
+            FeedStatus::Failed
         }
-        None => true,
+        None => FeedStatus::Exhausted,
     }
 }
 

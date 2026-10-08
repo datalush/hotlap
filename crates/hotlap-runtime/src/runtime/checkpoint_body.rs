@@ -2,12 +2,11 @@
 
 use hotlap::Hotlap;
 use hotlap::state::{StateBackend, StateError};
-use hotlap_engine::{
-    EngineError, EngineSnapshot, decode_framed, decode_snapshot, encode_framed, encode_snapshot,
-};
+use hotlap_engine::{EngineError, EngineSnapshot, decode_snapshot, encode_snapshot};
 
+use crate::runtime::source_checkpoint::{SourcesCheckpoint, decode_sources, encode_sources};
+use crate::runtime::sources::Sources;
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::{Source, SourceState};
 
 /// Value stored under `checkpoint/<id>/valid` once a checkpoint is complete.
 pub(crate) const VALID_MARKER: &[u8] = b"1";
@@ -30,11 +29,12 @@ pub(crate) async fn write(
     backend: &mut (dyn StateBackend + Send),
     id: u64,
     engine: &Hotlap,
-    source: &dyn Source,
+    sources: &Sources,
 ) -> Result<(), ConnectorError> {
     let snapshot = engine.checkpoint().map_err(hotlap_err)?;
     let engine_bytes = encode_snapshot(&snapshot).map_err(engine_err)?;
-    let source_bytes = encode_framed(&source.state()).map_err(engine_err)?;
+    let sources_checkpoint = SourcesCheckpoint::capture(sources)?;
+    let source_bytes = encode_sources(&sources_checkpoint)?;
     let base = checkpoint_prefix(id);
     backend
         .put(format!("{base}/engine").as_bytes(), engine_bytes)
@@ -62,7 +62,7 @@ pub(crate) fn clear_commit(
 pub(crate) fn read_body(
     backend: &dyn StateBackend,
     id: u64,
-) -> Result<Option<(EngineSnapshot, SourceState)>, ConnectorError> {
+) -> Result<Option<(EngineSnapshot, SourcesCheckpoint)>, ConnectorError> {
     let base = checkpoint_prefix(id);
     let Some(engine_bytes) = backend
         .get(format!("{base}/engine").as_bytes())
@@ -77,7 +77,7 @@ pub(crate) fn read_body(
     else {
         return Ok(None);
     };
-    let sources = decode_framed(&source_bytes).map_err(engine_err)?;
+    let sources = decode_sources(&source_bytes)?;
     Ok(Some((engine, sources)))
 }
 

@@ -14,10 +14,9 @@ use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_engine::MetricsRegistry;
 use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
-use hotlap_runtime::runtime::pipeline as runtime;
 use hotlap_runtime::runtime::recovery::{Recovery, RecoveryDecision};
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
-use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, rows, take};
+use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, rows, sources, take};
 
 /// A sink that overrides the default re-drivability declaration.
 struct DeclaringSink {
@@ -70,9 +69,9 @@ fn seed_valid_one() -> SharedBackend {
     let backend = SharedBackend::default();
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
-    let mut stream = runtime::merged_stream(pipe.source.as_ref()).unwrap();
-    drain(&mut engine, pipe.source.as_ref(), &mut stream, 3);
-    take(&mut checkpointer, &engine, pipe.source.as_ref());
+    let mut stream = pipe.sources.stream().unwrap();
+    drain(&mut engine, &pipe.sources, &mut stream, 3);
+    take(&mut checkpointer, &engine, &pipe.sources);
     backend
 }
 
@@ -105,7 +104,7 @@ fn a_sink_can_declare_commit_non_redrivable_despite_its_capability() {
     let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
         .with_sinks(vec![SinkSync::sink_only(sink)]);
 
-    match Recovery::inspect(&checkpointer).unwrap() {
+    match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
         RecoveryDecision::Discard {
             pending, fallback, ..
         } => {
@@ -125,7 +124,7 @@ fn a_sink_can_declare_commit_redrivable_despite_at_least_once() {
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
         .with_sinks(vec![SinkSync::sink_only(sink)]);
 
-    match Recovery::inspect(&checkpointer).unwrap() {
+    match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
         RecoveryDecision::Promote(checkpoint) => assert_eq!(checkpoint.id, 2),
         other => panic!("expected Promote, got {other:?}"),
     }
@@ -144,14 +143,13 @@ fn discarding_emits_a_warning_signal_and_metric() {
     let (sink, _) = declaring(SinkCapabilities::AtLeastOnce, false);
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
         .with_sinks(vec![SinkSync::sink_only(sink)]);
-    let (mut hotlap, _pipe) = engine_with(ResumableSource::new(log()));
-    let source = ResumableSource::new(log());
+    let (mut hotlap, pipe) = engine_with(ResumableSource::new(log()));
     let signal = Mutex::new(None);
     let metrics = MetricsRegistry::new();
 
     let _stream = futures::executor::block_on(Recovery::start(
         &mut hotlap,
-        &source,
+        &pipe.sources,
         &mut checkpointer,
         &signal,
         &metrics,

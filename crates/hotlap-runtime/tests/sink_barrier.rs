@@ -5,12 +5,13 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
-use hotlap::Hotlap;
 use hotlap::state::{StateBackend, StateEntry, StateError};
+use hotlap::{Hotlap, InputId};
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError, Sink, SinkCapabilities};
 use hotlap_runtime::runtime::checkpoint::Checkpointer;
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
+use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
 /// Call order recorded by a fake sink.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +175,17 @@ fn engine() -> Hotlap {
     Hotlap::open_with(Box::new(hotlap_engine::EngineCore::new()))
 }
 
+/// A single empty source set, enough for the barrier.
+fn sources() -> Sources {
+    Sources::new(vec![InputSource {
+        id: InputId(0),
+        name: "in".into(),
+        source: Arc::new(EmptySource),
+        watermark: None,
+    }])
+    .unwrap()
+}
+
 fn events() -> Arc<Mutex<Vec<Event>>> {
     Arc::new(Mutex::new(Vec::new()))
 }
@@ -190,7 +202,7 @@ async fn transactional_sink_prepares_then_commits_before_valid() {
         Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
 
     let id = checkpointer
-        .take(&engine(), &EmptySource)
+        .take(&engine(), &sources())
         .await
         .expect("checkpoint");
     assert_eq!(id, 1);
@@ -219,7 +231,7 @@ async fn capture_failure_aborts_and_discards_the_checkpoint() {
     let mut checkpointer =
         Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
 
-    let result = checkpointer.take(&engine(), &EmptySource).await;
+    let result = checkpointer.take(&engine(), &sources()).await;
     assert!(result.is_err(), "a failing write must surface the error");
     assert_eq!(
         *log.lock().unwrap(),
@@ -250,7 +262,7 @@ async fn prepare_failure_aborts_the_already_prepared_sinks() {
         SinkSync::sink_only(second),
     ]);
 
-    let result = checkpointer.take(&engine(), &EmptySource).await;
+    let result = checkpointer.take(&engine(), &sources()).await;
     assert!(result.is_err());
     assert_eq!(*log.lock().unwrap(), vec![Event::Prepare, Event::Abort]);
     assert_eq!(*second_log.lock().unwrap(), vec![Event::Prepare]);
@@ -269,7 +281,7 @@ async fn idempotent_sink_is_flushed_but_not_prepared() {
     let mut checkpointer =
         Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
 
-    checkpointer.take(&engine(), &EmptySource).await.unwrap();
+    checkpointer.take(&engine(), &sources()).await.unwrap();
     assert_eq!(
         *log.lock().unwrap(),
         vec![Event::Commit],
@@ -288,7 +300,7 @@ async fn at_least_once_sink_is_not_coordinated() {
     let mut checkpointer =
         Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
 
-    checkpointer.take(&engine(), &EmptySource).await.unwrap();
+    checkpointer.take(&engine(), &sources()).await.unwrap();
     assert!(
         log.lock().unwrap().is_empty(),
         "at-least-once sinks are already visible and must not be coordinated"
@@ -314,7 +326,7 @@ async fn commit_failure_aborts_the_failed_and_remaining_prepared_sinks() {
         SinkSync::sink_only(second),
     ]);
 
-    let result = checkpointer.take(&engine(), &EmptySource).await;
+    let result = checkpointer.take(&engine(), &sources()).await;
     assert!(result.is_err());
     assert_eq!(*log.lock().unwrap(), vec![Event::Prepare, Event::Commit]);
     assert_eq!(
@@ -344,7 +356,7 @@ async fn idempotent_flush_failure_aborts_prepared_transactional_sinks() {
         SinkSync::sink_only(idempotent),
     ]);
 
-    let result = checkpointer.take(&engine(), &EmptySource).await;
+    let result = checkpointer.take(&engine(), &sources()).await;
     assert!(result.is_err());
     assert_eq!(
         *transactional_log.lock().unwrap(),

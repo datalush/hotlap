@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use hotlap::InputId;
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::Source;
+use hotlap_connectors::source::{Source, Split};
 
 use crate::runtime::pipeline::Watermark;
 
@@ -71,5 +71,13 @@ impl Sources {
     /// Merge every split of every input into one identity-tagged stream.
     pub fn stream(&self) -> Result<InputStream, ConnectorError> {
         streams::tagged_stream(&self.entries)
+    }
+
+    /// Merge one explicitly resolved split list per input, in entry order.
+    ///
+    /// Recovery uses this with the splits a source returned from `resume`, so
+    /// the merge reads exactly the restored offsets and never re-opens a source.
+    pub fn stream_with(&self, splits: &[Vec<Split>]) -> Result<InputStream, ConnectorError> {
+        streams::tagged_from(&self.entries, splits)
     }
 }

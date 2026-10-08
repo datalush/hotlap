@@ -16,6 +16,7 @@ use hotlap_connectors::source::{
 };
 use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline::Pipeline;
+use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
 /// Shared view of what the source has produced and what the runtime has acked.
 #[derive(Clone, Default)]
@@ -121,13 +122,17 @@ fn pipeline(ledger: Ledger, advance: bool) -> Pipeline {
         }
     };
     Pipeline {
-        input: "in".into(),
-        source: Box::new(AckSource {
-            schema: schema(),
-            batch: batch(7),
-            ledger,
-        }),
-        watermark: None,
+        sources: Sources::new(vec![InputSource {
+            id: InputId(0),
+            name: "in".into(),
+            source: Arc::new(AckSource {
+                schema: schema(),
+                batch: batch(7),
+                ledger,
+            }),
+            watermark: None,
+        }])
+        .unwrap(),
         views: vec![("c".into(), view)],
         sinks: vec![],
         checkpoint: None,

@@ -7,6 +7,7 @@ mod backend;
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
+use hotlap::InputId;
 use hotlap::state::StateBackend;
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
@@ -14,6 +15,7 @@ use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_engine::EngineCore;
 use hotlap_runtime::runtime::checkpoint::Checkpointer;
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
+use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
 use backend::SharedBackend;
 
@@ -67,6 +69,17 @@ impl Source for EmptySource {
     }
 }
 
+/// A single empty source set, enough for the barrier.
+fn sources() -> Sources {
+    Sources::new(vec![InputSource {
+        id: InputId(0),
+        name: "in".into(),
+        source: Arc::new(EmptySource),
+        watermark: None,
+    }])
+    .unwrap()
+}
+
 #[tokio::test]
 async fn a_failed_commit_clears_the_marker_before_aborting() {
     let backend = SharedBackend::default();
@@ -80,7 +93,7 @@ async fn a_failed_commit_clears_the_marker_before_aborting() {
         .with_sinks(vec![SinkSync::sink_only(SharedSink::new(probe))]);
     let engine = hotlap::Hotlap::open_with(Box::new(EngineCore::new()));
 
-    let result = checkpointer.take(&engine, &EmptySource).await;
+    let result = checkpointer.take(&engine, &sources()).await;
 
     assert!(result.is_err(), "the failed commit must surface the error");
     assert!(

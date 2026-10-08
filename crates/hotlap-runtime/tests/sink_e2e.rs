@@ -14,6 +14,7 @@ use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, 
 use hotlap_connectors::{ChangeStream, ConnectorError};
 use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
+use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
 /// Emits a fixed set of `(k, _event_time)` batches, like the differential test.
 struct FakeSource {
@@ -166,9 +167,13 @@ fn start(batches: Vec<SourceBatch>, sink: FakeSink) -> (EngineHandle, FakeSink) 
         sink: Arc::new(sink.clone()),
     };
     let handle = EngineHandle::start(Pipeline {
-        input: "in".into(),
-        source: Box::new(FakeSource { schema, batches }),
-        watermark: None,
+        sources: Sources::new(vec![InputSource {
+            id: InputId(0),
+            name: "in".into(),
+            source: Arc::new(FakeSource { schema, batches }),
+            watermark: None,
+        }])
+        .unwrap(),
         views: vec![group_count()],
         sinks: vec![spec],
         checkpoint: None,

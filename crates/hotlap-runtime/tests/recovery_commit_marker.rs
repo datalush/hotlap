@@ -13,10 +13,9 @@ use hotlap::state::StateBackend;
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
-use hotlap_runtime::runtime::pipeline as runtime;
 use hotlap_runtime::runtime::recovery::{Recovery, RecoveryDecision};
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
-use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, rows, take};
+use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, rows, sources, take};
 
 fn log() -> Dataset {
     Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]]).with_retention(0)
@@ -77,9 +76,9 @@ fn seed_valid_one() -> SharedBackend {
     let backend = SharedBackend::default();
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
-    let mut stream = runtime::merged_stream(pipe.source.as_ref()).unwrap();
-    drain(&mut engine, pipe.source.as_ref(), &mut stream, 3);
-    take(&mut checkpointer, &engine, pipe.source.as_ref());
+    let mut stream = pipe.sources.stream().unwrap();
+    drain(&mut engine, &pipe.sources, &mut stream, 3);
+    take(&mut checkpointer, &engine, &pipe.sources);
     assert_eq!(
         rows(&engine.snapshot("c").unwrap()),
         vec![vec![1, 2], vec![2, 2]]
@@ -122,7 +121,7 @@ fn commit_marker_is_durable_before_commit_and_removed_after_valid() {
         .with_sinks(vec![SinkSync::sink_only(SharedSink::new(probe))]);
 
     let (engine, pipe) = engine_with(ResumableSource::new(log()));
-    let id = futures::executor::block_on(checkpointer.take(&engine, pipe.source.as_ref())).unwrap();
+    let id = futures::executor::block_on(checkpointer.take(&engine, &pipe.sources)).unwrap();
 
     assert_eq!(id, 1);
     assert_eq!(commits.load(Ordering::SeqCst), 1);
@@ -140,10 +139,11 @@ fn recovery_promotes_a_redrivable_interrupted_commit() {
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
         .with_sinks(vec![SinkSync::sink_only(sink)]);
 
-    let checkpoint = match Recovery::inspect(&checkpointer).unwrap() {
-        RecoveryDecision::Promote(checkpoint) => checkpoint,
-        other => panic!("expected Promote, got {other:?}"),
-    };
+    let checkpoint =
+        match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
+            RecoveryDecision::Promote(checkpoint) => checkpoint,
+            other => panic!("expected Promote, got {other:?}"),
+        };
     assert_eq!(checkpoint.id, 2);
     assert_eq!(commits.load(Ordering::SeqCst), 0, "inspect must not commit");
 
@@ -157,7 +157,7 @@ fn recovery_promotes_a_redrivable_interrupted_commit() {
     assert!(backend.get(b"checkpoint/2/valid").unwrap().is_some());
     assert_eq!(backend.get(b"checkpoint/2/commit").unwrap(), None);
     assert!(matches!(
-        Recovery::inspect(&checkpointer).unwrap(),
+        Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap(),
         RecoveryDecision::Resume(c) if c.id == 2
     ));
 }
@@ -170,7 +170,7 @@ fn recovery_discards_a_non_redrivable_interrupted_commit() {
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
         .with_sinks(vec![SinkSync::sink_only(sink)]);
 
-    match Recovery::inspect(&checkpointer).unwrap() {
+    match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
         RecoveryDecision::Discard {
             pending, fallback, ..
         } => {
@@ -186,7 +186,13 @@ fn recovery_discards_a_non_redrivable_interrupted_commit() {
         backend.list(b"checkpoint/2/").unwrap().is_empty(),
         "the discarded checkpoint must be removed"
     );
-    assert_eq!(Recovery::load(&checkpointer).unwrap().unwrap().id, 1);
+    assert_eq!(
+        Recovery::load(&checkpointer, &sources(ResumableSource::new(log())))
+            .unwrap()
+            .unwrap()
+            .id,
+        1
+    );
 }
 
 #[test]
@@ -194,7 +200,7 @@ fn recovery_without_a_marker_matches_the_newest_valid() {
     let backend = seed_valid_one();
     let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
 
-    match Recovery::inspect(&checkpointer).unwrap() {
+    match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
         RecoveryDecision::Resume(checkpoint) => assert_eq!(checkpoint.id, 1),
         other => panic!("expected Resume, got {other:?}"),
     }

@@ -10,6 +10,7 @@ use hotlap_connectors::ConnectorError;
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
 use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline::Pipeline;
+use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
 struct PendingSource {
     schema: SchemaRef,
@@ -38,9 +39,13 @@ impl Source for PendingSource {
 fn start_snapshot_shutdown() {
     let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
     let handle = EngineHandle::start(Pipeline {
-        input: "in".into(),
-        source: Box::new(PendingSource { schema }),
-        watermark: None,
+        sources: Sources::new(vec![InputSource {
+            id: InputId(0),
+            name: "in".into(),
+            source: Arc::new(PendingSource { schema }),
+            watermark: None,
+        }])
+        .unwrap(),
         views: vec![],
         sinks: vec![],
         checkpoint: None,
@@ -118,11 +123,15 @@ impl Source for OneBatchSource {
 fn snapshot_handle_reads_a_built_view() {
     let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
     let handle = EngineHandle::start(Pipeline {
-        input: "in".into(),
-        source: Box::new(OneBatchSource {
-            schema: schema.clone(),
-        }),
-        watermark: None,
+        sources: Sources::new(vec![InputSource {
+            id: InputId(0),
+            name: "in".into(),
+            source: Arc::new(OneBatchSource {
+                schema: schema.clone(),
+            }),
+            watermark: None,
+        }])
+        .unwrap(),
         views: vec![(
             "c".into(),
             Plan::GroupAggregate {
@@ -166,9 +175,13 @@ fn zset_rows(z: &hotlap::ZSetBatch) -> Vec<Vec<i64>> {
 fn source_error_is_surfaced() {
     let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
     let handle = EngineHandle::start(Pipeline {
-        input: "in".into(),
-        source: Box::new(FailingSource { schema }),
-        watermark: None,
+        sources: Sources::new(vec![InputSource {
+            id: InputId(0),
+            name: "in".into(),
+            source: Arc::new(FailingSource { schema }),
+            watermark: None,
+        }])
+        .unwrap(),
         views: vec![],
         sinks: vec![],
         checkpoint: None,
@@ -192,9 +205,13 @@ fn source_error_is_surfaced() {
 fn start_reports_setup_failure() {
     let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
     let result = EngineHandle::start(Pipeline {
-        input: "in".into(),
-        source: Box::new(PendingSource { schema }),
-        watermark: None,
+        sources: Sources::new(vec![InputSource {
+            id: InputId(0),
+            name: "in".into(),
+            source: Arc::new(PendingSource { schema }),
+            watermark: None,
+        }])
+        .unwrap(),
         // A view referencing an unknown input fails during setup.
         views: vec![(
             "c".into(),

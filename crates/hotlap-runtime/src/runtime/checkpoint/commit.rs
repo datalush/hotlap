@@ -6,8 +6,8 @@ use crate::runtime::checkpoint::Checkpointer;
 use crate::runtime::checkpoint_body::{
     checkpoint_prefix, clear_commit, mark_valid, state_err, write,
 };
+use crate::runtime::sources::Sources;
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::Source;
 
 impl Checkpointer {
     /// Capture `engine` and `source` and persist a new valid checkpoint,
@@ -27,12 +27,12 @@ impl Checkpointer {
     pub async fn take(
         &mut self,
         engine: &Hotlap,
-        source: &dyn Source,
+        sources: &Sources,
     ) -> Result<u64, ConnectorError> {
         let id = self.next_id;
         self.sinks.drain().await?;
         let prepared = self.sinks.prepare().await?;
-        if let Err(error) = write(self.backend.as_mut(), id, engine, source).await {
+        if let Err(error) = write(self.backend.as_mut(), id, engine, sources).await {
             let _ = clear_commit(self.backend.as_mut(), id);
             self.sinks.abort(&prepared).await;
             return Err(error);

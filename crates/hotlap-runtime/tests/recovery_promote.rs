@@ -11,7 +11,6 @@ use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_engine::MetricsRegistry;
 use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
-use hotlap_runtime::runtime::pipeline as runtime;
 use hotlap_runtime::runtime::recovery::Recovery;
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, rows, take};
@@ -66,9 +65,9 @@ fn seed_valid_one() -> SharedBackend {
     let backend = SharedBackend::default();
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
-    let mut stream = runtime::merged_stream(pipe.source.as_ref()).unwrap();
-    drain(&mut engine, pipe.source.as_ref(), &mut stream, 3);
-    take(&mut checkpointer, &engine, pipe.source.as_ref());
+    let mut stream = pipe.sources.stream().unwrap();
+    drain(&mut engine, &pipe.sources, &mut stream, 3);
+    take(&mut checkpointer, &engine, &pipe.sources);
     backend
 }
 
@@ -96,15 +95,14 @@ fn start(
     backend: &SharedBackend,
     sinks: Vec<SinkSync>,
 ) -> (hotlap::Hotlap, String, MetricsRegistry) {
-    let (mut hotlap, _pipe) = engine_with(ResumableSource::new(log()));
-    let source = ResumableSource::new(log());
+    let (mut hotlap, pipe) = engine_with(ResumableSource::new(log()));
     let mut checkpointer =
         Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(sinks);
     let signal = Mutex::new(None);
     let metrics = MetricsRegistry::new();
     let _stream = futures::executor::block_on(Recovery::start(
         &mut hotlap,
-        &source,
+        &pipe.sources,
         &mut checkpointer,
         &signal,
         &metrics,

@@ -19,6 +19,7 @@ use hotlap_connectors::source::{
 use hotlap_engine::EngineCore;
 use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, Checkpointer};
 use hotlap_runtime::runtime::pipeline::{self, Pipeline};
+use hotlap_runtime::runtime::sources::{InputSource, InputStream, Sources};
 
 /// A shared, immutable log plus the earliest offset still retained.
 #[derive(Clone)]
@@ -139,12 +140,21 @@ mod backend;
 
 pub use backend::SharedBackend;
 
+/// Build a single-entry [`Sources`] set over `source`, named like the pipeline.
+pub fn sources(source: ResumableSource) -> Sources {
+    Sources::new(vec![InputSource {
+        id: InputId(0),
+        name: "in".into(),
+        source: std::sync::Arc::new(source),
+        watermark: None,
+    }])
+    .unwrap()
+}
+
 /// Build a group-count pipeline over `source`, optionally checkpointing.
 pub fn pipeline(source: ResumableSource, checkpoint: Option<CheckpointConfig>) -> Pipeline {
     Pipeline {
-        input: "in".into(),
-        source: Box::new(source),
-        watermark: None,
+        sources: sources(source),
         views: vec![(
             "c".into(),
             Plan::GroupAggregate {
@@ -168,19 +178,24 @@ pub fn engine_with(source: ResumableSource) -> (Hotlap, Pipeline) {
 }
 
 /// Take a checkpoint synchronously and return its id.
-pub fn take(checkpointer: &mut Checkpointer, engine: &Hotlap, source: &dyn Source) -> u64 {
-    futures::executor::block_on(checkpointer.take(engine, source)).unwrap()
+pub fn take(checkpointer: &mut Checkpointer, engine: &Hotlap, sources: &Sources) -> u64 {
+    futures::executor::block_on(checkpointer.take(engine, sources)).unwrap()
 }
 
-/// Push up to `limit` readable batches from `stream` into `hotlap`, acking each
-/// one through `source` once it is applied (mirrors the runtime).
-pub fn drain(hotlap: &mut Hotlap, source: &dyn Source, stream: &mut SourceStream, limit: usize) {
+/// Push up to `limit` readable events from `stream` into `hotlap`, acking each
+/// one through the source that produced it once it is applied (mirrors runtime).
+pub fn drain(hotlap: &mut Hotlap, sources: &Sources, stream: &mut InputStream, limit: usize) {
     let mut pushed = 0;
     while pushed < limit {
         match futures::executor::block_on(stream.next()) {
-            Some(Ok(batch)) => {
-                pipeline::ingest(hotlap, "in", &batch).unwrap();
-                source.commit(batch.split, batch.next_offset).unwrap();
+            Some(Ok(event)) => {
+                pipeline::ingest_event(hotlap, sources, &event).unwrap();
+                sources
+                    .get(event.input)
+                    .unwrap()
+                    .source
+                    .commit(event.batch.split, event.batch.next_offset)
+                    .unwrap();
                 pushed += 1;
             }
             Some(Err(error)) => panic!("unexpected source error: {error}"),

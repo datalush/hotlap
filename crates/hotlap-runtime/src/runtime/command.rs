@@ -7,9 +7,9 @@ use hotlap::{Plan, ZSetBatch};
 use tokio::sync::oneshot;
 
 use crate::runtime::checkpoint::Checkpointer;
-use crate::runtime::pipeline::{Pipeline, record_error};
+use crate::runtime::pipeline::record_error;
+use crate::runtime::sources::Sources;
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::source::Source;
 
 /// Command sent from the handle to the engine thread.
 pub enum Command {
@@ -35,11 +35,16 @@ pub enum Command {
 }
 
 /// Handle one command; returns true when the engine must shut down.
+///
+/// After a source failure (`failed`), checkpoint and view-build commands are
+/// rejected because the engine state may no longer be consistent. Reads and
+/// shutdown stay available so the caller can still inspect and stop the engine.
 pub(crate) async fn handle(
     cmd: Option<Command>,
     hotlap: &mut Hotlap,
-    pipeline: &Pipeline,
+    sources: &Sources,
     checkpointer: &mut Option<Checkpointer>,
+    failed: bool,
 ) -> bool {
     match cmd {
         Some(Command::Snapshot { view, reply }) => {
@@ -51,11 +56,19 @@ pub(crate) async fn handle(
             false
         }
         Some(Command::Checkpoint { reply }) => {
-            let _ = reply.send(take(checkpointer, hotlap, pipeline.source.as_ref()).await);
+            let result = match reject_if_failed(failed) {
+                Ok(()) => take(checkpointer, hotlap, sources).await,
+                Err(error) => Err(error),
+            };
+            let _ = reply.send(result);
             false
         }
         Some(Command::BuildView { view, plan, reply }) => {
-            let _ = reply.send(hotlap.create_view(&view, plan).map_err(map_err));
+            let result = match reject_if_failed(failed) {
+                Ok(()) => hotlap.create_view(&view, plan).map_err(map_err),
+                Err(error) => Err(error),
+            };
+            let _ = reply.send(result);
             false
         }
         Some(Command::Shutdown { reply }) => {
@@ -70,11 +83,11 @@ pub(crate) async fn handle(
 pub(crate) async fn run_periodic(
     checkpointer: &mut Option<Checkpointer>,
     hotlap: &Hotlap,
-    pipeline: &Pipeline,
+    sources: &Sources,
     checkpoint_error: &Mutex<Option<String>>,
 ) {
     if let Some(active) = checkpointer
-        && let Err(error) = active.take(hotlap, pipeline.source.as_ref()).await
+        && let Err(error) = active.take(hotlap, sources).await
     {
         record_error(checkpoint_error, error);
     }
@@ -84,14 +97,23 @@ pub(crate) async fn run_periodic(
 async fn take(
     checkpointer: &mut Option<Checkpointer>,
     hotlap: &Hotlap,
-    source: &dyn Source,
+    sources: &Sources,
 ) -> Result<u64, ConnectorError> {
     match checkpointer {
-        Some(active) => active.take(hotlap, source).await,
+        Some(active) => active.take(hotlap, sources).await,
         None => Err(ConnectorError::Unsupported(
             "checkpointing is not configured".into(),
         )),
     }
+}
+
+fn reject_if_failed(failed: bool) -> Result<(), ConnectorError> {
+    if failed {
+        return Err(ConnectorError::Infrastructure(
+            "engine stopped after a source failure".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn map_err(error: hotlap::HotlapError) -> ConnectorError {

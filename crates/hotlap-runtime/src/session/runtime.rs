@@ -4,14 +4,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use hotlap::{Plan, ZSetBatch};
+use hotlap::{InputId, Plan, ZSetBatch};
 use hotlap_sql::catalog::MvDef;
 
 use super::mv_provider::MvTableProvider;
-use super::session_source::SharedSource;
 use super::{QueryResult, Snapshotter, SqlError, SqlSession, to_engine};
 use crate::runtime::handle::EngineHandle;
 use crate::runtime::pipeline::{Pipeline, SinkSpec};
+use crate::runtime::sources::{InputSource, Sources};
 
 impl SqlSession {
     /// Start the engine with the declared source and views.
@@ -69,6 +69,10 @@ impl SqlSession {
     }
 
     /// Build the pipeline, opening each declared sink against its view schema.
+    ///
+    /// Until the multi-source session lands (T5), the session declares a single
+    /// input with the stable id `InputId(0)`; the pipeline already consumes the
+    /// generic [`Sources`] set, so no mono-source runtime path is kept.
     async fn build_pipeline(&mut self) -> Result<Pipeline, SqlError> {
         let name = self
             .source_name
@@ -79,10 +83,15 @@ impl SqlSession {
             .clone()
             .ok_or_else(|| SqlError::Catalog("START before CREATE SOURCE".into()))?;
         let sinks = self.build_sinks().await?;
-        Ok(Pipeline {
-            input: name,
-            source: Box::new(SharedSource(source)),
+        let sources = Sources::new(vec![InputSource {
+            id: InputId(0),
+            name,
+            source,
             watermark: self.watermark,
+        }])
+        .map_err(to_engine)?;
+        Ok(Pipeline {
+            sources,
             views: self.views.clone(),
             sinks,
             checkpoint: self.checkpoint.take(),

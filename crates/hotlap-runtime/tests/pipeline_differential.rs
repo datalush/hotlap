@@ -10,6 +10,7 @@ use hotlap_engine::EngineCore;
 
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
 use hotlap_runtime::runtime::pipeline::{self, Pipeline};
+use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
 struct FakeSource {
     schema: SchemaRef,
@@ -75,10 +76,15 @@ fn open() -> Hotlap {
 }
 
 fn group_count(schema: SchemaRef, batches: Vec<SourceBatch>) -> (Hotlap, Pipeline) {
+    let source = Arc::new(FakeSource { schema, batches });
     let pipeline = Pipeline {
-        input: "in".into(),
-        source: Box::new(FakeSource { schema, batches }),
-        watermark: None,
+        sources: Sources::new(vec![InputSource {
+            id: InputId(0),
+            name: "in".into(),
+            source,
+            watermark: None,
+        }])
+        .unwrap(),
         views: vec![(
             "c".into(),
             Plan::GroupAggregate {
@@ -100,9 +106,9 @@ async fn fake_source_feeds_view() {
     let schema = source.batch.schema();
     let (mut hotlap, pipeline) = group_count(schema, vec![source, batch(&[2, 3], &[20, 20])]);
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
-    let mut stream = pipeline::merged_stream(pipeline.source.as_ref()).unwrap();
+    let mut stream = pipeline.sources.stream().unwrap();
     while let Some(item) = stream.next().await {
-        pipeline::ingest(&mut hotlap, "in", &item.unwrap()).unwrap();
+        pipeline::ingest_event(&mut hotlap, &pipeline.sources, &item.unwrap()).unwrap();
     }
     assert_eq!(
         snap_rows(&mut hotlap, "c"),
@@ -121,9 +127,9 @@ async fn empty_batch_is_a_noop() {
     };
     let (mut hotlap, pipeline) = group_count(good.batch.schema(), vec![good, empty]);
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
-    let mut stream = pipeline::merged_stream(pipeline.source.as_ref()).unwrap();
+    let mut stream = pipeline.sources.stream().unwrap();
     while let Some(item) = stream.next().await {
-        pipeline::ingest(&mut hotlap, "in", &item.unwrap()).unwrap();
+        pipeline::ingest_event(&mut hotlap, &pipeline.sources, &item.unwrap()).unwrap();
     }
     assert_eq!(snap_rows(&mut hotlap, "c"), vec![vec![1, 1]]);
 }
@@ -156,14 +162,19 @@ async fn two_splits_merge() {
     }
     let a = batch(&[1, 1], &[10, 10]);
     let b = batch(&[1, 2], &[10, 10]);
+    let source = Arc::new(TwoSplit {
+        schema: a.batch.schema(),
+        a: vec![a],
+        b: vec![b],
+    });
     let pipeline = Pipeline {
-        input: "in".into(),
-        source: Box::new(TwoSplit {
-            schema: a.batch.schema(),
-            a: vec![a],
-            b: vec![b],
-        }),
-        watermark: None,
+        sources: Sources::new(vec![InputSource {
+            id: InputId(0),
+            name: "in".into(),
+            source,
+            watermark: None,
+        }])
+        .unwrap(),
         views: vec![(
             "c".into(),
             Plan::GroupAggregate {
@@ -178,9 +189,9 @@ async fn two_splits_merge() {
     };
     let mut hotlap = open();
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
-    let mut stream = pipeline::merged_stream(pipeline.source.as_ref()).unwrap();
+    let mut stream = pipeline.sources.stream().unwrap();
     while let Some(item) = stream.next().await {
-        pipeline::ingest(&mut hotlap, "in", &item.unwrap()).unwrap();
+        pipeline::ingest_event(&mut hotlap, &pipeline.sources, &item.unwrap()).unwrap();
     }
     assert_eq!(snap_rows(&mut hotlap, "c"), vec![vec![1, 3], vec![2, 1]]);
 }
@@ -188,14 +199,18 @@ async fn two_splits_merge() {
 #[tokio::test]
 async fn window_without_watermark_is_rejected_at_push() {
     // No event-time -> the engine must reject a windowed view.
-    let source = FakeSource {
+    let source = Arc::new(FakeSource {
         schema: batch(&[0], &[0]).batch.schema(),
         batches: vec![batch(&[1], &[10])],
-    };
+    });
     let pipeline = Pipeline {
-        input: "in".into(),
-        source: Box::new(source),
-        watermark: None,
+        sources: Sources::new(vec![InputSource {
+            id: InputId(0),
+            name: "in".into(),
+            source,
+            watermark: None,
+        }])
+        .unwrap(),
         views: vec![(
             "w".into(),
             Plan::TumbleCount {
@@ -211,7 +226,7 @@ async fn window_without_watermark_is_rejected_at_push() {
     };
     let mut hotlap = open();
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
-    let mut stream = pipeline::merged_stream(pipeline.source.as_ref()).unwrap();
-    let sb = stream.next().await.unwrap().unwrap();
-    assert!(pipeline::ingest(&mut hotlap, "in", &sb).is_err());
+    let mut stream = pipeline.sources.stream().unwrap();
+    let event = stream.next().await.unwrap().unwrap();
+    assert!(pipeline::ingest_event(&mut hotlap, &pipeline.sources, &event).is_err());
 }

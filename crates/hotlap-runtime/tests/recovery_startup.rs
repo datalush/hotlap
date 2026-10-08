@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, Checkpointer, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::handle::EngineHandle;
-use hotlap_runtime::runtime::pipeline as runtime;
 use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, pipeline, rows, take};
 
 fn log() -> Dataset {
@@ -18,10 +17,10 @@ fn log() -> Dataset {
 fn startup_recovers_from_the_last_checkpoint() {
     let backend = SharedBackend::default();
     let (mut reference, ref_pipe) = engine_with(ResumableSource::new(log()));
-    let mut ref_stream = runtime::merged_stream(ref_pipe.source.as_ref()).unwrap();
+    let mut ref_stream = ref_pipe.sources.stream().unwrap();
     drain(
         &mut reference,
-        ref_pipe.source.as_ref(),
+        &ref_pipe.sources,
         &mut ref_stream,
         usize::MAX,
     );
@@ -30,9 +29,9 @@ fn startup_recovers_from_the_last_checkpoint() {
     // Seed a checkpoint at read offset 3.
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let (mut seeded, seed_pipe) = engine_with(ResumableSource::new(log()));
-    let mut seed_stream = runtime::merged_stream(seed_pipe.source.as_ref()).unwrap();
-    drain(&mut seeded, seed_pipe.source.as_ref(), &mut seed_stream, 3);
-    take(&mut checkpointer, &seeded, seed_pipe.source.as_ref());
+    let mut seed_stream = seed_pipe.sources.stream().unwrap();
+    drain(&mut seeded, &seed_pipe.sources, &mut seed_stream, 3);
+    take(&mut checkpointer, &seeded, &seed_pipe.sources);
     drop(seeded);
 
     // The broker retains only the tail; without recovery the engine would

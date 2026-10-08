@@ -16,7 +16,7 @@ use hotlap_runtime::runtime::recovery::{Recovery, RecoveryDecision};
 use hotlap_runtime::runtime::sink::SinkSync;
 
 use harness::{capability, delete_checkpoint, fallback_id, log, seed_pending, seed_valid_one};
-use recovery::{ResumableSource, engine_with, rows};
+use recovery::{ResumableSource, engine_with, rows, sources};
 
 #[test]
 fn transactional_sink_is_not_redrivable_by_default() {
@@ -27,7 +27,7 @@ fn transactional_sink_is_not_redrivable_by_default() {
             SinkSync::sink_only(capability(SinkCapabilities::Transactional)),
         ]);
 
-    match Recovery::inspect(&checkpointer).unwrap() {
+    match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
         RecoveryDecision::Discard {
             pending, fallback, ..
         } => {
@@ -47,8 +47,7 @@ fn corrupt_pending_body_falls_back_to_a_valid_predecessor() {
         .put(b"checkpoint/2/engine", b"not-a-snapshot".to_vec())
         .unwrap();
 
-    let (mut hotlap, _pipe) = engine_with(ResumableSource::new(log()));
-    let source = ResumableSource::new(log());
+    let (mut hotlap, pipe) = engine_with(ResumableSource::new(log()));
     let mut checkpointer =
         Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
             SinkSync::sink_only(capability(SinkCapabilities::AtLeastOnce)),
@@ -58,7 +57,7 @@ fn corrupt_pending_body_falls_back_to_a_valid_predecessor() {
 
     let _stream = futures::executor::block_on(Recovery::start(
         &mut hotlap,
-        &source,
+        &pipe.sources,
         &mut checkpointer,
         &signal,
         &metrics,
@@ -89,7 +88,7 @@ fn a_commit_marker_over_an_incomplete_body_is_discarded() {
         Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
             SinkSync::sink_only(capability(SinkCapabilities::Idempotent)),
         ]);
-    match Recovery::inspect(&checkpointer).unwrap() {
+    match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
         RecoveryDecision::Discard {
             pending, fallback, ..
         } => {
@@ -115,7 +114,7 @@ fn a_body_without_a_marker_is_not_a_pending_commit() {
     }
 
     let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    match Recovery::inspect(&checkpointer).unwrap() {
+    match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
         RecoveryDecision::Resume(checkpoint) => assert_eq!(checkpoint.id, 1),
         other => panic!("expected Resume, got {other:?}"),
     }
@@ -127,15 +126,14 @@ fn both_valid_and_commit_resumes_and_sweeps_the_marker() {
     let mut writer = backend.clone();
     writer.put(b"checkpoint/1/commit", b"1".to_vec()).unwrap();
 
-    let (mut hotlap, _pipe) = engine_with(ResumableSource::new(log()));
-    let source = ResumableSource::new(log());
+    let (mut hotlap, pipe) = engine_with(ResumableSource::new(log()));
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let signal = Mutex::new(None);
     let metrics = MetricsRegistry::new();
 
     let _stream = futures::executor::block_on(Recovery::start(
         &mut hotlap,
-        &source,
+        &pipe.sources,
         &mut checkpointer,
         &signal,
         &metrics,
@@ -172,8 +170,7 @@ fn discarding_without_a_fallback_starts_clean() {
     seed_pending(&backend, 1, 2);
     delete_checkpoint(&backend, 1);
 
-    let (mut hotlap, _pipe) = engine_with(ResumableSource::new(log()));
-    let source = ResumableSource::new(log());
+    let (mut hotlap, pipe) = engine_with(ResumableSource::new(log()));
     let mut checkpointer =
         Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
             SinkSync::sink_only(capability(SinkCapabilities::AtLeastOnce)),
@@ -183,7 +180,7 @@ fn discarding_without_a_fallback_starts_clean() {
 
     let _stream = futures::executor::block_on(Recovery::start(
         &mut hotlap,
-        &source,
+        &pipe.sources,
         &mut checkpointer,
         &signal,
         &metrics,

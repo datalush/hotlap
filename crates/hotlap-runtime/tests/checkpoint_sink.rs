@@ -22,6 +22,7 @@ use hotlap_engine::EngineCore;
 use hotlap_runtime::runtime::checkpoint::Checkpointer;
 use hotlap_runtime::runtime::pipeline::SinkSpec;
 use hotlap_runtime::runtime::sink::SinkPump;
+use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
 /// Ordered record of the observable events the test asserts on.
 #[derive(Clone, Default)]
@@ -178,7 +179,14 @@ async fn checkpoint_drains_queued_sink_deltas_before_valid() {
         ..JournalBackend::default()
     };
     let mut checkpointer = Checkpointer::new(Box::new(backend), 3).with_sinks(pump.coordinated());
-    let id = checkpointer.take(&hotlap, &EmptySource).await.unwrap();
+    let sources = Sources::new(vec![InputSource {
+        id: InputId(0),
+        name: "in".into(),
+        source: Arc::new(EmptySource),
+        watermark: None,
+    }])
+    .unwrap();
+    let id = checkpointer.take(&hotlap, &sources).await.unwrap();
     assert_eq!(id, 1);
 
     let entries = journal.entries();

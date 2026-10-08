@@ -70,6 +70,19 @@ impl SourcesCheckpoint {
     ) -> Result<(), ConnectorError> {
         validate::validate(self, sources, engine)
     }
+
+    /// The saved entry for `id`, or an explicit error when it is absent.
+    ///
+    /// Recovery already validates the id set, so a missing entry here means the
+    /// caller skipped validation; it must never fall back to another source.
+    pub fn entry(&self, id: InputId) -> Result<&SavedSource, ConnectorError> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| {
+                ConnectorError::Unsupported(format!("checkpoint has no source {}", id.0))
+            })
+    }
 }
 
 /// Map an engine codec error onto the connector error type.

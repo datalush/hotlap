@@ -6,11 +6,10 @@ use hotlap::state::StateBackend;
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
-use hotlap_runtime::runtime::pipeline as runtime;
 use hotlap_runtime::runtime::recovery::Recovery;
 use hotlap_runtime::runtime::sink::SharedSink;
 
-use crate::recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, take};
+use crate::recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, sources, take};
 
 pub(super) fn log() -> Dataset {
     Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]]).with_retention(0)
@@ -44,9 +43,9 @@ pub(super) fn seed_valid_one() -> SharedBackend {
     let backend = SharedBackend::default();
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
-    let mut stream = runtime::merged_stream(pipe.source.as_ref()).unwrap();
-    drain(&mut engine, pipe.source.as_ref(), &mut stream, 3);
-    take(&mut checkpointer, &engine, pipe.source.as_ref());
+    let mut stream = pipe.sources.stream().unwrap();
+    drain(&mut engine, &pipe.sources, &mut stream, 3);
+    take(&mut checkpointer, &engine, &pipe.sources);
     backend
 }
 
@@ -80,7 +79,8 @@ pub(super) fn delete_checkpoint(backend: &SharedBackend, id: u64) {
 
 pub(super) fn fallback_id(backend: &SharedBackend) -> u64 {
     let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    Recovery::load(&checkpointer)
+    let declared = sources(ResumableSource::new(log()));
+    Recovery::load(&checkpointer, &declared)
         .unwrap()
         .expect("checkpoint")
         .id

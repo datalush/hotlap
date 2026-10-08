@@ -5,7 +5,6 @@ mod ddl_exec;
 mod fluss_factory;
 mod mv_provider;
 mod runtime;
-mod session_source;
 mod sink_factory;
 
 pub use api::{MetricsSnapshot, Session};
