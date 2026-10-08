@@ -115,11 +115,38 @@ impl StateBackend for DurableStateBackend {
         validate_key(key)?;
         let file = self.path_for(key);
         match fs::remove_file(&file) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.prune_empty_parents(&file)?;
+                Ok(())
+            }
             // Already gone (or never stored), which keeps deletion idempotent.
             Err(e) if is_absent(e.kind()) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+impl DurableStateBackend {
+    /// Removes the now-empty ancestor directories of `file` up to the root.
+    ///
+    /// Retention deletes whole checkpoint namespaces; without this cleanup the
+    /// emptied directory tree would linger. The walk stops at the first
+    /// non-empty directory (its ancestors still hold siblings) and at `root`.
+    fn prune_empty_parents(&self, file: &Path) -> Result<(), StateError> {
+        let mut dir = file.parent();
+        while let Some(path) = dir {
+            if path == self.root {
+                break;
+            }
+            match fs::remove_dir(path) {
+                Ok(()) => dir = path.parent(),
+                // A non-empty dir means every ancestor is non-empty too.
+                Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => break,
+                Err(e) if is_absent(e.kind()) => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
     }
 }
 

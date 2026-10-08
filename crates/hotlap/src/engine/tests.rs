@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use hotlap_core::{Plan, ZSetBatch};
 use hotlap_engine::EngineCore;
 
 use super::*;

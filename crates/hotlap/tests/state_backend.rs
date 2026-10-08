@@ -172,3 +172,39 @@ fn durable_list_ignores_non_hex_leftovers() {
     assert!(!all.contains(&b"stray.tmp".to_vec()));
     assert_eq!(be.scan(b"checkpoint/").unwrap().len(), 3);
 }
+
+/// Recursively asserts that no directory under `path` is empty.
+fn assert_no_empty_dirs(path: &Path) {
+    for entry in entries(path) {
+        if entry.is_dir() {
+            assert!(
+                !entries(&entry).is_empty(),
+                "leftover empty dir: {}",
+                entry.display()
+            );
+            assert_no_empty_dirs(&entry);
+        }
+    }
+}
+
+#[test]
+fn durable_delete_prunes_emptied_namespace_dirs() {
+    let dir = TempDir::new("prune");
+    let mut be = seeded_durable(dir.path());
+
+    // Emptying checkpoint/1 removes its id directory but keeps checkpoint/.
+    be.delete(b"checkpoint/1/state").unwrap();
+    be.delete(b"checkpoint/1/offset").unwrap();
+    assert_eq!(
+        be.list(b"checkpoint/").unwrap(),
+        vec![b"checkpoint/2/state".to_vec()]
+    );
+    assert_no_empty_dirs(dir.path());
+
+    // Emptying the last checkpoint removes the whole namespace directory.
+    be.delete(b"checkpoint/2/state").unwrap();
+    assert!(be.list(b"checkpoint/").unwrap().is_empty());
+    assert_no_empty_dirs(dir.path());
+    // The root itself is never pruned.
+    assert!(dir.path().is_dir());
+}
