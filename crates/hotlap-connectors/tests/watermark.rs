@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use hotlap::Hotlap;
+use hotlap_engine::EngineCore;
 
 use hotlap_connectors::runtime::pipeline::{self, Pipeline, Watermark};
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
@@ -48,7 +49,7 @@ async fn watermark_uses_the_source_event_time_column() {
         views: vec![],
         sinks: vec![],
     };
-    let mut hotlap = Hotlap::open().unwrap();
+    let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
 }
 
@@ -64,7 +65,7 @@ async fn watermark_without_source_event_time_errors() {
         views: vec![],
         sinks: vec![],
     };
-    let mut hotlap = Hotlap::open().unwrap();
+    let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
     let error = pipeline::setup(&mut hotlap, &pipeline).unwrap_err();
     assert!(matches!(
         error,

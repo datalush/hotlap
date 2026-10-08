@@ -6,6 +6,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use hotlap::{Hotlap, InputId, Plan};
+use hotlap_engine::EngineCore;
 
 use hotlap_connectors::runtime::pipeline::{self, Pipeline};
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
@@ -51,6 +52,26 @@ fn batch(keys: &[i64], times: &[i64]) -> SourceBatch {
     }
 }
 
+/// Read a consolidated Z-set of Int64 columns as sorted integer rows.
+fn snap_rows(h: &mut Hotlap, view: &str) -> Vec<Vec<i64>> {
+    let z = h.snapshot(view).unwrap();
+    let columns: Vec<&Int64Array> = z
+        .batch
+        .columns()
+        .iter()
+        .map(|c| c.as_any().downcast_ref::<Int64Array>().unwrap())
+        .collect();
+    let mut rows: Vec<Vec<i64>> = (0..z.len())
+        .map(|row| columns.iter().map(|c| c.value(row)).collect())
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn open() -> Hotlap {
+    Hotlap::open_with(Box::new(EngineCore::new()))
+}
+
 fn group_count(schema: SchemaRef, batches: Vec<SourceBatch>) -> (Hotlap, Pipeline) {
     let pipeline = Pipeline {
         input: "in".into(),
@@ -65,7 +86,7 @@ fn group_count(schema: SchemaRef, batches: Vec<SourceBatch>) -> (Hotlap, Pipelin
         )],
         sinks: vec![],
     };
-    (Hotlap::open().unwrap(), pipeline)
+    (open(), pipeline)
 }
 
 #[tokio::test]
@@ -78,14 +99,10 @@ async fn fake_source_feeds_view() {
     while let Some(item) = stream.next().await {
         pipeline::ingest(&mut hotlap, "in", &item.unwrap()).unwrap();
     }
-    let mut snap = hotlap.snapshot("c").unwrap();
-    snap.sort();
-    let expect = vec![
-        hotlap::Row(vec![hotlap::Scalar::I64(1), hotlap::Scalar::I64(2)]),
-        hotlap::Row(vec![hotlap::Scalar::I64(2), hotlap::Scalar::I64(2)]),
-        hotlap::Row(vec![hotlap::Scalar::I64(3), hotlap::Scalar::I64(1)]),
-    ];
-    assert_eq!(snap, expect);
+    assert_eq!(
+        snap_rows(&mut hotlap, "c"),
+        vec![vec![1, 2], vec![2, 2], vec![3, 1]]
+    );
 }
 
 #[tokio::test]
@@ -101,13 +118,7 @@ async fn empty_batch_is_a_noop() {
     while let Some(item) = stream.next().await {
         pipeline::ingest(&mut hotlap, "in", &item.unwrap()).unwrap();
     }
-    assert_eq!(
-        hotlap.snapshot("c").unwrap(),
-        vec![hotlap::Row(vec![
-            hotlap::Scalar::I64(1),
-            hotlap::Scalar::I64(1)
-        ])]
-    );
+    assert_eq!(snap_rows(&mut hotlap, "c"), vec![vec![1, 1]]);
 }
 
 #[tokio::test]
@@ -155,26 +166,18 @@ async fn two_splits_merge() {
         )],
         sinks: vec![],
     };
-    let mut hotlap = Hotlap::open().unwrap();
+    let mut hotlap = open();
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
     let mut stream = pipeline::merged_stream(pipeline.source.as_ref()).unwrap();
     while let Some(item) = stream.next().await {
         pipeline::ingest(&mut hotlap, "in", &item.unwrap()).unwrap();
     }
-    let mut snap = hotlap.snapshot("c").unwrap();
-    snap.sort();
-    assert_eq!(
-        snap,
-        vec![
-            hotlap::Row(vec![hotlap::Scalar::I64(1), hotlap::Scalar::I64(3)]),
-            hotlap::Row(vec![hotlap::Scalar::I64(2), hotlap::Scalar::I64(1)]),
-        ]
-    );
+    assert_eq!(snap_rows(&mut hotlap, "c"), vec![vec![1, 3], vec![2, 1]]);
 }
 
 #[tokio::test]
 async fn window_without_watermark_is_rejected_at_push() {
-    // Review Focus #5: no event-time -> the kernel must reject a windowed view.
+    // No event-time -> the engine must reject a windowed view.
     let source = FakeSource {
         schema: batch(&[0], &[0]).batch.schema(),
         batches: vec![batch(&[1], &[10])],
@@ -194,7 +197,7 @@ async fn window_without_watermark_is_rejected_at_push() {
         )],
         sinks: vec![],
     };
-    let mut hotlap = Hotlap::open().unwrap();
+    let mut hotlap = open();
     pipeline::setup(&mut hotlap, &pipeline).unwrap();
     let mut stream = pipeline::merged_stream(pipeline.source.as_ref()).unwrap();
     let sb = stream.next().await.unwrap().unwrap();

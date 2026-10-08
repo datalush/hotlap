@@ -3,11 +3,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use hotlap::{ChangeBatch, InputId, Plan, Row, Scalar};
+use hotlap::{InputId, Plan, ZSetBatch};
 
 use hotlap_connectors::runtime::handle::EngineHandle;
 use hotlap_connectors::runtime::pipeline::{Pipeline, SinkSpec};
@@ -43,11 +43,10 @@ impl Source for FakeSource {
     }
 }
 
-/// Collects written change batches; `delay` forces engine backpressure.
-/// The commit/abort flags record whether the task drove the sink lifecycle.
+/// Collects written Z-sets; `delay` forces engine backpressure.
 #[derive(Clone)]
 struct FakeSink {
-    batches: Arc<Mutex<Vec<ChangeBatch>>>,
+    batches: Arc<Mutex<Vec<ZSetBatch>>>,
     delay: Option<Duration>,
     committed: Arc<AtomicBool>,
     aborted: Arc<AtomicBool>,
@@ -63,7 +62,7 @@ impl FakeSink {
         }
     }
 
-    fn consolidated(&self) -> BTreeMap<Row, i64> {
+    fn consolidated(&self) -> BTreeMap<Vec<i64>, i64> {
         consolidate(&self.batches.lock().unwrap())
     }
 
@@ -118,8 +117,33 @@ fn batch(keys: &[i64], times: &[i64]) -> SourceBatch {
 }
 
 /// A distinct trailing row, so observing it proves earlier batches were processed.
-fn sentinel() -> Row {
-    Row(vec![Scalar::I64(999), Scalar::I64(1)])
+fn sentinel() -> Vec<i64> {
+    vec![999, 1]
+}
+
+/// Read a consolidated Z-set of Int64 columns as plain integer rows.
+fn zset_rows(z: &ZSetBatch) -> Vec<Vec<i64>> {
+    let columns: Vec<&Int64Array> = z
+        .batch
+        .columns()
+        .iter()
+        .map(|c| c.as_any().downcast_ref::<Int64Array>().unwrap())
+        .collect();
+    (0..z.len())
+        .map(|row| columns.iter().map(|c| c.value(row)).collect())
+        .collect()
+}
+
+fn consolidate(batches: &[ZSetBatch]) -> BTreeMap<Vec<i64>, i64> {
+    let mut acc: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
+    for z in batches {
+        let diffs = z.diff.as_any().downcast_ref::<Int64Array>().unwrap();
+        for (row, diff) in zset_rows(z).into_iter().zip(diffs.values()) {
+            *acc.entry(row).or_insert(0) += diff;
+        }
+    }
+    acc.retain(|_, diff| *diff != 0);
+    acc
 }
 
 fn group_count() -> (String, Plan) {
@@ -149,23 +173,15 @@ fn start(batches: Vec<SourceBatch>, sink: FakeSink) -> (EngineHandle, FakeSink) 
     (handle, sink)
 }
 
-fn consolidate(batches: &[ChangeBatch]) -> BTreeMap<Row, i64> {
-    let mut acc: BTreeMap<Row, i64> = BTreeMap::new();
-    for batch in batches {
-        for (row, diff) in &batch.rows {
-            *acc.entry(row.clone()).or_insert(0) += diff;
-        }
-    }
-    acc.retain(|_, diff| *diff != 0);
-    acc
-}
-
 /// Wait until both the engine and the sink have observed the sentinel row.
-fn wait_converged(handle: &EngineHandle, sink: &FakeSink) -> Vec<Row> {
+fn wait_converged(handle: &EngineHandle, sink: &FakeSink) -> Vec<Vec<i64>> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let rows = handle.snapshot("c").unwrap_or_default();
-        let seen_engine = rows.iter().any(|r| r == &sentinel());
+        let rows = handle
+            .snapshot("c")
+            .map(|z| zset_rows(&z))
+            .unwrap_or_default();
+        let seen_engine = rows.contains(&sentinel());
         let seen_sink = sink.consolidated().contains_key(&sentinel());
         if seen_engine && seen_sink {
             return rows;
@@ -184,7 +200,7 @@ fn sink_consolidated_state_matches_snapshot() {
     ];
     let (handle, sink) = start(batches, FakeSink::new(None));
     let rows = wait_converged(&handle, &sink);
-    let expected: BTreeMap<Row, i64> = rows.iter().cloned().map(|r| (r, 1)).collect();
+    let expected: BTreeMap<Vec<i64>, i64> = rows.into_iter().map(|r| (r, 1)).collect();
     assert_eq!(sink.consolidated(), expected);
     handle.shutdown().unwrap();
 }

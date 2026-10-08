@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use hotlap::Row;
+use hotlap::ZSetBatch;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ConnectorError;
@@ -15,7 +15,7 @@ use crate::runtime::pipeline::Pipeline;
 pub enum Command {
     Snapshot {
         view: String,
-        reply: oneshot::Sender<Result<Vec<Row>, ConnectorError>>,
+        reply: oneshot::Sender<Result<ZSetBatch, ConnectorError>>,
     },
     LateDropped {
         input: String,
@@ -77,7 +77,7 @@ impl EngineHandle {
     ///
     /// Blocks on `blocking_recv`, so it must not be called from within an async
     /// runtime (it would panic or stall the executor).
-    pub fn snapshot(&self, view: &str) -> Result<Vec<Row>, ConnectorError> {
+    pub fn snapshot(&self, view: &str) -> Result<ZSetBatch, ConnectorError> {
         self.snapshot_handle().snapshot(view)
     }
 
@@ -164,7 +164,7 @@ impl SnapshotHandle {
     ///
     /// Blocks on `blocking_recv`, so it must not be called from within an async
     /// runtime; callers in async code should offload it to a blocking thread.
-    pub fn snapshot(&self, view: &str) -> Result<Vec<Row>, ConnectorError> {
+    pub fn snapshot(&self, view: &str) -> Result<ZSetBatch, ConnectorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Snapshot {

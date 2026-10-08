@@ -2068,6 +2068,8 @@ dependencies = [
  "fluss-rs",
  "futures",
  "hotlap",
+ "hotlap-core",
+ "hotlap-engine",
  "serde",
  "serde_json",
  "tokio",

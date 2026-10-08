@@ -1,11 +1,12 @@
 //! Fluss append sink: writes a view's changelog to a Fluss log table.
 
+use arrow::array::Int64Array;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use fluss::client::{AppendWriter, FlussConnection};
 use fluss::config::Config;
 use futures::StreamExt;
-use hotlap::ChangeBatch;
+use hotlap::ZSetBatch;
 
 use crate::error::ConnectorError;
 use crate::sink::{ChangeStream, Sink};
@@ -49,8 +50,13 @@ impl FlussSink {
 }
 
 /// Reject any change with a negative diff (append cannot delete).
-pub fn retraction_check(batch: &ChangeBatch) -> Result<(), ConnectorError> {
-    if batch.rows.iter().any(|(_, diff)| *diff < 0) {
+pub fn retraction_check(batch: &ZSetBatch) -> Result<(), ConnectorError> {
+    let diffs = batch
+        .diff
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| ConnectorError::Arrow("diff column must be Int64".into()))?;
+    if (0..diffs.len()).any(|i| diffs.value(i) < 0) {
         return Err(ConnectorError::Unsupported(
             "append sink cannot apply retractions (diff < 0)".into(),
         ));
@@ -91,27 +97,45 @@ impl Sink for FlussSink {
 mod tests {
     use std::sync::Arc;
 
+    use arrow::array::{ArrayRef, Int64Array, TimestampMillisecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use hotlap::{ChangeBatch, Row, Scalar};
+    use arrow::record_batch::RecordBatch;
 
     use super::*;
 
+    fn zset(schema: Arc<Schema>, columns: Vec<ArrayRef>, diffs: Vec<i64>) -> ZSetBatch {
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
+        ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs))).unwrap()
+    }
+
+    fn int_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
+    }
+
     #[test]
     fn rejects_retraction() {
-        let mut b = ChangeBatch::default();
-        b.push(Row(vec![Scalar::I64(1)]), 1);
-        assert!(retraction_check(&b).is_ok());
-        b.push(Row(vec![Scalar::I64(2)]), -1);
-        assert!(retraction_check(&b).is_err());
+        let z = zset(
+            int_schema(),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+            vec![1, -1],
+        );
+        assert!(retraction_check(&z).is_err());
+        let ok = zset(
+            int_schema(),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+            vec![1],
+        );
+        assert!(retraction_check(&ok).is_ok());
     }
 
     #[test]
     fn expands_multiplicity_into_rows() {
-        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-        let mut b = ChangeBatch::default();
-        b.push(Row(vec![Scalar::I64(7)]), 2);
-        b.push(Row(vec![Scalar::I64(8)]), 0);
-        let batch = rows_to_batch(&schema, &b).unwrap();
+        let z = zset(
+            int_schema(),
+            vec![Arc::new(Int64Array::from(vec![7, 8]))],
+            vec![2, 0],
+        );
+        let batch = rows_to_batch(&int_schema(), &z).unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 1);
     }
@@ -123,9 +147,9 @@ mod tests {
             DataType::Timestamp(TimeUnit::Millisecond, None),
             false,
         )]));
-        let mut b = ChangeBatch::default();
-        b.push(Row(vec![Scalar::I64(1000)]), 1);
-        let batch = rows_to_batch(&schema, &b).unwrap();
+        let columns: Vec<ArrayRef> = vec![Arc::new(TimestampMillisecondArray::from(vec![1000]))];
+        let z = zset(schema.clone(), columns, vec![1]);
+        let batch = rows_to_batch(&schema, &z).unwrap();
         assert_eq!(
             batch.schema().field(0).data_type(),
             schema.field(0).data_type()
@@ -136,8 +160,8 @@ mod tests {
     #[test]
     fn rejects_unsupported_type() {
         let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
-        let mut b = ChangeBatch::default();
-        b.push(Row(vec![Scalar::Null]), 1);
-        assert!(rows_to_batch(&schema, &b).is_err());
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1]))];
+        let z = zset(int_schema(), columns, vec![1]);
+        assert!(rows_to_batch(&schema, &z).is_err());
     }
 }

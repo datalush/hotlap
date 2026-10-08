@@ -3,12 +3,12 @@
 use std::pin::Pin;
 
 use futures::Stream;
-use hotlap::ChangeBatch;
+use hotlap::ZSetBatch;
 
 use crate::error::ConnectorError;
 
 /// A stream of change batches (Z-sets) to write.
-pub type ChangeStream = Pin<Box<dyn Stream<Item = Result<ChangeBatch, ConnectorError>> + Send>>;
+pub type ChangeStream = Pin<Box<dyn Stream<Item = Result<ZSetBatch, ConnectorError>> + Send>>;
 
 /// A sink of change batches with 2PC shape (real 2PC lands in SP4).
 #[async_trait::async_trait]

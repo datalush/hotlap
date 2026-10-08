@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use hotlap::{ChangeBatch, Row, Scalar};
+use arrow::record_batch::RecordBatch;
+use hotlap::ZSetBatch;
 use hotlap_connectors::fluss::sink::FlussSink;
 use hotlap_connectors::sink::Sink;
 
@@ -13,13 +15,14 @@ use hotlap_connectors::sink::Sink;
 async fn fluss_sink_appends_a_batch() {
     let bootstrap = std::env::var("FLUSS_BOOTSTRAP").expect("FLUSS_BOOTSTRAP");
     let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let sink = FlussSink::open_from_bootstrap(&bootstrap, "/default/sink_table", schema)
+    let sink = FlussSink::open_from_bootstrap(&bootstrap, "/default/sink_table", schema.clone())
         .await
         .expect("open sink");
 
-    let mut batch = ChangeBatch::default();
-    batch.push(Row(vec![Scalar::I64(1)]), 1);
-    let stream = Box::pin(futures::stream::iter(vec![Ok(batch)]));
+    let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1]))];
+    let batch = RecordBatch::try_new(schema, columns).unwrap();
+    let z = ZSetBatch::new(batch, Arc::new(Int64Array::from(vec![1]))).unwrap();
+    let stream = Box::pin(futures::stream::iter(vec![Ok(z)]));
     sink.write(stream).await.expect("write");
     sink.commit().await.expect("commit");
 }

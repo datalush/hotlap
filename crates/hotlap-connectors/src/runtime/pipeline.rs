@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use hotlap::{ChangeBatch, Hotlap, HotlapError, Plan};
+use hotlap::{Hotlap, HotlapError, Plan};
 
 use crate::convert;
 use crate::error::ConnectorError;
@@ -67,9 +67,8 @@ pub fn merged_stream(source: &dyn Source) -> Result<SourceStream, ConnectorError
 
 /// Convert one source batch and push it into the input.
 pub fn ingest(hotlap: &mut Hotlap, input: &str, sb: &SourceBatch) -> Result<(), ConnectorError> {
-    convert::ensure_supported(sb.batch.schema().as_ref())?;
-    let cb: ChangeBatch = convert::to_change_batch(&sb.batch)?;
-    hotlap.push(input, &cb).map_err(hotlap_err)
+    let zset = convert::to_zset(&sb.batch)?;
+    hotlap.push(input, &zset).map_err(hotlap_err)
 }
 
 fn hotlap_err(e: HotlapError) -> ConnectorError {

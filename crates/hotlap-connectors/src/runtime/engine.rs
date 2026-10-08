@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 use hotlap::Hotlap;
+use hotlap_engine::EngineCore;
 use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 
 use crate::error::ConnectorError;
@@ -45,13 +46,7 @@ async fn drive(
     built: &AtomicBool,
     ready: oneshot::Sender<Result<(), ConnectorError>>,
 ) {
-    let mut hotlap = match Hotlap::open() {
-        Ok(hotlap) => hotlap,
-        Err(error) => {
-            let _ = ready.send(Err(map_err(error)));
-            return;
-        }
-    };
+    let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
     if let Err(error) = pipeline::setup(&mut hotlap, &pipeline) {
         let _ = ready.send(Err(error));
         return;

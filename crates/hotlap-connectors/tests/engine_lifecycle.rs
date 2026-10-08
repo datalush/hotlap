@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::Int64Array;
+use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::stream;
-use hotlap::{InputId, Plan, Row, Scalar};
+use hotlap::{InputId, Plan};
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::runtime::handle::EngineHandle;
 use hotlap_connectors::runtime::pipeline::Pipeline;
@@ -135,16 +135,24 @@ fn snapshot_handle_reads_a_built_view() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(snap.is_built(), "engine never built the dataflow");
-    let mut rows = snap.snapshot("c").unwrap();
-    rows.sort();
-    assert_eq!(
-        rows,
-        vec![
-            Row(vec![Scalar::I64(1), Scalar::I64(2)]),
-            Row(vec![Scalar::I64(2), Scalar::I64(1)]),
-        ]
-    );
+    let rows = zset_rows(&snap.snapshot("c").unwrap());
+    assert_eq!(rows, vec![vec![1, 2], vec![2, 1]]);
     handle.shutdown().unwrap();
+}
+
+/// Read a consolidated Z-set of Int64 columns as sorted integer rows.
+fn zset_rows(z: &hotlap::ZSetBatch) -> Vec<Vec<i64>> {
+    let columns: Vec<&Int64Array> = z
+        .batch
+        .columns()
+        .iter()
+        .map(|c| c.as_any().downcast_ref::<Int64Array>().unwrap())
+        .collect();
+    let mut rows: Vec<Vec<i64>> = (0..z.len())
+        .map(|row| columns.iter().map(|c| c.value(row)).collect())
+        .collect();
+    rows.sort();
+    rows
 }
 
 #[test]

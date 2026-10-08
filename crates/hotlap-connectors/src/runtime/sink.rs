@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::Stream;
-use hotlap::{ChangeBatch, Hotlap, HotlapError};
+use hotlap::{Hotlap, HotlapError, ZSetBatch};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -22,11 +22,11 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Receiver end of a sink's bounded changelog channel.
 pub struct ChangelogStream {
-    rx: mpsc::Receiver<Result<ChangeBatch, ConnectorError>>,
+    rx: mpsc::Receiver<Result<ZSetBatch, ConnectorError>>,
 }
 
 impl Stream for ChangelogStream {
-    type Item = Result<ChangeBatch, ConnectorError>;
+    type Item = Result<ZSetBatch, ConnectorError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
@@ -34,7 +34,7 @@ impl Stream for ChangelogStream {
 }
 
 /// Sender side of a sink's bounded changelog channel.
-pub type ChangelogSender = mpsc::Sender<Result<ChangeBatch, ConnectorError>>;
+pub type ChangelogSender = mpsc::Sender<Result<ZSetBatch, ConnectorError>>;
 
 /// Spawn the sink task; returns the bounded sender the engine pumps into.
 ///
@@ -98,11 +98,7 @@ impl SinkPump {
             if changes.is_empty() {
                 continue;
             }
-            entry
-                .tx
-                .send(Ok(ChangeBatch { rows: changes }))
-                .await
-                .map_err(|_| stopped())?;
+            entry.tx.send(Ok(changes)).await.map_err(|_| stopped())?;
         }
         Ok(())
     }
