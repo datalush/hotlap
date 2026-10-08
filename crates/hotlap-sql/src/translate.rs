@@ -8,7 +8,7 @@ use datafusion::logical_expr::{
     Aggregate, Expr, Join, LogicalPlan, Projection, Volatility, create_udf,
 };
 use datafusion::prelude::SessionContext;
-use hotlap::{AggSpec, InputId, Plan};
+use hotlap::{AggSpec, InputId, Plan, aggregate_output_type};
 
 use crate::error::SqlError;
 use crate::translate_expr::{
@@ -88,6 +88,7 @@ fn translate_aggregate(a: &Aggregate, source: InputId) -> Result<Plan, SqlError>
         }
     }
     let aggs = parse_aggs(&a.aggr_expr, schema)?;
+    reconcile_output_types(a, &aggs)?;
     // A grouping-key-less aggregate cannot be represented: every irreducible
     // kernel group operator requires a non-empty key, so reject it here while
     // planning the view, not later at ingest.
@@ -116,6 +117,32 @@ fn translate_aggregate(a: &Aggregate, source: InputId) -> Result<Plan, SqlError>
             aggs,
         }),
     }
+}
+
+/// Fail-stop unless our mirrored aggregate output types match the types
+/// DataFusion resolved into `a.schema`.
+///
+/// [`aggregate_output_type`] restates DataFusion's rules for the supported
+/// subset. If the two ever disagree, the view schema built from our mirror
+/// would not match the plan that produces the rows, so reject at translation
+/// time instead of emitting a mis-typed changelog. The aggregate outputs follow
+/// the group expressions in `a.schema`.
+fn reconcile_output_types(a: &Aggregate, aggs: &[AggSpec]) -> Result<(), SqlError> {
+    let input = a.input.schema();
+    let offset = a.group_expr.len();
+    for (index, agg) in aggs.iter().enumerate() {
+        let input_type = agg.input.map(|i| input.field(i).data_type());
+        let ours = aggregate_output_type(agg.func, input_type)
+            .map_err(|e| SqlError::Unsupported(e.to_string()))?;
+        let resolved = a.schema.field(offset + index).data_type();
+        if &ours != resolved {
+            return Err(SqlError::Unsupported(format!(
+                "{} output type mismatch: kernel {ours:?}, DataFusion {resolved:?}",
+                agg.func.output_name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn translate_join(j: &Join, source: InputId) -> Result<Plan, SqlError> {

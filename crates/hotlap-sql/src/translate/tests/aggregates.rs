@@ -91,3 +91,29 @@ async fn translates_min_and_max() {
         other => panic!("expected GroupAggregate, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn reconciles_float_aggregate_output_types() {
+    // `sum`/`avg` over Float64 resolve to Float64 and `min`/`max` keep the
+    // input type; the reconciliation guard compares each to DataFusion's
+    // resolved `Aggregate.schema` and must accept them.
+    let ctx = ctx_with_src();
+    let plan = plan_for(
+        &ctx,
+        "SELECT k, sum(f), avg(f), min(f), max(f) FROM src GROUP BY k",
+    )
+    .await
+    .expect("Float64 aggregates must reconcile with DataFusion");
+    match plan {
+        Plan::GroupAggregate { aggs, .. } => assert_eq!(
+            aggs,
+            vec![
+                AggSpec::sum(2),
+                AggSpec::avg(2),
+                AggSpec::min(2),
+                AggSpec::max(2)
+            ]
+        ),
+        other => panic!("expected GroupAggregate, got {other:?}"),
+    }
+}

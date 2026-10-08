@@ -16,6 +16,7 @@ fn register_empty_table(ctx: &SessionContext, name: &str) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
         Field::new("ts", DataType::Int64, false),
+        Field::new("f", DataType::Float64, false),
     ]));
     let batch = RecordBatch::new_empty(schema.clone());
     let mem = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
