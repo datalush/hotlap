@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -69,4 +69,46 @@ fn join_rejects_diff_product_overflow() {
     let mut join = Join::new(&[0], &[0]);
     let result = join.apply(&zset(&[(1, "l", i64::MAX)]), &zset(&[(1, "r", 2)]));
     assert!(matches!(result, Err(EngineError::Infrastructure(_))));
+}
+
+/// Builds a single-column `k` Z-set with the given key element type.
+fn keyed(key_type: DataType, columns: ArrayRef, diffs: Vec<i64>) -> ZSetBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("k", key_type, false)]));
+    let batch = RecordBatch::try_new(schema, vec![columns]).unwrap();
+    ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs))).unwrap()
+}
+
+#[test]
+fn join_rejects_mismatched_key_types() {
+    // Int64 and Int32 keys encode to different `arrow::row` bytes, so the sides
+    // must not be joined positionally without a type match.
+    let mut join = Join::new(&[0], &[0]);
+    let left = keyed(
+        DataType::Int64,
+        Arc::new(Int64Array::from(vec![1i64])),
+        vec![1],
+    );
+    let right = keyed(
+        DataType::Int32,
+        Arc::new(Int32Array::from(vec![1i32])),
+        vec![1],
+    );
+    let result = join.apply(&left, &right);
+    assert!(matches!(result, Err(EngineError::Unsupported(_))));
+}
+
+#[test]
+fn join_rejects_schema_change_after_first_apply() {
+    let mut join = Join::new(&[0], &[0]);
+    join.apply(&zset(&[(1, "a", 1)]), &zset(&[(1, "x", 1)]))
+        .unwrap();
+    // The cached converters are only valid for the schema learned first; a
+    // different left schema must be rejected rather than silently reused.
+    let changed = keyed(
+        DataType::Int64,
+        Arc::new(Int64Array::from(vec![1i64])),
+        vec![1],
+    );
+    let result = join.apply(&changed, &zset(&[(1, "x", 1)]));
+    assert!(matches!(result, Err(EngineError::Unsupported(_))));
 }

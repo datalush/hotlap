@@ -39,7 +39,7 @@ pub(crate) fn consolidate_with(
 
     let mut positions = Vec::new();
     let mut sums = Vec::new();
-    for (position, sum) in grouped_sums(&rows, &order, &diffs) {
+    for (position, sum) in grouped_sums(&rows, &order, &diffs)? {
         if sum != 0 {
             positions.push(position as u32);
             sums.push(sum);
@@ -96,17 +96,27 @@ pub(crate) fn int64_diffs(diff: &ArrayRef) -> Result<Int64Array, EngineError> {
 }
 
 /// Sums diffs of adjacent equal rows, returning the kept source position and sum.
-fn grouped_sums(rows: &Rows, order: &UInt32Array, diffs: &Int64Array) -> Vec<(usize, i64)> {
+///
+/// Errors with `Infrastructure` if the running sum overflows `i64`.
+fn grouped_sums(
+    rows: &Rows,
+    order: &UInt32Array,
+    diffs: &Int64Array,
+) -> Result<Vec<(usize, i64)>, EngineError> {
     let mut groups: Vec<(usize, i64)> = Vec::new();
     for &value in order.values() {
         let position = value as usize;
         let sum = diffs.value(position);
         match groups.last_mut() {
-            Some(group) if rows.row(group.0) == rows.row(position) => group.1 += sum,
+            Some(group) if rows.row(group.0) == rows.row(position) => {
+                group.1 = group.1.checked_add(sum).ok_or_else(|| {
+                    EngineError::Infrastructure("consolidated diff sum overflowed i64".to_string())
+                })?;
+            }
             _ => groups.push((position, sum)),
         }
     }
-    groups
+    Ok(groups)
 }
 
 /// Applies the given row order to all columns of `batch`.

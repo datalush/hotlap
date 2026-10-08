@@ -65,7 +65,11 @@ impl ViewOutput {
             let sum = diffs.value(index);
             match self.diffs.get_mut(&key) {
                 Some(entry) => {
-                    *entry += sum;
+                    *entry = entry.checked_add(sum).ok_or_else(|| {
+                        EngineError::Infrastructure(
+                            "view output diff sum overflowed i64".to_string(),
+                        )
+                    })?;
                     if *entry == 0 {
                         self.diffs.remove(&key);
                     }

@@ -36,6 +36,14 @@ fn output_rows(core: &EngineCore, view: ViewId) -> usize {
 }
 
 #[test]
+fn view_output_rejects_diff_sum_overflow() {
+    // The output map sums multiplicities; two i64::MAX pushes cannot fit.
+    let mut output = super::output::ViewOutput::default();
+    output.update(&zset(&[(1, i64::MAX)])).unwrap();
+    assert!(output.update(&zset(&[(1, i64::MAX)])).is_err());
+}
+
+#[test]
 fn view_output_state_does_not_grow_with_history() {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();

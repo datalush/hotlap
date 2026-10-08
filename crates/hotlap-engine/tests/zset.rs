@@ -83,3 +83,10 @@ fn sort_rows_orders_by_key() {
     assert_eq!(key_values(&out), vec![1, 2, 3]);
     assert_eq!(diffs(&out), vec![2, 3, 1]);
 }
+
+#[test]
+fn consolidate_errors_on_diff_sum_overflow() {
+    // Two copies of the same row with i64::MAX never fit in a signed sum.
+    let input = zset(vec![1, 1], vec!["a", "a"], vec![i64::MAX, i64::MAX]);
+    assert!(consolidate(&input).is_err());
+}

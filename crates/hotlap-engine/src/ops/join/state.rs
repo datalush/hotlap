@@ -75,36 +75,37 @@ impl Join {
         Ok(delta)
     }
 
-    /// Joined output schema (`left || right`), learned from the first apply.
-    pub(super) fn output_schema(&self) -> Result<SchemaRef, EngineError> {
-        match (&self.left_schema, &self.right_schema) {
-            (Some(left), Some(right)) => Ok(joined_schema(left, right)),
-            _ => Err(EngineError::Infrastructure(
-                "join schemas uninitialized".to_string(),
-            )),
+    /// Joined output schema (`left || right`), built once from the first apply.
+    pub(super) fn output_schema(&mut self) -> Result<SchemaRef, EngineError> {
+        if self.out_schema.is_none() {
+            let left = self.left_schema.as_ref().ok_or_else(|| {
+                EngineError::Infrastructure("join left schema uninitialized".to_string())
+            })?;
+            let right = self.right_schema.as_ref().ok_or_else(|| {
+                EngineError::Infrastructure("join right schema uninitialized".to_string())
+            })?;
+            self.out_schema = Some(joined_schema(left, right));
         }
+        self.out_schema.clone().ok_or_else(|| {
+            EngineError::Infrastructure("join output schema uninitialized".to_string())
+        })
     }
 
-    /// Adds each side's delta to its arrangement, creating the arrangements from
-    /// the incoming schemas on the first call.
+    /// Adds each side's delta to its arrangement, creating the arrangements and
+    /// converters from the incoming schemas on the first call.
+    ///
+    /// Rejects a schema change on either side (the converters are cached and
+    /// only valid for the schema they were built from) and rejects key columns
+    /// whose `DataType`s differ across sides (their `arrow::row` encodings would
+    /// not be byte-comparable).
     pub(super) fn accumulate(
         &mut self,
         left: &ZSetBatch,
         right: &ZSetBatch,
     ) -> Result<(), EngineError> {
-        if self.left.is_none() {
-            self.left = Some(KeyedArrangement::new(left.schema(), &self.left_keys)?);
-            self.left_schema = Some(left.schema());
-            self.left_conv = Some(KeyConverter::new(left.schema().as_ref(), &self.left_keys)?);
-        }
-        if self.right.is_none() {
-            self.right = Some(KeyedArrangement::new(right.schema(), &self.right_keys)?);
-            self.right_schema = Some(right.schema());
-            self.right_conv = Some(KeyConverter::new(
-                right.schema().as_ref(),
-                &self.right_keys,
-            )?);
-        }
+        self.ensure_left(left)?;
+        self.ensure_right(right)?;
+        self.ensure_key_types_match()?;
         let left_keys = self
             .left_conv
             .as_ref()
@@ -123,6 +124,59 @@ impl Join {
             .as_mut()
             .ok_or_else(|| EngineError::Infrastructure("right arrangement uninitialized".into()))?;
         right_arrangement.apply(right, right_keys)?;
+        Ok(())
+    }
+
+    /// Validates the left schema against the cache and learns it on first use.
+    fn ensure_left(&mut self, z: &ZSetBatch) -> Result<(), EngineError> {
+        match &self.left_schema {
+            Some(existing) if existing != &z.schema() => Err(EngineError::Unsupported(
+                "join left input schema changed".to_string(),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.left = Some(KeyedArrangement::new(z.schema(), &self.left_keys)?);
+                self.left_schema = Some(z.schema());
+                self.left_conv = Some(KeyConverter::new(z.schema().as_ref(), &self.left_keys)?);
+                Ok(())
+            }
+        }
+    }
+
+    /// Validates the right schema against the cache and learns it on first use.
+    fn ensure_right(&mut self, z: &ZSetBatch) -> Result<(), EngineError> {
+        match &self.right_schema {
+            Some(existing) if existing != &z.schema() => Err(EngineError::Unsupported(
+                "join right input schema changed".to_string(),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.right = Some(KeyedArrangement::new(z.schema(), &self.right_keys)?);
+                self.right_schema = Some(z.schema());
+                self.right_conv = Some(KeyConverter::new(z.schema().as_ref(), &self.right_keys)?);
+                Ok(())
+            }
+        }
+    }
+
+    /// Ensures each paired left/right key column has the same `DataType`.
+    fn ensure_key_types_match(&self) -> Result<(), EngineError> {
+        let left = self.left_schema.as_ref().ok_or_else(|| {
+            EngineError::Infrastructure("join left schema uninitialized".to_string())
+        })?;
+        let right = self.right_schema.as_ref().ok_or_else(|| {
+            EngineError::Infrastructure("join right schema uninitialized".to_string())
+        })?;
+        for (&left_index, &right_index) in self.left_keys.iter().zip(&self.right_keys) {
+            let left_type = left.field(left_index).data_type();
+            let right_type = right.field(right_index).data_type();
+            if left_type != right_type {
+                return Err(EngineError::Unsupported(format!(
+                    "join key types differ: left column {left_index} is {left_type:?}, \
+                     right column {right_index} is {right_type:?}"
+                )));
+            }
+        }
         Ok(())
     }
 }

@@ -5,8 +5,9 @@
 //! per-push cost against a full `consolidate` over the whole history.
 //!
 //! The push is timed alone: snapshots are not part of the per-push cost, so the
-//! two operations are no longer conflated. The timing assertion uses a
-//! deliberately wide margin because wall-clock is environment-sensitive.
+//! two operations are no longer conflated. Timing is environment-sensitive, so
+//! the timing assertion lives in an `#[ignore]`d test; the normal suite keeps a
+//! non-timing correctness check that the snapshot equals the recomputation.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -50,8 +51,18 @@ fn group_plan() -> Plan {
     }
 }
 
-#[test]
-fn incremental_push_beats_full_recompute_on_large_state() {
+/// Costs and row counts measured by a single benchmark run.
+struct Measurement {
+    per_push_ns: u128,
+    snapshot_ns: u128,
+    recompute_ns: u128,
+    history_len: usize,
+    snapshot_len: usize,
+    recomputed_len: usize,
+}
+
+/// Runs the workload once, timing the pushes, the snapshot and the recompute.
+fn measure() -> Measurement {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();
     core.build_view(ViewId(0), &group_plan()).unwrap();
@@ -73,7 +84,6 @@ fn incremental_push_beats_full_recompute_on_large_state() {
         core.push(InputId(0), &batch).unwrap();
         push_ns += start.elapsed().as_nanos();
     }
-    let per_push = push_ns / EPOCHS as u128;
 
     // Materialize once (outside the push loop) and compare to recomputation.
     let start = Instant::now();
@@ -84,19 +94,43 @@ fn incremental_push_beats_full_recompute_on_large_state() {
     let recomputed = consolidate(&text_zset(&history)).unwrap();
     let recompute_ns = start.elapsed().as_nanos();
     std::hint::black_box(recomputed.len());
-    assert_eq!(snapshot.len(), recomputed.len());
 
+    Measurement {
+        per_push_ns: push_ns / EPOCHS as u128,
+        snapshot_ns,
+        recompute_ns,
+        history_len: history.len(),
+        snapshot_len: snapshot.len(),
+        recomputed_len: recomputed.len(),
+    }
+}
+
+#[test]
+fn incremental_push_matches_full_recompute() {
+    let measured = measure();
+    assert_eq!(measured.snapshot_len, measured.recomputed_len);
+}
+
+#[test]
+#[ignore = "wall-clock sensitive; run with --ignored to compare timings"]
+fn incremental_push_beats_full_recompute_on_large_state() {
+    let measured = measure();
+    assert_eq!(measured.snapshot_len, measured.recomputed_len);
     eprintln!(
-        "incremental push: {per_push} ns/push (snapshot {snapshot_ns} ns); full recompute: \
-         {recompute_ns} ns over {} history rows ({:.1}x)",
-        history.len(),
-        recompute_ns as f64 / per_push.max(1) as f64
+        "incremental push: {} ns/push (snapshot {} ns); full recompute: {} ns over {} history \
+         rows ({:.1}x)",
+        measured.per_push_ns,
+        measured.snapshot_ns,
+        measured.recompute_ns,
+        measured.history_len,
+        measured.recompute_ns as f64 / measured.per_push_ns.max(1) as f64
     );
     // Wide margin: a delta-scoped push should beat recomputing the whole
     // history by orders of magnitude, not merely by a few percent.
     assert!(
-        per_push.saturating_mul(4) < recompute_ns,
-        "incremental push ({per_push} ns) should beat full recompute ({recompute_ns} ns) \
-         by a wide margin"
+        measured.per_push_ns.saturating_mul(4) < measured.recompute_ns,
+        "incremental push ({} ns) should beat full recompute ({} ns) by a wide margin",
+        measured.per_push_ns,
+        measured.recompute_ns
     );
 }
