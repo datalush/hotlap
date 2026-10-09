@@ -41,12 +41,23 @@ impl SinkPump {
             }
         }
         if failure.is_none() && self.close_clean.load(std::sync::atomic::Ordering::SeqCst) {
-            for shared in drained {
-                if let Err(error) = shared.commit().await {
+            let commits = async {
+                for shared in drained {
+                    shared.commit().await?;
+                }
+                Ok::<(), ConnectorError>(())
+            };
+            match tokio::time::timeout(CLOSE_TIMEOUT, commits).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
                     self.close_clean
                         .store(false, std::sync::atomic::Ordering::SeqCst);
                     record(&mut failure, error);
-                    break;
+                }
+                Err(_) => {
+                    self.close_clean
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    record(&mut failure, commit_timed_out());
                 }
             }
         }
@@ -74,4 +85,8 @@ fn join_error(error: tokio::task::JoinError) -> ConnectorError {
 
 fn timed_out() -> ConnectorError {
     ConnectorError::Infrastructure("sink task timed out during close".into())
+}
+
+fn commit_timed_out() -> ConnectorError {
+    ConnectorError::Infrastructure("final sink commit timed out during close".into())
 }

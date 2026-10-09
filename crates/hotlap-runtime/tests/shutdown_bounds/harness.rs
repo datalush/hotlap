@@ -7,10 +7,15 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::{Stream, StreamExt};
+use hotlap::{InputId, Plan};
 use hotlap_connectors::sink::Sink;
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError};
 use hotlap_runtime::runtime::checkpoint::CheckpointConfig;
+use hotlap_runtime::runtime::handle::EngineHandle;
+use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
+use hotlap_runtime::runtime::sources::{InputSource, Sources};
+use tokio::sync::Notify;
 
 #[path = "../common/shutdown.rs"]
 mod common;
@@ -26,10 +31,44 @@ pub fn checkpoint() -> CheckpointConfig {
     }
 }
 
+/// Start two independent sink views over the same source for close ordering tests.
+pub fn start_pair(
+    source: Arc<dyn Source>,
+    first: Arc<dyn Sink>,
+    second: Arc<dyn Sink>,
+) -> EngineHandle {
+    let sources = Sources::new(vec![InputSource {
+        id: InputId(0),
+        name: "in".into(),
+        source,
+        watermark: None,
+    }])
+    .unwrap();
+    let plan = || Plan::Source(InputId(0));
+    EngineHandle::start(Pipeline {
+        sources,
+        views: vec![("first".into(), plan()), ("second".into(), plan())],
+        sinks: vec![
+            SinkSpec {
+                view: "first".into(),
+                sink: first,
+            },
+            SinkSpec {
+                view: "second".into(),
+                sink: second,
+            },
+        ],
+        checkpoint: None,
+        retention: None,
+    })
+    .unwrap()
+}
+
 /// A sink that records how many change rows it wrote and when it committed.
 pub struct RecordingSink {
     rows: Mutex<usize>,
     committed: AtomicBool,
+    aborted: AtomicBool,
     written: Signal,
 }
 
@@ -38,6 +77,7 @@ impl RecordingSink {
         Arc::new(Self {
             rows: Mutex::new(0),
             committed: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
             written,
         })
     }
@@ -48,6 +88,10 @@ impl RecordingSink {
 
     pub fn committed(&self) -> bool {
         self.committed.load(Ordering::SeqCst)
+    }
+
+    pub fn aborted(&self) -> bool {
+        self.aborted.load(Ordering::SeqCst)
     }
 }
 
@@ -68,6 +112,7 @@ impl Sink for RecordingSink {
         Ok(())
     }
     async fn abort(&self) -> Result<(), ConnectorError> {
+        self.aborted.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -75,6 +120,72 @@ impl Sink for RecordingSink {
 /// A sink whose final `commit` fails, so EOF cannot certify delivery.
 pub struct FailingCommitSink {
     written: Signal,
+}
+
+/// A final commit that parks until the test explicitly releases it.
+pub struct StallingCommitSink {
+    written: Signal,
+    entered: Signal,
+    released: Arc<Notify>,
+    resumed: Signal,
+    dropped: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
+}
+
+impl StallingCommitSink {
+    pub fn new(
+        written: Signal,
+        entered: Signal,
+        released: Arc<Notify>,
+        resumed: Signal,
+        dropped: Arc<AtomicBool>,
+        aborted: Arc<AtomicBool>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            written,
+            entered,
+            released,
+            resumed,
+            dropped,
+            aborted,
+        })
+    }
+}
+
+struct CommitDrop(Arc<AtomicBool>);
+
+impl Drop for CommitDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl Sink for StallingCommitSink {
+    async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
+        while let Some(item) = changes.next().await {
+            item?;
+        }
+        self.written.fire();
+        Ok(())
+    }
+
+    fn accepts_retractions(&self) -> bool {
+        true
+    }
+
+    async fn commit(&self) -> Result<(), ConnectorError> {
+        let _drop = CommitDrop(Arc::clone(&self.dropped));
+        self.entered.fire();
+        self.released.notified().await;
+        self.resumed.fire();
+        Ok(())
+    }
+
+    async fn abort(&self) -> Result<(), ConnectorError> {
+        self.aborted.store(true, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 impl FailingCommitSink {
