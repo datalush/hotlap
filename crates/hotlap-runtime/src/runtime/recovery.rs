@@ -8,6 +8,7 @@
 //! exactly the state the crashed run had reached.
 
 mod decision;
+mod load;
 mod pending;
 mod restore;
 mod resume;
@@ -24,10 +25,18 @@ use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
 use crate::runtime::sources::{InputStream, Sources};
 use hotlap_connectors::error::ConnectorError;
 use pending::{discard, pending_commit};
-use sources::{read_body, read_valid};
+use sources::read_body;
 
 /// The last valid checkpoint, if the store holds one.
 pub struct Recovery;
+
+/// What a resolved recovery decision yields.
+enum Resolved {
+    /// Serve a fresh source stream (clean start, or a discard without fallback).
+    Stream,
+    /// Resume from this checkpoint.
+    Checkpoint(Checkpoint),
+}
 
 impl Recovery {
     /// Decide how to recover, detecting a checkpoint that was mid-commit when
@@ -91,8 +100,7 @@ impl Recovery {
     /// This is the layer that holds the sinks, so it executes [`Self::inspect`]:
     /// a promoted checkpoint re-drives the commit before resuming; a discarded
     /// one replays from the fallback and records an explicit warning signal. A
-    /// failed re-drive is itself discarded and replayed rather than aborting
-    /// startup, so a hostile marker cannot wedge every restart in a retry loop.
+    /// failed re-drive is only discarded when a replay-safe sink allows it.
     pub async fn start(
         hotlap: &mut Hotlap,
         sources: &Sources,
@@ -101,86 +109,81 @@ impl Recovery {
         metrics: &MetricsRegistry,
     ) -> Result<InputStream, ConnectorError> {
         checkpointer.sweep_stale_commits()?;
-        let checkpoint = match Self::inspect(checkpointer, sources)? {
-            RecoveryDecision::Clean => return sources.stream(),
-            RecoveryDecision::Resume(checkpoint) => checkpoint,
+        let decision = Self::inspect(checkpointer, sources)?;
+        match Self::resolve(decision, sources, checkpointer, signal, metrics).await? {
+            Resolved::Stream => sources.stream(),
+            Resolved::Checkpoint(checkpoint) => {
+                checkpointer.resume_after(checkpoint.id);
+                Self::resume(hotlap, sources, &checkpoint)
+            }
+        }
+    }
+
+    /// Turn a recovery decision into a checkpoint to resume or a clean start.
+    async fn resolve(
+        decision: RecoveryDecision,
+        sources: &Sources,
+        checkpointer: &mut Checkpointer,
+        signal: &Mutex<Option<String>>,
+        metrics: &MetricsRegistry,
+    ) -> Result<Resolved, ConnectorError> {
+        match decision {
+            RecoveryDecision::Clean => Ok(Resolved::Stream),
+            RecoveryDecision::Resume(checkpoint) => Ok(Resolved::Checkpoint(checkpoint)),
             RecoveryDecision::Promote(checkpoint) => {
-                match checkpointer.promote(checkpoint.id).await {
-                    Ok(()) => checkpoint,
-                    // An operational failure publishing a promoted commit must
-                    // propagate untouched: no fallback read, no discard, no
-                    // source rollback or start. Only a considered decision (a
-                    // sink that cannot re-drive) discards and replays.
-                    Err(error @ ConnectorError::Storage(_)) => return Err(error),
-                    // A non-storage re-drive failure leaves the commit unresolved.
-                    // Only a replay-safe sink may be discarded and replayed;
-                    // otherwise keep the pending evidence and surface the error.
-                    Err(error) => {
-                        if !checkpointer.replay_safe() {
-                            return Err(error);
-                        }
-                        let fallback = Self::load(checkpointer, sources)?;
-                        let reason = format!("commit re-drive failed ({error})");
-                        match discard(
-                            checkpointer,
-                            metrics,
-                            signal,
-                            checkpoint.id,
-                            fallback,
-                            &reason,
-                        )? {
-                            Some(fallback) => fallback,
-                            None => return sources.stream(),
-                        }
-                    }
-                }
+                Self::promote(checkpoint, sources, checkpointer, signal, metrics).await
             }
             RecoveryDecision::Discard {
                 pending,
                 fallback,
                 reason,
             } => match discard(checkpointer, metrics, signal, pending, fallback, reason)? {
-                Some(checkpoint) => checkpoint,
-                None => return sources.stream(),
+                Some(checkpoint) => Ok(Resolved::Checkpoint(checkpoint)),
+                None => Ok(Resolved::Stream),
             },
             // Refuse rather than replay: a transactional sink may already have
-            // committed, so replay could duplicate it. The marker, the body and
-            // the sink state stay for a manual decision or an operator fix.
-            RecoveryDecision::Reject { pending, reason } => {
-                return Err(ConnectorError::Unsupported(format!(
-                    "refusing to replay interrupted checkpoint {pending}: {reason}"
-                )));
-            }
-        };
-        checkpointer.resume_after(checkpoint.id);
-        Self::resume(hotlap, sources, &checkpoint)
+            // committed, so the marker, body and sink state stay untouched.
+            RecoveryDecision::Reject { pending, reason } => Err(ConnectorError::Unsupported(
+                format!("refusing to replay interrupted checkpoint {pending}: {reason}"),
+            )),
+        }
     }
 
-    /// Newest valid checkpoint, or `None` for a clean start.
-    ///
-    /// The `latest` pointer is read only to classify it: a damaged pointer is
-    /// tolerated, but an operational read failure is fatal. Selection always
-    /// scans the namespace newest-first, so a pointer that lags behind a
-    /// checkpoint already published as `valid` cannot hide it. A checkpoint that
-    /// fails to decode as the current format is skipped; an incompatible one is a
-    /// fatal `Unsupported` rather than a silent skip.
-    pub fn load(
-        checkpointer: &Checkpointer,
+    /// Re-drive a promoted commit, discarding and replaying only when safe.
+    async fn promote(
+        checkpoint: Checkpoint,
         sources: &Sources,
-    ) -> Result<Option<Checkpoint>, ConnectorError> {
-        match checkpointer.latest() {
-            // A damaged `latest` pointer is current-format corruption: scan the
-            // store for a valid checkpoint instead of aborting startup. An
-            // operational failure propagates and is never treated as absence.
-            Ok(_) | Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => {}
-            Err(error) => return Err(error),
-        }
-        for id in checkpointer.ids_descending()? {
-            if let Some(checkpoint) = read_valid(checkpointer, id)? {
-                sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
-                return Ok(Some(checkpoint));
+        checkpointer: &mut Checkpointer,
+        signal: &Mutex<Option<String>>,
+        metrics: &MetricsRegistry,
+    ) -> Result<Resolved, ConnectorError> {
+        match checkpointer.promote(checkpoint.id).await {
+            Ok(()) => Ok(Resolved::Checkpoint(checkpoint)),
+            // An operational failure publishing a promoted commit must
+            // propagate untouched: no fallback read, no discard, no source
+            // rollback or start.
+            Err(error @ ConnectorError::Storage(_)) => Err(error),
+            // A non-storage re-drive failure leaves the commit unresolved. Only
+            // a replay-safe sink may be discarded and replayed; otherwise keep
+            // the pending evidence and surface the error.
+            Err(error) => {
+                if !checkpointer.replay_safe() {
+                    return Err(error);
+                }
+                let fallback = Self::load(checkpointer, sources)?;
+                let reason = format!("commit re-drive failed ({error})");
+                match discard(
+                    checkpointer,
+                    metrics,
+                    signal,
+                    checkpoint.id,
+                    fallback,
+                    &reason,
+                )? {
+                    Some(fallback) => Ok(Resolved::Checkpoint(fallback)),
+                    None => Ok(Resolved::Stream),
+                }
             }
         }
-        Ok(None)
     }
 }
