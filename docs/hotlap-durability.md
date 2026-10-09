@@ -85,8 +85,9 @@ Implementaciones:
   ya confirmado.
 - La creación de directorios sincroniza cada directorio nuevo y el **primer
   ancestro existente** que enlaza el subárbol, para que una entrada recién
-  creada sea durable. Un error de `fsync` se **propaga**; la operación no se
-  declara exitosa.
+  creada sea durable. `delete` sincroniza el **padre modificado** al borrar
+  archivos y al podar directorios vacíos. Un error de `fsync` se **propaga**; la
+  operación no se declara exitosa.
 - `open(root)` crea el directorio raíz (con `fsync` de directorios) si no existe.
 
 > Nota: los tests de orden de `fsync` y de propagación de fallos inyectan el

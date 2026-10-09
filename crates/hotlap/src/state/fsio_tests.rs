@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::fsio::{FsOps, RealFs, create_dirs_synced_with};
+use super::fsio::{FsOps, RealFs, create_dirs_synced_with, remove_file_pruning};
 
 /// Scratch directory removed on drop.
 struct Scratch(PathBuf);
@@ -65,6 +65,14 @@ impl FsOps for RecordingFs {
         }
         RealFs.sync_dir(dir)
     }
+
+    fn remove_file(&self, file: &Path) -> io::Result<()> {
+        RealFs.remove_file(file)
+    }
+
+    fn remove_dir(&self, dir: &Path) -> io::Result<()> {
+        RealFs.remove_dir(dir)
+    }
 }
 
 #[test]
@@ -92,4 +100,44 @@ fn create_propagates_anchor_sync_failure() {
     let ops = RecordingFs::failing_on(scratch.path().to_path_buf());
 
     assert!(create_dirs_synced_with(&ops, &scratch.path().join("a")).is_err());
+}
+
+#[test]
+fn delete_syncs_non_empty_parent() {
+    let scratch = Scratch::new("delete-leaf");
+    let dir = scratch.path().join("a");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("k1"), b"v").unwrap();
+    fs::write(dir.join("k2"), b"v").unwrap();
+    let ops = RecordingFs::default();
+
+    remove_file_pruning(&ops, &dir.join("k1"), scratch.path()).unwrap();
+
+    assert_eq!(&*ops.synced.borrow(), &[dir]);
+}
+
+#[test]
+fn delete_prunes_empty_dirs_and_syncs_root() {
+    let scratch = Scratch::new("delete-prune");
+    let dir = scratch.path().join("a").join("b");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("k"), b"v").unwrap();
+    let ops = RecordingFs::default();
+
+    remove_file_pruning(&ops, &dir.join("k"), scratch.path()).unwrap();
+
+    assert!(!dir.exists());
+    assert_eq!(&*ops.synced.borrow(), &[scratch.path().to_path_buf()]);
+}
+
+#[test]
+fn delete_propagates_sync_failure() {
+    let scratch = Scratch::new("delete-fail");
+    let dir = scratch.path().join("a");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("k1"), b"v").unwrap();
+    fs::write(dir.join("k2"), b"v").unwrap();
+    let ops = RecordingFs::failing_on(dir.clone());
+
+    assert!(remove_file_pruning(&ops, &dir.join("k1"), scratch.path()).is_err());
 }

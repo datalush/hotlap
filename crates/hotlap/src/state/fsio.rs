@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 pub(super) trait FsOps {
     fn create_dir(&self, dir: &Path) -> io::Result<()>;
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
+    fn remove_file(&self, file: &Path) -> io::Result<()>;
+    fn remove_dir(&self, dir: &Path) -> io::Result<()>;
 }
 
 /// Real filesystem operations.
@@ -23,6 +25,14 @@ impl FsOps for RealFs {
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         sync_dir(dir)
+    }
+
+    fn remove_file(&self, file: &Path) -> io::Result<()> {
+        fs::remove_file(file)
+    }
+
+    fn remove_dir(&self, dir: &Path) -> io::Result<()> {
+        fs::remove_dir(dir)
     }
 }
 
@@ -65,6 +75,33 @@ pub(super) fn create_dirs_synced_with(ops: &impl FsOps, dir: &Path) -> io::Resul
     }
     if !anchor.as_os_str().is_empty() {
         ops.sync_dir(&anchor)?;
+    }
+    Ok(())
+}
+
+/// Remove `file` and any emptied ancestor directories, syncing every parent
+/// directory whose entries changed so the deletion is durable. The walk stops at
+/// `root`, which is never pruned.
+pub(super) fn remove_file_pruning(ops: &impl FsOps, file: &Path, root: &Path) -> io::Result<()> {
+    ops.remove_file(file)?;
+    let mut modified = file.parent();
+    while let Some(path) = modified {
+        if path == root {
+            // The root lost an entry but is never pruned; sync it and stop.
+            ops.sync_dir(path)?;
+            break;
+        }
+        match ops.remove_dir(path) {
+            Ok(()) => modified = path.parent(),
+            // A non-empty dir keeps its ancestors non-empty too; it lost only the
+            // removed file, so sync it to make that removal durable.
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                ops.sync_dir(path)?;
+                break;
+            }
+            Err(e) if is_absent(e.kind()) => break,
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
