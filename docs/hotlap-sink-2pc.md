@@ -63,11 +63,16 @@ necesita.
   **antes** de publicar `valid`: un append puede ser visible pero no confirmado,
   y una entrega pendiente o un flush fallido no puede certificar los offsets.
 
-`SinkBarrier` ejecuta el orden **drain → prepare → capture → commit**. Si
-`capture` (snapshot + escritura del cuerpo) falla, o un `commit` / flush de la
-fase de confirmación falla, se **abortan todos los sinks preparados que aún no
-se hayan confirmado** (incluido el que falló), y el error se propaga: ningún
-checkpoint puede llegar a ser válido.
+`SinkBarrier` ejecuta el orden **drain → prepare → capture → commit**. Un fallo
+**antes** de la fase de commit (en `prepare`, o en `capture` sin cuerpo durable)
+aborta los sinks ya preparados, de modo que ninguno quede con una transacción a
+medio abrir; el marcador `commit` se borra **antes** de abortar y, si ese borrado
+falla, no se aborta nada y el error se propaga como `Storage`. Un fallo
+**durante** la fase de commit **no aborta nada**: un participante puede haber
+confirmado ya, y revertirlo sería incorrecto. En ese caso se conservan el
+marcador y el cuerpo durables para que recovery re-conduzca (si el sink es
+reconducible) o descarte y replaye. El error se propaga en todos los casos, de
+modo que ningún checkpoint queda válido por accidente.
 
 ## 3. Protocolo de commit recuperable
 

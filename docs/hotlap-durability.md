@@ -219,8 +219,21 @@ ids falla en vez de envolver a cero.
 **Fallo de escritura ambiguo.** Si escribir el cuerpo falla con `Storage`, el
 marcador `commit` y el cuerpo ya persistidos **se conservan** y los sinks
 preparados **no** se abortan: la incertidumbre se preserva como evidencia en vez
-de borrar la garantía. La limpieza de un marcador `commit` obsoleto (un
-checkpoint ya `valid`) también propaga un fallo de borrado como `Storage`.
+de borrar la garantía. Una fase de commit fallida **tampoco** aborta: un
+participante puede haber confirmado, así que solo un reinicio resuelve la
+ventana. La limpieza de un marcador `commit` obsoleto (un checkpoint ya `valid`)
+también propaga un fallo de borrado como `Storage`.
+
+**Estado explícito y fail-stop.** Un intento que falla tras `prepare` deja el
+runtime inconsistente: el motor y los offsets de las fuentes **no** se revierten
+con los sinks, así que abortar los sinks no restaura el estado. El
+`Checkpointer` mantiene un estado explícito (`Ready`, `Failed`,
+`CommitUncertain`) y **rechaza nuevos intentos** hasta el reinicio; el bucle de
+servicio deja de sondear fuentes y deja de aceptar checkpoints y vistas
+posteriores a `START`. Solo los fallos de reserva o previos a `prepare` (que no
+descartan ninguna escritura) quedan reintentables. Al reiniciar, recovery
+resuelve el marcador pendiente: re-conduce el commit y promueve, o descarta y
+replaya desde el predecesor válido.
 
 **Cobertura del sink.** El pump del motor drena los deltas de cada vista a un
 canal acotado que la tarea del sink consume de forma asíncrona. Antes de
