@@ -157,12 +157,18 @@ fn a_staged_transactional_commit_cancel_is_rejected_on_restart() {
         watermark: None,
     }])
     .unwrap();
+    let restarted_sink = StagedSink::reopen(store.clone());
     let restarted = Checkpointer::new(Box::new(backend), 3)
-        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(sink))]);
+        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(restarted_sink))]);
     let decision = Recovery::inspect(&restarted, &sources).expect("inspect");
     assert!(
         matches!(decision, RecoveryDecision::Reject { .. }),
         "a non-re-drivable transactional sink must be explicitly rejected, got {decision:?}"
+    );
+    assert_eq!(
+        store.staged(),
+        vec![7, 8],
+        "the staged payload must survive a restart"
     );
     assert!(
         store.published().is_empty(),

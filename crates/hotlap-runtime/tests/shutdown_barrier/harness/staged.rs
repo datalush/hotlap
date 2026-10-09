@@ -96,6 +96,23 @@ impl StagedSink {
         });
         (sink, release)
     }
+
+    /// A fresh writer over a persisted store, as a restart would build.
+    ///
+    /// The coordinated attempt died with the previous process, so this
+    /// instance holds no gate: it sees the staged payload but cannot publish
+    /// it, and a commit call fails instead of claiming delivery.
+    pub fn reopen(store: Arc<StagedStore>) -> Arc<Self> {
+        let (entered, _) = Signal::new();
+        let (written, _) = Signal::new();
+        Arc::new(Self {
+            store,
+            pending: Mutex::new(Vec::new()),
+            entered,
+            written,
+            release: Mutex::new(None),
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -129,18 +146,47 @@ impl Sink for StagedSink {
         Ok(())
     }
     async fn commit(&self) -> Result<(), ConnectorError> {
-        // Only the coordinated attempt holds the gate; it publishes on release.
+        // Only the coordinated attempt owns the gate. Without it this writer
+        // cannot deliver the staged payload, so it fails rather than report a
+        // commit that never happened.
         let held = self.release.lock().unwrap().take();
         let Some(held) = held else {
-            return Ok(());
+            return Err(ConnectorError::Infrastructure(
+                "commit has no coordinated attempt to publish".into(),
+            ));
         };
         self.entered.fire();
-        let _ = held.await;
+        held.await.map_err(|_| {
+            ConnectorError::Infrastructure("the coordinated attempt ended before commit".into())
+        })?;
         self.store.publish();
         Ok(())
     }
     async fn abort(&self) -> Result<(), ConnectorError> {
         self.store.discard();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hotlap_connectors::sink::Sink;
+
+    use super::{StagedSink, StagedStore};
+
+    #[tokio::test]
+    async fn a_commit_without_a_coordinated_attempt_fails() {
+        let store = StagedStore::new();
+        store.stage(vec![7, 8]);
+        let sink = StagedSink::reopen(store.clone());
+
+        assert!(
+            sink.commit().await.is_err(),
+            "a writer without the coordinated attempt must not report a commit"
+        );
+        assert!(
+            store.published().is_empty(),
+            "a failed commit must not publish"
+        );
     }
 }
