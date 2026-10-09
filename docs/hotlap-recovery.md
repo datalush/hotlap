@@ -21,15 +21,18 @@
    paso no hace nada.
 2. **Cargar el último checkpoint válido**: se intenta `latest` primero. Si su
    cuerpo tiene el formato actual pero está **corrupto** (truncado, longitud
-   incoherente, payload ilegible), se prueban los anteriores de más nuevo a más
-   viejo: un tip corrupto no aborta el arranque mientras quede un predecesor
-   válido. En cambio, un formato **ajeno o incompatible** (magic o versión
-   desconocida, frame interno del motor o snapshot del engine con versión no
-   soportada) o un checkpoint que **no valida** contra las fuentes declaradas
-   (ids, schema, watermark, renombrado) es `Unsupported` **fatal**: no se prueba
-   un lector viejo, no se cae a un predecesor y nunca arranca en vacío. Sin
-   ningún checkpoint válido (y sin error fatal), es un **arranque limpio**
-   (`None`).
+   incoherente, payload ilegible), o el puntero `latest` está dañado, se prueban
+   los anteriores de más nuevo a más viejo: un tip corrupto no aborta el arranque
+   mientras quede un predecesor válido. En cambio, un formato **ajeno o
+   incompatible** (magic o versión desconocida, frame interno del motor o
+   snapshot del engine con versión no soportada) o un checkpoint que **no valida**
+   contra las fuentes declaradas (ids, schema, watermark, renombrado) es
+   `Unsupported` **fatal**: no se prueba un lector viejo, no se cae a un
+   predecesor y nunca arranca en vacío. Un fallo **operativo** del backend
+   (lectura/escritura/borrado, `Storage`) también es fatal: se **propaga** sin
+   borrar markers, sin retroceder a un predecesor y sin arranque limpio
+   silencioso. Sin ningún checkpoint válido (y sin error fatal), es un
+   **arranque limpio** (`None`).
 3. **Restaurar** el motor con `EngineSnapshot` (`hotlap.restore`).
 4. **Reabrir cada source** en los offsets capturados (`Source::resume`) y
    **replayar** desde ahí, alimentando el mismo circuito.
@@ -96,6 +99,12 @@ follow-up fuera de SP4.
   (`on_demand_checkpoint_is_coherent_and_readable`), `checkpoint_retention.rs`
   (solo los N más nuevos), `checkpoint_periodic.rs` (disparo periódico, rechazo
   sin config y supresión tras fail-stop).
+- **Identidad y errores** (`tests/checkpoint_identity.rs`,
+  `tests/checkpoint_storage_errors.rs`): un id reservado no se reutiliza tras un
+  intento ambiguo, un crash ni una poda, y un `Checkpointer` nuevo parte del
+  mayor id presente/reservado; los fallos de `get`/`list`/`delete` (storage) se
+  propagan sin borrar markers, la corrupción del formato actual y el puntero
+  `latest` dañado se toleran, y una versión desconocida sigue siendo fatal.
 - **2PC** (`tests/sink_barrier.rs`): transaccional prepara→commit→valid;
   fallo de capture aborta y descarta; fallo de prepare aborta los ya preparados;
   fallo de commit aborta el sink que falló y el resto de preparados sin

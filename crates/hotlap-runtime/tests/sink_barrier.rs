@@ -48,7 +48,7 @@ async fn capture_failure_aborts_and_discards_the_checkpoint() {
         SinkCapabilities::Transactional,
         log.clone(),
     )));
-    let backend = MemBackend::failing();
+    let backend = MemBackend::failing_writes();
     let mut checkpointer =
         Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
 

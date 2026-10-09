@@ -14,8 +14,8 @@ use hotlap::state::StateBackend;
 use hotlap_engine::{EngineSnapshot, decode_snapshot};
 
 use crate::runtime::checkpoint_body::{
-    LATEST_KEY, checkpoint_prefix, decode_err, invalid, parse_id, read_body as decode_body,
-    state_err,
+    LATEST_KEY, RESERVED_KEY, checkpoint_prefix, decode_err, id_exhausted, invalid, parse_id,
+    read_body as decode_body, state_err,
 };
 use crate::runtime::sink::SinkSync;
 use crate::runtime::sink_barrier::SinkBarrier;
@@ -52,6 +52,7 @@ pub struct Checkpoint {
 pub struct Checkpointer {
     backend: Box<dyn StateBackend + Send>,
     next_id: u64,
+    initialized: bool,
     retain: usize,
     sinks: SinkBarrier,
 }
@@ -62,6 +63,7 @@ impl Checkpointer {
         Self {
             backend,
             next_id: 1,
+            initialized: false,
             retain,
             sinks: SinkBarrier::new(Vec::new()),
         }
@@ -78,8 +80,50 @@ impl Checkpointer {
 
     /// Continue the id sequence after a recovered checkpoint `id`, so the next
     /// checkpoint does not overwrite an existing one.
+    ///
+    /// An exhausted id space keeps the sequence at `u64::MAX`, so the next
+    /// [`Self::take`] fails instead of wrapping around to reuse id zero.
+    ///
+    /// The store's durable high-water mark still applies: clearing `initialized`
+    /// makes the next [`Self::take`] raise the sequence above any id reserved
+    /// after this checkpoint, so a recovered id cannot be handed out again.
     pub fn resume_after(&mut self, id: u64) {
-        self.next_id = self.next_id.max(id.saturating_add(1));
+        self.next_id = match id.checked_add(1) {
+            Some(next) => self.next_id.max(next),
+            None => u64::MAX,
+        };
+        self.initialized = false;
+    }
+
+    /// Raise `next_id` above every id already present and every id reserved.
+    ///
+    /// Runs once, lazily, so a fresh [`Checkpointer`] over a non-empty store
+    /// never starts at an id another run may already own, and does not pay a
+    /// scan on every checkpoint. The reservation key survives pruning, so the
+    /// floor holds even when only the high-water mark is left.
+    fn ensure_id_floor(&mut self) -> Result<(), ConnectorError> {
+        if self.initialized {
+            return Ok(());
+        }
+        let mut floor = self.reserved_high_water()?;
+        for id in
+            crate::runtime::retention::checkpoint_ids(self.backend.as_ref()).map_err(state_err)?
+        {
+            floor = floor.max(id);
+        }
+        self.next_id = self
+            .next_id
+            .max(floor.checked_add(1).ok_or_else(id_exhausted)?);
+        self.initialized = true;
+        Ok(())
+    }
+
+    /// Highest id ever reserved, or zero when none is recorded.
+    fn reserved_high_water(&self) -> Result<u64, ConnectorError> {
+        match self.get_bytes(RESERVED_KEY)? {
+            None => Ok(0),
+            Some(bytes) => parse_id(&bytes),
+        }
     }
 
     /// Whether every coordinated sink declares a re-drivable `commit`.

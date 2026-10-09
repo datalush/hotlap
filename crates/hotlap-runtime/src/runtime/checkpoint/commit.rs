@@ -4,7 +4,7 @@ use hotlap::Hotlap;
 
 use crate::runtime::checkpoint::Checkpointer;
 use crate::runtime::checkpoint_body::{
-    checkpoint_prefix, clear_commit, mark_valid, state_err, write,
+    checkpoint_prefix, clear_commit, id_exhausted, mark_valid, reserve, state_err, write,
 };
 use crate::runtime::sources::Sources;
 use hotlap_connectors::error::ConnectorError;
@@ -13,11 +13,12 @@ impl Checkpointer {
     /// Capture `engine` and `source` and persist a new valid checkpoint,
     /// coordinating the sinks in two-phase-commit order.
     ///
-    /// The order is drain -> prepare -> snapshot + write body + durable commit
-    /// marker -> commit -> mark valid -> clear marker. A failure aborts the
-    /// prepared sinks and clears the marker, so the engine keeps its last valid
-    /// checkpoint. A crash between the marker and validity leaves the marker for
-    /// recovery to resolve.
+    /// The order is reserve id -> drain -> prepare -> snapshot + write body +
+    /// durable commit marker -> commit -> mark valid -> clear marker. A failure
+    /// aborts the prepared sinks and clears the marker, so the engine keeps its
+    /// last valid checkpoint. A crash between the marker and validity leaves the
+    /// marker for recovery to resolve. The id is reserved durably first, so an
+    /// ambiguous attempt never lets a later one reuse it.
     ///
     /// The marker is cleared *before* the abort on a commit failure: otherwise a
     /// crash between the abort and the clear would leave a complete body with a
@@ -29,7 +30,15 @@ impl Checkpointer {
         engine: &Hotlap,
         sources: &Sources,
     ) -> Result<u64, ConnectorError> {
+        // Resolve the starting id and durably reserve this attempt's id before
+        // any sink or body mutation: an ambiguous attempt that crashes or
+        // fails must never hand the same id to a later attempt.
+        self.ensure_id_floor()?;
         let id = self.next_id;
+        let next = id.checked_add(1).ok_or_else(id_exhausted)?;
+        reserve(self.backend.as_mut(), id)?;
+        self.next_id = next;
+
         self.sinks.drain().await?;
         let prepared = self.sinks.prepare().await?;
         if let Err(error) = write(self.backend.as_mut(), id, engine, sources).await {
@@ -44,7 +53,6 @@ impl Checkpointer {
         }
         mark_valid(self.backend.as_mut(), id, self.retain)?;
         let _ = clear_commit(self.backend.as_mut(), id);
-        self.next_id = self.next_id.saturating_add(1);
         Ok(id)
     }
 

@@ -185,6 +185,7 @@ o un schema que no valida contra las fuentes declaradas es fatal.
 | `checkpoint/<id>/commit` | marcador `1`: intención de commit durable (se borra tras `valid`) |
 | `checkpoint/<id>/valid` | marcador `1`: el checkpoint está completo |
 | `checkpoint/latest` | id (8 bytes LE) del checkpoint nuevo más reciente |
+| `checkpoint/reserved` | id (8 bytes LE) más alto reservado nunca reutilizable |
 
 **Publicación coherente.** Un checkpoint solo es visible cuando **todas** sus
 partes están escritas: primero el cuerpo (`engine` + `sources`), luego el
@@ -194,6 +195,22 @@ parcial como el actual. El marcador `commit` se borra tras publicar `valid`: un
 `commit` presente **sin** `valid` señala a recovery que el proceso cayó en la
 ventana de commit (`hotlap-sink-2pc.md`).
 
+**Publicación y limpieza son pasos distintos.** Publicar (`valid` + `latest`) y
+podar los antiguos son operaciones separadas: un fallo al escribir `latest` o al
+podar **después** de que `valid` se escribió **no** des-publica el checkpoint ni
+autoriza a sobrescribir `engine`/`sources` bajo ese id. La poda solo puede
+eliminar checkpoints más antiguos que el recién publicado; el puntero `latest`
+nunca se poda.
+
+**Identidad nunca reutilizada.** El id se **reserva de forma durable** en
+`checkpoint/reserved` **antes** de drenar/preparar los sinks y de escribir
+cualquier byte del cuerpo, de modo que un intento ambiguo (un fallo o un crash
+después de una escritura ya confirmada) no puede entregar el mismo id a un
+intento posterior. La reserva vive **fuera** de `checkpoint/<id>/`, así que la
+poda no la borra. Un `Checkpointer` nuevo parte del mayor id presente **y** del
+mayor reservado, y `resume_after` nunca baja de ese suelo; agotar el espacio de
+ids falla en vez de envolver a cero.
+
 **Cobertura del sink.** El pump del motor drena los deltas de cada vista a un
 canal acotado que la tarea del sink consume de forma asíncrona. Antes de
 preparar y confirmar, la barrera **drena ese canal**: envía una marca de flush
@@ -201,6 +218,27 @@ detrás de los lotes encolados y espera la confirmación de la tarea, que respon
 solo tras escribirlos. Por tanto, al escribir `valid` **todos** los deltas de
 salida hasta ese punto ya llegaron al sink; un checkpoint no puede quedar válido
 con salida aún encolada (que un crash no volvería a entregar).
+
+**Fronteras de error.** Los fallos de checkpoint se clasifican por **tipo**, no
+por el texto del mensaje:
+
+- **Ausencia** (`Missing`): falta el checkpoint o una de sus partes, o falta el
+  marcador `valid`. Recovery puede saltarlo y buscar un predecesor.
+- **Corrupción del formato actual** (`Corruption`): los bytes tienen el formato
+  vigente pero están dañados (cabecera truncada, longitud incoherente, payload
+  ilegible). Es el **único** caso de bytes que recovery tolera cayendo al
+  predecesor válido más nuevo.
+- **Incompatibilidad fatal** (`Unsupported`): magic ajeno o versión desconocida
+  en el contenedor de fuentes, en el frame interno del motor o en el snapshot.
+  Es fatal: no hay lector antiguo, no se cae a un predecesor y nunca arranca en
+  vacío.
+- **Almacenamiento** (`Storage`): una operación de `StateBackend` falló. Conserva
+  el `StateError` subyacente (y su causa de I/O) como `source`. Es **operativo**,
+  nunca una clasificación de bytes: recovery debe propagarlo y **no** puede
+  confundirlo con ausencia o corrupción, ni borrar markers ni arrancar en limpio.
+
+Un error de **codificación** (al producir un frame desde estado vivo) es
+interno, no corrupción persistida, y no puede clasificarse como decodificable.
 
 **Retención** (`runtime/retention.rs`): tras publicar, se **podan** los
 checkpoints más antiguos para conservar los `retain` más nuevos. El borrado solo

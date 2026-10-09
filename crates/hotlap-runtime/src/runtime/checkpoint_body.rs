@@ -14,6 +14,12 @@ pub(crate) const VALID_MARKER: &[u8] = b"1";
 pub(crate) const COMMIT_MARKER: &[u8] = b"1";
 /// Key holding the id of the newest fully written checkpoint.
 pub(crate) const LATEST_KEY: &[u8] = b"checkpoint/latest";
+/// Key holding the highest checkpoint id ever reserved.
+///
+/// Written before an attempt touches the sinks or the body, so a crash during
+/// an ambiguous attempt cannot make a later run reuse that id even if every
+/// trace of the attempt is pruned.
+pub(crate) const RESERVED_KEY: &[u8] = b"checkpoint/reserved";
 
 pub(crate) fn checkpoint_prefix(id: u64) -> String {
     format!("checkpoint/{id}")
@@ -98,6 +104,20 @@ pub(crate) fn mark_valid(
     crate::runtime::retention::prune(backend, retain).map_err(state_err)
 }
 
+/// Durably reserve `id` before any ambiguous checkpoint attempt.
+///
+/// The reservation is a plain key outside the `checkpoint/<id>/` namespace, so
+/// pruning never removes it and a later checkpointer can read the high-water
+/// mark even when every body was pruned.
+pub(crate) fn reserve(
+    backend: &mut (dyn StateBackend + Send),
+    id: u64,
+) -> Result<(), ConnectorError> {
+    backend
+        .put(RESERVED_KEY, id.to_le_bytes().to_vec())
+        .map_err(state_err)
+}
+
 /// Decode an 8-byte little-endian checkpoint id.
 pub(crate) fn parse_id(bytes: &[u8]) -> Result<u64, ConnectorError> {
     let array: [u8; 8] = bytes
@@ -109,6 +129,11 @@ pub(crate) fn parse_id(bytes: &[u8]) -> Result<u64, ConnectorError> {
 /// Error for an unknown or incomplete checkpoint.
 pub(crate) fn invalid(id: u64) -> ConnectorError {
     ConnectorError::Missing(format!("checkpoint {id} is missing or not valid"))
+}
+
+/// Error for an exhausted, non-reusable checkpoint id space.
+pub(crate) fn id_exhausted() -> ConnectorError {
+    ConnectorError::Infrastructure("checkpoint id space is exhausted".into())
 }
 
 /// Map a hotlap facade error onto the connector error type.
