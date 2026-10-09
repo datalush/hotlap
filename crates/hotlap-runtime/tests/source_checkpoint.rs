@@ -106,6 +106,18 @@ fn unknown_version_is_not_supported() {
 }
 
 #[test]
+fn unknown_inner_frame_version_is_not_supported() {
+    let mut bytes = encode_sources(&SourcesCheckpoint { entries: vec![] }).unwrap();
+    // Keep the valid `HLSR`/version-1 header and overwrite only the inner
+    // engine frame's version, so the envelope is well-formed but incompatible.
+    bytes[12..16].copy_from_slice(&9u32.to_le_bytes());
+    assert!(matches!(
+        decode_sources(&bytes),
+        Err(ConnectorError::Unsupported(_))
+    ));
+}
+
+#[test]
 fn truncated_header_is_infrastructure() {
     let bytes = encode_sources(&SourcesCheckpoint { entries: vec![] }).unwrap();
     assert!(matches!(

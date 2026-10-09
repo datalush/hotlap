@@ -117,8 +117,15 @@ pub(crate) fn hotlap_err(error: hotlap::HotlapError) -> ConnectorError {
 }
 
 /// Map an engine codec error onto the connector error type.
+///
+/// An [`EngineError::Unsupported`] (an unknown engine frame or snapshot
+/// version) stays `Unsupported`, so recovery treats an incompatible snapshot as
+/// fatal instead of falling back or starting clean.
 pub(crate) fn engine_err(error: EngineError) -> ConnectorError {
-    ConnectorError::Infrastructure(error.to_string())
+    match error {
+        EngineError::Unsupported(message) => ConnectorError::Unsupported(message),
+        error => ConnectorError::Infrastructure(error.to_string()),
+    }
 }
 
 /// Map a state backend error onto the connector error type.

@@ -86,6 +86,13 @@ impl SourcesCheckpoint {
 }
 
 /// Map an engine codec error onto the connector error type.
+///
+/// An [`EngineError::Unsupported`] (an unknown inner frame or snapshot version)
+/// stays `Unsupported`, so recovery can treat an incompatible format as fatal
+/// instead of mistaking it for tolerated current-format corruption.
 pub(crate) fn codec_err(error: hotlap_engine::EngineError) -> ConnectorError {
-    ConnectorError::Infrastructure(error.to_string())
+    match error {
+        hotlap_engine::EngineError::Unsupported(message) => ConnectorError::Unsupported(message),
+        error => ConnectorError::Infrastructure(error.to_string()),
+    }
 }
