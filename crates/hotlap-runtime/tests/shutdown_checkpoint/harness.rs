@@ -1,0 +1,57 @@
+//! Sink fixture for the checkpoint-interruption tests.
+
+use std::sync::{Arc, Mutex};
+
+use futures::StreamExt;
+use hotlap_connectors::sink::{Sink, SinkCapabilities};
+use hotlap_connectors::{ChangeStream, ConnectorError};
+use tokio::sync::oneshot;
+
+#[path = "../common/shutdown.rs"]
+mod common;
+pub use common::*;
+
+/// A sink whose `commit` parks until the test releases it, signalling entry.
+pub struct GatedCommitSink {
+    entered: Signal,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl GatedCommitSink {
+    /// The sink and the sender that releases its parked `commit`.
+    pub fn new(entered: Signal) -> (Arc<Self>, oneshot::Sender<()>) {
+        let (release, held) = oneshot::channel();
+        let sink = Arc::new(Self {
+            entered,
+            release: Mutex::new(Some(held)),
+        });
+        (sink, release)
+    }
+}
+
+#[async_trait::async_trait]
+impl Sink for GatedCommitSink {
+    async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
+        while let Some(item) = changes.next().await {
+            item?;
+        }
+        Ok(())
+    }
+    fn capabilities(&self) -> SinkCapabilities {
+        SinkCapabilities::AtLeastOnce
+    }
+    fn accepts_retractions(&self) -> bool {
+        true
+    }
+    async fn commit(&self) -> Result<(), ConnectorError> {
+        self.entered.fire();
+        let held = self.release.lock().unwrap().take();
+        if let Some(held) = held {
+            let _ = held.await;
+        }
+        Ok(())
+    }
+    async fn abort(&self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}

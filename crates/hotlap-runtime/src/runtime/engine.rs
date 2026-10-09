@@ -113,8 +113,9 @@ async fn prepare(
     let coordinated = sinks.coordinated();
     let (source, checkpointer, ticker) = match pipeline.checkpoint.take() {
         Some(config) => {
-            let mut checkpointer =
-                Checkpointer::new(config.backend, config.retain).with_sinks(coordinated);
+            let mut checkpointer = Checkpointer::new(config.backend, config.retain)
+                .with_sinks(coordinated)
+                .with_cancel(shared.cancel.clone());
             let source = Recovery::start(
                 &mut hotlap,
                 &pipeline.sources,

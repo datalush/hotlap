@@ -38,8 +38,15 @@ impl Checkpointer {
         self.next_id = next;
         reserve(self.backend.as_mut(), id)?;
 
-        self.sinks.drain().await?;
-        let prepared = match self.sinks.prepare().await {
+        if let Err(error) = self.sinks.drain(&self.cancel).await {
+            // An abandoned drain has prepared nothing, but the attempt was
+            // interrupted: block continuation until a restart resolves it.
+            if self.cancel.tripped() {
+                self.fail(CheckpointState::Failed, &error);
+            }
+            return Err(error);
+        }
+        let prepared = match self.sinks.prepare(&self.cancel).await {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.fail(CheckpointState::Failed, &error);
@@ -51,7 +58,7 @@ impl Checkpointer {
             return self.capture_failed(id, prepared, error).await;
         }
 
-        if let Err(error) = self.sinks.commit(&prepared).await {
+        if let Err(error) = self.sinks.commit(&prepared, &self.cancel).await {
             // A participant may already have confirmed its commit, so no sink
             // may be rolled back. The marker and body written above stay for
             // recovery to re-drive or discard and replay.

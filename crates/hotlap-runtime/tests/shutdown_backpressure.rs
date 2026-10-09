@@ -1,11 +1,13 @@
 //! Shutdown must interrupt a sink pump blocked by backpressure.
 //!
-//! The engine is stopped while the pump is parked on a full channel. The
-//! shutdown call runs on its own OS thread and is bounded by an independent
-//! watchdog, never by a timer around the blocking call on the same thread.
+//! The engine is stopped while the pump is parked on a full channel. The test
+//! waits for two deterministic signals, not a timer: the sink parked in `write`,
+//! and the source reaching its final batch, which the engine can only do after
+//! it filled the channel and parked its next send. The shutdown call runs on its
+//! own OS thread, bounded by an independent watchdog.
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[path = "shutdown_backpressure/harness.rs"]
 mod harness;
@@ -26,21 +28,31 @@ fn with_watchdog<T: Send + 'static>(task: impl FnOnce() -> T + Send + 'static) -
 
 #[test]
 fn shutdown_cancels_a_pump_blocked_by_backpressure() {
-    let (entered, signal) = Signal::new();
+    let (entered, entered_rx) = Signal::new();
+    let (last, last_rx) = Signal::new();
     let sink = StallingSink::new(entered);
     let handle = harness::start(
-        harness::many(300),
+        harness::fill(last),
         sink.clone(),
         Some(harness::checkpoint()),
     );
-    signal
+    entered_rx
         .recv_timeout(SETUP)
         .expect("the sink never parked in write");
+    last_rx
+        .recv_timeout(SETUP)
+        .expect("the pump never filled the channel and blocked");
 
+    let started = Instant::now();
     let result = with_watchdog(move || handle.shutdown());
+    let elapsed = started.elapsed();
     assert!(
         result.is_err(),
         "a sink stalled behind a full channel must fail shutdown, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "the pump must be cancelled, not left to the caller timeout: took {elapsed:?}"
     );
     assert_eq!(
         sink.writes.load(Ordering::SeqCst),

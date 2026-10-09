@@ -1,24 +1,27 @@
 //! Thread-safe handle to a running engine, and the command protocol.
 
+mod thread;
+
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use hotlap::ZSetBatch;
 use hotlap_engine::MetricsRegistry;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
-use crate::runtime::cancel::Cancel;
+use crate::runtime::cancel::{Cancel, cancelled_error};
 use crate::runtime::command::Command;
-use crate::runtime::engine::{self, EngineShared};
+use crate::runtime::engine::EngineShared;
 use crate::runtime::pipeline::Pipeline;
 use crate::runtime::snapshot_handle::SnapshotHandle;
 use hotlap_connectors::error::ConnectorError;
 
 /// Owns the engine thread and speaks to it over a channel.
 pub struct EngineHandle {
-    tx: mpsc::UnboundedSender<Command>,
+    tx: tokio_mpsc::UnboundedSender<Command>,
     join: Option<JoinHandle<()>>,
+    done: mpsc::Receiver<()>,
     shared: EngineShared,
     metrics: Arc<MetricsRegistry>,
 }
@@ -32,7 +35,7 @@ impl EngineHandle {
         // Reject unsupported sink wiring before spawning the engine thread, so
         // no writer, source stream or tap starts for a pipeline that cannot run.
         pipeline.validate()?;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = tokio_mpsc::unbounded_channel();
         let shared = EngineShared {
             last_error: Arc::new(Mutex::new(None)),
             checkpoint_error: Arc::new(Mutex::new(None)),
@@ -40,13 +43,9 @@ impl EngineHandle {
             built: Arc::new(AtomicBool::new(false)),
             cancel: Cancel::new(),
         };
-        let engine_shared = shared.clone();
         let metrics = Arc::new(MetricsRegistry::new());
-        let engine_metrics = Arc::clone(&metrics);
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let join = std::thread::spawn(move || {
-            engine::run(pipeline, rx, engine_shared, engine_metrics, ready_tx)
-        });
+        let (join, done, ready_rx) =
+            thread::spawn(pipeline, rx, shared.clone(), Arc::clone(&metrics));
         match ready_rx.blocking_recv() {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -61,6 +60,7 @@ impl EngineHandle {
         Ok(Self {
             tx,
             join: Some(join),
+            done,
             shared,
             metrics,
         })
@@ -142,30 +142,25 @@ impl EngineHandle {
     pub fn shutdown(mut self) -> Result<(), ConnectorError> {
         let joined = self.stop();
         let closed = self.take_close_error();
-        joined.and(closed)
+        let cancelled = self.take_cancel_error();
+        joined.and(closed).and(cancelled)
     }
 
     /// Ask the engine to stop and join its thread, if still running.
     ///
-    /// The reply is deliberately not awaited: `blocking_recv` panics inside a
-    /// tokio executor, so `Drop` could not use it. Joining the engine thread
-    /// still blocks until the engine has processed the command and exited, and
-    /// `thread::join` is safe to call from within a runtime.
-    ///
-    /// A panic in the engine thread surfaces here instead of being swallowed.
+    /// Cancellation first breaks any await parked behind a stalled sink (pump,
+    /// barrier flush or sink control call) so the engine can reach the shutdown
+    /// command. The reply is deliberately not awaited; instead the caller waits
+    /// for the thread to signal completion, bounded on this side so a worker
+    /// wedged in non-yielding work cannot block it.
     fn stop(&mut self) -> Result<(), ConnectorError> {
         let Some(join) = self.join.take() else {
             return Ok(());
         };
-        // Break a pump parked on a full channel so the engine can reach the
-        // shutdown command; a ready send still wins inside the pump.
         self.shared.cancel.cancel();
         let (reply, _rx) = oneshot::channel();
         let _ = self.tx.send(Command::Shutdown { reply });
-        match join.join() {
-            Ok(()) => Ok(()),
-            Err(_) => Err(worker_panicked()),
-        }
+        thread::wait(join, &self.done)
     }
 
     /// Take the sink/close failure the engine recorded, if any.
@@ -179,6 +174,15 @@ impl EngineHandle {
             None => Ok(()),
         }
     }
+
+    /// Fail shutdown when it abandoned an in-flight sink or checkpoint await.
+    fn take_cancel_error(&self) -> Result<(), ConnectorError> {
+        if self.shared.cancel.tripped() {
+            Err(cancelled_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for EngineHandle {
@@ -189,8 +193,4 @@ impl Drop for EngineHandle {
 
 pub(super) fn stopped() -> ConnectorError {
     ConnectorError::Infrastructure("engine thread stopped".into())
-}
-
-fn worker_panicked() -> ConnectorError {
-    ConnectorError::Infrastructure("engine thread panicked".into())
 }

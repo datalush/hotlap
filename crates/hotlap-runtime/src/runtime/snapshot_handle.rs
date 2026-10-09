@@ -68,4 +68,16 @@ impl SnapshotHandle {
             .map_err(|_| stopped())?;
         rx.blocking_recv().map_err(|_| stopped())?
     }
+
+    /// Take a checkpoint now and return its id.
+    ///
+    /// Blocks on `blocking_recv`, so it must not be called from within an async
+    /// runtime; callers in async code should offload it to a blocking thread.
+    pub fn checkpoint(&self) -> Result<u64, ConnectorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Checkpoint { reply })
+            .map_err(|_| stopped())?;
+        rx.blocking_recv().map_err(|_| stopped())?
+    }
 }

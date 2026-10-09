@@ -2,7 +2,7 @@
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::task::{Context, Poll};
 
 use futures::{Stream, StreamExt};
@@ -98,6 +98,46 @@ pub struct PanickingSink;
 impl Sink for PanickingSink {
     async fn write(&self, _changes: ChangeStream) -> Result<(), ConnectorError> {
         panic!("sink write panicked");
+    }
+    fn accepts_retractions(&self) -> bool {
+        true
+    }
+    async fn commit(&self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+    async fn abort(&self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
+/// A sink whose `write` parks the runtime thread synchronously until released.
+pub struct BlockingSink {
+    entered: Signal,
+    gate: Mutex<Option<std_mpsc::Receiver<()>>>,
+}
+
+impl BlockingSink {
+    /// The sink and the sender that releases its blocked `write`.
+    pub fn new(entered: Signal) -> (Arc<Self>, std_mpsc::Sender<()>) {
+        let (release, held) = std_mpsc::channel();
+        let sink = Arc::new(Self {
+            entered,
+            gate: Mutex::new(Some(held)),
+        });
+        (sink, release)
+    }
+}
+
+#[async_trait::async_trait]
+impl Sink for BlockingSink {
+    async fn write(&self, _changes: ChangeStream) -> Result<(), ConnectorError> {
+        self.entered.fire();
+        let gate = self.gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            // Blocks the engine's runtime thread outright: no await, no timer.
+            let _ = gate.recv();
+        }
+        Ok(())
     }
     fn accepts_retractions(&self) -> bool {
         true

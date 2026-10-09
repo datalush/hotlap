@@ -4,13 +4,16 @@
 //! thread through a channel, so a test never depends on a sleep to decide
 //! whether the runtime is stuck.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use futures::Stream;
 use hotlap::{AggSpec, InputId, Plan};
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::sink::Sink;
@@ -57,11 +60,42 @@ pub fn batch(key: i64) -> SourceBatch {
 }
 
 /// A source replaying one single-row batch per key, then ending.
-pub struct FixedSource {
+///
+/// When `last` is set it fires as the final batch is yielded, so a test can wait
+/// until the engine has pulled every batch.
+pub struct SignalSource {
     batches: Vec<SourceBatch>,
+    last: Option<Signal>,
 }
 
-impl Source for FixedSource {
+struct BatchStream {
+    items: std::vec::IntoIter<SourceBatch>,
+    last: Option<Signal>,
+    fired: bool,
+}
+
+impl Stream for BatchStream {
+    type Item = Result<SourceBatch, ConnectorError>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.items.next() {
+            Some(batch) => {
+                if this.items.len() == 0
+                    && !this.fired
+                    && let Some(last) = &this.last
+                {
+                    this.fired = true;
+                    last.fire();
+                }
+                Poll::Ready(Some(Ok(batch)))
+            }
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+impl Source for SignalSource {
     fn schema(&self) -> SchemaRef {
         self.batches[0].batch.schema()
     }
@@ -69,9 +103,11 @@ impl Source for FixedSource {
         Ok(vec![Split { id: 0, start: 0 }])
     }
     fn read(&self, _split: &Split) -> Result<SourceStream, ConnectorError> {
-        let items: Vec<Result<SourceBatch, ConnectorError>> =
-            self.batches.iter().cloned().map(Ok).collect();
-        Ok(Box::pin(futures::stream::iter(items)))
+        Ok(Box::pin(BatchStream {
+            items: self.batches.clone().into_iter(),
+            last: self.last.clone(),
+            fired: false,
+        }))
     }
     fn state(&self) -> SourceState {
         SourceState::default()
@@ -82,17 +118,27 @@ impl Source for FixedSource {
 }
 
 /// A finite source of one-row batches, one per key.
-pub fn keys(values: &[i64]) -> Arc<dyn Source> {
+///
+/// `last`, when set, fires as the final batch is yielded.
+pub fn keys_with(values: &[i64], last: Option<Signal>) -> Arc<dyn Source> {
     let batches = values.iter().copied().map(batch).collect();
-    Arc::new(FixedSource { batches })
+    Arc::new(SignalSource { batches, last })
 }
 
 /// A checkpoint config backed by an in-memory store, with a long interval so
 /// no periodic checkpoint fires during a test.
 pub fn checkpoint() -> CheckpointConfig {
+    checkpoint_with(SharedBackend::default(), Duration::from_secs(3600))
+}
+
+/// A checkpoint config over `backend` firing every `interval`.
+///
+/// The backend is cloneable, so a test can keep a handle and inspect the durable
+/// evidence the engine retained.
+pub fn checkpoint_with(backend: SharedBackend, interval: Duration) -> CheckpointConfig {
     CheckpointConfig {
-        interval: Duration::from_secs(3600),
-        backend: Box::new(SharedBackend::default()),
+        interval,
+        backend: Box::new(backend),
         retain: 3,
     }
 }

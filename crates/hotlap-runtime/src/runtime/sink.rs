@@ -1,12 +1,12 @@
 //! Sink task: bounded changelog channel, serialized control and engine-side pump.
 
+mod writer;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hotlap::{Hotlap, HotlapError};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use crate::runtime::cancel::Cancel;
 use crate::runtime::pipeline::SinkSpec;
@@ -14,60 +14,17 @@ pub use crate::runtime::shared_sink::SharedSink;
 pub use crate::runtime::sink_sync::{ChangelogSender, SinkMessage, SinkSync};
 use hotlap_connectors::error::ConnectorError;
 use hotlap_engine::MetricsRegistry;
+use writer::SinkEntry;
+pub use writer::spawn_sink;
 
 /// Bound on how far a sink may lag the engine before backpressure bites.
-const CHANNEL_CAPACITY: usize = 64;
+pub const CHANNEL_CAPACITY: usize = 64;
 
 /// How long `SinkPump::close` waits for one sink task before giving up.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Spawn a sink task that writes every received batch through `shared`.
-///
-/// Dropping the returned sender ends the changelog and lets the task finish.
-/// The task ends with a final `commit` (delivery for the last batch), or an
-/// `abort` on write failure. A coordinated sink may also be committed by the
-/// checkpoint barrier, so `Sink::commit` must tolerate running more than once.
-pub fn spawn_sink(
-    shared: Arc<SharedSink>,
-    capacity: usize,
-) -> (ChangelogSender, JoinHandle<Result<(), ConnectorError>>) {
-    let (tx, mut rx) = mpsc::channel(capacity);
-    let handle = tokio::spawn(async move {
-        match drive(&shared, &mut rx).await {
-            Ok(()) => shared.commit().await,
-            Err(error) => {
-                let _ = shared.abort().await;
-                Err(error)
-            }
-        }
-    });
-    (tx, handle)
-}
-
-/// Write every batch until the channel closes.
-async fn drive(
-    shared: &SharedSink,
-    rx: &mut mpsc::Receiver<SinkMessage>,
-) -> Result<(), ConnectorError> {
-    while let Some(message) = rx.recv().await {
-        match message {
-            SinkMessage::Batch(item) => shared.write_batch(item?).await?,
-            // In-order processing means every earlier batch is already written.
-            SinkMessage::Flush(reply) => {
-                let _ = reply.send(());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// One running sink plus the view it is fed from.
-struct SinkEntry {
-    view: String,
-    tx: ChangelogSender,
-    shared: Arc<SharedSink>,
-    handle: JoinHandle<Result<(), ConnectorError>>,
-}
+/// Bound on reaping an aborted task before the close gives up on it.
+const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Engine-side owner of every sink channel and task.
 pub struct SinkPump {
@@ -172,9 +129,12 @@ impl SinkPump {
                 Ok(Err(join)) => record(&mut failure, join_error(join)),
                 Err(_) => {
                     // The join handle is still ours; abort the stalled task and
-                    // wait for it to unwind before reporting the timeout.
+                    // try to reap it. The reap is bounded: an aborted task is
+                    // dropped at its next await, but a task stuck in work that
+                    // never yields cannot be interrupted, so the close must not
+                    // await it without a bound.
                     entry.handle.abort();
-                    let _ = entry.handle.await;
+                    let _ = tokio::time::timeout(REAP_TIMEOUT, &mut entry.handle).await;
                     record(&mut failure, timed_out());
                 }
             }

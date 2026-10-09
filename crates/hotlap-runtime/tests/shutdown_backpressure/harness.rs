@@ -7,15 +7,18 @@ use futures::StreamExt;
 use hotlap_connectors::sink::Sink;
 use hotlap_connectors::source::Source;
 use hotlap_connectors::{ChangeStream, ConnectorError};
+use hotlap_runtime::runtime::sink::CHANNEL_CAPACITY;
 
 #[path = "../common/shutdown.rs"]
 mod common;
 pub use common::*;
 
-/// A long, finite source, enough to fill the sink channel and block the pump.
-pub fn many(count: usize) -> Arc<dyn Source> {
-    let values: Vec<i64> = (0..count as i64).collect();
-    keys(&values)
+/// A source of `CHANNEL_CAPACITY + 2` batches that fires `last` as the engine
+/// pulls the final one. It can only reach that batch after filling the channel,
+/// so the signal pins the next pump send as blocked.
+pub fn fill(last: Signal) -> Arc<dyn Source> {
+    let values: Vec<i64> = (0..CHANNEL_CAPACITY as i64 + 2).collect();
+    keys_with(&values, Some(last))
 }
 
 /// A sink that parks forever on its first write, so the channel fills.

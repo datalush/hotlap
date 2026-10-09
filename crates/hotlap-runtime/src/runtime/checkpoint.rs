@@ -13,6 +13,7 @@ pub use state::CheckpointState;
 use hotlap::state::StateBackend;
 use hotlap_engine::{EngineSnapshot, decode_snapshot};
 
+use crate::runtime::cancel::Cancel;
 use crate::runtime::checkpoint_body::{
     LATEST_KEY, RESERVED_KEY, checkpoint_prefix, decode_err, id_exhausted, invalid, parse_id,
     read_body as decode_body, state_err,
@@ -42,6 +43,7 @@ pub struct Checkpointer {
     sinks: SinkBarrier,
     state: CheckpointState,
     failure: Option<String>,
+    cancel: Cancel,
 }
 
 impl Checkpointer {
@@ -55,6 +57,7 @@ impl Checkpointer {
             sinks: SinkBarrier::new(Vec::new()),
             state: CheckpointState::Ready,
             failure: None,
+            cancel: Cancel::new(),
         }
     }
 
@@ -64,6 +67,16 @@ impl Checkpointer {
     /// drains queued deltas before committing the sink.
     pub fn with_sinks(mut self, sinks: Vec<SinkSync>) -> Self {
         self.sinks = SinkBarrier::new(sinks);
+        self
+    }
+
+    /// Abandon a barrier await when the engine is stopping.
+    ///
+    /// Without it, a checkpoint parked on a stalled sink would hold the engine
+    /// thread and block shutdown. A cancelled attempt is marked inconsistent so
+    /// no later attempt continues over uncertain sink state.
+    pub(crate) fn with_cancel(mut self, cancel: Cancel) -> Self {
+        self.cancel = cancel;
         self
     }
 

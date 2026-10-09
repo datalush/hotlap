@@ -24,6 +24,7 @@
 
 use tokio::sync::oneshot;
 
+use crate::runtime::cancel::Cancel;
 use crate::runtime::sink::{SinkMessage, SinkSync};
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::SinkCapabilities;
@@ -47,22 +48,29 @@ impl SinkBarrier {
     /// Drain every channel so all queued deltas have reached their sink.
     ///
     /// A `Flush` is sent behind the queued batches and awaited; the sink task
-    /// replies only after writing them, so its state covers the checkpoint.
-    pub(crate) async fn drain(&self) -> Result<(), ConnectorError> {
+    /// replies only after writing them, so its state covers the checkpoint. A
+    /// cancel abandons a flush parked on a stalled sink, so shutdown is not held
+    /// by the drain.
+    pub(crate) async fn drain(&self, cancel: &Cancel) -> Result<(), ConnectorError> {
         let mut replies = Vec::new();
         for sync in &self.sinks {
             let Some(sender) = sync.sender() else {
                 continue;
             };
             let (reply, rx) = oneshot::channel();
-            sender
-                .send(SinkMessage::Flush(reply))
-                .await
-                .map_err(|_| stopped())?;
+            match cancel.race(sender.send(SinkMessage::Flush(reply))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(stopped()),
+                Err(error) => return Err(error),
+            }
             replies.push(rx);
         }
         for rx in replies {
-            rx.await.map_err(|_| stopped())?;
+            match cancel.race(rx).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(stopped()),
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -70,19 +78,25 @@ impl SinkBarrier {
     /// Phase one: prepare every transactional sink.
     ///
     /// A failure aborts the sinks that already prepared, so no sink keeps a
-    /// half-open transaction.
-    pub(crate) async fn prepare(&self) -> Result<Prepared, ConnectorError> {
+    /// half-open transaction. A cancellation skips the best-effort abort, which
+    /// could itself park on the same stalled sink; the caller marks the attempt
+    /// inconsistent and blocks continuation until a restart resolves it.
+    pub(crate) async fn prepare(&self, cancel: &Cancel) -> Result<Prepared, ConnectorError> {
         let mut indices = Vec::new();
         for (index, sync) in self.sinks.iter().enumerate() {
             let sink = sync.sink();
             if sink.capabilities() != SinkCapabilities::Transactional {
                 continue;
             }
-            if let Err(error) = sink.prepare().await {
-                self.abort_indices(&indices).await;
-                return Err(error);
+            match cancel.race(sink.prepare()).await {
+                Ok(Ok(())) => indices.push(index),
+                Ok(Err(error)) | Err(error) => {
+                    if !cancel.is_cancelled() {
+                        self.abort_indices(&indices).await;
+                    }
+                    return Err(error);
+                }
             }
-            indices.push(index);
         }
         Ok(Prepared { indices })
     }
@@ -98,20 +112,30 @@ impl SinkBarrier {
     /// A failure does **not** abort anything: a participant may already have
     /// confirmed, and rolling a confirmed commit back would be wrong. The
     /// caller keeps the durable marker and body so recovery can re-drive or
-    /// discard and replay.
-    pub(crate) async fn commit(&self, prepared: &Prepared) -> Result<(), ConnectorError> {
+    /// discard and replay. A cancellation is reported the same way.
+    pub(crate) async fn commit(
+        &self,
+        prepared: &Prepared,
+        cancel: &Cancel,
+    ) -> Result<(), ConnectorError> {
         for sync in &self.sinks {
             let sink = sync.sink();
             let wait_for_delivery = matches!(
                 sink.capabilities(),
                 SinkCapabilities::Idempotent | SinkCapabilities::AtLeastOnce
             );
-            if wait_for_delivery && let Err(error) = sink.commit().await {
-                return Err(error);
+            if wait_for_delivery {
+                match cancel.race(sink.commit()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) | Err(error) => return Err(error),
+                }
             }
         }
         for &index in &prepared.indices {
-            self.sinks[index].sink().commit().await?;
+            match cancel.race(self.sinks[index].sink().commit()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) | Err(error) => return Err(error),
+            }
         }
         Ok(())
     }

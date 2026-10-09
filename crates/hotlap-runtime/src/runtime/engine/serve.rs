@@ -127,3 +127,6 @@ async fn tick(ticker: &mut Option<Interval>) {
         None => futures::future::pending::<()>().await,
     }
 }
+
+#[cfg(test)]
+mod tests;

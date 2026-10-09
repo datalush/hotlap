@@ -5,12 +5,14 @@
 //! same thread.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[path = "shutdown_bounds/harness.rs"]
 mod harness;
 
-use harness::{FailingCommitSink, PanickingSink, PanickingSource, RecordingSink, Signal};
+use harness::{
+    BlockingSink, FailingCommitSink, PanickingSink, PanickingSource, RecordingSink, Signal,
+};
 
 /// Generous ceiling: the runtime's own close timeout is far smaller.
 const WATCHDOG: Duration = Duration::from_secs(30);
@@ -40,7 +42,7 @@ fn shutdown_with_checkpointing_closes_and_commits() {
     let (written, signal) = Signal::new();
     let sink = RecordingSink::new(written);
     let handle = harness::start(
-        harness::keys(&[1, 2, 3]),
+        harness::keys_with(&[1, 2, 3], None),
         sink.clone(),
         Some(harness::checkpoint()),
     );
@@ -59,7 +61,7 @@ fn shutdown_with_checkpointing_closes_and_commits() {
 fn a_failed_final_commit_fails_shutdown() {
     let (written, signal) = Signal::new();
     let handle = harness::start(
-        harness::keys(&[1, 2, 3]),
+        harness::keys_with(&[1, 2, 3], None),
         FailingCommitSink::new(written),
         Some(harness::checkpoint()),
     );
@@ -74,7 +76,11 @@ fn a_failed_final_commit_fails_shutdown() {
 
 #[test]
 fn a_sink_task_panic_fails_shutdown() {
-    let handle = harness::start(harness::keys(&[1]), Arc::new(PanickingSink), None);
+    let handle = harness::start(
+        harness::keys_with(&[1], None),
+        Arc::new(PanickingSink),
+        None,
+    );
     let result = with_watchdog(move || handle.shutdown());
     assert!(
         result.is_err(),
@@ -101,4 +107,33 @@ fn an_engine_worker_panic_fails_shutdown() {
         result.is_err(),
         "a panicked engine thread must not report success, got {result:?}"
     );
+}
+
+#[test]
+fn a_nonyield_sink_bounds_the_caller_join() {
+    let (entered, signal) = Signal::new();
+    let (sink, release) = BlockingSink::new(entered);
+    let handle = harness::start(harness::keys_with(&[1], None), sink, None);
+    signal
+        .recv_timeout(SETUP)
+        .expect("the sink never entered a non-yielding write");
+
+    let started = Instant::now();
+    let result = with_watchdog(move || handle.shutdown());
+    let elapsed = started.elapsed();
+    assert!(
+        result.is_err(),
+        "a worker wedged in non-yielding work must not report success, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the caller must return at its own bound, took {elapsed:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(8),
+        "a non-yielding worker must fall back to the caller bound, took {elapsed:?}"
+    );
+    release
+        .send(())
+        .expect("release the wedged sink so the worker can exit");
 }
