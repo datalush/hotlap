@@ -176,8 +176,9 @@ schema. No hay **lectores de formatos anteriores**, migraciones ni fallbacks: un
 checkpoint monofuente previo o de versión incompatible produce `Unsupported`
 (ver `hotlap-cross-source-joins.md`). La corrupción del **formato actual** sí es
 tolerada: recovery cae al predecesor válido más nuevo; una versión incompatible,
-una vista con nombre/handle/plan desajustado o un schema que no valida contra
-las fuentes declaradas es fatal.
+un **namespace de vistas que no coincide exactamente** (nombre, handle o plan
+desajustado, o handles duplicados) o un schema que no valida contra las fuentes
+declaradas es fatal.
 
 **Layout en disco** (namespace bajo `checkpoint/`):
 
