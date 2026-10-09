@@ -1,8 +1,8 @@
 //! Full-recomputation oracle for cross-source inner joins.
 //!
-//! The oracle never calls the incremental join: it recomputes the equi-join
-//! from the raw input rows and their multiplicities after every delta, so a
-//! passing comparison is independent evidence of the incremental result.
+//! The oracle never calls the incremental join: it recombines the raw input
+//! rows and multiplicities after every delta, so a passing comparison is
+//! independent evidence of the incremental result.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,48 +14,36 @@ use arrow::record_batch::RecordBatch;
 use hotlap_core::{IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
 use hotlap_engine::EngineCore;
 
-/// Full recompute of `left JOIN right ON k` with insert/retract multiplicities.
-fn recompute(left: &[(i64, i64, i64)], right: &[(i64, i64, i64)]) -> Vec<(i64, i64, i64, i64)> {
-    let mut rows: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
-    for &(lk, lv, ld) in left {
-        for &(rk, rv, rd) in right {
-            if lk == rk {
-                *rows.entry((lk, lv, rv)).or_insert(0) += ld * rd;
+/// Full recompute: inputs are `[key..., value, diff]`, output is
+/// `[key..., left, right, diff]`, consolidated across duplicate pairs.
+fn recompute(left: &[Vec<i64>], right: &[Vec<i64>], keys: usize) -> Vec<Vec<i64>> {
+    let mut rows: BTreeMap<Vec<i64>, i64> = BTreeMap::new();
+    for l in left {
+        for r in right {
+            if l[..keys] == r[..keys] {
+                let mut key = l[..keys].to_vec();
+                key.push(l[keys]);
+                key.push(r[keys]);
+                *rows.entry(key).or_insert(0) += l[keys + 1] * r[keys + 1];
             }
         }
     }
     rows.into_iter()
         .filter(|(_, diff)| *diff != 0)
-        .map(|((k, l, r), diff)| (k, l, r, diff))
-        .collect()
-}
-
-/// Full recompute for composite keys `(k1, k2)`; rows are `(k1, k2, v, diff)`.
-fn recompute_composite(
-    left: &[(i64, i64, i64, i64)],
-    right: &[(i64, i64, i64, i64)],
-) -> Vec<(i64, i64, i64, i64, i64)> {
-    let mut rows: BTreeMap<(i64, i64, i64, i64), i64> = BTreeMap::new();
-    for &(lk1, lk2, lv, ld) in left {
-        for &(rk1, rk2, rv, rd) in right {
-            if lk1 == rk1 && lk2 == rk2 {
-                *rows.entry((lk1, lk2, lv, rv)).or_insert(0) += ld * rd;
-            }
-        }
-    }
-    rows.into_iter()
-        .filter(|(_, diff)| *diff != 0)
-        .map(|((k1, k2, l, r), diff)| (k1, k2, l, r, diff))
+        .map(|(mut key, diff)| {
+            key.push(diff);
+            key
+        })
         .collect()
 }
 
 #[test]
 fn oracle_consolidates_duplicate_pairs() {
-    assert_eq!(
-        recompute(&[(1, 10, 2)], &[(1, 20, 3)]),
-        vec![(1, 10, 20, 6)]
-    );
-    assert!(recompute(&[(1, 10, 1), (1, 10, -1)], &[(1, 20, 1)]).is_empty());
+    let left = [vec![1, 10, 2]];
+    let right = [vec![1, 20, 3]];
+    assert_eq!(recompute(&left, &right, 1), vec![vec![1, 10, 20, 6]]);
+    let cancels = [vec![1, 10, 1], vec![1, 10, -1]];
+    assert!(recompute(&cancels, &[vec![1, 20, 1]], 1).is_empty());
 }
 
 fn schema(fields: &[&str]) -> SchemaRef {
@@ -67,8 +55,7 @@ fn schema(fields: &[&str]) -> SchemaRef {
     ))
 }
 
-/// Builds a Z-set over `schema` from `rows` and their signed diffs.
-fn zset(schema: &SchemaRef, rows: &[Vec<i64>], diffs: &[i64]) -> ZSetBatch {
+fn batch(schema: &SchemaRef, rows: &[Vec<i64>], diffs: &[i64]) -> ZSetBatch {
     let columns: Vec<ArrayRef> = (0..schema.fields().len())
         .map(|column| -> ArrayRef {
             Arc::new(Int64Array::from(
@@ -80,15 +67,11 @@ fn zset(schema: &SchemaRef, rows: &[Vec<i64>], diffs: &[i64]) -> ZSetBatch {
     ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs.to_vec()))).unwrap()
 }
 
-fn single_delta(k: i64, v: i64, diff: i64) -> ZSetBatch {
-    zset(&schema(&["k", "v"]), &[vec![k, v]], &[diff])
+fn delta(schema: &SchemaRef, row: Vec<i64>, diff: i64) -> ZSetBatch {
+    batch(schema, &[row], &[diff])
 }
 
-fn composite_delta(k1: i64, k2: i64, v: i64, diff: i64) -> ZSetBatch {
-    zset(&schema(&["k1", "k2", "v"]), &[vec![k1, k2, v]], &[diff])
-}
-
-fn column(zset: &ZSetBatch, column: usize) -> Vec<i64> {
+fn column_values(zset: &ZSetBatch, column: usize) -> Vec<i64> {
     let array = zset
         .batch
         .column(column)
@@ -98,38 +81,35 @@ fn column(zset: &ZSetBatch, column: usize) -> Vec<i64> {
     (0..zset.len()).map(|row| array.value(row)).collect()
 }
 
-fn diffs(zset: &ZSetBatch) -> Vec<i64> {
+fn diff_values(zset: &ZSetBatch) -> Vec<i64> {
     let array = zset.diff.as_any().downcast_ref::<Int64Array>().unwrap();
     (0..zset.len()).map(|row| array.value(row)).collect()
 }
 
-/// Snapshot of a `(k, v)` join as sorted `(key, left, right, diff)` tuples.
-fn single_rows(zset: &ZSetBatch) -> Vec<(i64, i64, i64, i64)> {
+/// Snapshot rows `[key..., left, right, diff]` from a join over `keys` columns.
+fn joined_rows(zset: &ZSetBatch, keys: usize) -> Vec<Vec<i64>> {
     if zset.is_empty() {
         return Vec::new();
     }
-    let (keys, left) = (column(zset, 0), column(zset, 1));
-    let right = column(zset, 3);
-    let diffs = diffs(zset);
-    (0..zset.len())
-        .map(|row| (keys[row], left[row], right[row], diffs[row]))
-        .collect()
+    let columns: Vec<Vec<i64>> = (0..zset.batch.num_columns())
+        .map(|column| column_values(zset, column))
+        .collect();
+    let diffs = diff_values(zset);
+    let mut rows: Vec<Vec<i64>> = (0..zset.len())
+        .map(|row| {
+            let mut out: Vec<i64> = (0..keys).map(|key| columns[key][row]).collect();
+            out.push(columns[keys][row]);
+            out.push(columns[2 * keys + 1][row]);
+            out.push(diffs[row]);
+            out
+        })
+        .collect();
+    rows.sort();
+    rows
 }
 
-/// Snapshot of a `(k1, k2, v)` join as sorted `(k1, k2, left, right, diff)`.
-fn composite_rows(zset: &ZSetBatch) -> Vec<(i64, i64, i64, i64, i64)> {
-    if zset.is_empty() {
-        return Vec::new();
-    }
-    let (k1, k2, left) = (column(zset, 0), column(zset, 1), column(zset, 2));
-    let right = column(zset, 5);
-    let diffs = diffs(zset);
-    (0..zset.len())
-        .map(|row| (k1[row], k2[row], left[row], right[row], diffs[row]))
-        .collect()
-}
-
-fn join_core() -> EngineCore {
+/// A two-input join view over inputs 0 and 1 with the given key columns.
+fn join_core(left_key: Vec<usize>, right_key: Vec<usize>) -> EngineCore {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();
     core.register_input(InputId(1)).unwrap();
@@ -138,8 +118,8 @@ fn join_core() -> EngineCore {
         &Plan::Join {
             left: Box::new(Plan::Source(InputId(0))),
             right: Box::new(Plan::Source(InputId(1))),
-            left_key: vec![0],
-            right_key: vec![0],
+            left_key,
+            right_key,
         },
     )
     .unwrap();
@@ -148,10 +128,10 @@ fn join_core() -> EngineCore {
 
 #[test]
 fn single_key_join_matches_recomputation_after_every_delta() {
-    let mut core = join_core();
-    let mut left: Vec<(i64, i64, i64)> = Vec::new();
-    let mut right: Vec<(i64, i64, i64)> = Vec::new();
-    let deltas = [
+    let schema = schema(&["k", "v"]);
+    let mut core = join_core(vec![0], vec![0]);
+    let (mut left, mut right): (Vec<Vec<i64>>, Vec<Vec<i64>>) = (Vec::new(), Vec::new());
+    let deltas: [(u32, i64, i64, i64); 6] = [
         (0, 1, 10, 2),
         (1, 1, 20, 3),
         (0, 1, 10, -1),
@@ -160,44 +140,25 @@ fn single_key_join_matches_recomputation_after_every_delta() {
         (0, 2, 40, 1),
     ];
     for (side, k, v, diff) in deltas {
-        let batch = single_delta(k, v, diff);
+        let row = vec![k, v, diff];
         if side == 0 {
-            left.push((k, v, diff));
-            core.push(InputId(0), &batch).unwrap();
+            left.push(row);
         } else {
-            right.push((k, v, diff));
-            core.push(InputId(1), &batch).unwrap();
+            right.push(row);
         }
-        assert_eq!(
-            single_rows(&core.snapshot(ViewId(0)).unwrap()),
-            recompute(&left, &right)
-        );
+        core.push(InputId(side), &delta(&schema, vec![k, v], diff))
+            .unwrap();
+        let snapshot = core.snapshot(ViewId(0)).unwrap();
+        assert_eq!(joined_rows(&snapshot, 1), recompute(&left, &right, 1));
     }
-}
-
-fn composite_core() -> EngineCore {
-    let mut core = EngineCore::new();
-    core.register_input(InputId(0)).unwrap();
-    core.register_input(InputId(1)).unwrap();
-    core.build_view(
-        ViewId(0),
-        &Plan::Join {
-            left: Box::new(Plan::Source(InputId(0))),
-            right: Box::new(Plan::Source(InputId(1))),
-            left_key: vec![0, 1],
-            right_key: vec![0, 1],
-        },
-    )
-    .unwrap();
-    core
 }
 
 #[test]
 fn composite_key_join_matches_recomputation_after_every_delta() {
-    let mut core = composite_core();
-    let mut left: Vec<(i64, i64, i64, i64)> = Vec::new();
-    let mut right: Vec<(i64, i64, i64, i64)> = Vec::new();
-    let deltas = [
+    let schema = schema(&["k1", "k2", "v"]);
+    let mut core = join_core(vec![0, 1], vec![0, 1]);
+    let (mut left, mut right): (Vec<Vec<i64>>, Vec<Vec<i64>>) = (Vec::new(), Vec::new());
+    let deltas: [(u32, i64, i64, i64, i64); 7] = [
         (0, 1, 1, 10, 1),
         (1, 1, 1, 20, 2),
         (0, 1, 2, 11, 1),
@@ -207,48 +168,26 @@ fn composite_key_join_matches_recomputation_after_every_delta() {
         (0, 1, 2, 11, 1),
     ];
     for (side, k1, k2, v, diff) in deltas {
-        let batch = composite_delta(k1, k2, v, diff);
+        let row = vec![k1, k2, v, diff];
         if side == 0 {
-            left.push((k1, k2, v, diff));
-            core.push(InputId(0), &batch).unwrap();
+            left.push(row);
         } else {
-            right.push((k1, k2, v, diff));
-            core.push(InputId(1), &batch).unwrap();
+            right.push(row);
         }
-        assert_eq!(
-            composite_rows(&core.snapshot(ViewId(0)).unwrap()),
-            recompute_composite(&left, &right)
-        );
+        core.push(InputId(side), &delta(&schema, vec![k1, k2, v], diff))
+            .unwrap();
+        let snapshot = core.snapshot(ViewId(0)).unwrap();
+        assert_eq!(joined_rows(&snapshot, 2), recompute(&left, &right, 2));
     }
-}
 
-#[test]
-fn composite_join_is_independent_of_push_order() {
-    let forward = [(0, 1, 1, 10, 1), (1, 1, 1, 20, 2), (0, 1, 2, 11, 1)];
-    let reversed = [(0, 1, 2, 11, 1), (1, 1, 1, 20, 2), (0, 1, 1, 10, 1)];
-
-    let mut first = composite_core();
-    let mut second = composite_core();
-    for (side, k1, k2, v, diff) in forward {
-        let batch = composite_delta(k1, k2, v, diff);
-        first
-            .push(InputId(if side == 0 { 0 } else { 1 }), &batch)
+    // The same deltas in reverse push order must reach the same state.
+    let expected = recompute(&left, &right, 2);
+    let mut reversed = join_core(vec![0, 1], vec![0, 1]);
+    for (side, k1, k2, v, diff) in deltas.iter().rev() {
+        reversed
+            .push(InputId(*side), &delta(&schema, vec![*k1, *k2, *v], *diff))
             .unwrap();
     }
-    for (side, k1, k2, v, diff) in reversed {
-        let batch = composite_delta(k1, k2, v, diff);
-        second
-            .push(InputId(if side == 0 { 0 } else { 1 }), &batch)
-            .unwrap();
-    }
-
-    let left = [(1, 1, 10, 1), (1, 2, 11, 1)];
-    let right = [(1, 1, 20, 2)];
-    let expected = recompute_composite(&left, &right);
-    let first_rows = composite_rows(&first.snapshot(ViewId(0)).unwrap());
-    assert_eq!(first_rows, expected);
-    assert_eq!(
-        composite_rows(&second.snapshot(ViewId(0)).unwrap()),
-        expected
-    );
+    let snapshot = reversed.snapshot(ViewId(0)).unwrap();
+    assert_eq!(joined_rows(&snapshot, 2), expected);
 }

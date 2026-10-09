@@ -48,9 +48,48 @@ fn open(factory: &Arc<CrossSourceFactory>) -> Session {
     session
 }
 
-fn assert_snapshot(session: &Session, left: &[(i64, i64, i64)], right: &[(i64, i64, i64)]) {
-    let snapshot = session.snapshot("j").expect("MV snapshot");
-    assert_eq!(zset_tuples(&snapshot), recompute(left, right));
+/// Accumulates the oracle inputs and checks the snapshot after every append.
+#[derive(Default)]
+struct Oracle {
+    left: Vec<(i64, i64, i64)>,
+    right: Vec<(i64, i64, i64)>,
+    a_acks: usize,
+    b_acks: usize,
+}
+
+impl Oracle {
+    fn push_left(
+        &mut self,
+        session: &Session,
+        factory: &CrossSourceFactory,
+        triples: &[(i64, i64, i64)],
+        diff: i64,
+    ) {
+        send(factory, "a", rows(schema_left(), triples));
+        self.a_acks += 1;
+        assert!(wait_commits(factory, "a", self.a_acks), "a must ack");
+        self.left.push((triples[0].0, triples[0].1, diff));
+        self.snapshot(session);
+    }
+
+    fn push_right(
+        &mut self,
+        session: &Session,
+        factory: &CrossSourceFactory,
+        triples: &[(i64, i64, i64)],
+        diff: i64,
+    ) {
+        send(factory, "b", rows(schema_right(), triples));
+        self.b_acks += 1;
+        assert!(wait_commits(factory, "b", self.b_acks), "b must ack");
+        self.right.push((triples[0].0, triples[0].1, diff));
+        self.snapshot(session);
+    }
+
+    fn snapshot(&self, session: &Session) {
+        let snapshot = session.snapshot("j").expect("MV snapshot");
+        assert_eq!(zset_tuples(&snapshot), recompute(&self.left, &self.right));
+    }
 }
 
 #[test]
@@ -59,55 +98,21 @@ fn sql_join_matches_recomputation_after_every_append() {
     factory.declare("a", SourceSpec::new(schema_left(), 2));
     factory.declare("b", SourceSpec::new(schema_right(), 2));
     let mut session = open(&factory);
-    let mut left: Vec<(i64, i64, i64)> = Vec::new();
-    let mut right: Vec<(i64, i64, i64)> = Vec::new();
+    let mut oracle = Oracle::default();
 
-    // Two identical `a` rows: multiplicity 2 on the left.
-    send(
-        &factory,
-        "a",
-        rows(schema_left(), &[(1, 10, 0), (1, 10, 0)]),
-    );
-    assert!(wait_commits(&factory, "a", 1), "a must ack");
-    left.push((1, 10, 2));
-    assert_snapshot(&session, &left, &right);
-
-    // Three identical `b` rows: the join multiplies 2 * 3.
-    send(
-        &factory,
-        "b",
-        rows(schema_right(), &[(1, 20, 0), (1, 20, 0), (1, 20, 0)]),
-    );
-    assert!(wait_commits(&factory, "b", 1), "b must ack");
-    right.push((1, 20, 3));
-    assert_snapshot(&session, &left, &right);
-
-    // A new key on one side only must not match yet.
-    send(&factory, "a", rows(schema_left(), &[(2, 40, 0)]));
-    assert!(wait_commits(&factory, "a", 2), "a must ack twice");
-    left.push((2, 40, 1));
-    assert_snapshot(&session, &left, &right);
-
-    send(&factory, "b", rows(schema_right(), &[(2, 30, 0)]));
-    assert!(wait_commits(&factory, "b", 2), "b must ack twice");
-    right.push((2, 30, 1));
-    assert_snapshot(&session, &left, &right);
-
+    // Duplicates on both sides: the join multiplies 2 * 3.
+    oracle.push_left(&session, &factory, &[(1, 10, 0), (1, 10, 0)], 2);
+    oracle.push_right(&session, &factory, &[(1, 20, 0), (1, 20, 0), (1, 20, 0)], 3);
+    // A new key on one side only must not match until the other side arrives.
+    oracle.push_left(&session, &factory, &[(2, 40, 0)], 1);
+    oracle.push_right(&session, &factory, &[(2, 30, 0)], 1);
     // Keys with no match on the other source contribute nothing.
-    send(&factory, "a", rows(schema_left(), &[(3, 50, 0)]));
-    assert!(wait_commits(&factory, "a", 3), "a must ack thrice");
-    left.push((3, 50, 1));
-    assert_snapshot(&session, &left, &right);
-
-    send(&factory, "b", rows(schema_right(), &[(4, 60, 0)]));
-    assert!(wait_commits(&factory, "b", 3), "b must ack thrice");
-    right.push((4, 60, 1));
-    assert_snapshot(&session, &left, &right);
+    oracle.push_left(&session, &factory, &[(3, 50, 0)], 1);
+    oracle.push_right(&session, &factory, &[(4, 60, 0)], 1);
 
     // The SQL surface lists each distinct row once, without multiplicities.
     let select = session.sql("SELECT k, lv, rv FROM j").expect("select");
     assert_eq!(query_rows(select), vec![vec![1, 10, 20], vec![2, 40, 30]]);
-
     session.shutdown().expect("shutdown");
 }
 
