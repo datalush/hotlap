@@ -6,6 +6,7 @@ use super::Recovery;
 use super::restore::restore;
 use super::sources;
 use crate::runtime::checkpoint::Checkpoint;
+use crate::runtime::source_checkpoint::SavedView;
 use crate::runtime::sources::{InputStream, Sources};
 use hotlap_connectors::error::ConnectorError;
 
@@ -27,6 +28,10 @@ impl Recovery {
         sources: &Sources,
         checkpoint: &Checkpoint,
     ) -> Result<InputStream, ConnectorError> {
+        let declared = SavedView::from_registry(&hotlap.view_registry());
+        checkpoint
+            .sources
+            .validate_views(&declared, &checkpoint.engine)?;
         sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
         restore(hotlap, &checkpoint.engine)?;
         let splits = sources::resume(sources, &checkpoint.sources)?;

@@ -163,3 +163,28 @@ fn dropping_a_view_is_rejected() {
         "a shifted handle must not bind unrelated saved state"
     );
 }
+
+/// Dropping the last declared view leaves saved state with no declaration; the
+/// namespace must match exactly, so recovery rejects it.
+#[test]
+fn dropping_the_last_view_is_rejected() {
+    let backend = SharedBackend::default();
+    let (mut engine, pipe) = engine(vec![
+        ("a".into(), filter(1)),
+        ("b".into(), filter(2)),
+        ("c".into(), filter(1)),
+    ]);
+    let mut stream = pipe.sources.stream().unwrap();
+    recovery::drain(&mut engine, &pipe.sources, &mut stream, 2);
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    recovery::take(&mut checkpointer, &engine, &pipe.sources);
+
+    let (_, result) = restart(
+        &backend,
+        vec![("a".into(), filter(1)), ("b".into(), filter(2))],
+    );
+    assert!(
+        matches!(result, Err(ConnectorError::Unsupported(_))),
+        "an undeclared saved view must not be silently restored"
+    );
+}
