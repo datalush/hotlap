@@ -91,7 +91,7 @@ restart**: la historia de inputs **no** se persiste en el checkpoint. Por eso
 registrando deltas nuevos): tras un recovery, el estado restaurado es correcto
 pero un `build_view` post-start se rechaza **para siempre** en esa sesión. La
 persistencia de la historia de inputs (o el replay desde el source) es un
-follow-up fuera de SP4.
+follow-up fuera de alcance.
 
 ## 3. Testing
 
