@@ -1,21 +1,28 @@
 //! Durable view identity: a saved view must bind to the same declaration on a
 //! restart, or recovery must reject the checkpoint before restoring the engine.
 
-#[path = "common/recovery.rs"]
-mod recovery;
+#[path = "common/backend.rs"]
+mod backend;
+#[path = "common/recovery/ops.rs"]
+mod ops;
+#[path = "common/recovery/resumable.rs"]
+mod resumable;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use futures::executor::block_on;
 use hotlap::{CmpOp, Hotlap, InputId, Plan, Predicate, Scalar};
 use hotlap_connectors::error::ConnectorError;
+use hotlap_connectors::source::Source;
 use hotlap_engine::{EngineCore, MetricsRegistry};
 use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::pipeline::{self, Pipeline};
 use hotlap_runtime::runtime::recovery::Recovery;
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
-use recovery::{Dataset, ResumableSource, SharedBackend};
+use backend::SharedBackend;
+use ops::{drain, rows, take};
+use resumable::{Dataset, ResumableSource};
 
 /// The fixed log every attempt reads from; retention keeps all records.
 fn log() -> Dataset {
@@ -34,11 +41,11 @@ fn filter(value: i64) -> Plan {
     }
 }
 
-fn sources(source: ResumableSource) -> Sources {
+fn sources(source: Arc<dyn Source>) -> Sources {
     Sources::new(vec![InputSource {
         id: InputId(0),
         name: "in".into(),
-        source: std::sync::Arc::new(source),
+        source,
         watermark: None,
     }])
     .unwrap()
@@ -48,7 +55,7 @@ fn sources(source: ResumableSource) -> Sources {
 /// order the caller lists them (so the declaration order decides the handles).
 fn engine(views: Vec<(String, Plan)>) -> (Hotlap, Pipeline) {
     let pipeline = Pipeline {
-        sources: sources(ResumableSource::new(log())),
+        sources: sources(Arc::new(ResumableSource::new(log()))),
         views,
         sinks: vec![],
         checkpoint: None,
@@ -63,9 +70,9 @@ fn engine(views: Vec<(String, Plan)>) -> (Hotlap, Pipeline) {
 fn seed(backend: &SharedBackend) -> u64 {
     let (mut engine, pipe) = engine(vec![("a".into(), filter(1)), ("b".into(), filter(2))]);
     let mut stream = pipe.sources.stream().unwrap();
-    recovery::drain(&mut engine, &pipe.sources, &mut stream, 2);
+    drain(&mut engine, &pipe.sources, &mut stream, 2);
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    recovery::take(&mut checkpointer, &engine, &pipe.sources)
+    take(&mut checkpointer, &engine, &pipe.sources)
 }
 
 /// Restart over the seeded checkpoint with `views` as the declaration order.
@@ -101,16 +108,8 @@ fn inverted_view_declaration_binds_each_name_to_its_own_plan() {
     match result {
         Err(ConnectorError::Unsupported(_)) => {}
         Ok(()) => {
-            assert_eq!(
-                recovery::rows(&engine.snapshot("a").unwrap()),
-                vec![vec![1]],
-                "`a` must read the k=1 view"
-            );
-            assert_eq!(
-                recovery::rows(&engine.snapshot("b").unwrap()),
-                vec![vec![2]],
-                "`b` must read the k=2 view"
-            );
+            assert_eq!(rows(&engine.snapshot("a").unwrap()), vec![vec![1]]);
+            assert_eq!(rows(&engine.snapshot("b").unwrap()), vec![vec![2]]);
         }
         Err(error) => panic!("unexpected recovery error: {error}"),
     }
@@ -126,14 +125,8 @@ fn preserved_view_declaration_restores_both_views() {
         vec![("a".into(), filter(1)), ("b".into(), filter(2))],
     );
     result.expect("a matching declaration must recover");
-    assert_eq!(
-        recovery::rows(&engine.snapshot("a").unwrap()),
-        vec![vec![1]]
-    );
-    assert_eq!(
-        recovery::rows(&engine.snapshot("b").unwrap()),
-        vec![vec![2]]
-    );
+    assert_eq!(rows(&engine.snapshot("a").unwrap()), vec![vec![1]]);
+    assert_eq!(rows(&engine.snapshot("b").unwrap()), vec![vec![2]]);
 }
 
 /// The same name with a changed plan must not bind to the saved view.
@@ -175,9 +168,9 @@ fn dropping_the_last_view_is_rejected() {
         ("c".into(), filter(1)),
     ]);
     let mut stream = pipe.sources.stream().unwrap();
-    recovery::drain(&mut engine, &pipe.sources, &mut stream, 2);
+    drain(&mut engine, &pipe.sources, &mut stream, 2);
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    recovery::take(&mut checkpointer, &engine, &pipe.sources);
+    take(&mut checkpointer, &engine, &pipe.sources);
 
     let (_, result) = restart(
         &backend,

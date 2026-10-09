@@ -1,14 +1,17 @@
 //! Session view identity: an incompatible saved view registry must be rejected
 //! before any sink writer or source stream opens.
 
-#[path = "sql_session_rejected_start/harness.rs"]
-mod harness;
+#[path = "common/backend.rs"]
+mod backend;
+#[path = "sql_session_rejected_start/factories.rs"]
+mod factories;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use harness::{CountedFactory, SharedBackend, ToggleFactory};
+use backend::SharedBackend;
+use factories::{CountedFactory, ToggleFactory};
 use hotlap::state::StateBackend;
 use hotlap_runtime::runtime::checkpoint::DEFAULT_RETAIN;
 use hotlap_runtime::{Session, SessionConfig, SessionError};

@@ -1,8 +1,10 @@
 //! A public `Pipeline` with an incompatible saved view registry must fail
 //! before the sink pump starts, so no writer opens and no EOF commit runs.
 
-#[path = "common/recovery.rs"]
-mod recovery;
+#[path = "common/backend.rs"]
+mod backend;
+#[path = "common/recovery/resumable.rs"]
+mod resumable;
 #[path = "common/spy.rs"]
 mod spy;
 
@@ -21,7 +23,8 @@ use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline::{self, Pipeline, SinkSpec};
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
-use recovery::{Dataset, ResumableSource, SharedBackend};
+use backend::SharedBackend;
+use resumable::{Dataset, ResumableSource};
 use spy::SpySource;
 
 fn log() -> Dataset {
@@ -60,14 +63,11 @@ fn seed(backend: &SharedBackend) {
     };
     let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
     pipeline::setup(&mut hotlap, &pipe).unwrap();
-    let mut stream = pipe.sources.stream().unwrap();
-    recovery::drain(&mut hotlap, &pipe.sources, &mut stream, 2);
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    recovery::take(&mut checkpointer, &hotlap, &pipe.sources);
+    futures::executor::block_on(checkpointer.take(&hotlap, &pipe.sources)).unwrap();
 }
 
-/// Counts writes, commits and aborts so a rejected pipeline can prove no writer
-/// was ever driven.
+/// Counts writes and commits so a rejected pipeline can prove no writer ran.
 #[derive(Default)]
 struct RecordingSink {
     writes: AtomicU32,
@@ -128,4 +128,5 @@ fn an_incompatible_registry_fails_before_the_pump_starts() {
         "the pump must not run its EOF commit"
     );
     assert_eq!(spy.resumed(), 0, "no source may be reopened");
+    assert_eq!(spy.offset(), None, "no source may be reopened");
 }
