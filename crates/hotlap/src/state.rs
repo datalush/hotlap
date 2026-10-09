@@ -17,6 +17,8 @@ use std::io;
 mod durable;
 mod fsio;
 #[cfg(test)]
+mod fsio_edge_tests;
+#[cfg(test)]
 mod fsio_tests;
 mod path;
 

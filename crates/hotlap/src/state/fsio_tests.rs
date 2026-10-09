@@ -54,6 +54,10 @@ impl RecordingFs {
 }
 
 impl FsOps for RecordingFs {
+    fn exists(&self, path: &Path) -> bool {
+        RealFs.exists(path)
+    }
+
     fn create_dir(&self, dir: &Path) -> io::Result<()> {
         RealFs.create_dir(dir)
     }

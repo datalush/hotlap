@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 /// Filesystem mutations the durable backend performs. Behind a trait so tests
 /// can observe the order of syncs and force failures against a real tree.
 pub(super) trait FsOps {
+    fn exists(&self, path: &Path) -> bool;
     fn create_dir(&self, dir: &Path) -> io::Result<()>;
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
     fn remove_file(&self, file: &Path) -> io::Result<()>;
@@ -19,6 +20,10 @@ pub(super) trait FsOps {
 pub(super) struct RealFs;
 
 impl FsOps for RealFs {
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+
     fn create_dir(&self, dir: &Path) -> io::Result<()> {
         fs::create_dir(dir)
     }
@@ -61,9 +66,11 @@ pub(super) fn create_dirs_synced(dir: &Path) -> io::Result<()> {
 /// [`create_dirs_synced`] against injected [`FsOps`].
 ///
 /// The mapping from the first existing ancestor into the new top directory is a
-/// modification of that ancestor, so it is synced after the new dirs.
+/// modification of that ancestor, so it is synced after the new dirs. A relative
+/// path with no existing component has an empty anchor, which names the current
+/// directory and is spelled `.`.
 pub(super) fn create_dirs_synced_with(ops: &impl FsOps, dir: &Path) -> io::Result<()> {
-    let (missing, anchor) = missing_ancestors(dir);
+    let (missing, anchor) = missing_ancestors(ops, dir);
     if missing.is_empty() {
         return Ok(());
     }
@@ -73,9 +80,12 @@ pub(super) fn create_dirs_synced_with(ops: &impl FsOps, dir: &Path) -> io::Resul
     for path in &missing {
         ops.sync_dir(path)?;
     }
-    if !anchor.as_os_str().is_empty() {
-        ops.sync_dir(&anchor)?;
-    }
+    let anchor = if anchor.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        anchor.as_path()
+    };
+    ops.sync_dir(anchor)?;
     Ok(())
 }
 
@@ -108,10 +118,10 @@ pub(super) fn remove_file_pruning(ops: &impl FsOps, file: &Path, root: &Path) ->
 
 /// Missing ancestors of `dir`, deepest first, plus the first existing ancestor
 /// that will link the new subtree.
-fn missing_ancestors(dir: &Path) -> (Vec<PathBuf>, PathBuf) {
+fn missing_ancestors(ops: &impl FsOps, dir: &Path) -> (Vec<PathBuf>, PathBuf) {
     let mut missing = Vec::new();
     let mut current = dir;
-    while !current.as_os_str().is_empty() && !current.exists() {
+    while !current.as_os_str().is_empty() && !ops.exists(current) {
         missing.push(current.to_path_buf());
         match current.parent() {
             Some(parent) => current = parent,
