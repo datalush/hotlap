@@ -44,7 +44,7 @@ impl Sink for Probe {
     async fn commit(&self) -> Result<(), ConnectorError> {
         self.events.lock().unwrap().push(Event::Commit);
         if self.fail_commit {
-            return Err(ConnectorError::Infrastructure("commit failed".into()));
+            return Err(ConnectorError::Unsupported("commit rejected".into()));
         }
         Ok(())
     }
