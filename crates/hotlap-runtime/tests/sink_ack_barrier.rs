@@ -5,8 +5,10 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::{GatedSink, RemoteStore, SharedBackend, latest, stage_writes, start};
+use harness::{GatedSink, RemoteStore, SharedBackend, latest, restart, stage_writes, start};
 use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
+use hotlap_runtime::runtime::recovery::{Recovery, RecoveryDecision};
+use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 
 #[tokio::test]
 async fn a_checkpoint_waits_for_the_writer_ack() {
@@ -34,7 +36,19 @@ async fn a_checkpoint_waits_for_the_writer_ack() {
         release.notify_one();
         let id = take.await.unwrap();
         assert_eq!(latest(&backend), Some(id), "valid after the confirmed ACK");
-        assert!(remote.total() > 0, "output visible after the ACK");
+        let delivered = remote.total();
+        assert!(delivered > 0, "output visible after the ACK");
+
+        // Restart: a fresh empty writer against the same output store; the
+        // checkpoint still restores its offsets and the output is not lost.
+        let (_, pipeline, fresh) = restart(remote.clone());
+        let reader = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+            .with_sinks(vec![SinkSync::sink_only(SharedSink::new(fresh))]);
+        match Recovery::inspect(&reader, &pipeline.sources).unwrap() {
+            RecoveryDecision::Resume(checkpoint) => assert_eq!(checkpoint.id, id),
+            other => panic!("a fresh writer must resume the valid checkpoint: {other:?}"),
+        }
+        assert_eq!(remote.total(), delivered, "output survives the restart");
     })
     .await
     .expect("test timed out");

@@ -139,6 +139,23 @@ pub fn start(sink: Arc<dyn Sink>) -> (Hotlap, Pipeline, SinkPump) {
     (hotlap, pipeline, pump)
 }
 
+/// A fresh engine and sources over the same log, plus an empty sink sharing
+/// `remote`, to model a writer restart.
+pub fn restart(remote: RemoteStore) -> (Hotlap, Pipeline, Arc<GatedSink>) {
+    let dataset = Dataset::new(vec![vec![1], vec![1], vec![2]]).with_retention(0);
+    let pipeline = Pipeline {
+        sources: sources(ResumableSource::new(dataset)),
+        views: vec![group_count()],
+        sinks: vec![],
+        checkpoint: None,
+        retention: None,
+    };
+    let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
+    pipeline::setup(&mut hotlap, &pipeline).unwrap();
+    let (sink, _, _) = GatedSink::new(remote, false);
+    (hotlap, pipeline, sink)
+}
+
 /// Drive two events through the pump so the sink stages invisible writes.
 pub async fn stage_writes(hotlap: &mut Hotlap, pipeline: &Pipeline, pump: &SinkPump) {
     let mut stream = pipeline.sources.stream().unwrap();
