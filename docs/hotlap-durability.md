@@ -200,16 +200,27 @@ podar los antiguos son operaciones separadas: un fallo al escribir `latest` o al
 podar **después** de que `valid` se escribió **no** des-publica el checkpoint ni
 autoriza a sobrescribir `engine`/`sources` bajo ese id. La poda solo puede
 eliminar checkpoints más antiguos que el recién publicado; el puntero `latest`
-nunca se poda.
+nunca se poda. El puntero `latest` es **orientativo**: recovery no se fía de él
+para elegir el checkpoint, sino que escanea el namespace y toma el `valid` más
+nuevo, de modo que un `latest` que se quedó atrás no oculta uno ya publicado. Un
+fallo **operativo** (`Storage`) al publicar un commit promovido **propaga** sin
+leer un fallback, sin descartar el pending ni tocar las fuentes; solo un fallo de
+re-conducción del sink se descarta y se replaya.
 
-**Identidad nunca reutilizada.** El id se **reserva de forma durable** en
-`checkpoint/reserved` **antes** de drenar/preparar los sinks y de escribir
-cualquier byte del cuerpo, de modo que un intento ambiguo (un fallo o un crash
-después de una escritura ya confirmada) no puede entregar el mismo id a un
-intento posterior. La reserva vive **fuera** de `checkpoint/<id>/`, así que la
+**Identidad nunca reutilizada.** El id se **reserva** en `checkpoint/reserved`
+con la secuencia en memoria **avanzada antes** del `put`, de modo que un intento
+ambiguo (un fallo o un crash después de una escritura ya confirmada) no puede
+entregar el mismo id a un intento posterior, ni siquiera reintentando desde el
+mismo `Checkpointer`. La reserva vive **fuera** de `checkpoint/<id>/`, así que la
 poda no la borra. Un `Checkpointer` nuevo parte del mayor id presente **y** del
 mayor reservado, y `resume_after` nunca baja de ese suelo; agotar el espacio de
 ids falla en vez de envolver a cero.
+
+**Fallo de escritura ambiguo.** Si escribir el cuerpo falla con `Storage`, el
+marcador `commit` y el cuerpo ya persistidos **se conservan** y los sinks
+preparados **no** se abortan: la incertidumbre se preserva como evidencia en vez
+de borrar la garantía. La limpieza de un marcador `commit` obsoleto (un
+checkpoint ya `valid`) también propaga un fallo de borrado como `Storage`.
 
 **Cobertura del sink.** El pump del motor drena los deltas de cada vista a un
 canal acotado que la tarea del sink consume de forma asíncrona. Antes de

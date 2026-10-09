@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use hotlap::state::StateBackend;
 use hotlap_connectors::sink::SinkCapabilities;
 use hotlap_runtime::runtime::checkpoint::Checkpointer;
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
@@ -42,7 +43,7 @@ async fn transactional_sink_prepares_then_commits_before_valid() {
 }
 
 #[tokio::test]
-async fn capture_failure_aborts_and_discards_the_checkpoint() {
+async fn capture_storage_failure_preserves_commit_evidence() {
     let log = events();
     let sink = SharedSink::new(Arc::new(FakeSink::new(
         SinkCapabilities::Transactional,
@@ -54,11 +55,15 @@ async fn capture_failure_aborts_and_discards_the_checkpoint() {
 
     let result = checkpointer.take(&engine(), &sources()).await;
     assert!(result.is_err(), "a failing write must surface the error");
+    // An ambiguous storage write may have persisted part of the body or the
+    // marker, so the prepared sinks are left untouched instead of rolled back
+    // and the evidence is kept for an uncertain commit.
     assert_eq!(
         *log.lock().unwrap(),
-        vec![Event::Prepare, Event::Abort],
-        "a prepared sink must be aborted"
+        vec![Event::Prepare],
+        "a storage write failure must not abort the prepared sink"
     );
+    assert_eq!(backend.get(b"checkpoint/1/commit").unwrap(), None);
     let reader = Checkpointer::new(Box::new(backend), 3);
     assert_eq!(
         reader.latest().unwrap(),
