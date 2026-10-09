@@ -178,11 +178,23 @@ START;
    lote se entrega** antes de que el task termine. Si un envío del pump queda
    bloqueado con el canal lleno, el motor lo cancela antes de esperar: un envío
    listo siempre gana, así que un cierre limpio no pierde lotes; un envío encolado
-   se abandona y el cierre lo reporta como error. El join de cada task está
-   acotado por un **timeout** de 5 s; al superarlo se aborta y se recoge la task.
+   se abandona y el cierre lo reporta como error. La misma cancelación cubre un
+   **checkpoint activo**: el barrier compite cada `Flush`, `prepare` y `commit`
+   contra la cancelación, de modo que un checkpoint periódico o manual parkeado en
+   un sink detenido tampoco retiene el bucle. Un intento cancelado se marca
+   inconsistente (queda `Failed` antes de evidencia de commit y `CommitUncertain`
+   en cuanto existe marker), conserva reserva, body y marker para que el restart
+   los resuelva, y `shutdown` lo reporta en vez de devolver `Ok`. El join de cada
+   task está acotado por un **timeout** de 5 s; al superarlo se aborta y se recoge
+   la task con un reap también acotado. El hilo del motor corre en su propio
+   runtime *current-thread*, así que un sink que bloquea sin ceder nunca puede
+   sondear el comando de parada ni un timer; `EngineHandle::shutdown` espera la
+   señal de fin con un **timeout del lado del llamante (10 s)**, independiente de
+   ese runtime, y si no llega **desacopla** el hilo y devuelve error: no se puede
+   terminar a la fuerza un hilo de Rust, así que no se promete entrega.
    `EngineHandle::shutdown` propaga el fallo de cierre, el commit final fallido,
-   el panic de una task de sink y el panic del hilo del motor, en vez de devolver
-   `Ok` incondicionalmente.
+   el checkpoint cancelado, el panic de una task de sink y el panic del hilo del
+   motor, en vez de devolver `Ok` incondicionalmente.
 
 ## 9. No-goals
 
@@ -212,12 +224,15 @@ START;
   `false`; un plan que pueda retractar (agregado por clave o ventana tumbling)
   se **rechaza** antes de arrancar/escribir en `Pipeline::validate` y en
   `SqlSession::start`. No se añaden deletes/upserts nuevos.
-- **`SinkPump::close` con timeout.** El join de cada task está acotado a 5 s;
-  superarlo aborta y recoge la task y reporta un error de infraestructura en vez
-  de colgar `shutdown`. La cancelación es **cooperativa**: aborta una task
-  parkeada en un `await` (por ejemplo un sink detenido), pero no puede
-  interrumpir trabajo que nunca cede; en ese caso `close` sigue reportando el
-  timeout, no una entrega completada. No se garantiza cancelación.
+- **`SinkPump::close` y join acotados.** El join de cada task está acotado a 5 s;
+  superarlo aborta y recoge la task (reap igualmente acotado) y reporta un error de
+  infraestructura en vez de colgar `shutdown`. La cancelación es **cooperativa**:
+  aborta una task parkeada en un `await` (por ejemplo un sink detenido), pero no
+  puede interrumpir trabajo que nunca cede; en ese caso `close` sigue reportando el
+  timeout, no una entrega completada. El hilo del motor se espera con un **timeout
+  del llamante (10 s)**; si no responde, se **desacopla** y `shutdown` devuelve
+  error: no existe terminación forzada de un hilo de Rust. No se garantiza
+  cancelación ni entrega tras un timeout.
 - **Parkeado (LOW) — sin drenado final antes de `close`.** `close` no hace un
   último `pump` defensivo: se confía en que el bucle del engine drena tras cada
   `ingest`. Un `close` sin drenado previo podría perder los deltas pendientes;
