@@ -105,14 +105,14 @@ fn wait_offsets(factory: &ResumableSessionFactory, a: i64, b: i64) -> bool {
 
 /// Run the first session to completion, checkpoint it, and return its factory.
 fn first_run(backend: &SharedBackend) -> Arc<ResumableSessionFactory> {
-    // `a` has two matching records, `b` one; the view exposes the join row once
-    // (the MV snapshot keeps distinct rows, not multiplicities).
+    // `a` has two matching records, `b` one; the join multiplies, so the bag
+    // exposes two rows and the MV snapshot keeps their multiplicities.
     let first = ResumableSessionFactory::new();
     first.declare("a", Dataset::new(vec![vec![1], vec![1]]));
     first.declare("b", Dataset::new(vec![vec![1]]));
     let mut session = open(&first, backend, Order::Ab);
     session.sql("START;").expect("first start");
-    assert_eq!(wait_ints(&mut session, &[1]), vec![1]);
+    assert_eq!(wait_ints(&mut session, &[1, 1]), vec![1, 1]);
     assert!(wait_offsets(&first, 2, 1), "both sources must be applied");
     let id = session.checkpoint().expect("checkpoint");
     assert!(id >= 1, "checkpoint must be durable");
@@ -133,8 +133,8 @@ fn restart_restores_join_and_seeds_offsets() {
     let mut session = open(&second, &backend, Order::Ba);
     session.sql("START;").expect("recovered start");
     assert_eq!(
-        wait_ints(&mut session, &[1]),
-        vec![1],
+        wait_ints(&mut session, &[1, 1]),
+        vec![1, 1],
         "the restored join must equal the checkpointed one"
     );
     assert!(
@@ -161,7 +161,7 @@ fn restart_continues_from_captured_offset() {
     session
         .sql("START;")
         .expect("recovered start with new batch");
-    assert_eq!(wait_ints(&mut session, &[1]), vec![1]);
+    assert_eq!(wait_ints(&mut session, &[1, 1, 1]), vec![1, 1, 1]);
     assert!(wait_offsets(&third, 3, 1));
     session.shutdown().expect("shutdown");
 }

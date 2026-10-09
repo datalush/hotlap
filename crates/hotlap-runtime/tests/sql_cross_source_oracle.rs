@@ -13,6 +13,7 @@ mod support;
 
 use std::sync::Arc;
 
+use arrow::array::{Array, Int64Array};
 use arrow::datatypes::SchemaRef;
 use hotlap_connectors::source::SourceBatch;
 use hotlap_runtime::{Session, SessionConfig};
@@ -110,10 +111,92 @@ fn sql_join_matches_recomputation_after_every_append() {
     oracle.push_left(&session, &factory, &[(3, 50, 0)], 1);
     oracle.push_right(&session, &factory, &[(4, 60, 0)], 1);
 
-    // The SQL surface lists each distinct row once, without multiplicities.
+    // The SQL surface expands multiplicities: key 1 occurs 2 * 3 = 6 times and
+    // key 2 once, so `SELECT` returns seven bag rows (no implicit DISTINCT).
     let select = session.sql("SELECT k, lv, rv FROM j").expect("select");
-    assert_eq!(query_rows(select), vec![vec![1, 10, 20], vec![2, 40, 30]]);
+    let mut expected = vec![vec![1, 10, 20]; 6];
+    expected.push(vec![2, 40, 30]);
+    assert_eq!(query_rows(select), expected);
     session.shutdown().expect("shutdown");
+}
+
+/// The corrected bag semantics: a snapshot weight expands into that many rows,
+/// so a `2 x 3` join match yields six rows and aggregates see all six. The
+/// expected aggregates come from a fresh DataFusion context over literal
+/// `VALUES`, independent of the view's own conversion.
+#[test]
+fn join_multiset_expands_to_a_bag_and_matches_values_oracle() {
+    let factory = CrossSourceFactory::new();
+    factory.declare("a", SourceSpec::new(schema_left(), 2));
+    factory.declare("b", SourceSpec::new(schema_right(), 2));
+    let mut session = open(&factory);
+
+    send(
+        &factory,
+        "a",
+        rows(schema_left(), &[(1, 10, 0), (1, 10, 0)]),
+    );
+    send(
+        &factory,
+        "b",
+        rows(schema_right(), &[(1, 20, 0), (1, 20, 0), (1, 20, 0)]),
+    );
+    assert!(wait_commits(&factory, "a", 1), "a must ack");
+    assert!(wait_commits(&factory, "b", 1), "b must ack");
+
+    // The consolidated snapshot keeps one row with weight 2 * 3 = 6.
+    let snapshot = session.snapshot("j").expect("MV snapshot");
+    assert_eq!(zset_tuples(&snapshot), vec![(1, 10, 20, 6)]);
+
+    // SELECT expands the weight into six identical rows.
+    let select = session.sql("SELECT k, lv, rv FROM j").expect("select");
+    assert_eq!(query_rows(select), vec![vec![1, 10, 20]; 6]);
+
+    // Aggregates see the six rows, not one distinct row.
+    let aggregate = session
+        .sql("SELECT count(*), sum(lv), CAST(avg(rv) AS BIGINT), min(lv), max(rv) FROM j")
+        .expect("aggregate");
+    let aggregate = query_rows(aggregate);
+    assert_eq!(aggregate, vec![vec![6, 60, 20, 10, 20]]);
+
+    // Independent oracle: the same six literals folded by DataFusion.
+    let oracle = values_oracle(
+        "SELECT count(*), sum(lv), CAST(avg(rv) AS BIGINT), min(lv), max(rv) FROM \
+         (VALUES (1, 10, 20), (1, 10, 20), (1, 10, 20), (1, 10, 20), (1, 10, 20), (1, 10, 20)) \
+         AS t(k, lv, rv)",
+    );
+    assert_eq!(aggregate, oracle);
+    session.shutdown().expect("shutdown");
+}
+
+/// Run `sql` in a fresh DataFusion context and read the integer result rows.
+fn values_oracle(sql: &str) -> Vec<Vec<i64>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("oracle runtime");
+    runtime.block_on(async {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("oracle plan")
+            .collect()
+            .await
+            .expect("oracle run");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let columns: Vec<&Int64Array> = batch
+                .columns()
+                .iter()
+                .map(|column| column.as_any().downcast_ref::<Int64Array>().unwrap())
+                .collect();
+            for row in 0..batch.num_rows() {
+                rows.push(columns.iter().map(|column| column.value(row)).collect());
+            }
+        }
+        rows
+    })
 }
 
 #[test]
