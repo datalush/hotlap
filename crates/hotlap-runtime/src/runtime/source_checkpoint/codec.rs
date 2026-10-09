@@ -13,7 +13,10 @@ use super::{SourcesCheckpoint, decode_err, encode_err};
 /// Magic bytes at the start of every sources checkpoint.
 const MAGIC: [u8; 4] = *b"HLSR";
 /// Layout version of the sources checkpoint container.
-const VERSION: u32 = 1;
+///
+/// Bumped to 2 when the payload gained the named view registry, so an older
+/// reader rejects the new body instead of decoding a truncated view list.
+const VERSION: u32 = 2;
 /// Fixed header length: magic (4) plus version (4).
 const HEADER: usize = 8;
 

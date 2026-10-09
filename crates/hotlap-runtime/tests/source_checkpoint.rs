@@ -96,9 +96,12 @@ fn previous_payload_is_not_supported() {
 
 #[test]
 fn unknown_version_is_not_supported() {
-    let empty = SourcesCheckpoint { entries: vec![] };
+    let empty = SourcesCheckpoint {
+        entries: vec![],
+        views: vec![],
+    };
     let mut bytes = encode_sources(&empty).unwrap();
-    bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
     assert!(matches!(
         decode_sources(&bytes),
         Err(ConnectorError::Unsupported(_))
@@ -107,8 +110,12 @@ fn unknown_version_is_not_supported() {
 
 #[test]
 fn unknown_inner_frame_version_is_not_supported() {
-    let mut bytes = encode_sources(&SourcesCheckpoint { entries: vec![] }).unwrap();
-    // Keep the valid `HLSR`/version-1 header and overwrite only the inner
+    let mut bytes = encode_sources(&SourcesCheckpoint {
+        entries: vec![],
+        views: vec![],
+    })
+    .unwrap();
+    // Keep the valid `HLSR`/version-2 header and overwrite only the inner
     // engine frame's version, so the envelope is well-formed but incompatible.
     bytes[12..16].copy_from_slice(&9u32.to_le_bytes());
     assert!(matches!(
@@ -119,7 +126,11 @@ fn unknown_inner_frame_version_is_not_supported() {
 
 #[test]
 fn truncated_header_is_corruption() {
-    let bytes = encode_sources(&SourcesCheckpoint { entries: vec![] }).unwrap();
+    let bytes = encode_sources(&SourcesCheckpoint {
+        entries: vec![],
+        views: vec![],
+    })
+    .unwrap();
     assert!(matches!(
         decode_sources(&bytes[..4]),
         Err(ConnectorError::Corruption(_))
@@ -132,7 +143,11 @@ fn truncated_header_is_corruption() {
 
 #[test]
 fn corrupt_payload_is_corruption() {
-    let mut bytes = encode_sources(&SourcesCheckpoint { entries: vec![] }).unwrap();
+    let mut bytes = encode_sources(&SourcesCheckpoint {
+        entries: vec![],
+        views: vec![],
+    })
+    .unwrap();
     bytes[8] ^= 0xff;
     assert!(matches!(
         decode_sources(&bytes),
@@ -142,7 +157,11 @@ fn corrupt_payload_is_corruption() {
 
 #[test]
 fn trailing_bytes_are_corruption() {
-    let mut bytes = encode_sources(&SourcesCheckpoint { entries: vec![] }).unwrap();
+    let mut bytes = encode_sources(&SourcesCheckpoint {
+        entries: vec![],
+        views: vec![],
+    })
+    .unwrap();
     bytes.push(0);
     assert!(matches!(
         decode_sources(&bytes),

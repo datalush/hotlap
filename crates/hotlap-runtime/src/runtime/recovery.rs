@@ -13,6 +13,7 @@ mod pending;
 mod restore;
 mod resume;
 mod sources;
+mod views;
 
 pub use decision::RecoveryDecision;
 
@@ -110,6 +111,7 @@ impl Recovery {
     ) -> Result<InputStream, ConnectorError> {
         checkpointer.sweep_stale_commits()?;
         let decision = Self::inspect(checkpointer, sources)?;
+        views::validate(hotlap, &decision)?;
         match Self::resolve(decision, sources, checkpointer, signal, metrics).await? {
             Resolved::Stream => sources.stream(),
             Resolved::Checkpoint(checkpoint) => {

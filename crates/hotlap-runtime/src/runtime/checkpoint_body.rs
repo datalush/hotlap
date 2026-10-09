@@ -4,7 +4,9 @@ use hotlap::Hotlap;
 use hotlap::state::{StateBackend, StateError};
 use hotlap_engine::{EngineError, EngineSnapshot, decode_snapshot, encode_snapshot};
 
-use crate::runtime::source_checkpoint::{SourcesCheckpoint, decode_sources, encode_sources};
+use crate::runtime::source_checkpoint::{
+    SavedView, SourcesCheckpoint, decode_sources, encode_sources,
+};
 use crate::runtime::sources::Sources;
 use hotlap_connectors::error::ConnectorError;
 
@@ -39,7 +41,8 @@ pub(crate) async fn write(
 ) -> Result<(), ConnectorError> {
     let snapshot = engine.checkpoint().map_err(hotlap_err)?;
     let engine_bytes = encode_snapshot(&snapshot).map_err(encode_err)?;
-    let sources_checkpoint = SourcesCheckpoint::capture(sources)?;
+    let views = SavedView::from_registry(&engine.view_registry());
+    let sources_checkpoint = SourcesCheckpoint::capture_with_views(sources, &views)?;
     let source_bytes = encode_sources(&sources_checkpoint)?;
     let base = checkpoint_prefix(id);
     backend

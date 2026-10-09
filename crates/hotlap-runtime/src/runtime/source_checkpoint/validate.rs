@@ -11,6 +11,10 @@ use crate::runtime::sources::{InputSource, Sources};
 
 use super::{SavedSource, SourcesCheckpoint, decode_err};
 
+mod views;
+
+pub(super) use views::validate_views;
+
 /// Validate `checkpoint` against `sources` and `engine`.
 pub(super) fn validate(
     checkpoint: &SourcesCheckpoint,

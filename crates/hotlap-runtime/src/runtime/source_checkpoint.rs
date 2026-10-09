@@ -8,7 +8,7 @@
 mod codec;
 mod validate;
 
-use hotlap::InputId;
+use hotlap::{InputId, Plan, ViewId};
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::source::SourceState;
 use hotlap_engine::{EngineSnapshot, encode_schema};
@@ -34,11 +34,43 @@ pub struct SavedSource {
     pub state: SourceState,
 }
 
-/// The durable state of every source feeding one runtime.
+/// One view's durable identity inside a [`SourcesCheckpoint`].
+///
+/// The engine snapshot stores a plan per numeric handle but not the
+/// caller-facing name, so this registry records the name↔handle↔plan
+/// association the view was captured with.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SavedView {
+    /// Caller-facing view name.
+    pub name: String,
+    /// Numeric handle the name was bound to.
+    pub id: ViewId,
+    /// The plan the handle was compiled from.
+    pub plan: Plan,
+}
+
+impl SavedView {
+    /// Convert a facade registry (`name`, handle, plan) into saved views.
+    pub fn from_registry(registry: &[(String, ViewId, Plan)]) -> Vec<Self> {
+        registry
+            .iter()
+            .map(|(name, id, plan)| Self {
+                name: name.clone(),
+                id: *id,
+                plan: plan.clone(),
+            })
+            .collect()
+    }
+}
+
+/// The durable state of every source feeding one runtime, plus the named view
+/// registry needed to bind restored state back to the same declarations.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SourcesCheckpoint {
     /// One entry per source, ordered by input id.
     pub entries: Vec<SavedSource>,
+    /// One entry per declared view, ordered by handle.
+    pub views: Vec<SavedView>,
 }
 
 impl SourcesCheckpoint {
@@ -59,7 +91,26 @@ impl SourcesCheckpoint {
                 state: input.source.state(),
             });
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            views: Vec::new(),
+        })
+    }
+
+    /// Capture the applied source state plus the live named view registry.
+    ///
+    /// `views` is the declared view set, so a restart can prove each restored
+    /// handle still belongs to the same declaration instead of trusting schema
+    /// alone.
+    pub fn capture_with_views(
+        sources: &Sources,
+        views: &[SavedView],
+    ) -> Result<Self, ConnectorError> {
+        let mut checkpoint = Self::capture(sources)?;
+        let mut saved = views.to_vec();
+        saved.sort_by_key(|view| view.id);
+        checkpoint.views = saved;
+        Ok(checkpoint)
     }
 
     /// Validate this checkpoint against the declared `sources` and `engine`.
@@ -69,6 +120,15 @@ impl SourcesCheckpoint {
         engine: &EngineSnapshot,
     ) -> Result<(), ConnectorError> {
         validate::validate(self, sources, engine)
+    }
+
+    /// Validate the saved named views against `declared` and the `engine`.
+    pub fn validate_views(
+        &self,
+        declared: &[SavedView],
+        engine: &EngineSnapshot,
+    ) -> Result<(), ConnectorError> {
+        validate::validate_views(self, declared, engine)
     }
 
     /// The saved entry for `id`, or an explicit error when it is absent.

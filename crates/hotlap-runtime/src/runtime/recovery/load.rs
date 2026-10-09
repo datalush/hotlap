@@ -5,7 +5,6 @@ use crate::runtime::sources::Sources;
 use hotlap_connectors::error::ConnectorError;
 
 use super::Recovery;
-use super::sources::read_valid;
 
 impl Recovery {
     /// Newest valid checkpoint, or `None` for a clean start.
@@ -27,12 +26,10 @@ impl Recovery {
             Ok(_) | Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => {}
             Err(error) => return Err(error),
         }
-        for id in checkpointer.ids_descending()? {
-            if let Some(checkpoint) = read_valid(checkpointer, id)? {
-                super::sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
-                return Ok(Some(checkpoint));
-            }
-        }
-        Ok(None)
+        let Some(checkpoint) = checkpointer.newest_valid()? else {
+            return Ok(None);
+        };
+        super::sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
+        Ok(Some(checkpoint))
     }
 }
