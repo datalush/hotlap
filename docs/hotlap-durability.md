@@ -156,7 +156,9 @@ fuentes: cada entrada guarda id, nombre canónico, schema Arrow IPC, lag de
 watermark, columna event-time y `SourceState` (offsets por split). No hay
 **lectores de formatos anteriores**, migraciones ni fallbacks: un checkpoint
 monofuente previo o de versión incompatible produce `Unsupported` (ver
-`hotlap-cross-source-joins.md`).
+`hotlap-cross-source-joins.md`). La corrupción del **formato actual** sí es
+tolerada: recovery cae al predecesor válido más nuevo; una versión incompatible
+o un schema que no valida contra las fuentes declaradas es fatal.
 
 **Layout en disco** (namespace bajo `checkpoint/`):
 

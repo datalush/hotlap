@@ -19,14 +19,17 @@
    sinks son re-conducibles, o se **descarta C con señal explícita** y se
    replaya desde el anterior (ver `docs/hotlap-sink-2pc.md`). Sin marker, este
    paso no hace nada.
-2. **Cargar el último checkpoint válido**: se intenta `latest` primero; si su
-   checkpoint no decodifica o no valida, se prueban los anteriores de más nuevo a
-   más viejo. Como un checkpoint solo es visible cuando todas sus partes están
-   escritas, uno legible es siempre **coherente**; un tip corrupto no aborta el
-   arranque mientras quede un predecesor válido. Sin ningún checkpoint válido, es
-   un **arranque limpio** (`None`). Un formato **anterior o incompatible** no es
-   corrupción tolerada: produce `Unsupported` y nunca arranca en vacío probando un
-   lector viejo.
+2. **Cargar el último checkpoint válido**: se intenta `latest` primero. Si su
+   cuerpo tiene el formato actual pero está **corrupto** (truncado, longitud
+   incoherente, payload ilegible), se prueban los anteriores de más nuevo a más
+   viejo: un tip corrupto no aborta el arranque mientras quede un predecesor
+   válido. En cambio, un formato **ajeno o incompatible** (magic o versión
+   desconocida, frame interno del motor o snapshot del engine con versión no
+   soportada) o un checkpoint que **no valida** contra las fuentes declaradas
+   (ids, schema, watermark, renombrado) es `Unsupported` **fatal**: no se prueba
+   un lector viejo, no se cae a un predecesor y nunca arranca en vacío. Sin
+   ningún checkpoint válido (y sin error fatal), es un **arranque limpio**
+   (`None`).
 3. **Restaurar** el motor con `EngineSnapshot` (`hotlap.restore`).
 4. **Reabrir cada source** en los offsets capturados (`Source::resume`) y
    **replayar** desde ahí, alimentando el mismo circuito.

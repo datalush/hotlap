@@ -95,10 +95,14 @@ La captura es coherente con la ingesta: no mezcla un snapshot anterior a un push
 con offsets posteriores. No implica una transacción distribuida ni un corte
 simultáneo en los sistemas externos.
 
-No hay lectores de **formatos anteriores**, migraciones ni fallbacks: un
-checkpoint monofuente previo o de versión incompatible produce
-`ConnectorError::Unsupported` y recovery **no** arranca en vacío probando un
-lector viejo.
+No hay lectores de **formatos anteriores**, migraciones ni fallbacks. Un
+checkpoint monofuente previo o de versión/magic **incompatible** —incluida una
+versión desconocida del frame interno del engine— produce
+`ConnectorError::Unsupported` **fatal**: recovery **no** arranca en vacío ni cae
+a un checkpoint anterior. Un schema, nombre o identidad que no valida contra las
+fuentes declaradas también es fatal. Solo la **corrupción del formato actual**
+(truncado o payload ilegible) es tolerada, cayendo al predecesor válido más
+nuevo (SP8).
 
 ## 7. Recovery
 
@@ -151,6 +155,11 @@ del kernel. El límite se caracteriza en
 - `cross_source_pending.rs` y `cross_source_pending_schema.rs`: SP8
   promovible/descartable con dos fuentes, schema cambiado y formato ajeno antes
   de cualquier commit de sink.
+- `cross_source_incompatible_codec.rs`: una versión interna de frame o snapshot
+  no soportada es **fatal** (sin fallback ni arranque limpio) antes de leer
+  fuentes o confirmar sinks.
+- `sql_session_durable_start.rs`: un `START` durable fallido no se reintenta sin
+  su checkpoint; se exige una sesión nueva.
 - `cross_source_failures.rs`: fail-stop de lectura en una sesión SQL de dos
   fuentes, sin publicar el lote no confirmado. Los modos lectura/push/ack a nivel
   de pipeline se cubren en `runtime_fail_stop*.rs`.

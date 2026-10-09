@@ -166,6 +166,14 @@ cada MV contra esa asignación e ingiere cada fuente con identidad propia. Un
 `CREATE SOURCE` duplicado o con nombre ya usado se rechaza sin sustituir la
 fuente/watermark vivos (ver `hotlap-cross-source-joins.md`).
 
+Un `START` con **checkpoint durable** consume su configuración (el backend no es
+clonable) al arrancar el engine. Si ese arranque falla —recovery rechaza un
+checkpoint incompatible, o un source no abre— la sesión queda en estado
+**fallido-durable**: un `START` de reintento se rechaza con `SqlError::Unsupported`
+en lugar de arrancar sin recovery. Para reintentar hay que **reabrir una sesión
+nueva** y reconfigurar el checkpoint explícitamente; un `START` **sin**
+checkpoint conserva el reintento normal (recompila contra el registro vigente).
+
 ## 7. Nota sobre `_event_time`
 
 La columna event-time la **añade el source** (el connector Fluss la agrega desde
