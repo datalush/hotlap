@@ -110,6 +110,31 @@ fn split_zero_of_each_source_commits_independently() {
     handle.shutdown().unwrap();
 }
 
+/// One source permanently pending must not block the other or checkpointing.
+#[test]
+fn a_pending_source_does_not_block_ingest_or_checkpoint() {
+    let (a, a_tx) = ControlledSource::new(schema(), vec![split(0)]);
+    let (b, _b_tx) = ControlledSource::new(schema(), vec![split(0)]);
+    let handle = EngineHandle::start(pipeline(
+        sources(a.clone(), b.clone()),
+        SharedBackend::default(),
+    ))
+    .unwrap();
+
+    // A checkpoint before the first batch is valid and reads empty.
+    assert!(handle.snapshot("j").unwrap().is_empty());
+    assert!(handle.checkpoint().is_ok());
+
+    // B never sends, so its read future stays pending; A is still ingested and
+    // acked while the join view (needing both) stays empty.
+    a_tx[0].send(Ok(batch_on(0, 1))).unwrap();
+    assert!(wait_for(|| !a.commits().is_empty()));
+    assert!(b.commits().is_empty());
+    assert!(handle.snapshot("j").unwrap().is_empty());
+    assert!(handle.checkpoint().is_ok());
+    handle.shutdown().unwrap();
+}
+
 #[test]
 fn a_source_that_cannot_open_aborts_startup() {
     let bad = ControlledSource::failing_read(schema());
