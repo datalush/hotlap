@@ -10,14 +10,17 @@
 
 use std::sync::Arc;
 
-use hotlap::{InputId, Plan};
+use hotlap::{InputId, Plan, ViewId};
+use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::source::Source;
 use hotlap_sql::bindings::{InputSchemas, SourceBindings};
 use hotlap_sql::error::SqlError;
 use hotlap_sql::translate::to_kernel_plan;
 
 use super::{SqlSession, to_engine};
+use crate::runtime::checkpoint::{CheckpointConfig, Checkpointer};
 use crate::runtime::pipeline::Watermark;
+use crate::runtime::source_checkpoint::SavedView;
 use crate::runtime::sources::{InputSource, Sources};
 
 /// A registered source and its optional watermark policy.
@@ -87,10 +90,52 @@ impl SqlSession {
         Sources::new(entries).map_err(to_engine)
     }
 
+    /// Reject an incompatible saved view registry before opening any writer.
+    ///
+    /// Views are declared in the compiled order, so a view's handle is its
+    /// position. Comparing that predicted registry with the checkpoint proves a
+    /// restart would rebind every name to the same plan; the checkpoint config
+    /// is put back so a rejected attempt still owns its durable store.
+    pub(super) fn validate_recovery_views(
+        &mut self,
+        views: &[(String, Plan)],
+    ) -> Result<(), SqlError> {
+        let Some(config) = self.checkpoint.take() else {
+            return Ok(());
+        };
+        let declared: Vec<SavedView> = views
+            .iter()
+            .enumerate()
+            .map(|(index, (name, plan))| SavedView {
+                name: name.clone(),
+                id: ViewId(index as u32),
+                plan: plan.clone(),
+            })
+            .collect();
+        let checkpointer = Checkpointer::new(config.backend, config.retain);
+        let result = checkpointer
+            .validate_views(&declared)
+            .map_err(view_identity_err);
+        self.checkpoint = Some(CheckpointConfig {
+            interval: config.interval,
+            retain: config.retain,
+            backend: checkpointer.into_backend(),
+        });
+        result
+    }
+
     fn session_source(&self, name: &str) -> Result<&SessionSource, SqlError> {
         self.sources
             .get(name)
             .ok_or_else(|| SqlError::Catalog(format!("source not registered: {name}")))
+    }
+}
+
+/// Map a view-identity failure onto the public SQL error type.
+fn view_identity_err(error: ConnectorError) -> SqlError {
+    match error {
+        ConnectorError::Unsupported(message) => SqlError::Unsupported(message),
+        other => SqlError::Engine(other.to_string()),
     }
 }
 

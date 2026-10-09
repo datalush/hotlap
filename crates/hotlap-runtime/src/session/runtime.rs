@@ -101,6 +101,8 @@ impl SqlSession {
         // Refuse unsupported wiring before the factory opens any writer; the
         // created sinks are re-checked by `validate` so a factory cannot lie.
         super::sink_preflight::preflight_sinks(&self.sinks, self.sink_factory.as_ref(), &views)?;
+        // Refuse an incompatible checkpoint before the factory opens a writer.
+        self.validate_recovery_views(&views)?;
         let sinks = self.build_sinks().await?;
         let sources = self.build_sources(bindings)?;
         let mut pipeline = Pipeline {
