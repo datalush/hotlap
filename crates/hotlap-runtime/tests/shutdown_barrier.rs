@@ -19,8 +19,8 @@ mod harness;
 mod support;
 
 use harness::{
-    GatedPrepareSink, ParkedWriteSink, SharedBackend, Signal, WatchedBackend, fill_queue,
-    keys_with, start,
+    GatedPrepareSink, ParkedWriteSink, SharedBackend, Signal, StagedSink, StagedStore,
+    WatchedBackend, fill_queue, keys_with, start,
 };
 use support::{
     assert_cancelled, assert_evidence, commit_uncertain, config, spawn_checkpoint, with_watchdog,
@@ -108,32 +108,64 @@ fn shutdown_cancels_a_checkpoint_blocked_in_commit() {
 }
 
 #[test]
-fn a_commit_uncertain_checkpoint_promotes_or_rejects_on_restart() {
-    let backend = commit_uncertain();
+fn a_staged_transactional_commit_cancel_is_rejected_on_restart() {
+    let store = StagedStore::new();
+    let (entered, entered_rx) = Signal::new();
+    let (written, written_rx) = Signal::new();
+    let (sink, _release) = StagedSink::new(store.clone(), entered, written);
+    let backend = SharedBackend::default();
+    let watched = WatchedBackend::watch(backend.clone(), None, None);
+    let handle = start(
+        keys_with(&[7, 8], None),
+        sink.clone(),
+        Some(config(watched)),
+    );
+    for _ in 0..2 {
+        written_rx
+            .recv_timeout(support::SETUP)
+            .expect("the sink never wrote a batch");
+    }
+
+    let reply = spawn_checkpoint(&handle);
+    entered_rx
+        .recv_timeout(support::SETUP)
+        .expect("commit never entered");
+    assert_eq!(
+        store.staged(),
+        vec![7, 8],
+        "prepare must persist the real written payload"
+    );
+    let started = Instant::now();
+    let result = with_watchdog(move || handle.shutdown());
+
+    assert_cancelled(result, started.elapsed(), &reply);
+    assert_evidence(&backend, true);
+    assert!(
+        store.published().is_empty(),
+        "a cancelled commit must not publish the staged payload"
+    );
+    assert_eq!(
+        store.staged(),
+        vec![7, 8],
+        "the staged payload must be retained"
+    );
+
     let sources = Sources::new(vec![InputSource {
         id: InputId(0),
         name: "in".into(),
-        source: keys_with(&[1], None),
+        source: keys_with(&[7, 8], None),
         watermark: None,
     }])
     .unwrap();
-
-    let redriable =
-        Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(
-            SharedSink::new(harness::CapabilitySink::redriable()),
-        )]);
-    let decision = Recovery::inspect(&redriable, &sources).expect("inspect");
-    assert!(
-        matches!(decision, RecoveryDecision::Promote(_)),
-        "a re-drivable sink must promote the interrupted commit, got {decision:?}"
-    );
-
-    let staged = Checkpointer::new(Box::new(backend), 3).with_sinks(vec![SinkSync::sink_only(
-        SharedSink::new(harness::CapabilitySink::staged()),
-    )]);
-    let decision = Recovery::inspect(&staged, &sources).expect("inspect");
+    let restarted = Checkpointer::new(Box::new(backend), 3)
+        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(sink))]);
+    let decision = Recovery::inspect(&restarted, &sources).expect("inspect");
     assert!(
         matches!(decision, RecoveryDecision::Reject { .. }),
-        "a non-re-drivable transactional sink must reject, got {decision:?}"
+        "a non-re-drivable transactional sink must be explicitly rejected, got {decision:?}"
+    );
+    assert!(
+        store.published().is_empty(),
+        "a rejected commit must not have published"
     );
 }

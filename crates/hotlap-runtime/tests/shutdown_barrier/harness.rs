@@ -2,6 +2,8 @@
 
 #[path = "harness/sinks.rs"]
 mod sinks;
+#[path = "harness/staged.rs"]
+mod staged;
 
 use std::sync::Arc;
 
@@ -11,6 +13,7 @@ use hotlap::state::{StateBackend, StateEntry, StateError};
 mod common;
 pub use common::*;
 pub use sinks::*;
+pub use staged::*;
 
 /// A [`SharedBackend`] that signals a test when a watched key is written.
 pub struct WatchedBackend {
