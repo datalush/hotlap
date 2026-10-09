@@ -8,6 +8,7 @@ use hotlap::ZSetBatch;
 use hotlap_engine::MetricsRegistry;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::runtime::cancel::Cancel;
 use crate::runtime::command::Command;
 use crate::runtime::engine::{self, EngineShared};
 use crate::runtime::pipeline::Pipeline;
@@ -37,6 +38,7 @@ impl EngineHandle {
             checkpoint_error: Arc::new(Mutex::new(None)),
             close_error: Arc::new(Mutex::new(None)),
             built: Arc::new(AtomicBool::new(false)),
+            cancel: Cancel::new(),
         };
         let engine_shared = shared.clone();
         let metrics = Arc::new(MetricsRegistry::new());
@@ -155,6 +157,9 @@ impl EngineHandle {
         let Some(join) = self.join.take() else {
             return Ok(());
         };
+        // Break a pump parked on a full channel so the engine can reach the
+        // shutdown command; a ready send still wins inside the pump.
+        self.shared.cancel.cancel();
         let (reply, _rx) = oneshot::channel();
         let _ = self.tx.send(Command::Shutdown { reply });
         match join.join() {
@@ -165,9 +170,10 @@ impl EngineHandle {
 
     /// Take the sink/close failure the engine recorded, if any.
     fn take_close_error(&self) -> Result<(), ConnectorError> {
-        let mut slot = self.shared.close_error.lock().map_err(|_| {
-            ConnectorError::Infrastructure("shutdown error state poisoned".into())
-        })?;
+        let mut slot =
+            self.shared.close_error.lock().map_err(|_| {
+                ConnectorError::Infrastructure("shutdown error state poisoned".into())
+            })?;
         match slot.take() {
             Some(error) => Err(error),
             None => Ok(()),

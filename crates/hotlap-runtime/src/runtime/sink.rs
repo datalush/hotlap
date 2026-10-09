@@ -1,12 +1,14 @@
 //! Sink task: bounded changelog channel, serialized control and engine-side pump.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hotlap::{Hotlap, HotlapError};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::runtime::cancel::Cancel;
 use crate::runtime::pipeline::SinkSpec;
 pub use crate::runtime::shared_sink::SharedSink;
 pub use crate::runtime::sink_sync::{ChangelogSender, SinkMessage, SinkSync};
@@ -70,16 +72,24 @@ struct SinkEntry {
 /// Engine-side owner of every sink channel and task.
 pub struct SinkPump {
     entries: Vec<SinkEntry>,
+    cancel: Cancel,
+    /// Whether shutdown abandoned a send parked on a full channel.
+    interrupted: AtomicBool,
 }
 
 impl SinkPump {
     /// Spawn one sink task per spec; the views were tapped during setup.
     pub fn start(specs: &[SinkSpec]) -> Self {
-        Self::start_with_metrics(specs, None)
+        Self::start_with_metrics(specs, None, Cancel::new())
     }
 
-    /// Like [`Self::start`], but counts successful commits into `metrics`.
-    pub fn start_with_metrics(specs: &[SinkSpec], metrics: Option<Arc<MetricsRegistry>>) -> Self {
+    /// Like [`Self::start`], but counts successful commits into `metrics` and
+    /// carries the engine's cancellation flag for a parked pump.
+    pub(crate) fn start_with_metrics(
+        specs: &[SinkSpec],
+        metrics: Option<Arc<MetricsRegistry>>,
+        cancel: Cancel,
+    ) -> Self {
         let entries = specs
             .iter()
             .map(|spec| {
@@ -98,7 +108,11 @@ impl SinkPump {
                 }
             })
             .collect();
-        Self { entries }
+        Self {
+            entries,
+            cancel,
+            interrupted: AtomicBool::new(false),
+        }
     }
 
     /// The sinks the checkpoint barrier coordinates, sharing this pump's state.
@@ -115,35 +129,47 @@ impl SinkPump {
     /// Drain each tapped view's deltas and push them to its sink.
     ///
     /// Awaiting `send` blocks while a channel is full, which propagates
-    /// backpressure to the source loop instead of buffering without bound.
+    /// backpressure to the source loop instead of buffering without bound. A
+    /// ready send wins so a clean shutdown never drops a batch, but once the
+    /// engine cancels, a send parked on a full channel is abandoned and the
+    /// pump reports that delivery could not be guaranteed.
     pub async fn pump(&self, hotlap: &mut Hotlap) -> Result<(), ConnectorError> {
         for entry in &self.entries {
             let changes = hotlap.take_changes(&entry.view).map_err(hotlap_err)?;
             if changes.is_empty() {
                 continue;
             }
-            entry
-                .tx
-                .send(SinkMessage::Batch(Ok(changes)))
-                .await
-                .map_err(|_| stopped())?;
+            let message = SinkMessage::Batch(Ok(changes));
+            tokio::select! {
+                biased;
+                sent = entry.tx.send(message) => sent.map_err(|_| stopped())?,
+                () = self.cancel.cancelled() => {
+                    self.interrupted.store(true, Ordering::SeqCst);
+                    return Err(cancelled());
+                }
+            }
         }
         Ok(())
     }
 
     /// Close every channel and wait for its task, surfacing the first failure.
     ///
-    /// Each join is bounded by [`CLOSE_TIMEOUT`] so a stalled sink cannot hang
-    /// shutdown forever; a timeout is reported like any other sink failure. The
-    /// task is aborted and reaped so it cannot outlive `shutdown`.
+    /// Each join is bounded by [`CLOSE_TIMEOUT`]. A timed-out task is aborted
+    /// and reaped: abort drops the task at its next await, so a sink parked in
+    /// an await cannot outlive the close. A task stuck in work that never
+    /// yields cannot be interrupted by abort, so the close still reports the
+    /// timeout instead of claiming delivery. If cancellation abandoned a send,
+    /// delivery is likewise unproven and the close fails even when every task
+    /// happened to finish.
     pub async fn close(self) -> Result<(), ConnectorError> {
+        let interrupted = self.interrupted.load(Ordering::SeqCst);
         let mut failure = None;
         for mut entry in self.entries {
             drop(entry.tx);
             match tokio::time::timeout(CLOSE_TIMEOUT, &mut entry.handle).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(error))) => record(&mut failure, error),
-                Ok(Err(_)) => record(&mut failure, stopped()),
+                Ok(Err(join)) => record(&mut failure, join_error(join)),
                 Err(_) => {
                     // The join handle is still ours; abort the stalled task and
                     // wait for it to unwind before reporting the timeout.
@@ -152,6 +178,9 @@ impl SinkPump {
                     record(&mut failure, timed_out());
                 }
             }
+        }
+        if failure.is_none() && interrupted {
+            return Err(cancelled());
         }
         match failure {
             Some(error) => Err(error),
@@ -170,6 +199,20 @@ fn stopped() -> ConnectorError {
 
 fn timed_out() -> ConnectorError {
     ConnectorError::Infrastructure("sink task timed out during close".into())
+}
+
+fn cancelled() -> ConnectorError {
+    ConnectorError::Infrastructure(
+        "shutdown cancelled a sink send before the changelog drained".into(),
+    )
+}
+
+fn join_error(error: tokio::task::JoinError) -> ConnectorError {
+    if error.is_panic() {
+        ConnectorError::Infrastructure(format!("sink task panicked: {error}"))
+    } else {
+        stopped()
+    }
 }
 
 fn hotlap_err(error: HotlapError) -> ConnectorError {

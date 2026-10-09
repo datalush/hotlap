@@ -8,6 +8,7 @@ use hotlap_engine::{EngineCore, MetricsRegistry};
 use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
 use tokio::time::{Instant, Interval, interval_at};
 
+use crate::runtime::cancel::Cancel;
 use crate::runtime::checkpoint::Checkpointer;
 use crate::runtime::command::Command;
 use crate::runtime::pipeline::{self, Pipeline};
@@ -31,6 +32,8 @@ pub(crate) struct EngineShared {
     pub(crate) close_error: Arc<Mutex<Option<ConnectorError>>>,
     /// Whether at least one batch has built the dataflow.
     pub(crate) built: Arc<AtomicBool>,
+    /// Breaks a sink pump parked on a full channel during shutdown.
+    pub(crate) cancel: Cancel,
 }
 
 /// Run the engine loop until shutdown or channel close.
@@ -56,7 +59,6 @@ pub(crate) fn run(
     };
     rt.block_on(drive(pipeline, &mut rx, &shared, metrics, ready));
 }
-
 
 /// Live state owned by the serving loop after startup.
 struct Engine {
@@ -103,7 +105,11 @@ async fn prepare(
     // Reject an incompatible checkpoint before the pump opens any writer or the
     // recovery re-drives any commit, so a rejected pipeline has no side effect.
     pipeline.preflight_recovery()?;
-    let sinks = SinkPump::start_with_metrics(&pipeline.sinks, Some(Arc::clone(&metrics)));
+    let sinks = SinkPump::start_with_metrics(
+        &pipeline.sinks,
+        Some(Arc::clone(&metrics)),
+        shared.cancel.clone(),
+    );
     let coordinated = sinks.coordinated();
     let (source, checkpointer, ticker) = match pipeline.checkpoint.take() {
         Some(config) => {

@@ -1,5 +1,6 @@
 //! Runtime: pipeline wiring, engine thread and handle.
 
+mod cancel;
 pub mod checkpoint;
 mod checkpoint_body;
 pub mod command;

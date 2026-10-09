@@ -21,6 +21,7 @@ use hotlap_engine::EngineCore;
 use tokio::sync::mpsc;
 
 use super::{Engine, EngineShared, serve};
+use crate::runtime::cancel::Cancel;
 use crate::runtime::command::Command;
 use crate::runtime::pipeline::Pipeline;
 use crate::runtime::sink::SinkPump;
@@ -143,6 +144,7 @@ fn drive_until_pending(engine: Engine, pipeline: Pipeline) -> Option<String> {
         checkpoint_error: Arc::new(Mutex::new(None)),
         close_error: Arc::new(Mutex::new(None)),
         built: Arc::new(AtomicBool::new(false)),
+        cancel: Cancel::new(),
     };
     // Keep the sender alive so the command channel stays pending.
     let (_tx, mut rx) = mpsc::unbounded_channel::<Command>();
