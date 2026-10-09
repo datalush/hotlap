@@ -16,9 +16,8 @@ pub enum CheckpointState {
     /// An attempt failed after the sinks were prepared and, when it reached the
     /// commit path, wrote no durable evidence that could be promoted.
     Failed,
-    /// An attempt failed during the commit phase or while writing durable
-    /// commit evidence: a participant may have confirmed, so the marker and
-    /// body are kept for recovery to re-drive or discard.
+    /// Durable prepare or commit evidence remains unresolved, so a restart must
+    /// reject, re-drive, or discard it before continuing.
     CommitUncertain,
 }
 

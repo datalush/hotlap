@@ -72,7 +72,8 @@ pub fn assert_evidence(backend: &SharedBackend, committed: bool) {
 /// Assert the marker written before an unacknowledged prepare, with no body.
 pub fn assert_prepare_uncertain(backend: &SharedBackend) {
     use hotlap::state::StateBackend;
-    assert!(backend.get(b"checkpoint/1/commit").unwrap().is_some());
+    assert!(backend.get(b"checkpoint/1/prepare").unwrap().is_some());
+    assert!(backend.get(b"checkpoint/1/commit").unwrap().is_none());
     assert!(backend.get(b"checkpoint/1/engine").unwrap().is_none());
     assert!(backend.get(b"checkpoint/1/sources").unwrap().is_none());
     assert!(backend.get(b"checkpoint/1/valid").unwrap().is_none());

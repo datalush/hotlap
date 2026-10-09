@@ -14,6 +14,8 @@ use hotlap_connectors::error::ConnectorError;
 pub(crate) const VALID_MARKER: &[u8] = b"1";
 /// Value stored under `checkpoint/<id>/commit` once a commit is intended.
 pub(crate) const COMMIT_MARKER: &[u8] = b"1";
+/// Value stored under `checkpoint/<id>/prepare` before external prepare starts.
+pub(crate) const PREPARE_MARKER: &[u8] = b"prepare-v1";
 /// Key holding the id of the newest fully written checkpoint.
 pub(crate) const LATEST_KEY: &[u8] = b"checkpoint/latest";
 /// Key holding the highest checkpoint id ever reserved.
@@ -29,11 +31,8 @@ pub(crate) fn checkpoint_prefix(id: u64) -> String {
 
 /// Encode the engine snapshot and source offsets under `checkpoint/<id>/`.
 ///
-/// A commit-intent marker is persisted before external prepare; the body is
-/// written afterwards and the marker is refreshed last, before sinks commit.
-/// [`publish_valid`] publishes the checkpoint afterwards. An interrupted
-/// prepare can therefore be rejected even when no complete body exists.
-pub(crate) async fn write(
+/// The engine snapshot and source offsets are written before the commit marker.
+pub(crate) async fn write_body(
     backend: &mut (dyn StateBackend + Send),
     id: u64,
     engine: &Hotlap,
@@ -50,9 +49,6 @@ pub(crate) async fn write(
         .map_err(state_err)?;
     backend
         .put(format!("{base}/sources").as_bytes(), source_bytes)
-        .map_err(state_err)?;
-    backend
-        .put(format!("{base}/commit").as_bytes(), COMMIT_MARKER.to_vec())
         .map_err(state_err)
 }
 
@@ -61,7 +57,9 @@ pub(crate) fn clear_commit(
     backend: &mut (dyn StateBackend + Send),
     id: u64,
 ) -> Result<(), StateError> {
-    backend.delete(format!("{}/commit", checkpoint_prefix(id)).as_bytes())
+    let base = checkpoint_prefix(id);
+    backend.delete(format!("{base}/commit").as_bytes())?;
+    backend.delete(format!("{base}/prepare").as_bytes())
 }
 
 /// Decode the body of `id` without requiring the `valid` marker.
@@ -122,7 +120,20 @@ pub(crate) fn reserve(
         .map_err(state_err)
 }
 
-/// Record that an attempt may have entered an external sink's prepare phase.
+/// Record a checkpoint that may have entered an external prepare phase.
+pub(crate) fn mark_prepare_intent(
+    backend: &mut (dyn StateBackend + Send),
+    id: u64,
+) -> Result<(), ConnectorError> {
+    backend
+        .put(
+            format!("{}/prepare", checkpoint_prefix(id)).as_bytes(),
+            PREPARE_MARKER.to_vec(),
+        )
+        .map_err(state_err)
+}
+
+/// Record a complete body whose prepared sinks may now enter commit.
 pub(crate) fn mark_commit_intent(
     backend: &mut (dyn StateBackend + Send),
     id: u64,
@@ -133,6 +144,13 @@ pub(crate) fn mark_commit_intent(
             COMMIT_MARKER.to_vec(),
         )
         .map_err(state_err)
+}
+
+pub(crate) fn clear_prepare_intent(
+    backend: &mut (dyn StateBackend + Send),
+    id: u64,
+) -> Result<(), StateError> {
+    backend.delete(format!("{}/prepare", checkpoint_prefix(id)).as_bytes())
 }
 
 /// Decode an 8-byte little-endian checkpoint id.

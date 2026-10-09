@@ -92,8 +92,7 @@ impl Sink for FakeSink {
     }
 }
 
-/// In-memory backend that can be toggled to fail every `put` except the durable
-/// id reservation, so a body write fails after the sinks were prepared.
+/// In-memory backend that fails the engine-body write after sinks are prepared.
 #[derive(Clone, Default)]
 pub struct MemBackend {
     map: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
@@ -114,9 +113,7 @@ impl StateBackend for MemBackend {
     }
 
     fn put(&mut self, key: &[u8], value: Vec<u8>) -> Result<(), StateError> {
-        // The reservation must succeed so the failure lands on the checkpoint
-        // body, after the two-phase-commit sinks were prepared.
-        if *self.failing.lock().unwrap() && key != b"checkpoint/reserved" {
+        if *self.failing.lock().unwrap() && key == b"checkpoint/1/engine" {
             return Err(StateError::Io(io::Error::other("backend write failed")));
         }
         self.map.lock().unwrap().insert(key.to_vec(), value);

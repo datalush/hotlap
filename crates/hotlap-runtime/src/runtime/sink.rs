@@ -1,5 +1,6 @@
 //! Sink task: bounded changelog channel, serialized control and engine-side pump.
 
+mod close;
 mod writer;
 
 use std::sync::Arc;
@@ -30,6 +31,7 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 pub struct SinkPump {
     entries: Vec<SinkEntry>,
     cancel: Cancel,
+    close_clean: Arc<AtomicBool>,
     /// Whether shutdown abandoned a send parked on a full channel.
     interrupted: AtomicBool,
 }
@@ -56,7 +58,7 @@ impl SinkPump {
                     }
                     None => SharedSink::new(Arc::clone(&spec.sink)),
                 };
-                let (tx, handle) = writer::spawn_sink_with_close_gate(
+                let (tx, handle) = writer::spawn_sink_for_pump(
                     Arc::clone(&shared),
                     CHANNEL_CAPACITY,
                     Arc::clone(&close_clean),
@@ -72,6 +74,7 @@ impl SinkPump {
         Self {
             entries,
             cancel,
+            close_clean,
             interrupted: AtomicBool::new(false),
         }
     }
@@ -112,71 +115,16 @@ impl SinkPump {
         }
         Ok(())
     }
-
-    /// Close every channel and wait for its task, surfacing the first failure.
-    ///
-    /// Each join is bounded by [`CLOSE_TIMEOUT`]. A timed-out task is aborted
-    /// and reaped: abort drops the task at its next await, so a sink parked in
-    /// an await cannot outlive the close. A task stuck in work that never
-    /// yields cannot be interrupted by abort, so the close still reports the
-    /// timeout instead of claiming delivery. If cancellation abandoned a send,
-    /// delivery is likewise unproven and the close fails even when every task
-    /// happened to finish.
-    pub async fn close(self) -> Result<(), ConnectorError> {
-        let interrupted = self.interrupted.load(Ordering::SeqCst);
-        let mut failure = None;
-        for mut entry in self.entries {
-            drop(entry.tx);
-            match tokio::time::timeout(CLOSE_TIMEOUT, &mut entry.handle).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => record(&mut failure, error),
-                Ok(Err(join)) => record(&mut failure, join_error(join)),
-                Err(_) => {
-                    // The join handle is still ours; abort the stalled task and
-                    // try to reap it. The reap is bounded: an aborted task is
-                    // dropped at its next await, but a task stuck in work that
-                    // never yields cannot be interrupted, so the close must not
-                    // await it without a bound.
-                    entry.handle.abort();
-                    let _ = tokio::time::timeout(REAP_TIMEOUT, &mut entry.handle).await;
-                    record(&mut failure, timed_out());
-                }
-            }
-        }
-        if failure.is_none() && interrupted {
-            return Err(cancelled());
-        }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-}
-
-fn record(slot: &mut Option<ConnectorError>, error: ConnectorError) {
-    slot.get_or_insert(error);
 }
 
 fn stopped() -> ConnectorError {
     ConnectorError::Infrastructure("sink task stopped".into())
 }
 
-fn timed_out() -> ConnectorError {
-    ConnectorError::Infrastructure("sink task timed out during close".into())
-}
-
 fn cancelled() -> ConnectorError {
     ConnectorError::Infrastructure(
         "shutdown cancelled a sink send before the changelog drained".into(),
     )
-}
-
-fn join_error(error: tokio::task::JoinError) -> ConnectorError {
-    if error.is_panic() {
-        ConnectorError::Infrastructure(format!("sink task panicked: {error}"))
-    } else {
-        stopped()
-    }
 }
 
 fn hotlap_err(error: HotlapError) -> ConnectorError {

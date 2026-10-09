@@ -38,11 +38,6 @@ impl Cancel {
         self.tx.send_replace(true);
     }
 
-    /// Whether cancellation has been requested.
-    pub(crate) fn is_cancelled(&self) -> bool {
-        *self.tx.borrow()
-    }
-
     /// Whether an awaited operation was abandoned by cancellation.
     ///
     /// The engine uses this to refuse a false success: an interrupted delivery

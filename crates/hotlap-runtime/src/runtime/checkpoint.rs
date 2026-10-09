@@ -5,22 +5,23 @@
 
 mod commit;
 mod config;
+mod pending;
 mod state;
+mod views;
 
 pub use config::{CheckpointConfig, DEFAULT_RETAIN};
 pub use state::CheckpointState;
 
 use hotlap::state::StateBackend;
-use hotlap_engine::{EngineSnapshot, decode_snapshot};
+use hotlap_engine::EngineSnapshot;
 
 use crate::runtime::cancel::Cancel;
 use crate::runtime::checkpoint_body::{
-    LATEST_KEY, RESERVED_KEY, checkpoint_prefix, decode_err, id_exhausted, invalid, parse_id,
-    read_body as decode_body, state_err,
+    LATEST_KEY, RESERVED_KEY, id_exhausted, parse_id, state_err,
 };
 use crate::runtime::sink::SinkSync;
 use crate::runtime::sink_barrier::SinkBarrier;
-use crate::runtime::source_checkpoint::{SavedView, SourcesCheckpoint, decode_sources};
+use crate::runtime::source_checkpoint::SourcesCheckpoint;
 use hotlap_connectors::error::ConnectorError;
 
 /// A decoded checkpoint: engine snapshot plus resumable source offsets.
@@ -138,80 +139,9 @@ impl Checkpointer {
         self.sinks.replay_safe()
     }
 
-    /// Every candidate checkpoint's named views must match `declared`.
-    ///
-    /// Checks the newest valid checkpoint and any interrupted commit above it,
-    /// without consuming the store, so a caller can reject an incompatible
-    /// declaration before opening writers or re-driving a commit.
-    pub fn validate_views(&self, declared: &[SavedView]) -> Result<(), ConnectorError> {
-        let valid = self.newest_valid()?;
-        if let Some(checkpoint) = &valid {
-            checkpoint
-                .sources
-                .validate_views(declared, &checkpoint.engine)?;
-        }
-        let floor = valid.as_ref().map(|checkpoint| checkpoint.id);
-        if let Some(id) = self.pending_commit(floor)?
-            && let Some(checkpoint) = self.read_body(id)?
-        {
-            checkpoint
-                .sources
-                .validate_views(declared, &checkpoint.engine)?;
-        }
-        Ok(())
-    }
-
-    /// Newest checkpoint with a `valid` marker that decodes, or `None`.
-    ///
-    /// An incompatible format is fatal; current-format corruption or an absent
-    /// marker is skipped so an older checkpoint can still be selected.
-    pub fn newest_valid(&self) -> Result<Option<Checkpoint>, ConnectorError> {
-        for id in self.ids_descending()? {
-            match self.read(id) {
-                Ok(checkpoint) => return Ok(Some(checkpoint)),
-                Err(error @ ConnectorError::Unsupported(_)) => return Err(error),
-                Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(None)
-    }
-
-    /// Newest id above `floor` with a commit marker but no valid marker.
-    fn pending_commit(&self, floor: Option<u64>) -> Result<Option<u64>, ConnectorError> {
-        let floor = floor.unwrap_or(0);
-        for id in self.ids_descending()? {
-            if id <= floor {
-                break;
-            }
-            let base = format!("checkpoint/{id}");
-            if self.has_key(&format!("{base}/commit"))?
-                && !self.has_key(&format!("{base}/valid"))?
-            {
-                return Ok(Some(id));
-            }
-        }
-        Ok(None)
-    }
-
     /// Recover the store, for example to move it into a new checkpointer.
     pub fn into_backend(self) -> Box<dyn StateBackend + Send> {
         self.backend
-    }
-
-    /// Decode the body of `id` without requiring the `valid` marker.
-    pub(crate) fn read_body(&self, id: u64) -> Result<Option<Checkpoint>, ConnectorError> {
-        let body = decode_body(self.backend.as_ref(), id)?;
-        Ok(body.map(|(engine, sources)| Checkpoint {
-            id,
-            engine,
-            sources,
-        }))
-    }
-
-    /// Whether `key` is present in the store.
-    pub(crate) fn has_key(&self, key: &str) -> Result<bool, ConnectorError> {
-        Ok(self.get(key)?.is_some())
     }
 
     /// Id of the newest complete checkpoint, or `None` when none exists.
@@ -230,27 +160,6 @@ impl Checkpointer {
         ids.dedup();
         ids.reverse();
         Ok(ids)
-    }
-
-    /// Read and decode the checkpoint `id`, rejecting an incomplete one.
-    pub fn read(&self, id: u64) -> Result<Checkpoint, ConnectorError> {
-        let base = checkpoint_prefix(id);
-        if self.get(&format!("{base}/valid"))?.is_none() {
-            return Err(invalid(id));
-        }
-        let engine_bytes = self
-            .get(&format!("{base}/engine"))?
-            .ok_or_else(|| invalid(id))?;
-        let engine = decode_snapshot(&engine_bytes).map_err(decode_err)?;
-        let source_bytes = self
-            .get(&format!("{base}/sources"))?
-            .ok_or_else(|| invalid(id))?;
-        let sources = decode_sources(&source_bytes)?;
-        Ok(Checkpoint {
-            id,
-            engine,
-            sources,
-        })
     }
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, ConnectorError> {

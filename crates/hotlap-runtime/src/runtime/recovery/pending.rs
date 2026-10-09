@@ -6,6 +6,7 @@ use hotlap_engine::MetricsRegistry;
 
 use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
 use crate::runtime::pipeline;
+use crate::runtime::recovery::RecoveryDecision;
 use hotlap_connectors::error::ConnectorError;
 
 /// Newest checkpoint above `floor` with a `commit` marker but no `valid` one.
@@ -22,13 +23,36 @@ pub(super) fn pending_commit(
             break;
         }
         let base = format!("checkpoint/{id}");
-        if checkpointer.has_key(&format!("{base}/commit"))?
+        if (checkpointer.has_key(&format!("{base}/commit"))?
+            || checkpointer.has_key(&format!("{base}/prepare"))?)
             && !checkpointer.has_key(&format!("{base}/valid"))?
         {
             return Ok(Some(id));
         }
     }
     Ok(None)
+}
+
+pub(super) fn prepare_decision(
+    checkpointer: &Checkpointer,
+    pending: u64,
+    fallback: &mut Option<Checkpoint>,
+) -> Result<Option<RecoveryDecision>, ConnectorError> {
+    if !checkpointer.prepare_pending(pending)? {
+        return Ok(None);
+    }
+    if !checkpointer.replay_safe() {
+        return Ok(Some(RecoveryDecision::Reject {
+            pending,
+            reason: "an interrupted prepare has no commit decision; transactional \
+                     rollback was not durably confirmed",
+        }));
+    }
+    Ok(Some(RecoveryDecision::Discard {
+        pending,
+        fallback: fallback.take(),
+        reason: "an interrupted prepare did not enter commit",
+    }))
 }
 
 /// Record the discard of `pending`, delete it, and return the checkpoint to

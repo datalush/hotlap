@@ -6,10 +6,9 @@
 //! between the engine-side pump and the sink task, so a checkpoint can never be
 //! marked valid while output deltas are still queued in its channel.
 //!
-//! A failure in `prepare` aborts the sinks that already prepared, so no sink
-//! keeps a half-open transaction. A failure during `commit` aborts nothing: a
-//! participant may have confirmed, so the caller keeps the durable commit
-//! intent and the body for recovery to re-drive or discard and replay.
+//! A failure in `prepare` aborts every participant that might have staged data;
+//! the prepare marker stays unless each abort is confirmed. A failure during
+//! `commit` aborts nothing because a participant may already have confirmed.
 //!
 //! Non-transactional sinks adapt the protocol: `Idempotent` sinks are only
 //! flushed on commit (safe to replay after a crash), and `AtLeastOnce` sinks
@@ -29,6 +28,11 @@ use crate::runtime::sink::{SinkMessage, SinkSync};
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::SinkCapabilities;
 
+#[path = "sink_barrier/abort.rs"]
+mod abort;
+#[path = "sink_barrier/recovery.rs"]
+mod recovery;
+
 /// The sinks a checkpoint barrier coordinates.
 pub struct SinkBarrier {
     sinks: Vec<SinkSync>,
@@ -37,6 +41,11 @@ pub struct SinkBarrier {
 /// Indices of the transactional sinks that reached the prepared state.
 pub struct Prepared {
     indices: Vec<usize>,
+}
+
+pub(crate) struct PrepareFailure {
+    pub(crate) error: ConnectorError,
+    pub(crate) aborted: bool,
 }
 
 impl SinkBarrier {
@@ -77,11 +86,10 @@ impl SinkBarrier {
 
     /// Phase one: prepare every transactional sink.
     ///
-    /// A failure aborts the sinks that already prepared, so no sink keeps a
-    /// half-open transaction. A cancellation skips the best-effort abort, which
-    /// could itself park on the same stalled sink; the caller marks the attempt
-    /// inconsistent and blocks continuation until a restart resolves it.
-    pub(crate) async fn prepare(&self, cancel: &Cancel) -> Result<Prepared, ConnectorError> {
+    /// A failure aborts each sink whose `prepare` may have changed remote state,
+    /// including the participant that returned the error. Cancellation skips
+    /// abort because the operation may be parked; its durable marker remains.
+    pub(crate) async fn prepare(&self, cancel: &Cancel) -> Result<Prepared, PrepareFailure> {
         let mut indices = Vec::new();
         for (index, sync) in self.sinks.iter().enumerate() {
             let sink = sync.sink();
@@ -90,11 +98,24 @@ impl SinkBarrier {
             }
             match cancel.race(sink.prepare()).await {
                 Ok(Ok(())) => indices.push(index),
-                Ok(Err(error)) | Err(error) => {
-                    if !cancel.is_cancelled() {
-                        self.abort_indices(&indices).await;
-                    }
-                    return Err(error);
+                Ok(Err(error)) => {
+                    indices.push(index);
+                    return Err(match self.abort_indices(&indices).await {
+                        Ok(()) => PrepareFailure {
+                            error,
+                            aborted: true,
+                        },
+                        Err(error) => PrepareFailure {
+                            error,
+                            aborted: false,
+                        },
+                    });
+                }
+                Err(error) => {
+                    return Err(PrepareFailure {
+                        error,
+                        aborted: false,
+                    });
                 }
             }
         }
@@ -140,51 +161,9 @@ impl SinkBarrier {
         Ok(())
     }
 
-    /// Abort every prepared transactional sink.
-    pub(crate) async fn abort(&self, prepared: &Prepared) {
-        self.abort_indices(&prepared.indices).await;
-    }
-
-    /// Whether every coordinated sink declares its `commit` re-drivable.
-    ///
-    /// The barrier trusts each sink's
-    /// [`commit_redriable`](hotlap_connectors::sink::Sink::commit_redriable)
-    /// declaration. No capability is re-drivable by default: a sink opts in
-    /// explicitly only when it holds durable staged state or its re-driven
-    /// commit is a true no-op, and otherwise is discarded and replayed.
-    pub fn redriable(&self) -> bool {
-        self.sinks.iter().all(|sync| sync.sink().commit_redriable())
-    }
-
-    /// Whether every coordinated sink tolerates replay after an interrupted
-    /// commit.
-    ///
-    /// A transactional sink that cannot be re-driven must not be discarded and
-    /// replayed: its commit may already be visible, so replay would duplicate
-    /// it. Idempotent and at-least-once sinks declare their own replay contract
-    /// (deduplication or documented duplication).
-    pub fn replay_safe(&self) -> bool {
-        self.sinks
-            .iter()
-            .all(|sync| sync.sink().capabilities() != SinkCapabilities::Transactional)
-    }
-
-    /// Re-drive `commit` for every sink after an interrupted commit.
-    ///
-    /// Only valid when [`Self::redriable`] holds: `Sink::commit` must tolerate
-    /// running more than once, which the sink contract already requires.
-    pub async fn redrive_commit(&self) -> Result<(), ConnectorError> {
-        for sync in &self.sinks {
-            sync.sink().commit().await?;
-        }
-        Ok(())
-    }
-
-    /// Best-effort abort of the given sink indices.
-    async fn abort_indices(&self, indices: &[usize]) {
-        for &index in indices {
-            let _ = self.sinks[index].sink().abort().await;
-        }
+    /// Abort every prepared transactional sink, failing if rollback is unconfirmed.
+    pub(crate) async fn abort(&self, prepared: &Prepared) -> Result<(), ConnectorError> {
+        self.abort_indices(&prepared.indices).await
     }
 }
 

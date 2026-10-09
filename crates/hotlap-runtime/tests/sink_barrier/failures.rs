@@ -1,7 +1,7 @@
 //! Failure paths of the two-phase-commit barrier.
 //!
 //! A commit-phase failure keeps the marker and never rolls a sink back; a
-//! pre-commit failure aborts the prepared sinks after clearing the marker.
+//! pre-commit failure clears its marker only after confirmed rollback.
 
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +13,7 @@ use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 use crate::harness::{Event, FakeSink, MemBackend, engine, events, sources};
 
 #[tokio::test]
-async fn capture_storage_failure_preserves_commit_evidence() {
+async fn capture_storage_failure_aborts_before_clearing_prepare_evidence() {
     let log = events();
     let sink = SharedSink::new(Arc::new(FakeSink::new(
         SinkCapabilities::Transactional,
@@ -25,14 +25,12 @@ async fn capture_storage_failure_preserves_commit_evidence() {
 
     let result = checkpointer.take(&engine(), &sources()).await;
     assert!(result.is_err(), "a failing write must surface the error");
-    // The durable pre-prepare marker must be written before any sink control
-    // call, so a failed marker write cannot leave a sink prepared without evidence.
     assert_eq!(
         *log.lock().unwrap(),
-        Vec::<Event>::new(),
-        "a failed marker write must not enter prepare"
+        vec![Event::Prepare, Event::Abort],
+        "a capture fault must abort the prepared sink before clearing evidence"
     );
-    assert_eq!(backend.get(b"checkpoint/1/commit").unwrap(), None);
+    assert_eq!(backend.get(b"checkpoint/1/prepare").unwrap(), None);
     let reader = Checkpointer::new(Box::new(backend), 3);
     assert_eq!(
         reader.latest().unwrap(),
@@ -60,7 +58,11 @@ async fn prepare_failure_aborts_the_already_prepared_sinks() {
     let result = checkpointer.take(&engine(), &sources()).await;
     assert!(result.is_err());
     assert_eq!(*log.lock().unwrap(), vec![Event::Prepare, Event::Abort]);
-    assert_eq!(*second_log.lock().unwrap(), vec![Event::Prepare]);
+    assert_eq!(
+        *second_log.lock().unwrap(),
+        vec![Event::Prepare, Event::Abort],
+        "a failing prepare may have staged data and must be rolled back"
+    );
     let reader = Checkpointer::new(Box::new(backend), 3);
     assert_eq!(reader.latest().unwrap(), None);
 }

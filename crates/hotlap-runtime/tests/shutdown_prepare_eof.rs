@@ -31,6 +31,19 @@ struct PrepareStalls {
     entered: Signal,
 }
 
+impl PrepareStalls {
+    fn reopen(remote: Arc<Remote>) -> Arc<Self> {
+        let (written, _) = Signal::new();
+        let (entered, _) = Signal::new();
+        Arc::new(Self {
+            remote,
+            pending: Mutex::new(Vec::new()),
+            written,
+            entered,
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl Sink for PrepareStalls {
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
@@ -111,7 +124,7 @@ fn shutdown_does_not_commit_payload_staged_by_cancelled_prepare() {
         .recv_timeout(Duration::from_secs(10))
         .expect("prepare never staged the payload");
     assert_eq!(*remote.staged.lock().unwrap(), vec![7]);
-    assert_shutdown_keeps_prepare_unpublished(handle, reply_rx, remote, backend, sink);
+    assert_shutdown_keeps_prepare_unpublished(handle, reply_rx, remote, backend);
 }
 
 fn assert_shutdown_keeps_prepare_unpublished(
@@ -119,7 +132,6 @@ fn assert_shutdown_keeps_prepare_unpublished(
     reply_rx: std::sync::mpsc::Receiver<Result<u64, ConnectorError>>,
     remote: Arc<Remote>,
     backend: SharedBackend,
-    sink: Arc<PrepareStalls>,
 ) {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -141,7 +153,7 @@ fn assert_shutdown_keeps_prepare_unpublished(
         Vec::<i64>::new(),
         "EOF must not publish payload from a cancelled prepare"
     );
-    assert!(backend.get(b"checkpoint/1/commit").unwrap().is_some());
+    assert!(backend.get(b"checkpoint/1/prepare").unwrap().is_some());
     assert!(backend.get(b"checkpoint/1/engine").unwrap().is_none());
     assert!(backend.get(b"checkpoint/1/valid").unwrap().is_none());
     let sources = Sources::new(vec![InputSource {
@@ -152,7 +164,9 @@ fn assert_shutdown_keeps_prepare_unpublished(
     }])
     .unwrap();
     let checkpointer = hotlap_runtime::runtime::checkpoint::Checkpointer::new(Box::new(backend), 3)
-        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(sink))]);
+        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(
+            PrepareStalls::reopen(remote.clone()),
+        ))]);
     assert!(matches!(
         Recovery::inspect(&checkpointer, &sources).unwrap(),
         RecoveryDecision::Reject { pending: 1, .. }

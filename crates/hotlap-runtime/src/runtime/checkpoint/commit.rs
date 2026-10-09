@@ -4,8 +4,8 @@ use hotlap::Hotlap;
 
 use crate::runtime::checkpoint::{CheckpointState, Checkpointer};
 use crate::runtime::checkpoint_body::{
-    checkpoint_prefix, clear_commit, id_exhausted, mark_commit_intent, publish_valid, reserve,
-    state_err, write,
+    checkpoint_prefix, clear_commit, clear_prepare_intent, id_exhausted, mark_commit_intent,
+    mark_prepare_intent, publish_valid, reserve, state_err, write_body,
 };
 use crate::runtime::retention::prune;
 use crate::runtime::sink_barrier::Prepared;
@@ -16,12 +16,9 @@ impl Checkpointer {
     /// Capture `engine` and `sources` and persist a new valid checkpoint,
     /// coordinating the sinks in two-phase-commit order.
     ///
-    /// The order is advance id -> reserve id -> drain -> prepare -> snapshot +
-    /// write body + durable commit marker -> commit -> publish valid -> prune ->
-    /// clear marker. The engine and source offsets are never rolled back with
-    /// the sinks, so a failure after the sinks were prepared marks the state
-    /// inconsistent and blocks later attempts until a restart resolves it;
-    /// reservation and drain failures, which discard no write, stay retryable.
+    /// The order is reserve -> drain -> prepare marker -> prepare -> body ->
+    /// commit marker -> commit -> publish valid. Confirmed rollback clears the
+    /// prepare marker only after every abort succeeds.
     ///
     /// Returns the id of the checkpoint; later reads must use [`Self::read`].
     pub async fn take(
@@ -47,7 +44,7 @@ impl Checkpointer {
             }
             return Err(error);
         }
-        if let Err(error) = mark_commit_intent(self.backend.as_mut(), id) {
+        if let Err(error) = mark_prepare_intent(self.backend.as_mut(), id) {
             self.fail(
                 if matches!(error, ConnectorError::Storage(_)) {
                     CheckpointState::CommitUncertain
@@ -60,14 +57,30 @@ impl Checkpointer {
         }
         let prepared = match self.sinks.prepare(&self.cancel).await {
             Ok(prepared) => prepared,
-            Err(error) => {
-                self.fail(CheckpointState::Failed, &error);
-                return Err(error);
+            Err(failure) => {
+                if failure.aborted
+                    && let Err(error) = clear_prepare_intent(self.backend.as_mut(), id)
+                {
+                    let storage = ConnectorError::Storage(error);
+                    self.fail(CheckpointState::CommitUncertain, &storage);
+                    return Err(storage);
+                }
+                let state = if failure.aborted {
+                    CheckpointState::Failed
+                } else {
+                    CheckpointState::CommitUncertain
+                };
+                self.fail(state, &failure.error);
+                return Err(failure.error);
             }
         };
 
-        if let Err(error) = write(self.backend.as_mut(), id, engine, sources).await {
+        if let Err(error) = write_body(self.backend.as_mut(), id, engine, sources).await {
             return self.capture_failed(id, prepared, error).await;
+        }
+        if let Err(error) = mark_commit_intent(self.backend.as_mut(), id) {
+            self.fail(CheckpointState::CommitUncertain, &error);
+            return Err(error);
         }
 
         if let Err(error) = self.sinks.commit(&prepared, &self.cancel).await {
@@ -94,25 +107,20 @@ impl Checkpointer {
 
     /// Resolve a capture (`write`) failure.
     ///
-    /// A storage failure may have persisted part of the body or the marker, so
-    /// the commit is uncertain and the prepared sinks are kept. Any other
-    /// failure wrote no durable body: the marker is cleared and only then are
-    /// the prepared sinks aborted. If clearing fails, aborting is not safe (a
-    /// marker over rolled-back sinks could be promoted), so the sinks and the
-    /// evidence are kept and the storage error surfaces.
+    /// Body-capture errors happen before commit intent, so abort first; clear
+    /// the prepare marker only when every participant confirms rollback.
     async fn capture_failed(
         &mut self,
         id: u64,
         prepared: Prepared,
         error: ConnectorError,
     ) -> Result<u64, ConnectorError> {
-        if matches!(error, ConnectorError::Storage(_)) {
-            self.fail(CheckpointState::CommitUncertain, &error);
-            return Err(error);
+        if let Err(abort_error) = self.sinks.abort(&prepared).await {
+            self.fail(CheckpointState::CommitUncertain, &abort_error);
+            return Err(abort_error);
         }
-        match clear_commit(self.backend.as_mut(), id) {
+        match clear_prepare_intent(self.backend.as_mut(), id) {
             Ok(()) => {
-                self.sinks.abort(&prepared).await;
                 self.fail(CheckpointState::Failed, &error);
                 Err(error)
             }
@@ -153,7 +161,10 @@ impl Checkpointer {
     pub fn sweep_stale_commits(&mut self) -> Result<(), ConnectorError> {
         for id in self.ids_descending()? {
             let base = checkpoint_prefix(id);
-            if self.has_key(&format!("{base}/valid"))? && self.has_key(&format!("{base}/commit"))? {
+            if self.has_key(&format!("{base}/valid"))?
+                && (self.has_key(&format!("{base}/commit"))?
+                    || self.has_key(&format!("{base}/prepare"))?)
+            {
                 clear_commit(self.backend.as_mut(), id).map_err(state_err)?;
             }
         }

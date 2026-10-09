@@ -85,13 +85,11 @@ async fn a_precommit_capture_abort_is_failed() {
 }
 
 #[tokio::test]
-async fn a_clear_failure_keeps_the_sink_and_is_storage() {
-    // The poisoned engine wrote no body, so no marker exists; the failing delete
-    // still proves a clear error keeps the sink instead of aborting it.
+async fn a_clear_failure_after_confirmed_abort_keeps_evidence() {
     let backend = SharedBackend::default();
     let events = Arc::new(Mutex::new(Vec::new()));
     let faulty = FaultBackend::new(backend.clone());
-    faulty.fail("delete", b"checkpoint/1/commit", false);
+    faulty.fail("delete", b"checkpoint/1/prepare", false);
     let mut checkpointer =
         Checkpointer::new(Box::new(faulty), DEFAULT_RETAIN).with_sinks(vec![sink(&events, false)]);
 
@@ -102,10 +100,11 @@ async fn a_clear_failure_keeps_the_sink_and_is_storage() {
 
     assert!(matches!(error, ConnectorError::Storage(_)), "got {error:?}");
     assert_eq!(checkpointer.state(), CheckpointState::CommitUncertain);
+    assert!(backend.get(b"checkpoint/1/prepare").unwrap().is_some());
     assert_eq!(
         *events.lock().unwrap(),
-        vec![Event::Prepare],
-        "no abort may run when the marker could not be cleared"
+        vec![Event::Prepare, Event::Abort],
+        "a confirmed abort precedes the failed marker clear"
     );
     assert!(
         checkpointer

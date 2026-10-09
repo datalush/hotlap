@@ -25,7 +25,7 @@ use hotlap_engine::MetricsRegistry;
 use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
 use crate::runtime::sources::{InputStream, Sources};
 use hotlap_connectors::error::ConnectorError;
-use pending::{discard, pending_commit};
+use pending::{discard, pending_commit, prepare_decision};
 use sources::read_body;
 
 /// The last valid checkpoint, if the store holds one.
@@ -52,8 +52,11 @@ impl Recovery {
         checkpointer: &Checkpointer,
         sources: &Sources,
     ) -> Result<RecoveryDecision, ConnectorError> {
-        let fallback = Self::load(checkpointer, sources)?;
+        let mut fallback = Self::load(checkpointer, sources)?;
         if let Some(pending) = pending_commit(checkpointer, fallback.as_ref().map(|c| c.id))? {
+            if let Some(decision) = prepare_decision(checkpointer, pending, &mut fallback)? {
+                return Ok(decision);
+            }
             let reason = match read_body(checkpointer, pending)? {
                 Some(checkpoint) => {
                     sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;

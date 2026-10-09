@@ -65,7 +65,7 @@ pub(crate) async fn handle(
                 Ok(()) => take(checkpointer, hotlap, sources).await,
                 Err(error) => Err(error),
             };
-            if result.is_err() {
+            if result.is_err() && checkpointer.as_ref().is_some_and(inconsistent) {
                 close_clean.store(false, Ordering::SeqCst);
             }
             if result.is_err() && checkpointer.as_ref().is_some_and(inconsistent) {
@@ -104,8 +104,10 @@ pub(crate) async fn run_periodic(
     match active.take(hotlap, sources).await {
         Ok(_) => false,
         Err(error) => {
-            close_clean.store(false, Ordering::SeqCst);
             let inconsistent = inconsistent(active);
+            if inconsistent {
+                close_clean.store(false, Ordering::SeqCst);
+            }
             record_error(checkpoint_error, error);
             inconsistent
         }
