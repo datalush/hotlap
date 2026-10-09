@@ -17,11 +17,20 @@ use fault::FaultBackend;
 use recovery::{SharedBackend, rows};
 use support::{TrackingBackend, seed_pending, seed_valid, spy_sources, start};
 
+/// The pending body is a 4-record checkpoint; the fallback is a 3-record one.
+const PENDING_EVENTS: usize = 4;
+const PENDING_OFFSET: i64 = 4;
+const PENDING_ROWS: [&[i64]; 3] = [&[1, 2], &[2, 2], &[3, 1]];
+
+fn pending_rows() -> Vec<Vec<i64>> {
+    PENDING_ROWS.iter().map(|row| row.to_vec()).collect()
+}
+
 #[test]
 fn promotion_publication_failure_is_storage_without_discard() {
     let backend = SharedBackend::default();
     seed_valid(&backend);
-    seed_pending(&backend, 1, 2);
+    seed_pending(&backend, 1, 2, PENDING_EVENTS);
     let track = TrackingBackend::new(backend.clone());
     let faulty = FaultBackend::new(track.clone());
     faulty.fail("put", b"checkpoint/2/valid", false);
@@ -38,17 +47,23 @@ fn promotion_publication_failure_is_storage_without_discard() {
     assert!(backend.get(b"checkpoint/2/commit").unwrap().is_some());
     assert_eq!(backend.get(b"checkpoint/2/valid").unwrap(), None);
 
-    // A fresh restart over the recovered store promotes and resumes id 2.
+    // A fresh restart over the recovered store promotes and resumes id 2, which
+    // must restore the pending state, not the fallback.
     let (result, _) = start(Box::new(backend.clone()), &sources);
-    assert!(result.is_ok(), "the recovered store must start");
-    assert!(backend.get(b"checkpoint/2/valid").unwrap().is_some());
+    let (mut hotlap, _stream) = result.expect("the recovered store must start");
+    assert_eq!(
+        backend.get(b"checkpoint/2/valid").unwrap(),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(rows(&hotlap.snapshot("c").unwrap()), pending_rows());
+    assert_eq!(spy.offset(), Some(PENDING_OFFSET));
 }
 
 #[test]
 fn promotion_latest_failure_keeps_the_published_valid() {
     let backend = SharedBackend::default();
     seed_valid(&backend);
-    seed_pending(&backend, 1, 2);
+    seed_pending(&backend, 1, 2, PENDING_EVENTS);
     let track = TrackingBackend::new(backend.clone());
     let faulty = FaultBackend::new(track.clone());
     faulty.fail("put", b"checkpoint/latest", false);
@@ -63,10 +78,8 @@ fn promotion_latest_failure_keeps_the_published_valid() {
 
     let (result, _) = start(Box::new(backend.clone()), &sources);
     let (mut hotlap, _stream) = result.expect("a valid body must resume");
-    assert_eq!(
-        rows(&hotlap.snapshot("c").unwrap()),
-        vec![vec![1, 2], vec![2, 2]]
-    );
+    assert_eq!(rows(&hotlap.snapshot("c").unwrap()), pending_rows());
+    assert_eq!(spy.offset(), Some(PENDING_OFFSET));
 }
 
 #[test]
@@ -89,7 +102,7 @@ fn a_store_read_error_through_start_stops_before_sources() {
 fn a_store_list_error_through_start_deletes_nothing() {
     let backend = SharedBackend::default();
     seed_valid(&backend);
-    seed_pending(&backend, 1, 2);
+    seed_pending(&backend, 1, 2, PENDING_EVENTS);
     let track = TrackingBackend::new(backend.clone());
     let faulty = FaultBackend::new(track.clone());
     faulty.fail("list", b"checkpoint/", false);

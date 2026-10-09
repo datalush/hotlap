@@ -109,12 +109,33 @@ pub fn seed_valid(backend: &SharedBackend) -> u64 {
     take(&mut checkpointer, &engine, &pipe.sources)
 }
 
-/// Copy checkpoint `valid` under `pending` plus a commit marker, no `valid`.
-pub fn seed_pending(backend: &SharedBackend, valid: u64, pending: u64) {
+/// Write a pending body for `pending` with genuinely different engine state and
+/// applied offsets than `valid`, plus a commit marker and no `valid`.
+///
+/// The body comes from a real checkpoint over a fresh engine drained to `events`
+/// records, so a recovery that wrongly chose the `valid` fallback would restore a
+/// different snapshot and offset. `valid` must already exist.
+pub fn seed_pending(backend: &SharedBackend, valid: u64, pending: u64, events: usize) {
+    let scratch = SharedBackend::default();
+    let mut checkpointer = Checkpointer::new(Box::new(scratch.clone()), DEFAULT_RETAIN);
+    let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
+    let mut stream = pipe.sources.stream().unwrap();
+    drain(&mut engine, &pipe.sources, &mut stream, events);
+    take(&mut checkpointer, &engine, &pipe.sources);
+
     let mut writer = backend.clone();
+    let fallback = writer
+        .get(format!("checkpoint/{valid}/engine").as_bytes())
+        .unwrap()
+        .unwrap();
+    let pending_engine = scratch.get(b"checkpoint/1/engine").unwrap().unwrap();
+    assert_ne!(
+        pending_engine, fallback,
+        "the pending fixture must differ from the fallback body"
+    );
     for part in ["engine", "sources"] {
-        let value = writer
-            .get(format!("checkpoint/{valid}/{part}").as_bytes())
+        let value = scratch
+            .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()
             .unwrap();
         writer
