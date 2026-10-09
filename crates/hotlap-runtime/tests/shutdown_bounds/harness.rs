@@ -4,15 +4,27 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use hotlap_connectors::sink::Sink;
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError};
+use hotlap_runtime::runtime::checkpoint::CheckpointConfig;
 
 #[path = "../common/shutdown.rs"]
 mod common;
 pub use common::*;
+
+/// A checkpoint config backed by an in-memory store, with a long interval so no
+/// periodic checkpoint fires during a test.
+pub fn checkpoint() -> CheckpointConfig {
+    CheckpointConfig {
+        interval: Duration::from_secs(3600),
+        backend: Box::new(SharedBackend::default()),
+        retain: 3,
+    }
+}
 
 /// A sink that records how many change rows it wrote and when it committed.
 pub struct RecordingSink {

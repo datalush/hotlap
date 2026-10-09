@@ -8,7 +8,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -123,24 +122,6 @@ impl Source for SignalSource {
 pub fn keys_with(values: &[i64], last: Option<Signal>) -> Arc<dyn Source> {
     let batches = values.iter().copied().map(batch).collect();
     Arc::new(SignalSource { batches, last })
-}
-
-/// A checkpoint config backed by an in-memory store, with a long interval so
-/// no periodic checkpoint fires during a test.
-pub fn checkpoint() -> CheckpointConfig {
-    checkpoint_with(SharedBackend::default(), Duration::from_secs(3600))
-}
-
-/// A checkpoint config over `backend` firing every `interval`.
-///
-/// The backend is cloneable, so a test can keep a handle and inspect the durable
-/// evidence the engine retained.
-pub fn checkpoint_with(backend: SharedBackend, interval: Duration) -> CheckpointConfig {
-    CheckpointConfig {
-        interval,
-        backend: Box::new(backend),
-        retain: 3,
-    }
 }
 
 fn group_count() -> Plan {

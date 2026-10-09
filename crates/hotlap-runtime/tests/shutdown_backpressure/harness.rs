@@ -2,16 +2,28 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use futures::StreamExt;
 use hotlap_connectors::sink::Sink;
 use hotlap_connectors::source::Source;
 use hotlap_connectors::{ChangeStream, ConnectorError};
+use hotlap_runtime::runtime::checkpoint::CheckpointConfig;
 use hotlap_runtime::runtime::sink::CHANNEL_CAPACITY;
 
 #[path = "../common/shutdown.rs"]
 mod common;
 pub use common::*;
+
+/// A checkpoint config backed by an in-memory store, with a long interval so no
+/// periodic checkpoint fires during a test.
+pub fn checkpoint() -> CheckpointConfig {
+    CheckpointConfig {
+        interval: Duration::from_secs(3600),
+        backend: Box::new(SharedBackend::default()),
+        retain: 3,
+    }
+}
 
 /// A source of `CHANNEL_CAPACITY + 2` batches that fires `last` as the engine
 /// pulls the final one. It can only reach that batch after filling the channel,
