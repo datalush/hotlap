@@ -16,6 +16,8 @@ use std::io;
 
 mod durable;
 mod fsio;
+#[cfg(test)]
+mod fsio_tests;
 mod path;
 
 pub use durable::DurableStateBackend;

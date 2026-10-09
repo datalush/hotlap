@@ -83,7 +83,16 @@ Implementaciones:
   padre y de los ancestros recién creados (`state/fsio.rs`). Un fallo de
   escritura **nunca** expone un valor a medio escribir, y un crash no pierde uno
   ya confirmado.
+- La creación de directorios sincroniza cada directorio nuevo y el **primer
+  ancestro existente** que enlaza el subárbol, para que una entrada recién
+  creada sea durable. Un error de `fsync` se **propaga**; la operación no se
+  declara exitosa.
 - `open(root)` crea el directorio raíz (con `fsync` de directorios) si no existe.
+
+> Nota: los tests de orden de `fsync` y de propagación de fallos inyectan el
+> fallo sobre un árbol de directorios real (`state/fsio_tests.rs`); comprueban el
+> **orden de las escrituras durables**, no el comportamiento de un corte
+> eléctrico real.
 
 ## 4. `EngineCore::checkpoint` / `restore`
 
