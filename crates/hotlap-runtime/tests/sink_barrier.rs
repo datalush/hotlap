@@ -111,7 +111,7 @@ async fn idempotent_sink_is_flushed_but_not_prepared() {
 }
 
 #[tokio::test]
-async fn at_least_once_sink_is_not_coordinated() {
+async fn at_least_once_sink_is_flushed_before_valid() {
     let log = events();
     let sink = SharedSink::new(Arc::new(FakeSink::new(
         SinkCapabilities::AtLeastOnce,
@@ -122,9 +122,35 @@ async fn at_least_once_sink_is_not_coordinated() {
         Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
 
     checkpointer.take(&engine(), &sources()).await.unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![Event::Commit],
+        "at-least-once sinks must confirm their flush before the checkpoint is valid"
+    );
+}
+
+#[tokio::test]
+async fn at_least_once_flush_failure_keeps_no_valid_checkpoint() {
+    let log = events();
+    let sink = SharedSink::new(Arc::new(FakeSink::failing_commit(
+        SinkCapabilities::AtLeastOnce,
+        log.clone(),
+    )));
+    let backend = MemBackend::default();
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
+
+    let result = checkpointer.take(&engine(), &sources()).await;
     assert!(
-        log.lock().unwrap().is_empty(),
-        "at-least-once sinks are already visible and must not be coordinated"
+        result.is_err(),
+        "a failed delivery must not publish validity"
+    );
+    assert_eq!(*log.lock().unwrap(), vec![Event::Commit]);
+    let reader = Checkpointer::new(Box::new(backend), 3);
+    assert_eq!(
+        reader.latest().unwrap(),
+        None,
+        "an unconfirmed append must not certify the offsets"
     );
 }
 

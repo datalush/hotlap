@@ -12,8 +12,11 @@
 //! promote sinks that were rolled back.
 //!
 //! Non-transactional sinks adapt the protocol: `Idempotent` sinks are only
-//! flushed on commit (safe to replay after a crash), `AtLeastOnce` sinks are
-//! not coordinated at all (their writes are already visible).
+//! flushed on commit (safe to replay after a crash), and `AtLeastOnce` sinks
+//! must still confirm their flush before the checkpoint is published: appends
+//! may be visible but unacknowledged, so an unconfirmed delivery cannot certify
+//! the offsets. Neither can be rolled back, so both are flushed before the
+//! prepared transactional sinks commit.
 //!
 //! Each sink is a [`SharedSink`](crate::runtime::sink::SharedSink), whose mutex
 //! serializes these control calls against the concurrent `write` in the sink
@@ -101,25 +104,29 @@ impl SinkBarrier {
         Ok(Prepared { indices })
     }
 
-    /// Phase two: flush idempotent sinks first, then commit the prepared
-    /// transactional ones. At-least-once sinks are already visible and skipped.
+    /// Phase two: flush the sinks that cannot be rolled back first, then commit
+    /// the prepared transactional ones.
     ///
-    /// Flushing first means an idempotent failure cannot strand a checkpoint
-    /// whose transactional sinks already committed (which would replay and
-    /// duplicate). On failure the error carries the prepared sinks still to
-    /// abort: all of them when an idempotent flush fails, otherwise the failed
-    /// transactional sink and those after it. The caller aborts them after
-    /// clearing the durable commit intent, so no sink keeps a half-open
-    /// transaction and no rolled-back commit stays promotable.
+    /// `Idempotent` and `AtLeastOnce` sinks confirm delivery with `commit`;
+    /// neither can be rolled back, so flushing them first means their failure
+    /// cannot strand a checkpoint whose transactional sinks already committed
+    /// (which would replay and duplicate). On failure the error carries the
+    /// prepared sinks still to abort: all of them when a non-transactional
+    /// flush fails, otherwise the failed transactional sink and those after it.
+    /// The caller aborts them after clearing the durable commit intent, so no
+    /// sink keeps a half-open transaction and no rolled-back commit stays
+    /// promotable.
     pub(crate) async fn commit(
         &self,
         prepared: &Prepared,
     ) -> Result<(), (ConnectorError, Prepared)> {
         for sync in &self.sinks {
             let sink = sync.sink();
-            if sink.capabilities() == SinkCapabilities::Idempotent
-                && let Err(error) = sink.commit().await
-            {
+            let wait_for_delivery = matches!(
+                sink.capabilities(),
+                SinkCapabilities::Idempotent | SinkCapabilities::AtLeastOnce
+            );
+            if wait_for_delivery && let Err(error) = sink.commit().await {
                 return Err((error, Prepared::all(prepared)));
             }
         }
@@ -141,10 +148,9 @@ impl SinkBarrier {
     ///
     /// The barrier trusts each sink's
     /// [`commit_redriable`](hotlap_connectors::sink::Sink::commit_redriable)
-    /// declaration: `Idempotent` sinks qualify by default, but any sink may opt
-    /// in or out when its effects are not repeatable, and an `AtLeastOnce` sink
-    /// must be discarded and replayed. A `Transactional` sink is not re-drivable
-    /// unless it opts in explicitly.
+    /// declaration. No capability is re-drivable by default: a sink opts in
+    /// explicitly only when it holds durable staged state or its re-driven
+    /// commit is a true no-op, and otherwise is discarded and replayed.
     pub fn redriable(&self) -> bool {
         self.sinks.iter().all(|sync| sync.sink().commit_redriable())
     }
