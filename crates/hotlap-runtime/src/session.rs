@@ -97,6 +97,10 @@ pub struct SqlSession {
     retention: Option<usize>,
     /// Periodic checkpoint settings, moved into the engine at `START`.
     checkpoint: Option<CheckpointConfig>,
+    /// Set when a durable `START` consumed its checkpoint and failed; the
+    /// session must be rebuilt with a fresh config rather than retried without
+    /// durability.
+    durable_failed: bool,
 }
 
 impl SqlSession {
@@ -128,6 +132,7 @@ impl SqlSession {
             frozen: None,
             retention: None,
             checkpoint: None,
+            durable_failed: false,
         }
     }
 

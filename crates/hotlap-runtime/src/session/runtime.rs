@@ -23,11 +23,19 @@ impl SqlSession {
         if self.started {
             return Err(SqlError::Unsupported("session already started".into()));
         }
+        if self.durable_failed {
+            return Err(SqlError::Unsupported(
+                "start failed after consuming its checkpoint; reopen a new session".into(),
+            ));
+        }
         let bindings = self.source_bindings()?;
         if bindings.is_empty() {
             return Err(SqlError::Catalog("START before CREATE SOURCE".into()));
         }
         let pipeline = self.build_pipeline(&bindings).await?;
+        // `build_pipeline` has moved the checkpoint config into the pipeline:
+        // from here on a failure must not be retried without it.
+        self.durable_failed = pipeline.checkpoint.is_some();
         let engine = tokio::task::spawn_blocking(move || EngineHandle::start(pipeline))
             .await
             .map_err(to_engine)?
@@ -35,6 +43,8 @@ impl SqlSession {
         self.register_mv_providers(&engine)?;
         self.engine = Some(engine);
         self.started = true;
+        // A fully started session never consults the latch again.
+        self.durable_failed = false;
         // Freeze only once `START` has succeeded, so a failed startup never
         // leaves stale bindings that would hide a source declared afterwards.
         self.frozen = Some(bindings);
