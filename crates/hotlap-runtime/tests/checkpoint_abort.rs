@@ -1,105 +1,94 @@
-//! A failed checkpoint commit must clear the durable marker before it aborts
-//! the sinks, so recovery can never promote a rolled-back checkpoint.
+//! Ordering between the durable commit marker and a sink abort.
+//!
+//! A commit-phase failure keeps the marker and never rolls a sink back, because
+//! a participant may already have confirmed. A capture failure that wrote no
+//! durable body only aborts after the marker is durably cleared; when clearing
+//! fails the sinks are kept and the failure surfaces as storage.
 
 #[path = "common/backend.rs"]
 mod backend;
+#[path = "common/fault.rs"]
+mod fault;
+#[path = "checkpoint_abort/harness.rs"]
+mod harness;
 
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::{Field, Schema, SchemaRef};
-use hotlap::InputId;
 use hotlap::state::StateBackend;
 use hotlap_connectors::ConnectorError;
-use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
-use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
-use hotlap_engine::EngineCore;
-use hotlap_runtime::runtime::checkpoint::Checkpointer;
-use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
-use hotlap_runtime::runtime::sources::{InputSource, Sources};
+use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
 
 use backend::SharedBackend;
+use fault::FaultBackend;
+use harness::{Event, healthy_engine, poisoned_engine, sink, sources};
 
-/// Records whether the commit marker was still present when `abort` ran.
-struct AbortProbe {
-    backend: SharedBackend,
-    id: u64,
-    marker_at_abort: Arc<Mutex<bool>>,
-}
+#[tokio::test]
+async fn a_commit_failure_preserves_the_marker_and_does_not_abort() {
+    let backend = SharedBackend::default();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+        .with_sinks(vec![sink(&events, true)]);
 
-#[async_trait::async_trait]
-impl Sink for AbortProbe {
-    async fn write(&self, _changes: ChangeStream) -> Result<(), ConnectorError> {
-        Ok(())
-    }
-    fn capabilities(&self) -> SinkCapabilities {
-        SinkCapabilities::Transactional
-    }
-    async fn commit(&self) -> Result<(), ConnectorError> {
-        Err(ConnectorError::Infrastructure("commit failed".into()))
-    }
-    async fn abort(&self) -> Result<(), ConnectorError> {
-        let marker = self
-            .backend
-            .get(format!("checkpoint/{}/commit", self.id).as_bytes())
-            .unwrap()
-            .is_some();
-        *self.marker_at_abort.lock().unwrap() = marker;
-        Ok(())
-    }
-}
-
-/// A source with no splits, enough for the barrier.
-struct EmptySource;
-
-impl Source for EmptySource {
-    fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(Vec::<Field>::new()))
-    }
-    fn splits(&self) -> Result<Vec<Split>, ConnectorError> {
-        Ok(Vec::new())
-    }
-    fn read(&self, _split: &Split) -> Result<SourceStream, ConnectorError> {
-        Ok(Box::pin(futures::stream::empty()))
-    }
-    fn state(&self) -> SourceState {
-        SourceState::default()
-    }
-    fn event_time_column(&self) -> Option<usize> {
-        None
-    }
-}
-
-/// A single empty source set, enough for the barrier.
-fn sources() -> Sources {
-    Sources::new(vec![InputSource {
-        id: InputId(0),
-        name: "in".into(),
-        source: Arc::new(EmptySource),
-        watermark: None,
-    }])
-    .unwrap()
+    let result = checkpointer.take(&healthy_engine(), &sources()).await;
+    assert!(result.is_err(), "the failed commit must surface");
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![Event::Prepare, Event::Commit],
+        "a sink whose commit may have confirmed must not be rolled back"
+    );
+    assert!(
+        backend.get(b"checkpoint/1/commit").unwrap().is_some(),
+        "the commit marker must survive for recovery"
+    );
+    assert_eq!(backend.get(b"checkpoint/1/valid").unwrap(), None);
 }
 
 #[tokio::test]
-async fn a_failed_commit_clears_the_marker_before_aborting() {
+async fn a_prepared_capture_failure_clears_before_a_safe_abort() {
     let backend = SharedBackend::default();
-    let marker_at_abort = Arc::new(Mutex::new(true));
-    let probe = Arc::new(AbortProbe {
-        backend: backend.clone(),
-        id: 1,
-        marker_at_abort: Arc::clone(&marker_at_abort),
-    });
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3)
-        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(probe))]);
-    let engine = hotlap::Hotlap::open_with(Box::new(EngineCore::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+        .with_sinks(vec![sink(&events, false)]);
 
-    let result = checkpointer.take(&engine, &sources()).await;
-
-    assert!(result.is_err(), "the failed commit must surface the error");
-    assert!(
-        !*marker_at_abort.lock().unwrap(),
-        "the marker must already be gone when the sink is aborted"
+    let result = checkpointer.take(&poisoned_engine(), &sources()).await;
+    assert!(result.is_err(), "a poisoned engine must fail the capture");
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![Event::Prepare, Event::Abort],
+        "the marker was cleared, so the prepared sink is safely aborted"
     );
     assert_eq!(backend.get(b"checkpoint/1/commit").unwrap(), None);
-    assert_eq!(backend.get(b"checkpoint/1/valid").unwrap(), None);
+    assert!(
+        checkpointer
+            .take(&healthy_engine(), &sources())
+            .await
+            .is_err(),
+        "a failed attempt must block later attempts on the same runtime"
+    );
+}
+
+#[tokio::test]
+async fn a_marker_clear_failure_is_storage_and_keeps_the_prepared_sink() {
+    let backend = SharedBackend::default();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let faulty = FaultBackend::new(backend.clone());
+    faulty.fail("delete", b"checkpoint/1/commit", false);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(faulty), DEFAULT_RETAIN).with_sinks(vec![sink(&events, false)]);
+
+    let result = checkpointer.take(&poisoned_engine(), &sources()).await;
+    let error = result.expect_err("a failed clear must surface");
+    assert!(matches!(error, ConnectorError::Storage(_)), "got {error:?}");
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![Event::Prepare],
+        "no abort may run when the marker could not be cleared"
+    );
+    assert!(
+        checkpointer
+            .take(&healthy_engine(), &sources())
+            .await
+            .is_err(),
+        "the ambiguous clear must block later attempts"
+    );
 }
