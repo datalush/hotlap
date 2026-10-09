@@ -94,6 +94,11 @@ pub trait Sink: Send + Sync {
 - `write` consume el stream hasta que termina (cierre del canal) y vuelve.
 - `commit` = confirmar lo escrito desde el último commit.
 - `abort` = descartar lo escrito desde el último commit.
+- `accepts_retractions` = si el sink aplica diffs negativos; por defecto `false`
+  (append-only). El runtime rechaza un plan retractor antes de escribir.
+- `commit_redriable` = si un commit interrumpido puede re-conducirse tras un
+  reinicio; por defecto `false`. Una cola volátil en memoria no habilita el
+  re-drive aunque el replay sea idempotente.
 
 El task del runtime dirige el ciclo de vida completo: `write` hasta el cierre del
 canal y, al terminar, `commit` (que entrega lo fire-and-forget del sink Fluss) o
@@ -110,11 +115,15 @@ exactly-once), pero el runtime ya invoca el contrato, no solo el test live.
 - `write`: por cada `ChangeBatch`, convierte filas del kernel → `RecordBatch`
   Arrow con el **schema de la MV** (`sink_convert::rows_to_batch`) y llama
   `append_arrow_batch`. Los batches sin filas se saltan.
-- **Rechazo de retracciones:** `retraction_check` exige `diff >= 0`; cualquier
+- **Rechazo de retracciones:** `accepts_retractions()` es `false`, así que el
+  runtime rechaza antes de arrancar/escribir un plan que pueda retractar; además
+  `retraction_check` exige `diff >= 0` en cada lote (defensa residual): cualquier
   `diff < 0` devuelve `ConnectorError::Unsupported` (una tabla log append-only no
   borra). Se invoca dentro de `rows_to_batch`, por lo que `write` lo aplica.
 - `commit` → `writer.flush().await`; los errores de `append` diferidos (fire and
-  forget) afloran aquí.
+  forget) afloran aquí. Fluss **no** declara el commit re-conducible: su writer
+  encola en memoria y una instancia nueva tras un crash no puede entregar lo
+  perdido, así que recovery replaya en vez de promover.
 - `abort` → `Ok(())`: el append no tiene transacción; lo ya encolado es visible.
 
 Conversión de tipos (`sink_convert.rs`): `diff` es la **multiplicidad** (cada
@@ -165,9 +174,11 @@ START;
 ## 9. No-goals
 
 - `upsert`/`delete` sobre tablas con PK — v1 solo **append**.
-- **2PC real / exactly-once**: `commit`/`abort` son forma nominal (SP4).
-- **N sinks / fan-out**: v1 un sink por vista; un segundo `CREATE SINK` sobre la
-  misma vista se **rechaza** con `SqlError::Unsupported` (ver §10).
+- **2PC real / exactly-once**: `commit`/`abort` son forma nominal.
+- **N sinks / fan-out**: v1 un sink por vista; un segundo sink sobre la misma
+  vista se **rechaza** con `SqlError::Unsupported` en `CREATE SINK` y, en la
+  frontera pública, `Pipeline::validate` lo rechaza antes de abrir writers,
+  streams o taps (ver §10).
 - `CREATE SINK` tras `START`.
 - Persistencia de estado / recuperación desde checkpoint.
 - **Proyección explícita**: solo `AS SELECT * FROM <mv>`; cualquier otra
@@ -178,11 +189,16 @@ START;
 - **`commit` cableado al cierre del stream.** El task del sink llama a `commit`
   al aceptar el changelog (o a `abort` si `write` falló), de modo que el `flush`
   de Fluss ya no depende solo del cierre del writer. Falta el **commit
-  periódico** por ciclo y la semántica 2PC real (SP4).
+  periódico** por ciclo y la semántica 2PC real.
 - **Un sink por vista.** `take_changes` **drena** el buffer, así que dos sinks
   sobre la misma vista se pisarían; el segundo `CREATE SINK` sobre una vista ya
-  suscrita se **rechaza** en la capa SQL (`SqlError::Unsupported`). Sinks sobre
-  vistas **distintas** funcionan; el fan-out no es un objetivo v1.
+  suscrita se **rechaza** en la capa SQL (`SqlError::Unsupported`) y
+  `Pipeline::validate` lo rechaza antes de abrir writers, streams o taps. Sinks
+  sobre vistas **distintas** funcionan; el fan-out no es un objetivo v1.
+- **Capacidad de retracción negociada.** `Sink::accepts_retractions` por defecto
+  `false`; un plan que pueda retractar (agregado por clave o ventana tumbling)
+  se **rechaza** antes de arrancar/escribir en `Pipeline::validate` y en
+  `SqlSession::start`. No se añaden deletes/upserts nuevos.
 - **`SinkPump::close` con timeout.** El join de cada task está acotado a 5 s;
   superarlo reporta un error de infraestructura en vez de colgar `shutdown`.
 - **Parkeado (LOW) — sin drenado final antes de `close`.** `close` no hace un

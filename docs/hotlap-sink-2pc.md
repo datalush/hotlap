@@ -1,7 +1,7 @@
 # Hotlap — 2PC de sinks y capacidades
 
 - Fecha: 2026-10-09
-- Estado: implementado (SP4; commit recuperable en SP8), tests verdes
+- Estado: implementado, tests verdes
 - Alcance: coordinación 2PC de sinks con capacidades y ventana de commit
   recuperable.
 - Complementa `docs/hotlap-durability.md` (backend, snapshot, checkpointer) y
@@ -27,14 +27,20 @@ y la forma 2PC: `prepare()` (por defecto no-op), `commit()`, `abort()`.
 `capabilities()` por defecto es `AtLeastOnce`.
 
 El sink también **declara** si su `commit` es **re-conducible** tras un
-reinicio (`commit_redriable()`, por defecto sólo `Idempotent`): un sink
-`Transactional` debe **sobreescribirlo** para optar explícitamente, porque sus
-escrituras preparadas pueden no haber sobrevivido al crash y promover un commit
-sin confirmar perdería datos en silencio. Un sink puede sobreescribir la
-declaración cuando la capacidad subestima o sobreestima la garantía real (p.ej.
-un sink aparentemente idempotente cuyos efectos externos no son repetibles).
-Recovery usa esta declaración para **promover** o **descartar** la ventana de
-crash (ver `docs/hotlap-recovery.md`).
+reinicio (`commit_redriable()`, por defecto `false`). La idempotencia de replay
+**no** implica que un commit interrumpido pueda completarse: un sink que sólo
+encola escrituras en memoria (como Fluss) pierde la cola al morir el proceso, de
+modo que una instancia nueva no puede entregar lo que aceptó la anterior. Un
+sink **sobreescribe** la declaración a `true` sólo cuando mantiene estado
+preparado durable o su commit re-conducido es realmente un no-op, y su `commit`
+tolera ejecutarse más de una vez. Recovery usa esta declaración para **promover**
+o **descartar** la ventana de crash (ver `docs/hotlap-recovery.md`).
+
+El sink también **negocia retracciones**: `accepts_retractions()` por defecto es
+`false` (append-only). El runtime **rechaza antes de arrancar/escribir** un plan
+que pueda retractar (agregado por clave o ventana tumbling) si el sink no
+declara soporte; sólo un sink que de verdad aplica diffs negativos debe
+sobreescribirlo a `true`.
 
 ## 2. `SinkBarrier`
 
@@ -44,13 +50,15 @@ crash (ver `docs/hotlap-recovery.md`).
   cualquier fallo previo a completar el commit, `abort` de los sinks preparados.
 - **`Idempotent`**: no hay `prepare`; solo se hace `commit` (flush) en la fase
   dos. Reenviar tras un crash es seguro.
-- **`AtLeastOnce`**: no se coordina; sus escrituras ya son visibles.
+- **`AtLeastOnce`**: no hay `prepare`, pero su `commit` (flush/ACK) se espera
+  **antes** de publicar `valid`: un append puede ser visible pero no confirmado,
+  y una entrega pendiente o un flush fallido no puede certificar los offsets.
 
-`SinkBarrier::around(capture)` ejecuta el orden **drain → prepare → capture →
-commit**. Si `capture` (snapshot + escritura del cuerpo) falla, o un `commit` /
-flush de la fase de confirmación falla, se **abortan todos los sinks preparados
-que aún no se hayan confirmado** (incluido el que falló), y el error se propaga:
-ningún checkpoint puede llegar a ser válido.
+`SinkBarrier` ejecuta el orden **drain → prepare → capture → commit**. Si
+`capture` (snapshot + escritura del cuerpo) falla, o un `commit` / flush de la
+fase de confirmación falla, se **abortan todos los sinks preparados que aún no
+se hayan confirmado** (incluido el que falló), y el error se propaga: ningún
+checkpoint puede llegar a ser válido.
 
 ## 3. Protocolo de commit recuperable
 
@@ -75,14 +83,15 @@ retain**:
 **Contrato del sink.** `Sink::commit` **debe tolerar ejecutarse más de una
 vez**: la barrera puede confirmar el mismo sink más de una vez y recovery
 re-conduce el commit tras un reinicio. Un sink que no pueda repetir su commit
-debe declarar `commit_redriable() == false` (p.ej. `AtLeastOnce` y
-`Transactional` lo hacen por defecto); recovery entonces descarta C y replaya.
+**o** que sólo mantenga estado volátil en memoria debe dejar
+`commit_redriable() == false` (el valor por defecto, para cualquier capacidad);
+recovery entonces descarta C y replaya.
 
 **Garantías por capacidad.**
 
 | Capacidad | Antes (replay a ciegas) | Con el marker |
 | --- | --- | --- |
-| `Idempotent` | replay (dedup por clave) → effectively-once | promover C sin replay → effectively-once |
+| `Idempotent` | replay (dedup por clave) → effectively-once | replay → effectively-once (no re-conduce salvo opt-in) |
 | `Transactional` | replay → **duplicado** | re-conducir commit + promover → exactly-once\* (requiere opt-in) |
 | `AtLeastOnce` | replay → at-least-once | replay + **señal explícita** → at-least-once |
 
@@ -101,10 +110,10 @@ Detalles de corrección (`SharedSink`, `runtime/shared_sink.rs`):
   sink) contra `prepare`/`commit`/`abort` (barrera). Así `prepare` **nunca**
   observa un `write` en vuelo. La tarea escribe un batch por llamada, de modo que
   el control entre batches no queda bloqueado detrás de un stream vivo.
-- En la fase de commit se **flushean antes los idempotentes** y luego se
-  confirman los transaccionales preparados. Si un idempotente fallara después de
-  que un transaccional ya confirmó, el replay duplicaría; flush primero evita esa
-  ventana.
+- En la fase de commit se **flushean antes los sinks no reversibles**
+  (`Idempotent` y `AtLeastOnce`) y luego se confirman los transaccionales
+  preparados. Si un no reversible fallara después de que un transaccional ya
+  confirmó, el replay duplicaría; flush primero evita esa ventana.
 - Un sink transaccional puede ser confirmado por la barrera **y** al cerrar el
   canal; `Sink::commit` debe tolerar ejecutarse **más de una vez**.
 
@@ -112,12 +121,15 @@ Detalles de corrección (`SharedSink`, `runtime/shared_sink.rs`):
 
 `fluss/sink.rs`: `FlussSink` elige el writer según la tabla. Tabla con **primary
 key** → upsert → `Idempotent`; tabla **log** → append → `AtLeastOnce`. En ambos
-modos se **rechazan retracciones** (`diff < 0`). Fluss **no tiene transacción de
-sink**: `commit` es el `flush` esperado y `abort` es un no-op intencional (los
-appends ya son visibles y los upserts son idempotentes). Por tanto, **con Fluss
-el techo es effectively-once (PK) o at-least-once (append)**; exactly-once real
-requeriría un sink `Transactional` (hoy ninguno) y 2PC en el almacén.
+modos se **rechazan retracciones** (`diff < 0`): `accepts_retractions()` es
+`false`, así que un plan retractor se rechaza antes de escribir. Fluss **no tiene
+transacción de sink**: `commit` es el `flush` esperado y `abort` es un no-op
+intencional (los appends ya son visibles y los upserts son idempotentes). Como su
+writer sólo encola en memoria, Fluss **no** declara su commit re-conducible: un
+reinicio replaya en vez de re-conducir. Por tanto, **con Fluss el techo es
+effectively-once (PK) o at-least-once (append)**; exactly-once real requeriría un
+sink `Transactional` (hoy ninguno) y 2PC en el almacén.
 
-**Sin 2PC nuevo.** Este slice (joins cross-source) **no** añade una transacción
-distribuida ni 2PC nueva: conserva el protocolo SP8 de marker durable, commit del
-sink y publicación de `valid`/`latest`, con las mismas garantías por capacidad.
+**Sin 2PC nuevo.** Estas correcciones **no** añaden una transacción distribuida ni
+2PC nueva: conservan el protocolo de marker durable, commit del sink y
+publicación de `valid`/`latest`, con las mismas garantías por capacidad.
