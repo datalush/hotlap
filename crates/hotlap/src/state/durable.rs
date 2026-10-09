@@ -114,12 +114,10 @@ impl StateBackend for DurableStateBackend {
     fn delete(&mut self, key: &[u8]) -> Result<(), StateError> {
         validate_key(key)?;
         let file = self.path_for(key);
-        match remove_file_pruning(&RealFs, &file, &self.root) {
-            Ok(()) => Ok(()),
-            // Already gone (or never stored), which keeps deletion idempotent.
-            Err(e) if is_absent(e.kind()) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        // A not-found result means the file was already absent; every other
+        // failure, including one surfaced after the file was removed, propagates.
+        remove_file_pruning(&RealFs, &file, &self.root)?;
+        Ok(())
     }
 }
 

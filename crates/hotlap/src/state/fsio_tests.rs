@@ -121,17 +121,26 @@ fn delete_syncs_non_empty_parent() {
 }
 
 #[test]
-fn delete_prunes_empty_dirs_and_syncs_root() {
+fn delete_syncs_each_pruned_parent_in_order() {
     let scratch = Scratch::new("delete-prune");
-    let dir = scratch.path().join("a").join("b");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("k"), b"v").unwrap();
+    let inner = scratch.path().join("a").join("b");
+    fs::create_dir_all(&inner).unwrap();
+    fs::write(inner.join("k"), b"v").unwrap();
     let ops = RecordingFs::default();
 
-    remove_file_pruning(&ops, &dir.join("k"), scratch.path()).unwrap();
+    remove_file_pruning(&ops, &inner.join("k"), scratch.path()).unwrap();
 
-    assert!(!dir.exists());
-    assert_eq!(&*ops.synced.borrow(), &[scratch.path().to_path_buf()]);
+    assert!(!inner.exists());
+    // Each modified directory is synced after its child left it, before its own
+    // removal, then its parent follows.
+    assert_eq!(
+        &*ops.synced.borrow(),
+        &[
+            scratch.path().join("a").join("b"),
+            scratch.path().join("a"),
+            scratch.path().to_path_buf(),
+        ]
+    );
 }
 
 #[test]

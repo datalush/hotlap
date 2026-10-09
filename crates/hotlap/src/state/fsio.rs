@@ -89,31 +89,36 @@ pub(super) fn create_dirs_synced_with(ops: &impl FsOps, dir: &Path) -> io::Resul
     Ok(())
 }
 
-/// Remove `file` and any emptied ancestor directories, syncing every parent
-/// directory whose entries changed so the deletion is durable. The walk stops at
-/// `root`, which is never pruned.
-pub(super) fn remove_file_pruning(ops: &impl FsOps, file: &Path, root: &Path) -> io::Result<()> {
-    ops.remove_file(file)?;
+/// Remove `file` and any emptied ancestor directories.
+///
+/// Returns `Ok(false)` only when `file` was already absent, so a caller can keep
+/// deletion idempotent without mistaking a later error for absence. Every
+/// directory that lost an entry is synced right after the entry is gone and
+/// before that directory is itself removed; a directory that is removed leaves
+/// its own parent modified, so the walk syncs it on the next step. The walk stops
+/// at `root`, which is never pruned but is synced when it loses an entry.
+pub(super) fn remove_file_pruning(ops: &impl FsOps, file: &Path, root: &Path) -> io::Result<bool> {
+    match ops.remove_file(file) {
+        Ok(()) => {}
+        Err(e) if is_absent(e.kind()) => return Ok(false),
+        Err(e) => return Err(e),
+    }
     let mut modified = file.parent();
     while let Some(path) = modified {
+        // The file or a removed child directory just left `path`.
+        ops.sync_dir(path)?;
         if path == root {
-            // The root lost an entry but is never pruned; sync it and stop.
-            ops.sync_dir(path)?;
             break;
         }
         match ops.remove_dir(path) {
             Ok(()) => modified = path.parent(),
-            // A non-empty dir keeps its ancestors non-empty too; it lost only the
-            // removed file, so sync it to make that removal durable.
-            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {
-                ops.sync_dir(path)?;
-                break;
-            }
-            Err(e) if is_absent(e.kind()) => break,
+            // A non-empty dir keeps its ancestors non-empty too.
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => break,
+            // Absence after a delete (or any other failure) is not idempotency.
             Err(e) => return Err(e),
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Missing ancestors of `dir`, deepest first, plus the first existing ancestor

@@ -35,6 +35,20 @@ fn empty_and_invalid_keys_are_rejected() {
 }
 
 #[test]
+fn durable_delete_of_an_absent_key_is_ok() {
+    let dir = TempDir::new("absent-delete");
+    let mut be = DurableStateBackend::open(dir.path()).unwrap();
+
+    // Idempotent: a key that was never stored (or already removed) is not an
+    // error, so retention can retry safely.
+    be.delete(b"checkpoint/9/state").unwrap();
+    be.put(b"checkpoint/1/state", b"v".to_vec()).unwrap();
+    be.delete(b"checkpoint/1/state").unwrap();
+    be.delete(b"checkpoint/1/state").unwrap();
+    assert!(be.list(b"checkpoint/").unwrap().is_empty());
+}
+
+#[test]
 fn durable_io_errors_are_returned_not_panicked() {
     let dir = TempDir::new("ioerr");
     let mut be = DurableStateBackend::open(dir.path()).unwrap();

@@ -86,9 +86,13 @@ Implementaciones:
 - La creación de directorios sincroniza cada directorio nuevo y el **primer
   ancestro existente** que enlaza el subárbol, para que una entrada recién
   creada sea durable. Con una raíz relativa sin componente existente, ese
-  ancestro es el directorio actual (`.`). `delete` sincroniza el **padre
-  modificado** al borrar archivos y al podar directorios vacíos. Un error de
-  `fsync` se **propaga**; la operación no se declara exitosa.
+  ancestro es el directorio actual (`.`).
+- `delete` sincroniza **cada** directorio que pierde una entrada justo después
+  del borrado y **antes** de podarlo; si el directorio se poda, su padre queda
+  modificado y se sincroniza en el paso siguiente (incluido `root`, que nunca se
+  poda). La ausencia se clasifica **sólo** a partir del borrado del fichero: un
+  error posterior, aunque sea de tipo `NotFound`/`NotADirectory`, se **propaga**;
+  la operación no se declara exitosa.
 - `open(root)` crea el directorio raíz (con `fsync` de directorios) si no existe.
 
 > Nota: los tests de orden de `fsync` y de propagación de fallos inyectan el
