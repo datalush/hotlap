@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use hotlap_core::{AggSpec, Plan, ZSetBatch};
+use hotlap_core::{AggSpec, CmpOp, EngineSnapshot, Plan, Predicate, Scalar, ZSetBatch};
 use hotlap_engine::EngineCore;
 
 use super::*;
@@ -117,4 +117,65 @@ fn declare_watermark_facade_validates() {
     // Declaring after the first push is rejected: the schema is frozen.
     h.push("in", &zset(&[Vec::new(), Vec::new()], &[])).unwrap();
     assert!(h.declare_watermark("in", 0, 0).is_err());
+}
+
+/// A filter plan selecting the rows whose first column equals `value`.
+fn filter(value: i64) -> Plan {
+    Plan::Filter {
+        input: Box::new(Plan::Source(InputId(0))),
+        pred: Predicate::Cmp {
+            op: CmpOp::Eq,
+            col: 0,
+            scalar: Scalar::I64(value),
+        },
+    }
+}
+
+/// Capture a two-view snapshot whose views hold distinguishable output.
+fn two_view_snapshot() -> EngineSnapshot {
+    let mut h = open();
+    h.register_input("in").unwrap();
+    h.create_view("a", filter(1)).unwrap();
+    h.create_view("b", filter(2)).unwrap();
+    h.push("in", &zset(&[vec![1, 2], vec![10, 20]], &[1, 1]))
+        .unwrap();
+    h.checkpoint().unwrap()
+}
+
+#[test]
+fn restore_rejects_a_reordered_view_declaration() {
+    let snapshot = two_view_snapshot();
+    let mut h = open();
+    h.register_input("in").unwrap();
+    h.create_view("b", filter(2)).unwrap();
+    h.create_view("a", filter(1)).unwrap();
+    assert!(
+        h.restore(&snapshot).is_err(),
+        "two same-schema views declared in reverse must not rebind silently"
+    );
+}
+
+#[test]
+fn restore_rejects_a_changed_view_plan() {
+    let snapshot = two_view_snapshot();
+    let mut h = open();
+    h.register_input("in").unwrap();
+    h.create_view("a", filter(7)).unwrap();
+    h.create_view("b", filter(2)).unwrap();
+    assert!(
+        h.restore(&snapshot).is_err(),
+        "the same name with a changed plan must not bind the saved state"
+    );
+}
+
+#[test]
+fn restore_binds_each_name_to_its_own_plan() {
+    let snapshot = two_view_snapshot();
+    let mut h = open();
+    h.register_input("in").unwrap();
+    h.create_view("a", filter(1)).unwrap();
+    h.create_view("b", filter(2)).unwrap();
+    h.restore(&snapshot).unwrap();
+    assert_eq!(rows(&h.snapshot("a").unwrap()), vec![vec![1, 10]]);
+    assert_eq!(rows(&h.snapshot("b").unwrap()), vec![vec![2, 20]]);
 }

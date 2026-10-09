@@ -95,7 +95,8 @@ impl Hotlap {
             .build_view(id, &plan)
             .map_err(|e| HotlapError(format!("{e}")))?;
         self.next_view += 1;
-        self.views.insert(name.to_string(), id);
+        self.views
+            .insert(name.to_string(), super::ViewSlot { id, plan });
         Ok(())
     }
 
@@ -175,9 +176,10 @@ impl Hotlap {
     /// caller-facing names, so the `inputs`/`views` maps cannot be rebuilt. The
     /// caller must register the same names through [`Self::register_input`] and
     /// [`Self::create_view`] before restoring (the runtime does this during
-    /// setup). The id counters are advanced past the restored ids so later
-    /// declarations cannot collide.
+    /// setup). Each registered view must match the snapshot's handle and plan,
+    /// so a renamed or reordered declaration cannot be silently rebound.
     pub fn restore(&mut self, snapshot: &EngineSnapshot) -> Result<(), HotlapError> {
+        self.check_view_identity(snapshot)?;
         self.core
             .restore(snapshot)
             .map_err(|error| HotlapError(format!("{error}")))?;
