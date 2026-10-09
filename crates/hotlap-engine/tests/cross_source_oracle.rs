@@ -1,8 +1,7 @@
 //! Full-recomputation oracle for cross-source inner joins.
 //!
-//! The oracle never calls the incremental join: it recombines the raw input
-//! rows and multiplicities after every delta, so a passing comparison is
-//! independent evidence of the incremental result.
+//! The oracle never calls the incremental join: it recombines the raw input rows
+//! and multiplicities after every delta.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -42,8 +41,7 @@ fn oracle_consolidates_duplicate_pairs() {
     let left = [vec![1, 10, 2]];
     let right = [vec![1, 20, 3]];
     assert_eq!(recompute(&left, &right, 1), vec![vec![1, 10, 20, 6]]);
-    let cancels = [vec![1, 10, 1], vec![1, 10, -1]];
-    assert!(recompute(&cancels, &[vec![1, 20, 1]], 1).is_empty());
+    assert!(recompute(&[vec![1, 10, 1], vec![1, 10, -1]], &right, 1).is_empty());
 }
 
 fn schema(fields: &[&str]) -> SchemaRef {
@@ -108,7 +106,6 @@ fn joined_rows(zset: &ZSetBatch, keys: usize) -> Vec<Vec<i64>> {
     rows
 }
 
-/// A two-input join view over inputs 0 and 1 with the given key columns.
 fn join_core(left_key: Vec<usize>, right_key: Vec<usize>) -> EngineCore {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();
@@ -180,14 +177,23 @@ fn composite_key_join_matches_recomputation_after_every_delta() {
         assert_eq!(joined_rows(&snapshot, 2), recompute(&left, &right, 2));
     }
 
-    // The same deltas in reverse push order must reach the same state.
-    let expected = recompute(&left, &right, 2);
+    // The same deltas in reverse push order, checked after every delta against
+    // an independently accumulated oracle (not the forward final state).
+    let (mut rev_left, mut rev_right): (Vec<Vec<i64>>, Vec<Vec<i64>>) = (Vec::new(), Vec::new());
     let mut reversed = join_core(vec![0, 1], vec![0, 1]);
     for (side, k1, k2, v, diff) in deltas.iter().rev() {
+        if *side == 0 {
+            rev_left.push(vec![*k1, *k2, *v, *diff]);
+        } else {
+            rev_right.push(vec![*k1, *k2, *v, *diff]);
+        }
         reversed
             .push(InputId(*side), &delta(&schema, vec![*k1, *k2, *v], *diff))
             .unwrap();
+        let snapshot = reversed.snapshot(ViewId(0)).unwrap();
+        assert_eq!(
+            joined_rows(&snapshot, 2),
+            recompute(&rev_left, &rev_right, 2)
+        );
     }
-    let snapshot = reversed.snapshot(ViewId(0)).unwrap();
-    assert_eq!(joined_rows(&snapshot, 2), expected);
 }

@@ -15,7 +15,7 @@ use hotlap_runtime::runtime::pipeline::Pipeline;
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
 use backend::SharedBackend;
-use harness::{ControlledSource, batch_on, schema, sources, split};
+use harness::{ControlledSource, batch_on, bounded, schema, sources, split};
 
 /// A join of both inputs on column 0, exposed as view `j`.
 fn pipeline(sources: Sources, backend: SharedBackend) -> Pipeline {
@@ -113,26 +113,28 @@ fn split_zero_of_each_source_commits_independently() {
 /// One source permanently pending must not block the other or checkpointing.
 #[test]
 fn a_pending_source_does_not_block_ingest_or_checkpoint() {
-    let (a, a_tx) = ControlledSource::new(schema(), vec![split(0)]);
-    let (b, _b_tx) = ControlledSource::new(schema(), vec![split(0)]);
-    let handle = EngineHandle::start(pipeline(
-        sources(a.clone(), b.clone()),
-        SharedBackend::default(),
-    ))
-    .unwrap();
+    bounded(Duration::from_secs(10), || {
+        let (a, a_tx) = ControlledSource::new(schema(), vec![split(0)]);
+        let (b, _b_tx) = ControlledSource::new(schema(), vec![split(0)]);
+        let handle = EngineHandle::start(pipeline(
+            sources(a.clone(), b.clone()),
+            SharedBackend::default(),
+        ))
+        .unwrap();
 
-    // A checkpoint before the first batch is valid and reads empty.
-    assert!(handle.snapshot("j").unwrap().is_empty());
-    assert!(handle.checkpoint().is_ok());
+        // A checkpoint before the first batch is valid and reads empty.
+        assert!(handle.snapshot("j").unwrap().is_empty());
+        assert!(handle.checkpoint().is_ok());
 
-    // B never sends, so its read future stays pending; A is still ingested and
-    // acked while the join view (needing both) stays empty.
-    a_tx[0].send(Ok(batch_on(0, 1))).unwrap();
-    assert!(wait_for(|| !a.commits().is_empty()));
-    assert!(b.commits().is_empty());
-    assert!(handle.snapshot("j").unwrap().is_empty());
-    assert!(handle.checkpoint().is_ok());
-    handle.shutdown().unwrap();
+        // B never sends, so its read future stays pending; A is still ingested
+        // and acked while the join view (needing both) stays empty.
+        a_tx[0].send(Ok(batch_on(0, 1))).unwrap();
+        assert!(wait_for(|| !a.commits().is_empty()));
+        assert!(b.commits().is_empty());
+        assert!(handle.snapshot("j").unwrap().is_empty());
+        assert!(handle.checkpoint().is_ok());
+        handle.shutdown().unwrap();
+    });
 }
 
 #[test]

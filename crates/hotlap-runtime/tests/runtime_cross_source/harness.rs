@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -158,6 +159,21 @@ pub fn batch_on(split: i32, key: i64) -> SourceBatch {
         base_offset: 0,
         next_offset: 1,
         split,
+    }
+}
+
+/// Runs `case` on a worker thread and panics if it does not finish in time, so
+/// a deadlocked engine command fails the test instead of hanging the suite.
+pub fn bounded(timeout: Duration, case: impl FnOnce() + Send + 'static) {
+    let (done, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(case));
+        let _ = done.send(result);
+    });
+    match wait.recv_timeout(timeout) {
+        Ok(Ok(())) => {}
+        Ok(Err(payload)) => std::panic::resume_unwind(payload),
+        Err(_) => panic!("case did not finish within {timeout:?} (possible deadlock)"),
     }
 }
 
