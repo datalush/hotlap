@@ -20,10 +20,12 @@
    señal explícita** y se replaya desde el anterior; y si algún sink es
    **transaccional** y no re-conducible, se **rechaza** conservando el marcador y
    el cuerpo, porque replayar podría duplicar una transacción confirmada (ver
-   `docs/hotlap-sink-2pc.md`). Sin marker, este paso no hace nada. Si publicar
-   el commit promovido falla de forma **operativa** (`Storage`), el error
-   **propaga** sin leer un fallback, sin descartar el pending y sin reabrir
-   ninguna fuente.
+   `docs/hotlap-sink-2pc.md`). El rechazo también aplica cuando el cuerpo
+   pendiente **no se puede decodificar** y cuando la re-conducción falla con un
+   error no operativo: un sink transaccional impide caer a un predecesor. Sin
+   marker, este paso no hace nada. Si publicar el commit promovido falla de forma
+   **operativa** (`Storage`), el error **propaga** sin leer un fallback, sin
+   descartar el pending y sin reabrir ninguna fuente.
 2. **Cargar el último checkpoint válido**: `latest` se lee solo para
    clasificarlo, no para elegir. Se escanea el namespace de más nuevo a más
    viejo y se toma el `valid` más nuevo, así un puntero `latest` que se quedó

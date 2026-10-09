@@ -98,8 +98,11 @@ retain**:
 - **Rechazar sin replay**: si un sink **transaccional** no es re-conducible,
   replayar podría duplicar una transacción que ya está confirmada y no hay forma
   de deshacerla. Recovery **no descarta**: conserva el marcador y el cuerpo,
-  falla con un error explícito y deja la resolución a un operador. Esto no añade
-  un handle de transacción durable ni 2PC nuevo a Fluss.
+  falla con un error explícito y deja la resolución a un operador. El rechazo
+  también aplica si el cuerpo pendiente **no se puede decodificar o reconstruir**
+  (no hay nada que promover y replay sería inseguro) y si la **re-conducción**
+  falla con un error no operativo. Esto no añade un handle de transacción durable
+  ni 2PC nuevo a Fluss.
 
 **Contrato del sink.** `Sink::commit` **debe tolerar ejecutarse más de una
 vez**: la barrera puede confirmar el mismo sink más de una vez y recovery

@@ -10,6 +10,7 @@
 mod decision;
 mod pending;
 mod restore;
+mod resume;
 mod sources;
 
 pub use decision::RecoveryDecision;
@@ -23,7 +24,6 @@ use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
 use crate::runtime::sources::{InputStream, Sources};
 use hotlap_connectors::error::ConnectorError;
 use pending::{discard, pending_commit};
-use restore::restore;
 use sources::{read_body, read_valid};
 
 /// The last valid checkpoint, if the store holds one.
@@ -59,7 +59,20 @@ impl Recovery {
                     }
                     "a sink is not re-drivable"
                 }
-                None => "the pending commit body is corrupt or incomplete",
+                // The body cannot be decoded or restored, so the commit cannot
+                // be promoted either. Replaying over a transactional sink could
+                // duplicate an already-committed transaction, so refuse rather
+                // than fall back.
+                None => {
+                    if !checkpointer.replay_safe() {
+                        return Ok(RecoveryDecision::Reject {
+                            pending,
+                            reason: "the pending commit body is corrupt or incomplete and a \
+                                     transactional sink cannot be safely replayed",
+                        });
+                    }
+                    "the pending commit body is corrupt or incomplete"
+                }
             };
             return Ok(RecoveryDecision::Discard {
                 pending,
@@ -99,7 +112,13 @@ impl Recovery {
                     // source rollback or start. Only a considered decision (a
                     // sink that cannot re-drive) discards and replays.
                     Err(error @ ConnectorError::Storage(_)) => return Err(error),
+                    // A non-storage re-drive failure leaves the commit unresolved.
+                    // Only a replay-safe sink may be discarded and replayed;
+                    // otherwise keep the pending evidence and surface the error.
                     Err(error) => {
+                        if !checkpointer.replay_safe() {
+                            return Err(error);
+                        }
                         let fallback = Self::load(checkpointer, sources)?;
                         let reason = format!("commit re-drive failed ({error})");
                         match discard(
@@ -128,7 +147,7 @@ impl Recovery {
             // committed, so replay could duplicate it. The marker, the body and
             // the sink state stay for a manual decision or an operator fix.
             RecoveryDecision::Reject { pending, reason } => {
-                return Err(ConnectorError::Infrastructure(format!(
+                return Err(ConnectorError::Unsupported(format!(
                     "refusing to replay interrupted checkpoint {pending}: {reason}"
                 )));
             }
@@ -163,29 +182,5 @@ impl Recovery {
             }
         }
         Ok(None)
-    }
-
-    /// Restore `checkpoint` into `hotlap` and reopen `sources` at the captured
-    /// offsets, yielding a stream that replays from the checkpoint.
-    ///
-    /// [`SourceState`](hotlap_connectors::source::SourceState) holds the offset of the
-    /// **next** record to read, advanced only after a batch is applied. The
-    /// checkpoint therefore already contains every record below that offset and
-    /// replay must start exactly there: starting one record earlier duplicates,
-    /// one later loses. The runtime commits offsets after ingestion, so no
-    /// in-flight batch can break the invariant.
-    ///
-    /// The checkpoint is validated before the engine is restored or any source
-    /// is reopened. Errors when a source can no longer serve a captured offset,
-    /// so insufficient retention fails loudly instead of losing records.
-    pub fn resume(
-        hotlap: &mut Hotlap,
-        sources: &Sources,
-        checkpoint: &Checkpoint,
-    ) -> Result<InputStream, ConnectorError> {
-        sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
-        restore(hotlap, &checkpoint.engine)?;
-        let splits = sources::resume(sources, &checkpoint.sources)?;
-        sources.stream_with(&splits)
     }
 }
