@@ -1,6 +1,7 @@
 //! Commands from the handle to the engine thread and their dispatch.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hotlap::Hotlap;
 use hotlap::{Plan, ZSetBatch};
@@ -48,6 +49,7 @@ pub(crate) async fn handle(
     sources: &Sources,
     checkpointer: &mut Option<Checkpointer>,
     failed: &mut bool,
+    close_clean: &AtomicBool,
 ) -> bool {
     match cmd {
         Some(Command::Snapshot { view, reply }) => {
@@ -63,6 +65,9 @@ pub(crate) async fn handle(
                 Ok(()) => take(checkpointer, hotlap, sources).await,
                 Err(error) => Err(error),
             };
+            if result.is_err() {
+                close_clean.store(false, Ordering::SeqCst);
+            }
             if result.is_err() && checkpointer.as_ref().is_some_and(inconsistent) {
                 *failed = true;
             }
@@ -91,6 +96,7 @@ pub(crate) async fn run_periodic(
     hotlap: &Hotlap,
     sources: &Sources,
     checkpoint_error: &Mutex<Option<String>>,
+    close_clean: &AtomicBool,
 ) -> bool {
     let Some(active) = checkpointer else {
         return false;
@@ -98,6 +104,7 @@ pub(crate) async fn run_periodic(
     match active.take(hotlap, sources).await {
         Ok(_) => false,
         Err(error) => {
+            close_clean.store(false, Ordering::SeqCst);
             let inconsistent = inconsistent(active);
             record_error(checkpoint_error, error);
             inconsistent

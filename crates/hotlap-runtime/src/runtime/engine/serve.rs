@@ -29,6 +29,9 @@ pub(super) async fn serve(
                     // periodic checkpoints and view builds, but the command
                     // channel stays open so the handle can still shut down.
                     FeedStatus::Failed => {
+                        shared
+                            .close_clean
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
                         source_done = true;
                         failed = true;
                     }
@@ -42,7 +45,7 @@ pub(super) async fn serve(
                 }
             }
             cmd = rx.recv() => {
-                if handle(cmd, &mut engine, &pipeline, &mut failed).await {
+                if handle(cmd, &mut engine, &pipeline, &mut failed, shared).await {
                     shut_down(engine, shared).await;
                     return;
                 }
@@ -97,6 +100,7 @@ async fn run_periodic(engine: &mut Engine, pipeline: &Pipeline, shared: &EngineS
         &engine.hotlap,
         &pipeline.sources,
         &shared.checkpoint_error,
+        &shared.close_clean,
     )
     .await
 }
@@ -107,6 +111,7 @@ async fn handle(
     engine: &mut Engine,
     pipeline: &Pipeline,
     failed: &mut bool,
+    shared: &EngineShared,
 ) -> bool {
     command::handle(
         cmd,
@@ -114,6 +119,7 @@ async fn handle(
         &pipeline.sources,
         &mut engine.checkpointer,
         failed,
+        &shared.close_clean,
     )
     .await
 }

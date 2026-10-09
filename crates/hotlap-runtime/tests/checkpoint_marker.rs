@@ -1,8 +1,8 @@
 //! Durable marker handling when it is observable: an ambiguous marker write and
 //! a clear failure over an already published checkpoint.
 //!
-//! Both keep the marker on disk; restart either promotes the pending commit or
-//! sweeps the redundant marker and resumes the valid checkpoint.
+//! A pre-prepare marker is discarded when no sink state can be uncertain; a
+//! clear failure over a published checkpoint leaves a redundant marker to sweep.
 
 #[path = "common/fault.rs"]
 mod fault;
@@ -71,9 +71,10 @@ fn an_ambiguous_marker_write_is_commit_uncertain() {
     assert!(backend.get(b"checkpoint/1/commit").unwrap().is_some());
     assert_eq!(backend.get(b"checkpoint/1/valid").unwrap(), None);
 
-    // Restart resolves the retained marker and publishes the checkpoint.
-    recover(&backend).expect("an empty sink set is re-drivable");
-    assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
+    // The body is incomplete and there are no unsafe sinks, so restart discards
+    // the attempt rather than promoting a checkpoint whose prepare never began.
+    recover(&backend).expect("an empty sink set is replay-safe");
+    assert_eq!(backend.get(b"checkpoint/1/valid").unwrap(), None);
     assert_eq!(backend.get(b"checkpoint/1/commit").unwrap(), None);
 }
 

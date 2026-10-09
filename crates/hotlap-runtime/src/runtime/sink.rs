@@ -37,15 +37,15 @@ pub struct SinkPump {
 impl SinkPump {
     /// Spawn one sink task per spec; the views were tapped during setup.
     pub fn start(specs: &[SinkSpec]) -> Self {
-        Self::start_with_metrics(specs, None, Cancel::new())
+        Self::start_with_metrics(specs, None, Cancel::new(), Arc::new(AtomicBool::new(true)))
     }
 
-    /// Like [`Self::start`], but counts successful commits into `metrics` and
-    /// carries the engine's cancellation flag for a parked pump.
+    /// Like [`Self::start`], with shared metrics, cancellation and close state.
     pub(crate) fn start_with_metrics(
         specs: &[SinkSpec],
         metrics: Option<Arc<MetricsRegistry>>,
         cancel: Cancel,
+        close_clean: Arc<AtomicBool>,
     ) -> Self {
         let entries = specs
             .iter()
@@ -56,7 +56,11 @@ impl SinkPump {
                     }
                     None => SharedSink::new(Arc::clone(&spec.sink)),
                 };
-                let (tx, handle) = spawn_sink(Arc::clone(&shared), CHANNEL_CAPACITY);
+                let (tx, handle) = writer::spawn_sink_with_close_gate(
+                    Arc::clone(&shared),
+                    CHANNEL_CAPACITY,
+                    Arc::clone(&close_clean),
+                );
                 SinkEntry {
                     view: spec.view.clone(),
                     tx,

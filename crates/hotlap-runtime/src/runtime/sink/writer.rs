@@ -1,6 +1,7 @@
 //! One sink task: drain a bounded changelog channel and write each batch.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -19,10 +20,19 @@ pub fn spawn_sink(
     shared: Arc<SharedSink>,
     capacity: usize,
 ) -> (ChangelogSender, JoinHandle<Result<(), ConnectorError>>) {
+    spawn_sink_with_close_gate(shared, capacity, Arc::new(AtomicBool::new(true)))
+}
+
+pub(super) fn spawn_sink_with_close_gate(
+    shared: Arc<SharedSink>,
+    capacity: usize,
+    close_clean: Arc<AtomicBool>,
+) -> (ChangelogSender, JoinHandle<Result<(), ConnectorError>>) {
     let (tx, mut rx) = mpsc::channel(capacity);
     let handle = tokio::spawn(async move {
         match drive(&shared, &mut rx).await {
-            Ok(()) => shared.commit().await,
+            Ok(()) if close_clean.load(Ordering::SeqCst) => shared.commit().await,
+            Ok(()) => Ok(()),
             Err(error) => {
                 let _ = shared.abort().await;
                 Err(error)

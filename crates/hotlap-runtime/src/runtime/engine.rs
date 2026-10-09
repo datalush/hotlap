@@ -34,6 +34,8 @@ pub(crate) struct EngineShared {
     pub(crate) built: Arc<AtomicBool>,
     /// Breaks a sink pump parked on a full channel during shutdown.
     pub(crate) cancel: Cancel,
+    /// Authorizes the sink writer's implicit EOF commit only after a clean run.
+    pub(crate) close_clean: Arc<AtomicBool>,
 }
 
 /// Run the engine loop until shutdown or channel close.
@@ -109,6 +111,7 @@ async fn prepare(
         &pipeline.sinks,
         Some(Arc::clone(&metrics)),
         shared.cancel.clone(),
+        Arc::clone(&shared.close_clean),
     );
     let coordinated = sinks.coordinated();
     let (source, checkpointer, ticker) = match pipeline.checkpoint.take() {

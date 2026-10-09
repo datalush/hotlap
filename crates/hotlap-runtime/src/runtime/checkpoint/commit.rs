@@ -4,7 +4,8 @@ use hotlap::Hotlap;
 
 use crate::runtime::checkpoint::{CheckpointState, Checkpointer};
 use crate::runtime::checkpoint_body::{
-    checkpoint_prefix, clear_commit, id_exhausted, publish_valid, reserve, state_err, write,
+    checkpoint_prefix, clear_commit, id_exhausted, mark_commit_intent, publish_valid, reserve,
+    state_err, write,
 };
 use crate::runtime::retention::prune;
 use crate::runtime::sink_barrier::Prepared;
@@ -44,6 +45,17 @@ impl Checkpointer {
             if self.cancel.tripped() {
                 self.fail(CheckpointState::Failed, &error);
             }
+            return Err(error);
+        }
+        if let Err(error) = mark_commit_intent(self.backend.as_mut(), id) {
+            self.fail(
+                if matches!(error, ConnectorError::Storage(_)) {
+                    CheckpointState::CommitUncertain
+                } else {
+                    CheckpointState::Failed
+                },
+                &error,
+            );
             return Err(error);
         }
         let prepared = match self.sinks.prepare(&self.cancel).await {

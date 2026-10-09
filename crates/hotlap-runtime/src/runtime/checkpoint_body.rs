@@ -29,10 +29,10 @@ pub(crate) fn checkpoint_prefix(id: u64) -> String {
 
 /// Encode the engine snapshot and source offsets under `checkpoint/<id>/`.
 ///
-/// The body is written first and the durable commit marker last, before the
-/// sinks commit; [`publish_valid`] publishes the checkpoint afterwards. An
-/// interrupted body never becomes the current checkpoint, and a marker left by
-/// a crash tells recovery that the current checkpoint was mid-commit.
+/// A commit-intent marker is persisted before external prepare; the body is
+/// written afterwards and the marker is refreshed last, before sinks commit.
+/// [`publish_valid`] publishes the checkpoint afterwards. An interrupted
+/// prepare can therefore be rejected even when no complete body exists.
 pub(crate) async fn write(
     backend: &mut (dyn StateBackend + Send),
     id: u64,
@@ -119,6 +119,19 @@ pub(crate) fn reserve(
 ) -> Result<(), ConnectorError> {
     backend
         .put(RESERVED_KEY, id.to_le_bytes().to_vec())
+        .map_err(state_err)
+}
+
+/// Record that an attempt may have entered an external sink's prepare phase.
+pub(crate) fn mark_commit_intent(
+    backend: &mut (dyn StateBackend + Send),
+    id: u64,
+) -> Result<(), ConnectorError> {
+    backend
+        .put(
+            format!("{}/commit", checkpoint_prefix(id)).as_bytes(),
+            COMMIT_MARKER.to_vec(),
+        )
         .map_err(state_err)
 }
 

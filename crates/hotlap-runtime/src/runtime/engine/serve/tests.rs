@@ -145,6 +145,7 @@ fn drive_until_pending(engine: Engine, pipeline: Pipeline) -> Option<String> {
         close_error: Arc::new(Mutex::new(None)),
         built: Arc::new(AtomicBool::new(false)),
         cancel: Cancel::new(),
+        close_clean: Arc::new(AtomicBool::new(true)),
     };
     // Keep the sender alive so the command channel stays pending.
     let (_tx, mut rx) = mpsc::unbounded_channel::<Command>();

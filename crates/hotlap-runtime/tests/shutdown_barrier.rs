@@ -23,7 +23,8 @@ use harness::{
     WatchedBackend, fill_queue, keys_with, start,
 };
 use support::{
-    assert_cancelled, assert_evidence, commit_uncertain, config, spawn_checkpoint, with_watchdog,
+    assert_cancelled, assert_evidence, assert_prepare_uncertain, commit_uncertain, config,
+    spawn_checkpoint, with_watchdog,
 };
 
 #[test]
@@ -98,7 +99,7 @@ fn shutdown_cancels_a_checkpoint_blocked_in_prepare() {
     let result = with_watchdog(move || handle.shutdown());
 
     assert_cancelled(result, started.elapsed(), &reply);
-    assert_evidence(&backend, false);
+    assert_prepare_uncertain(&backend);
 }
 
 #[test]

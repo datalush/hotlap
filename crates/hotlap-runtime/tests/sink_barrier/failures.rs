@@ -25,13 +25,12 @@ async fn capture_storage_failure_preserves_commit_evidence() {
 
     let result = checkpointer.take(&engine(), &sources()).await;
     assert!(result.is_err(), "a failing write must surface the error");
-    // An ambiguous storage write may have persisted part of the body or the
-    // marker, so the prepared sinks are left untouched instead of rolled back
-    // and the evidence is kept for an uncertain commit.
+    // The durable pre-prepare marker must be written before any sink control
+    // call, so a failed marker write cannot leave a sink prepared without evidence.
     assert_eq!(
         *log.lock().unwrap(),
-        vec![Event::Prepare],
-        "a storage write failure must not abort the prepared sink"
+        Vec::<Event>::new(),
+        "a failed marker write must not enter prepare"
     );
     assert_eq!(backend.get(b"checkpoint/1/commit").unwrap(), None);
     let reader = Checkpointer::new(Box::new(backend), 3);

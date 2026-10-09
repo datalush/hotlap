@@ -42,6 +42,7 @@ impl EngineHandle {
             close_error: Arc::new(Mutex::new(None)),
             built: Arc::new(AtomicBool::new(false)),
             cancel: Cancel::new(),
+            close_clean: Arc::new(AtomicBool::new(true)),
         };
         let metrics = Arc::new(MetricsRegistry::new());
         let (join, done, ready_rx) =
