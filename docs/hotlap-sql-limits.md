@@ -59,3 +59,40 @@ más sustantivos tienen issue de kata para repararse; el resto queda aquí:
 - **Opción `table` engañosa:** en `CREATE SOURCE`, `table` es una ruta
   `<db>/<table>` (la esperada por `FlussSource::open_from_bootstrap`); el nombre
   del source no se usa. El nombre de la opción sugiere lo contrario.
+
+## 4. Multiconjuntos SQL (bag) y cota de expansión
+
+El `SELECT ... FROM <mv>` de la superficie SQL usa **semántica de multiconjunto
+estándar** (bag), **sin `DISTINCT` implícito**. El motor mantiene el snapshot
+**consolidado** de una vista como un Z-set: como mucho una fila por valor
+distinto, ordenada, con los pesos cero eliminados. El conversor
+(`hotlap-sql/src/convert.rs`, `zset_to_batch`) **expande** cada peso positivo `w`
+en `w` filas idénticas antes de entregarlas a DataFusion, de modo que
+`SELECT`, `COUNT(*)`, `SUM`/`AVG` y demás agregados ven **todas** las
+repeticiones. Ejemplo: un join `2 × 3` produce un snapshot con una fila de peso
+6 y la consulta devuelve **seis** filas (y `COUNT(*) = 6`); no una fila distinta.
+
+Contrato y rechazos (errores tipados `SqlError::Unsupported`, nunca `abs`,
+ignorados ni truncados):
+
+- **Peso negativo inválido:** un peso `< 0` no describe un multiconjunto y la
+  conversión **falla**. Un *changelog* incremental sí admite deltas negativos
+  (retracciones); un *snapshot* válido para SQL, no. Son conceptos distintos y
+  el rechazo es explícito.
+- **Peso cero:** se elimina de la salida (ya lo elimina la consolidación del
+  motor).
+- **Cota de expansión:** la suma de pesos se calcula con **aritmética
+  checked** (el desbordamiento de `i64` falla) y se compara con
+  `MAX_SNAPSHOT_ROWS = 1_048_576` **antes** de reservar ningún índice. Un
+  snapshot que expanda a más filas falla con error tipado en vez de agotar
+  memoria. La cota es fija; no se expone configuración porque no se necesitó.
+- **La cota se aplica antes de cualquier `LIMIT` de consulta:** el proveedor
+  materializa el snapshot completo en un `RecordBatch`, así que un
+  `SELECT ... LIMIT n` no evita la expansión; si el snapshot excede la cota, la
+  consulta falla aunque el `LIMIT` fuera pequeño.
+
+El snapshot es la salida **consolidada** del motor
+(`hotlap-engine/src/core/output.rs`), verificado en
+`hotlap-sql/src/convert.rs` (unit) y `hotlap-runtime/tests/sql_cross_source_oracle.rs`
+(paridad de `SELECT`/agregados contra un `VALUES` de DataFusion independiente).
+

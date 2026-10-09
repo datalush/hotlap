@@ -41,7 +41,10 @@ SELECT k, value FROM j;
 Secuencia: se declaran las dos fuentes y la MV **antes** de `START`; `START`
 congela las asignaciones, registra ambos inputs y arranca el engine; tras
 `START`, cada lote de A o B se ingiere en su input y solo entonces se confirma
-su offset. `SELECT` lee el snapshot consolidado de la MV (DataFusion).
+su offset. `SELECT` lee el snapshot consolidado de la MV (DataFusion) y lo
+expande a un **multiconjunto**: dos filas de A y tres de B con la misma clave
+producen `2 × 3 = 6` filas para `SELECT` (y `COUNT(*) = 6`), no una fila
+distinta. Ver `docs/hotlap-sql-limits.md` §4.
 
 ## 3. Nombres de salida y aliases
 

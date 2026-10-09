@@ -124,7 +124,11 @@ planifica como una tabla normal:
   (`Snapshotter::snapshot`) en un hilo bloqueante
   (`tokio::task::spawn_blocking`, porque el handle del motor usa
   `blocking_recv`), lo convierte a **un** `RecordBatch` con
-  `convert::rows_to_batch` y lo envuelve en un ejecutor en memoria.
+  `convert::zset_to_batch` y lo envuelve en un ejecutor en memoria. La
+  conversión **expande** los pesos positivos del snapshot en filas repetidas
+  (semántica de multiconjunto, sin `DISTINCT` implícito); un peso negativo falla
+  y la expansión está acotada. Detalles y límites en
+  `docs/hotlap-sql-limits.md` §4.
 - El **esquema** de la MV (`mv_schema.rs`) sigue el contrato de salida del
   kernel: `key ++ [window_start, count]` para `TumbleCount` y
   `key ++ [count, sum, min, max, avg]` para `GroupAggregate`. Los nombres de las
@@ -154,7 +158,9 @@ planifica como una tabla normal:
 3. `START` construye el `Pipeline` (source + watermark + vistas), arranca el
    `EngineHandle` y registra los `MvTableProvider`.
 4. Los `SELECT` se ejecutan con DataFusion; las consultas a MVs leen el
-   snapshot consolidado.
+   snapshot consolidado y lo expanden a un **multiconjunto** (cada peso positivo
+   se convierte en tantas filas como indique), sin `DISTINCT` implícito
+   (`docs/hotlap-sql-limits.md` §4).
 
 El **DDL se declara antes de `START`** (ventana DDL). Crear un **source** o un
 **sink** después de `START` se **rechaza** con `SqlError::Unsupported`. Una
