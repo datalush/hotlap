@@ -17,23 +17,22 @@ use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::source::SourceState;
 use hotlap_engine::{MetricsRegistry, encode_framed, encode_schema};
 use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
-use hotlap_runtime::runtime::pipeline::Pipeline;
 use hotlap_runtime::runtime::recovery::Recovery;
 use hotlap_runtime::runtime::source_checkpoint::{decode_sources, encode_sources};
 use hotlap_runtime::runtime::sources::InputStream;
 
 use backend::SharedBackend;
-use pending::{copy_to_pending, counting, engine_with, seed};
+use pending::{counting, engine_with, fresh_pipeline, put_sources, seed_pair, sources_bytes};
 
 /// Run recovery against an incompatible pending and count sink commits.
 fn run_incompatible(
     backend: &SharedBackend,
-    pipe: &Pipeline,
 ) -> (Result<InputStream, ConnectorError>, Arc<AtomicU32>) {
     let (sink, commits) = counting(true);
     let mut checkpointer =
         Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![sink]);
-    let mut hotlap = engine_with(pipe);
+    let pipe = fresh_pipeline();
+    let mut hotlap = engine_with(&pipe);
     let signal = Mutex::new(None);
     let metrics = MetricsRegistry::new();
     let result = futures::executor::block_on(Recovery::start(
@@ -46,29 +45,8 @@ fn run_incompatible(
     (result, commits)
 }
 
-/// Rewrite the pending `sources` body with `mutate` applied.
-fn rewrite_pending(backend: &SharedBackend, pending: u64, mutate: impl FnOnce(&mut Vec<u8>)) {
-    let mut writer = backend.clone();
-    let key = format!("checkpoint/{pending}/sources");
-    let mut raw = writer.get(key.as_bytes()).unwrap().unwrap();
-    mutate(&mut raw);
-    writer.put(key.as_bytes(), raw).unwrap();
-}
-
-#[test]
-fn a_pending_commit_with_a_changed_schema_errors_before_any_commit() {
-    let backend = SharedBackend::default();
-    let (pipe, valid) = seed(&backend, 3);
-    let pending = copy_to_pending(&backend, valid);
-    rewrite_pending(&backend, pending, |raw| {
-        let mut saved = decode_sources(raw).unwrap();
-        let changed = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
-        saved.entries[0].schema = encode_schema(&changed).unwrap();
-        *raw = encode_sources(&saved).unwrap();
-    });
-
-    let (result, commits) = run_incompatible(&backend, &pipe);
-    assert!(matches!(result, Err(ConnectorError::Unsupported(_))));
+/// Assert the pending `pending` was never published and no sink committed.
+fn assert_not_promoted(backend: &SharedBackend, pending: u64, commits: &Arc<AtomicU32>) {
     assert_eq!(commits.load(Ordering::SeqCst), 0, "must not commit");
     assert!(
         backend
@@ -79,21 +57,30 @@ fn a_pending_commit_with_a_changed_schema_errors_before_any_commit() {
 }
 
 #[test]
+fn a_pending_commit_with_a_changed_schema_errors_before_any_commit() {
+    let backend = SharedBackend::default();
+    let (_valid, pending) = seed_pair(&backend);
+    let mut saved = decode_sources(&sources_bytes(&backend, pending)).unwrap();
+    let changed = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+    saved.entries[0].schema = encode_schema(&changed).unwrap();
+    put_sources(&backend, pending, encode_sources(&saved).unwrap());
+
+    let (result, commits) = run_incompatible(&backend);
+    assert!(matches!(result, Err(ConnectorError::Unsupported(_))));
+    assert_not_promoted(&backend, pending, &commits);
+}
+
+#[test]
 fn a_pending_commit_in_a_foreign_format_is_not_decoded_or_promoted() {
     let backend = SharedBackend::default();
-    let (pipe, valid) = seed(&backend, 3);
-    let pending = copy_to_pending(&backend, valid);
-    rewrite_pending(&backend, pending, |raw| {
-        *raw = encode_framed(&SourceState::default()).unwrap();
-    });
-
-    let (result, commits) = run_incompatible(&backend, &pipe);
-    assert!(matches!(result, Err(ConnectorError::Unsupported(_))));
-    assert_eq!(commits.load(Ordering::SeqCst), 0, "must not re-drive");
-    assert!(
-        backend
-            .get(format!("checkpoint/{pending}/valid").as_bytes())
-            .unwrap()
-            .is_none()
+    let (_valid, pending) = seed_pair(&backend);
+    put_sources(
+        &backend,
+        pending,
+        encode_framed(&SourceState::default()).unwrap(),
     );
+
+    let (result, commits) = run_incompatible(&backend);
+    assert!(matches!(result, Err(ConnectorError::Unsupported(_))));
+    assert_not_promoted(&backend, pending, &commits);
 }

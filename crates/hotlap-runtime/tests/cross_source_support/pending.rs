@@ -1,33 +1,36 @@
 //! Two-source pipeline and SP8 sink fixtures for cross-source pending recovery.
 //!
-//! It reuses the recovery suite's resumable source so each input keeps its own
-//! applied offset, and adds the join pipeline, a checkpoint seed, an ingestion
-//! helper and a sink that observes whether `commit` was re-driven after an
-//! interrupted checkpoint.
+//! Seeding writes a *distinct* pending body: a real checkpoint is taken after
+//! more events than the valid one, so promote and discard resume different
+//! per-source offsets. The pending body is then reduced to the crash window
+//! (`commit` marker without `valid`) over the previous valid checkpoint, and its
+//! sources payload is kept in the real `HLSR` container.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use futures::StreamExt;
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::record_batch::RecordBatch;
 use hotlap::state::StateBackend;
 use hotlap::{Hotlap, InputId, Plan};
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
+use hotlap_connectors::source::SourceBatch;
 use hotlap_engine::EngineCore;
 use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::pipeline::{self, Pipeline};
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
-use hotlap_runtime::runtime::sources::{InputSource, InputStream, Sources};
+use hotlap_runtime::runtime::sources::{InputSource, SourceEvent, Sources};
 
 use crate::backend::SharedBackend;
 use crate::resumable::{Dataset, ResumableSource};
 
-/// Log for source `a`: three batches, so a partial run leaves a replayable tail.
+/// Log for source `a`: `k = 1, 1, 2`.
 pub fn log_a() -> Dataset {
     Dataset::new(vec![vec![1], vec![1], vec![2]]).with_retention(0)
 }
 
-/// Log for source `b`: two batches keyed to match `a`.
+/// Log for source `b`: `k = 1, 2`.
 pub fn log_b() -> Dataset {
     Dataset::new(vec![vec![1], vec![2]]).with_retention(0)
 }
@@ -70,6 +73,11 @@ pub fn join_pipeline(sources: Sources) -> Pipeline {
     }
 }
 
+/// A fresh two-source join pipeline, independent of any previous run.
+pub fn fresh_pipeline() -> Pipeline {
+    join_pipeline(two_sources(log_a(), log_b()))
+}
+
 /// Register both inputs and the join view against a fresh engine.
 pub fn engine_with(pipeline: &Pipeline) -> Hotlap {
     let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
@@ -77,25 +85,23 @@ pub fn engine_with(pipeline: &Pipeline) -> Hotlap {
     hotlap
 }
 
-/// Push up to `limit` events into `hotlap`, acking each through its own source.
-pub fn drain(hotlap: &mut Hotlap, sources: &Sources, stream: &mut InputStream, limit: usize) {
-    let mut pushed = 0;
-    while pushed < limit {
-        match futures::executor::block_on(stream.next()) {
-            Some(Ok(event)) => {
-                pipeline::ingest_event(hotlap, sources, &event).unwrap();
-                sources
-                    .get(event.input)
-                    .unwrap()
-                    .source
-                    .commit(event.batch.split, event.batch.next_offset)
-                    .unwrap();
-                pushed += 1;
-            }
-            Some(Err(error)) => panic!("unexpected source error: {error}"),
-            None => break,
-        }
-    }
+/// Push one `k` row into `input`, acking it at its own next offset.
+pub fn push(hotlap: &mut Hotlap, sources: &Sources, input: InputId, key: i64) {
+    let entry = sources.get(input).unwrap();
+    let offset = entry.source.state().offsets.get(&0).copied().unwrap_or(0);
+    let array: ArrayRef = Arc::new(Int64Array::from(vec![key]));
+    let batch = RecordBatch::try_new(entry.source.schema(), vec![array]).unwrap();
+    let event = SourceEvent {
+        input,
+        batch: SourceBatch {
+            batch,
+            base_offset: offset,
+            next_offset: offset + 1,
+            split: 0,
+        },
+    };
+    pipeline::ingest_event(hotlap, sources, &event).unwrap();
+    entry.source.commit(0, offset + 1).unwrap();
 }
 
 /// Take a checkpoint synchronously and return its id.
@@ -103,37 +109,51 @@ pub fn take(checkpointer: &mut Checkpointer, engine: &Hotlap, sources: &Sources)
     futures::executor::block_on(checkpointer.take(engine, sources)).unwrap()
 }
 
-/// Drain `n` events into a fresh engine and persist a valid checkpoint.
-pub fn seed(backend: &SharedBackend, drained: usize) -> (Pipeline, u64) {
-    let pipe = join_pipeline(two_sources(log_a(), log_b()));
-    let mut engine = engine_with(&pipe);
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    let mut stream = pipe.sources.stream().unwrap();
-    drain(&mut engine, &pipe.sources, &mut stream, drained);
-    let id = take(&mut checkpointer, &engine, &pipe.sources);
-    (pipe, id)
-}
-
-/// Copy the valid body to `pending` and add the durable commit marker.
-pub fn copy_to_pending(backend: &SharedBackend, valid: u64) -> u64 {
-    let pending = valid + 1;
+/// Leave `pending` with a `commit` marker, no `valid`, over the valid predecessor.
+fn mark_pending(backend: &SharedBackend, valid: u64, pending: u64) {
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
-        let value = writer
-            .get(format!("checkpoint/{valid}/{part}").as_bytes())
-            .unwrap()
-            .unwrap();
-        writer
-            .put(format!("checkpoint/{pending}/{part}").as_bytes(), value)
-            .unwrap();
-    }
+    writer
+        .delete(format!("checkpoint/{pending}/valid").as_bytes())
+        .unwrap();
     writer
         .put(
             format!("checkpoint/{pending}/commit").as_bytes(),
             b"1".to_vec(),
         )
         .unwrap();
-    pending
+    writer
+        .put(b"checkpoint/latest", valid.to_le_bytes().to_vec())
+        .unwrap();
+}
+
+/// Take a valid checkpoint after `k=1,1`/`1`, then a distinct pending body after
+/// `k=2` on both sources. Returns `(valid, pending)` ids.
+pub fn seed_pair(backend: &SharedBackend) -> (u64, u64) {
+    let pipe = fresh_pipeline();
+    let mut engine = engine_with(&pipe);
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    let sources = &pipe.sources;
+    push(&mut engine, sources, InputId(0), 1);
+    push(&mut engine, sources, InputId(0), 1);
+    push(&mut engine, sources, InputId(1), 1);
+    let valid = take(&mut checkpointer, &engine, sources);
+    push(&mut engine, sources, InputId(0), 2);
+    push(&mut engine, sources, InputId(1), 2);
+    let pending = take(&mut checkpointer, &engine, sources);
+    mark_pending(backend, valid, pending);
+    (valid, pending)
+}
+
+/// The stored `sources` body of `id`, in the real `HLSR` container.
+pub fn sources_bytes(backend: &SharedBackend, id: u64) -> Vec<u8> {
+    let key = format!("checkpoint/{id}/sources");
+    backend.clone().get(key.as_bytes()).unwrap().unwrap()
+}
+
+/// Replace the stored `sources` body of `id`.
+pub fn put_sources(backend: &SharedBackend, id: u64, bytes: Vec<u8>) {
+    let key = format!("checkpoint/{id}/sources");
+    backend.clone().put(key.as_bytes(), bytes).unwrap();
 }
 
 /// A sink that counts commits and declares whether they may be re-driven.

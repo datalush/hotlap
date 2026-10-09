@@ -1,14 +1,15 @@
 //! Cross-source fail-stop at the SQL session boundary.
 //!
 //! A read failure in one source stops the whole session and forbids later
-//! checkpoints, while a source that sends after the failure is neither read nor
-//! confirmed. The SELECT surface lists distinct rows, so the oracle compares the
-//! raw MV snapshot (which keeps multiplicities) against a full recompute of the
-//! records that were actually acked.
+//! checkpoints, while a later row that *would* change the join is neither read
+//! nor published. The SELECT surface lists distinct rows, so the oracle compares
+//! the raw MV snapshot (which keeps multiplicities) against a full recompute of
+//! the records that were actually acked.
 //!
 //! The read/push/ack mechanisms at the runtime-pipeline boundary are already
 //! covered by `runtime_fail_stop.rs` and `runtime_fail_stop_modes.rs`; this file
-//! only adds the embedded-session boundary.
+//! only adds the embedded-session boundary, with every blocking `Session` call
+//! bounded by a deadline so a deadlock fails instead of hanging the suite.
 
 #[path = "common/backend.rs"]
 mod backend;
@@ -41,6 +42,21 @@ const CREATE_B: &str = "CREATE SOURCE b WITH (connector='inmem') WATERMARK FOR \
      _event_time AS _event_time - INTERVAL '1 s';";
 const VIEW: &str = "CREATE MATERIALIZED VIEW j AS SELECT a.k, a.lv, b.rv \
      FROM a JOIN b ON a.k = b.k;";
+
+/// Run `case` on a worker and panic if it does not finish in `timeout`, so a
+/// blocking `Session` call fails the test instead of hanging the suite.
+fn bounded(timeout: Duration, case: impl FnOnce() + Send + 'static) {
+    let (done, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(case));
+        let _ = done.send(result);
+    });
+    match wait.recv_timeout(timeout) {
+        Ok(Ok(())) => {}
+        Ok(Err(payload)) => std::panic::resume_unwind(payload),
+        Err(_) => panic!("case did not finish within {timeout:?} (possible deadlock)"),
+    }
+}
 
 /// A checkpointed session over declared sources `a` and `b` and the join view.
 fn open(factory: &Arc<CrossSourceFactory>, backend: SharedBackend) -> Session {
@@ -77,44 +93,46 @@ fn wait_failure(session: &Session) -> String {
 
 #[test]
 fn read_error_stops_the_session_and_keeps_only_acked_rows() {
-    let factory = CrossSourceFactory::new();
-    factory.declare("a", SourceSpec::new(schema_left(), 2));
-    factory.declare("b", SourceSpec::new(schema_right(), 2));
-    let mut session = open(&factory, SharedBackend::default());
+    bounded(Duration::from_secs(10), || {
+        let factory = CrossSourceFactory::new();
+        factory.declare("a", SourceSpec::new(schema_left(), 2));
+        factory.declare("b", SourceSpec::new(schema_right(), 2));
+        let mut session = open(&factory, SharedBackend::default());
 
-    send(&factory, "a", rows(schema_left(), &[(1, 10, 0)]));
-    send(&factory, "b", rows(schema_right(), &[(1, 20, 0)]));
-    assert!(
-        wait_commits(&factory, "a", 1) && wait_commits(&factory, "b", 1),
-        "both sources must ack the first lot"
-    );
+        send(&factory, "a", rows(schema_left(), &[(1, 10, 0)]));
+        send(&factory, "b", rows(schema_right(), &[(1, 20, 0)]));
+        assert!(
+            wait_commits(&factory, "a", 1) && wait_commits(&factory, "b", 1),
+            "both sources must ack the first lot"
+        );
 
-    factory.senders("a")[0]
-        .send(Err(ConnectorError::Infrastructure("read boom".into())))
-        .expect("source channel open");
-    let error = wait_failure(&session);
-    assert!(
-        error.contains("source failure"),
-        "unexpected error: {error}"
-    );
+        factory.senders("a")[0]
+            .send(Err(ConnectorError::Infrastructure("read boom".into())))
+            .expect("source channel open");
+        let error = wait_failure(&session);
+        assert!(
+            error.contains("source failure"),
+            "unexpected error: {error}"
+        );
 
-    // B sends after the failure: the stopped runtime must not read or confirm it.
-    send(&factory, "b", rows(schema_right(), &[(2, 30, 0)]));
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(
-        factory.source("b").commits().len(),
-        1,
-        "no source may continue after a fail-stop"
-    );
+        // The runtime already stopped, so this later `k=1` row (which would
+        // change the join) must neither be read nor published. No sleep: the
+        // failure is observed through a responsive command before it is sent.
+        send(&factory, "b", rows(schema_right(), &[(1, 999, 0)]));
+        assert_eq!(
+            factory.source("b").commits().len(),
+            1,
+            "no source may continue after a fail-stop"
+        );
 
-    let snapshot = session.snapshot("j").expect("MV snapshot");
-    assert_eq!(
-        zset_tuples(&snapshot),
-        recompute(&[(1, 10, 1)], &[(1, 20, 1)]),
-        "only the acked lot may be published"
-    );
-    // The SELECT surface lists the distinct row once, without the multiplicity.
-    let select = session.sql("SELECT k, lv, rv FROM j").expect("select");
-    assert_eq!(query_rows(select), vec![vec![1, 10, 20]]);
-    session.shutdown().expect("shutdown");
+        let snapshot = session.snapshot("j").expect("MV snapshot");
+        assert_eq!(
+            zset_tuples(&snapshot),
+            recompute(&[(1, 10, 1)], &[(1, 20, 1)]),
+            "only the acked lot may be published"
+        );
+        let select = session.sql("SELECT k, lv, rv FROM j").expect("select");
+        assert_eq!(query_rows(select), vec![vec![1, 10, 20]]);
+        session.shutdown().expect("shutdown");
+    });
 }
