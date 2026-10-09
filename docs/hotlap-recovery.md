@@ -18,18 +18,22 @@
    commit; se **promueve** (re-conducir commit + publicar `valid`) si todos los
    sinks son re-conducibles, o se **descarta C con señal explícita** y se
    replaya desde el anterior (ver `docs/hotlap-sink-2pc.md`). Sin marker, este
-   paso no hace nada.
-2. **Cargar el último checkpoint válido**: se intenta `latest` primero. Si su
-   cuerpo tiene el formato actual pero está **corrupto** (truncado, longitud
-   incoherente, payload ilegible), o el puntero `latest` está dañado, se prueban
-   los anteriores de más nuevo a más viejo: un tip corrupto no aborta el arranque
+   paso no hace nada. Si publicar el commit promovido falla de forma **operativa**
+   (`Storage`), el error **propaga** sin leer un fallback, sin descartar el
+   pending y sin reabrir ninguna fuente.
+2. **Cargar el último checkpoint válido**: `latest` se lee solo para
+   clasificarlo, no para elegir. Se escanea el namespace de más nuevo a más
+   viejo y se toma el `valid` más nuevo, así un puntero `latest` que se quedó
+   atrás (p.ej. su escritura falló) **no** oculta uno ya publicado. Un puntero
+   `latest` dañado o un cuerpo del formato actual **corrupto** (truncado, longitud
+   incoherente, payload ilegible) se saltan: un tip corrupto no aborta el arranque
    mientras quede un predecesor válido. En cambio, un formato **ajeno o
    incompatible** (magic o versión desconocida, frame interno del motor o
    snapshot del engine con versión no soportada) o un checkpoint que **no valida**
    contra las fuentes declaradas (ids, schema, watermark, renombrado) es
    `Unsupported` **fatal**: no se prueba un lector viejo, no se cae a un
    predecesor y nunca arranca en vacío. Un fallo **operativo** del backend
-   (lectura/escritura/borrado, `Storage`) también es fatal: se **propaga** sin
+   (lectura/listado/borrado, `Storage`) también es fatal: se **propaga** sin
    borrar markers, sin retroceder a un predecesor y sin arranque limpio
    silencioso. Sin ningún checkpoint válido (y sin error fatal), es un
    **arranque limpio** (`None`).
@@ -100,13 +104,19 @@ follow-up fuera de SP4.
   (solo los N más nuevos), `checkpoint_periodic.rs` (disparo periódico, rechazo
   sin config y supresión tras fail-stop).
 - **Identidad y errores** (`tests/checkpoint_identity.rs`,
-  `tests/checkpoint_storage_errors.rs`): un id reservado no se reutiliza tras un
-  intento ambiguo, un crash ni una poda, y un `Checkpointer` nuevo parte del
-  mayor id presente/reservado; los fallos de `get`/`list`/`delete` (storage) se
-  propagan sin borrar markers, la corrupción del formato actual y el puntero
-  `latest` dañado se toleran, y una versión desconocida sigue siendo fatal.
+  `tests/checkpoint_storage_errors.rs`, `tests/checkpoint_reserve_faults.rs`,
+  `tests/checkpoint_recovery_selection.rs`,
+  `tests/checkpoint_recovery_storage.rs`): un id reservado no se reutiliza tras
+  un intento ambiguo (incluso con el mismo `Checkpointer`), un crash ni una poda,
+  y un `Checkpointer` nuevo parte del mayor id presente/reservado; el marker de
+  commit se conserva ante una escritura ambigua; la limpieza de un marker obsoleto
+  propaga `Storage`; recovery elige el `valid` más nuevo aunque `latest` se quede
+  atrás y un fallo de `get`/`list`/publicación se propaga sin descartar ni borrar
+  ni reabrir fuentes, mientras que la corrupción del formato actual se tolera y
+  una versión desconocida sigue siendo fatal.
 - **2PC** (`tests/sink_barrier.rs`): transaccional prepara→commit→valid;
-  fallo de capture aborta y descarta; fallo de prepare aborta los ya preparados;
+  fallo **operativo** de escritura del cuerpo conserva el marker/cuerpo y no
+  aborta los sinks preparados; fallo de prepare aborta los ya preparados;
   fallo de commit aborta el sink que falló y el resto de preparados sin
   confirmar; fallo de flush idempotente aborta los transaccionales preparados;
   idempotente se flushea sin prepare; at-least-once no se coordina.
