@@ -1,5 +1,6 @@
 //! Source -> kernel pipeline: setup, stream merging and batch ingestion.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +36,44 @@ pub struct Pipeline {
     /// Maximum input deltas retained for views created after `START`; `None`
     /// disables retention, so post-start views are rejected.
     pub retention: Option<usize>,
+}
+
+impl Pipeline {
+    /// Validate the sink wiring before any writer, stream or tap starts.
+    ///
+    /// Returns an explicit error for two out-of-scope configurations: two sinks
+    /// tapping the same view (the changelog is drained per view, so a second
+    /// sink would silently receive nothing) and a sink that cannot apply
+    /// retractions on a view whose plan may retract (the failure would
+    /// otherwise surface per batch, after writes or ingestion began).
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        let mut claimed: HashSet<&str> = HashSet::new();
+        for spec in &self.sinks {
+            if !claimed.insert(spec.view.as_str()) {
+                return Err(ConnectorError::Unsupported(format!(
+                    "view `{}` already has a sink; fan-out is not supported",
+                    spec.view
+                )));
+            }
+        }
+        for spec in &self.sinks {
+            let plan = self
+                .views
+                .iter()
+                .find(|(name, _)| name == &spec.view)
+                .map(|(_, plan)| plan);
+            if let Some(plan) = plan
+                && hotlap::plan::may_retract(plan)
+                && !spec.sink.accepts_retractions()
+            {
+                return Err(ConnectorError::Unsupported(format!(
+                    "sink on view `{}` cannot apply retractions; its plan may retract",
+                    spec.view
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Outcome of feeding one source item.

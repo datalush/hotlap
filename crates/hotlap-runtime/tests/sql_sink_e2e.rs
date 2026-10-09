@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use hotlap_sql::SqlError;
 
-use sink_support::{consolidate, recompute, session, source_batch, wait_for_rows, wait_for_sink};
+use sink_support::{
+    consolidate, recompute, session, session_with, source_batch, wait_for_rows, wait_for_sink,
+};
 
 const SOURCE: &str = "CREATE SOURCE src WITH (connector='inmem') WATERMARK FOR \
      _event_time AS _event_time - INTERVAL '1 s';";
@@ -59,6 +61,22 @@ async fn create_sink_unknown_view_rejected() {
     session.sql(SOURCE).await.unwrap();
     let bad = "CREATE SINK out WITH (connector='inmem') AS SELECT * FROM nope;";
     assert!(matches!(session.sql(bad).await, Err(SqlError::Catalog(_))));
+}
+
+#[tokio::test]
+async fn retracting_view_with_append_only_sink_rejected_at_start() {
+    let sink_batches = Arc::new(Mutex::new(Vec::new()));
+    // A sink that does not accept retractions cannot target the grouped,
+    // tumbling view; START must refuse before any write.
+    let mut session = session_with(vec![source_batch(&[1], &[1000])], &sink_batches, false);
+    session.sql(SOURCE).await.unwrap();
+    session.sql(VIEW).await.unwrap();
+    session.sql(SINK).await.unwrap();
+    let error = match session.sql("START;").await {
+        Err(error) => error,
+        Ok(_) => panic!("a retracting plan must be rejected before writes"),
+    };
+    assert!(matches!(error, SqlError::Engine(_)), "{error:?}");
 }
 
 #[tokio::test]

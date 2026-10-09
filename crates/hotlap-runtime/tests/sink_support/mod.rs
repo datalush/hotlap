@@ -2,7 +2,7 @@
 
 mod fakes;
 
-pub use fakes::{session, source_batch};
+pub use fakes::{session, session_with, source_batch};
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

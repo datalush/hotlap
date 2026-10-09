@@ -91,6 +91,12 @@ impl Sink for FlussSink {
         self.writer.capabilities()
     }
 
+    fn accepts_retractions(&self) -> bool {
+        // Both append and upsert modes reject negative diffs; the plan must be
+        // refused before any write rather than failing per batch.
+        false
+    }
+
     fn commit_redriable(&self) -> bool {
         // Idempotent upserts make a replay safe, but not a re-driven commit: the
         // writer only queues writes in memory, so a new writer after a crash

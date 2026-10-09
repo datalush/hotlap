@@ -30,6 +30,9 @@ impl EngineHandle {
     /// Blocks until the engine reports startup success or failure, so setup
     /// errors surface here instead of later as a stopped engine.
     pub fn start(pipeline: Pipeline) -> Result<Self, ConnectorError> {
+        // Reject unsupported sink wiring before spawning the engine thread, so
+        // no writer, source stream or tap starts for a pipeline that cannot run.
+        pipeline.validate()?;
         let (tx, rx) = mpsc::unbounded_channel();
         let last_error = Arc::new(Mutex::new(None));
         let engine_error = Arc::clone(&last_error);

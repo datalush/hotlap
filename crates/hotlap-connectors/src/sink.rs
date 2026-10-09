@@ -34,6 +34,15 @@ pub trait Sink: Send + Sync {
     fn capabilities(&self) -> SinkCapabilities {
         SinkCapabilities::AtLeastOnce
     }
+    /// Whether the sink can apply retractions (negative diffs).
+    ///
+    /// Defaults to `false`: a sink that has not declared support is treated as
+    /// append-only, so the runtime refuses a plan that may retract (e.g. a
+    /// grouped aggregate or a tumbling window) before any write or ingestion.
+    /// Override to `true` only when the sink truly handles deletes.
+    fn accepts_retractions(&self) -> bool {
+        false
+    }
     /// Whether [`Sink::commit`] may be safely re-driven after a restart.
     ///
     /// Recovery finds a checkpoint whose body is complete but whose `valid`

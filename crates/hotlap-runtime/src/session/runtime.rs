@@ -102,13 +102,17 @@ impl SqlSession {
         }
         let sinks = self.build_sinks().await?;
         let sources = self.build_sources(bindings)?;
-        Ok(Pipeline {
+        let pipeline = Pipeline {
             sources,
             views,
             sinks,
             checkpoint: self.checkpoint.take(),
             retention: self.retention,
-        })
+        };
+        // Refuse an unsupported sink wiring before the engine opens any source
+        // stream or writer, mirroring the public pipeline boundary.
+        pipeline.validate().map_err(to_engine)?;
+        Ok(pipeline)
     }
 
     /// Open every declared sink via the factory, resolving its view schema.

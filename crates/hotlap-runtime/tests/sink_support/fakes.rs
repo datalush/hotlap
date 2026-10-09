@@ -62,6 +62,7 @@ impl SourceFactory for FakeFactory {
 /// Sink accumulating every received change batch for later inspection.
 struct FakeSink {
     batches: Arc<Mutex<Vec<ZSetBatch>>>,
+    accepts_retractions: bool,
 }
 
 #[async_trait::async_trait]
@@ -71,6 +72,9 @@ impl Sink for FakeSink {
             self.batches.lock().unwrap().push(item?);
         }
         Ok(())
+    }
+    fn accepts_retractions(&self) -> bool {
+        self.accepts_retractions
     }
     async fn commit(&self) -> Result<(), ConnectorError> {
         Ok(())
@@ -83,6 +87,7 @@ impl Sink for FakeSink {
 /// Sink factory handing every create call a handle to one shared accumulator.
 struct FakeSinkFactory {
     batches: Arc<Mutex<Vec<ZSetBatch>>>,
+    accepts_retractions: bool,
 }
 
 #[async_trait::async_trait]
@@ -95,18 +100,29 @@ impl SinkFactory for FakeSinkFactory {
     ) -> Result<Arc<dyn Sink>, SqlError> {
         Ok(Arc::new(FakeSink {
             batches: Arc::clone(&self.batches),
+            accepts_retractions: self.accepts_retractions,
         }))
     }
 }
 
-/// Build a session wired to a fake source and a fake sink accumulator.
+/// Build a session wired to a fake source and a retraction-capable sink.
 pub fn session(batches: Vec<SourceBatch>, sink_batches: &Arc<Mutex<Vec<ZSetBatch>>>) -> SqlSession {
+    session_with(batches, sink_batches, true)
+}
+
+/// Build a session whose sink declares whether it can apply retractions.
+pub fn session_with(
+    batches: Vec<SourceBatch>,
+    sink_batches: &Arc<Mutex<Vec<ZSetBatch>>>,
+    accepts_retractions: bool,
+) -> SqlSession {
     let source = Arc::new(FakeFactory {
         schema: kv_schema(),
         batches,
     });
     let sink = Arc::new(FakeSinkFactory {
         batches: Arc::clone(sink_batches),
+        accepts_retractions,
     });
     SqlSession::open_with_factories(source, sink)
 }

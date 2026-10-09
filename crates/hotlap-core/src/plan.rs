@@ -160,6 +160,21 @@ pub enum Plan {
     },
 }
 
+/// Whether evaluating the plan may emit retractions (negative diffs).
+///
+/// A grouped aggregate retracts the previous row of a key when its state
+/// changes, and a tumbling window retracts rows that leave the window, so both
+/// are treated as retract-producing. Append-only sinks must refuse such a plan
+/// before any write or ingestion.
+pub fn may_retract(plan: &Plan) -> bool {
+    match plan {
+        Plan::GroupAggregate { .. } | Plan::TumbleCount { .. } => true,
+        Plan::Filter { input, .. } | Plan::Project { input, .. } => may_retract(input),
+        Plan::Join { left, right, .. } => may_retract(left) || may_retract(right),
+        Plan::Source(_) => false,
+    }
+}
+
 /// Does the plan contain any window?
 pub fn has_window(plan: &Plan) -> bool {
     match plan {

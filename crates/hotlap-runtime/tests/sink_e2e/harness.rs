@@ -93,6 +93,11 @@ impl Sink for FakeSink {
         }
         Ok(())
     }
+    fn accepts_retractions(&self) -> bool {
+        // The accumulator consolidates negative diffs, so it handles the
+        // retractions produced by the group-count view.
+        true
+    }
     async fn commit(&self) -> Result<(), ConnectorError> {
         self.committed.store(true, Ordering::SeqCst);
         Ok(())
