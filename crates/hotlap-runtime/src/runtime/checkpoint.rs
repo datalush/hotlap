@@ -138,12 +138,12 @@ impl Checkpointer {
                 .validate_views(declared, &checkpoint.engine)?;
         }
         let floor = valid.as_ref().map(|checkpoint| checkpoint.id);
-        if let Some(id) = self.pending_commit(floor)? {
-            if let Some(checkpoint) = self.read_body(id)? {
-                checkpoint
-                    .sources
-                    .validate_views(declared, &checkpoint.engine)?;
-            }
+        if let Some(id) = self.pending_commit(floor)?
+            && let Some(checkpoint) = self.read_body(id)?
+        {
+            checkpoint
+                .sources
+                .validate_views(declared, &checkpoint.engine)?;
         }
         Ok(())
     }
