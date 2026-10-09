@@ -11,6 +11,7 @@ use hotlap_core::plan::AggSpec;
 use super::GroupAggregate;
 use crate::batch::ZSetBatch;
 
+mod nulls;
 mod types;
 
 /// Builds a Z-set with an `Int64` key column and the given value column.

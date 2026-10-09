@@ -18,12 +18,7 @@ pub enum OperatorState {
 
 /// Accumulated value of one aggregate for one group.
 ///
-/// Floats are compared with [`f64::total_cmp`], so equality is reflexive even
-/// for `NaN`. `PartialEq` is implemented manually: `min`/`max` compare by their
-/// current extreme rather than by their whole multiset, so two states that
-/// render the same output row are equal and no redundant upsert is emitted.
-/// `Eq` is implemented to keep the snapshot container usable as an `Eq` type,
-/// mirroring `Scalar`.
+/// Floats compare with `f64::total_cmp`; `min`/`max` compare by current extreme.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AggValue {
     /// A `count` accumulator.
@@ -35,16 +30,11 @@ pub enum AggValue {
         /// Number of non-null values folded in; zero means the sum is null.
         count: i64,
     },
-    /// A float `sum` accumulator plus its non-null count.
-    ///
-    /// `sum` folds only finite inputs; `NaN` and the infinities are not
-    /// invertible from a running float, so each is counted separately and
-    /// recombined with IEEE semantics when the cell is materialized. This lets a
-    /// retraction of a special recover the finite sum that remains.
+    /// A float `sum` accumulator: finite sum plus `NaN`/`+Inf`/`-Inf` counts.
     SumFloat {
         /// Running sum of the finite values.
         sum: f64,
-        /// Number of non-null values folded in; zero means the sum is null.
+        /// Total number of non-null values folded in.
         count: i64,
         /// Multiplicity of `NaN` inputs.
         nan: i64,
@@ -53,14 +43,11 @@ pub enum AggValue {
         /// Multiplicity of `-Infinity` inputs.
         neg_inf: i64,
     },
-    /// An `avg` accumulator: the running finite sum plus its non-null count.
-    ///
-    /// Like [`AggValue::SumFloat`], special float inputs are kept as separate
-    /// multiplicities so retracting one restores the finite average.
+    /// An `avg` accumulator; the fields mirror [`AggValue::SumFloat`].
     Avg {
         /// Running sum of the finite input values.
         sum: f64,
-        /// Number of non-null values folded in.
+        /// Total number of non-null values folded in.
         count: i64,
         /// Multiplicity of `NaN` inputs.
         nan: i64,
@@ -131,17 +118,6 @@ pub struct GroupEntry {
     pub rows: i64,
     /// One accumulated value per aggregate, in plan order.
     pub values: Vec<AggValue>,
-}
-
-impl GroupEntry {
-    /// Whether two entries render the same output aggregate row.
-    ///
-    /// The row multiplicity is internal bookkeeping: `min`/`max` can change it
-    /// (retracting a null or a non-extreme value) without changing any emitted
-    /// cell, so comparisons that gate emission must ignore it.
-    pub fn same_output(&self, other: &Self) -> bool {
-        self.values == other.values
-    }
 }
 
 /// `groupaggregate` retained state: encoded key bytes to accumulator values.

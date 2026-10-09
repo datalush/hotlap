@@ -11,6 +11,8 @@ use hotlap_core::plan::AggSpec;
 use super::GroupAggregate;
 use crate::batch::ZSetBatch;
 
+mod snapshot;
+
 /// One `(key, value, diff)` row over an `Int64` key and a `Float64` value.
 fn zset(rows: &[(i64, f64, i64)]) -> ZSetBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -155,37 +157,16 @@ fn over_retracting_a_special_is_rejected() {
 }
 
 #[test]
-fn checkpoint_restore_keeps_special_state_then_retracts() {
-    let mut source = reducer();
-    source
+fn adding_a_finite_while_nan_present_does_not_churn() {
+    let mut reducer = reducer();
+    reducer
         .apply(&zset(&[(1, f64::NAN, 1), (1, 2.0, 1)]))
         .unwrap();
-    let state = source.export_state().unwrap();
-    let bytes = crate::encode_framed(&state).unwrap();
-    let decoded: hotlap_core::snapshot::GroupState = crate::decode_framed(&bytes).unwrap();
+    // The rendered sum/avg are still `NaN`, so nothing is emitted even though
+    // the finite remainder grew.
+    let out = reducer.apply(&zset(&[(1, 5.0, 1)])).unwrap();
+    assert!(out.is_empty(), "the materialized NaN sum is unchanged");
 
-    let mut restored = reducer();
-    restored.import_state(&decoded).unwrap();
-    let out = restored.apply(&zset(&[(1, f64::NAN, -1)])).unwrap();
-    assert_eq!(current(&out), vec![(1, Some(2.0), Some(2.0))]);
-}
-
-#[test]
-fn checkpoint_restore_keeps_infinite_state_then_retracts() {
-    let mut source = reducer();
-    source
-        .apply(&zset(&[
-            (1, f64::INFINITY, 1),
-            (1, f64::NEG_INFINITY, 1),
-            (1, 5.0, 1),
-        ]))
-        .unwrap();
-    let state = source.export_state().unwrap();
-    let mut restored = reducer();
-    restored.import_state(&state).unwrap();
-
-    let out = restored
-        .apply(&zset(&[(1, f64::INFINITY, -1), (1, f64::NEG_INFINITY, -1)]))
-        .unwrap();
-    assert_eq!(current(&out), vec![(1, Some(5.0), Some(5.0))]);
+    let recovered = reducer.apply(&zset(&[(1, f64::NAN, -1)])).unwrap();
+    assert_eq!(current(&recovered), vec![(1, Some(7.0), Some(3.5))]);
 }

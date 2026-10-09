@@ -72,9 +72,46 @@ impl Ord for ExtremeValue {
 ///
 /// Each value carries a multiplicity so retracting one occurrence keeps the
 /// value available until its last occurrence is removed.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct OrderedMultiset {
     counts: BTreeMap<ExtremeValue, i64>,
+}
+
+#[cfg(feature = "test-instrumentation")]
+thread_local! {
+    static COPIED_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Records that `entries` multiset entries were copied on this thread.
+#[cfg(feature = "test-instrumentation")]
+fn record_copy(entries: usize) {
+    COPIED_ENTRIES.with(|count| count.set(count.get() + entries as u64));
+}
+
+/// Number of multiset entries copied by `Clone` since the last reset.
+///
+/// Only available with the `test-instrumentation` feature; used to show that a
+/// delta update is independent of the multiset cardinality. The count is
+/// thread-local so parallel tests cannot inflate each other's measurement.
+#[cfg(feature = "test-instrumentation")]
+pub fn copied_entries() -> u64 {
+    COPIED_ENTRIES.with(std::cell::Cell::get)
+}
+
+/// Resets the copied-entry counter for the current thread.
+#[cfg(feature = "test-instrumentation")]
+pub fn reset_copied_entries() {
+    COPIED_ENTRIES.with(|count| count.set(0));
+}
+
+impl Clone for OrderedMultiset {
+    fn clone(&self) -> Self {
+        #[cfg(feature = "test-instrumentation")]
+        record_copy(self.counts.len());
+        Self {
+            counts: self.counts.clone(),
+        }
+    }
 }
 
 impl OrderedMultiset {

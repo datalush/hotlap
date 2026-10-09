@@ -8,9 +8,8 @@ use arrow::record_batch::RecordBatch;
 use arrow::row::{Row, RowConverter};
 
 use hotlap_core::plan::{AggSpec, aggregate_output_type};
-use hotlap_core::snapshot::GroupEntry;
 
-use super::columns::ColumnBuilder;
+use super::columns::{ColumnBuilder, OutputCell};
 use crate::batch::ZSetBatch;
 use crate::error::EngineError;
 
@@ -18,10 +17,10 @@ use crate::error::EngineError;
 pub(crate) struct Change {
     /// Encoded key bytes.
     pub key: Vec<u8>,
-    /// Prior aggregate row, retracted with diff `-1`.
-    pub previous: Option<GroupEntry>,
-    /// New aggregate row, inserted with diff `+1`.
-    pub current: Option<GroupEntry>,
+    /// Prior materialized output row, retracted with diff `-1`.
+    pub previous: Option<Vec<OutputCell>>,
+    /// New materialized output row, inserted with diff `+1`.
+    pub current: Option<Vec<OutputCell>>,
 }
 
 /// Builds the changelog for `changes` under the frozen input `schema`.
@@ -51,9 +50,9 @@ pub(crate) fn materialize(
         .iter()
         .map(|agg| ColumnBuilder::new(agg, schema))
         .collect::<Result<_, _>>()?;
-    for (_, entry, _) in &emitted {
-        for (builder, value) in builders.iter_mut().zip(entry.values.iter()) {
-            builder.push(value)?;
+    for (_, cells, _) in &emitted {
+        for (builder, cell) in builders.iter_mut().zip(cells.iter()) {
+            builder.push_cell(cell)?;
         }
     }
     for builder in builders {
@@ -66,15 +65,15 @@ pub(crate) fn materialize(
     Ok(ZSetBatch::new(batch, diff)?)
 }
 
-/// Expands changes into `(key, entry, diff)` rows: old `-1`, new `+1`.
-fn flatten(changes: &[Change]) -> Vec<(&[u8], &GroupEntry, i64)> {
+/// Expands changes into `(key, cells, diff)` rows: old `-1`, new `+1`.
+fn flatten(changes: &[Change]) -> Vec<(&[u8], &[OutputCell], i64)> {
     let mut emitted = Vec::new();
     for change in changes {
-        if let Some(entry) = &change.previous {
-            emitted.push((change.key.as_slice(), entry, -1));
+        if let Some(cells) = &change.previous {
+            emitted.push((change.key.as_slice(), cells.as_slice(), -1));
         }
-        if let Some(entry) = &change.current {
-            emitted.push((change.key.as_slice(), entry, 1));
+        if let Some(cells) = &change.current {
+            emitted.push((change.key.as_slice(), cells.as_slice(), 1));
         }
     }
     emitted

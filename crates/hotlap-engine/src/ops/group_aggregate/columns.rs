@@ -1,4 +1,4 @@
-//! Builds one output column per aggregate, fixing its Arrow type up front.
+//! Builds one output column per aggregate from materialized cells.
 
 use std::sync::Arc;
 
@@ -9,6 +9,104 @@ use hotlap_core::plan::{AggSpec, aggregate_output_type};
 use hotlap_core::snapshot::{AggValue, ExtremeValue};
 
 use crate::error::EngineError;
+
+/// A materialized output cell: what an aggregate renders for one group.
+#[derive(Clone, Debug)]
+pub(crate) enum OutputCell {
+    /// A null cell (empty sum/avg or an empty min/max multiset).
+    Empty,
+    /// An integer cell (count, integer sum, or integer min/max).
+    Int(i64),
+    /// A float cell (float sum/avg or float min/max).
+    Float(f64),
+}
+
+impl PartialEq for OutputCell {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (OutputCell::Empty, OutputCell::Empty) => true,
+            (OutputCell::Int(a), OutputCell::Int(b)) => a == b,
+            // `total_cmp` keeps two `NaN` cells equal, so a delta that leaves
+            // the rendered `NaN` unchanged emits nothing.
+            (OutputCell::Float(a), OutputCell::Float(b)) => a.total_cmp(b).is_eq(),
+            _ => false,
+        }
+    }
+}
+
+/// Renders every aggregate of one group into its output cell.
+pub(crate) fn render(values: &[AggValue]) -> Result<Vec<OutputCell>, EngineError> {
+    values.iter().map(cell).collect()
+}
+
+/// Renders one aggregate accumulator into its output cell.
+fn cell(value: &AggValue) -> Result<OutputCell, EngineError> {
+    Ok(match value {
+        AggValue::Count(count) => OutputCell::Int(*count),
+        AggValue::SumInteger { sum, count } => {
+            if *count == 0 {
+                OutputCell::Empty
+            } else {
+                OutputCell::Int(range_i64(*sum, "sum")?)
+            }
+        }
+        AggValue::SumFloat {
+            sum,
+            count,
+            nan,
+            pos_inf,
+            neg_inf,
+        } => {
+            if *count == 0 {
+                OutputCell::Empty
+            } else {
+                OutputCell::Float(float_sum(*sum, *nan, *pos_inf, *neg_inf))
+            }
+        }
+        AggValue::Avg {
+            sum,
+            count,
+            nan,
+            pos_inf,
+            neg_inf,
+        } => {
+            if *count == 0 {
+                OutputCell::Empty
+            } else {
+                OutputCell::Float(float_sum(*sum, *nan, *pos_inf, *neg_inf) / *count as f64)
+            }
+        }
+        AggValue::Min(multiset) => extreme_cell(multiset.min(), "min")?,
+        AggValue::Max(multiset) => extreme_cell(multiset.max(), "max")?,
+    })
+}
+
+/// Renders an optional extreme, widening integers and keeping floats as-is.
+fn extreme_cell(value: Option<ExtremeValue>, what: &str) -> Result<OutputCell, EngineError> {
+    Ok(match value {
+        None => OutputCell::Empty,
+        Some(ExtremeValue::Int(v)) => OutputCell::Int(range_i64(v, what)?),
+        Some(ExtremeValue::Float(v)) => OutputCell::Float(v),
+    })
+}
+
+/// Recombines the finite running sum with the special-input multiplicities.
+///
+/// Follows IEEE semantics: any `NaN` poisons the result, and mixing `+Inf` with
+/// `-Inf` is `NaN`; a single infinite sign dominates. A finite sum that
+/// overflowed to infinity is returned as-is (finite-only overflow is out of
+/// scope).
+fn float_sum(finite: f64, nan: i64, pos_inf: i64, neg_inf: i64) -> f64 {
+    if nan > 0 || (pos_inf > 0 && neg_inf > 0) {
+        f64::NAN
+    } else if pos_inf > 0 {
+        f64::INFINITY
+    } else if neg_inf > 0 {
+        f64::NEG_INFINITY
+    } else {
+        finite
+    }
+}
 
 /// Accumulates one output column, fixing its Arrow type up front.
 pub(crate) enum ColumnBuilder {
@@ -31,54 +129,22 @@ impl ColumnBuilder {
         }
     }
 
-    /// Appends one accumulated value, mapping empty groups to null.
-    pub(crate) fn push(&mut self, value: &AggValue) -> Result<(), EngineError> {
-        match (self, value) {
-            (ColumnBuilder::Int32(out), AggValue::Min(m)) => out.push(int32_cell(m.min(), "min")?),
-            (ColumnBuilder::Int32(out), AggValue::Max(m)) => out.push(int32_cell(m.max(), "max")?),
-            (ColumnBuilder::Int(out), AggValue::Count(count)) => out.push(Some(*count)),
-            (ColumnBuilder::Int(out), AggValue::SumInteger { sum, count }) => {
-                out.push(sum_cell(*count, *sum)?);
+    /// Appends one materialized cell, mapping empties to null.
+    pub(crate) fn push_cell(&mut self, cell: &OutputCell) -> Result<(), EngineError> {
+        match (self, cell) {
+            (ColumnBuilder::Int32(out), OutputCell::Empty) => out.push(None),
+            (ColumnBuilder::Int32(out), OutputCell::Int(v)) => {
+                out.push(Some(
+                    i32::try_from(*v).map_err(|_| out_of_range("cell", "Int32"))?,
+                ));
             }
-            (ColumnBuilder::Int(out), AggValue::Min(m)) => out.push(int64_cell(m.min(), "min")?),
-            (ColumnBuilder::Int(out), AggValue::Max(m)) => out.push(int64_cell(m.max(), "max")?),
-            (
-                ColumnBuilder::Float(out),
-                AggValue::SumFloat {
-                    sum,
-                    count,
-                    nan,
-                    pos_inf,
-                    neg_inf,
-                },
-            ) => {
-                out.push(if *count == 0 {
-                    None
-                } else {
-                    Some(float_sum(*sum, *nan, *pos_inf, *neg_inf))
-                });
-            }
-            (
-                ColumnBuilder::Float(out),
-                AggValue::Avg {
-                    sum,
-                    count,
-                    nan,
-                    pos_inf,
-                    neg_inf,
-                },
-            ) => {
-                out.push(if *count == 0 {
-                    None
-                } else {
-                    Some(float_sum(*sum, *nan, *pos_inf, *neg_inf) / *count as f64)
-                });
-            }
-            (ColumnBuilder::Float(out), AggValue::Min(m)) => out.push(float_cell(m.min(), "min")?),
-            (ColumnBuilder::Float(out), AggValue::Max(m)) => out.push(float_cell(m.max(), "max")?),
+            (ColumnBuilder::Int(out), OutputCell::Empty) => out.push(None),
+            (ColumnBuilder::Int(out), OutputCell::Int(v)) => out.push(Some(*v)),
+            (ColumnBuilder::Float(out), OutputCell::Empty) => out.push(None),
+            (ColumnBuilder::Float(out), OutputCell::Float(v)) => out.push(Some(*v)),
             _ => {
                 return Err(EngineError::Infrastructure(
-                    "aggregate output type mismatch".to_string(),
+                    "aggregate output cell type mismatch".to_string(),
                 ));
             }
         }
@@ -95,69 +161,10 @@ impl ColumnBuilder {
     }
 }
 
-/// The `Int64` sum cell: null when empty, checked for range otherwise.
-fn sum_cell(count: i64, sum: i128) -> Result<Option<i64>, EngineError> {
-    if count == 0 {
-        return Ok(None);
-    }
-    Ok(Some(range_i64(sum, "sum")?))
-}
-
-/// Recombines the finite running sum with the special-input multiplicities.
-///
-/// Follows IEEE semantics: any `NaN` poisons the result, and mixing `+Inf` with
-/// `-Inf` is `NaN`; a single infinite sign dominates. A finite sum that
-/// overflowed to infinity is returned as-is (finite-only overflow is out of
-/// scope).
-fn float_sum(finite: f64, nan: i64, pos_inf: i64, neg_inf: i64) -> f64 {
-    if nan > 0 || (pos_inf > 0 && neg_inf > 0) {
-        f64::NAN
-    } else if pos_inf > 0 {
-        f64::INFINITY
-    } else if neg_inf > 0 {
-        f64::NEG_INFINITY
-    } else {
-        finite
-    }
-}
-
-/// An `Int32` min/max cell, null when the group holds no values.
-fn int32_cell(value: Option<ExtremeValue>, what: &str) -> Result<Option<i32>, EngineError> {
-    match value {
-        None => Ok(None),
-        Some(ExtremeValue::Int(v)) => i32::try_from(v)
-            .map(Some)
-            .map_err(|_| out_of_range(what, "Int32")),
-        Some(ExtremeValue::Float(_)) => Err(mismatch(what)),
-    }
-}
-
-/// An `Int64` min/max cell, null when the group holds no values.
-fn int64_cell(value: Option<ExtremeValue>, what: &str) -> Result<Option<i64>, EngineError> {
-    match value {
-        None => Ok(None),
-        Some(ExtremeValue::Int(v)) => Ok(Some(range_i64(v, what)?)),
-        Some(ExtremeValue::Float(_)) => Err(mismatch(what)),
-    }
-}
-
-/// A `Float64` min/max cell, null when the group holds no values.
-fn float_cell(value: Option<ExtremeValue>, what: &str) -> Result<Option<f64>, EngineError> {
-    match value {
-        None => Ok(None),
-        Some(ExtremeValue::Float(v)) => Ok(Some(v)),
-        Some(ExtremeValue::Int(_)) => Err(mismatch(what)),
-    }
-}
-
 fn range_i64(value: i128, what: &str) -> Result<i64, EngineError> {
     i64::try_from(value).map_err(|_| out_of_range(what, "Int64"))
 }
 
 fn out_of_range(what: &str, ty: &str) -> EngineError {
     EngineError::Infrastructure(format!("group {what} out of range for {ty}"))
-}
-
-fn mismatch(what: &str) -> EngineError {
-    EngineError::Infrastructure(format!("group {what} value type mismatch"))
 }

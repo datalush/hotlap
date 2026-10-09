@@ -8,7 +8,9 @@
 //! diff `+1`, for every key whose values changed.
 
 mod accumulate;
+mod changes;
 mod columns;
+mod fold;
 mod materialize;
 mod read;
 mod snapshot;
@@ -27,7 +29,8 @@ use crate::error::EngineError;
 use crate::keys::converter_for;
 use crate::zset::int64_diffs;
 
-use accumulate::{empty_entry, fold_row};
+use accumulate::empty_entry;
+use fold::fold_row;
 use materialize::Change;
 
 /// Incremental grouped aggregate over the key columns named by `key`.
@@ -59,17 +62,18 @@ impl GroupAggregate {
     pub fn apply(&mut self, z: &ZSetBatch) -> Result<ZSetBatch, EngineError> {
         self.ensure_schema(z)?;
         let key_rows = self.encode_keys(z)?;
-        let (keys, mut previous) = self.record_keys(&key_rows, z.len());
+        let (keys, mut previous) = self.record_keys(&key_rows, z.len())?;
         #[cfg(test)]
         {
             self.work = keys.len() as u64;
         }
         self.fold(z, &key_rows)?;
-        let changes: Vec<Change> = keys
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, key)| self.change(key, previous[slot].take()))
-            .collect();
+        let mut changes: Vec<Change> = Vec::new();
+        for (slot, key) in keys.iter().enumerate() {
+            if let Some(change) = self.change(key, previous[slot].take())? {
+                changes.push(change);
+            }
+        }
         self.materialize(&changes)
     }
 
@@ -116,22 +120,6 @@ impl GroupAggregate {
         Ok(converter.convert_columns(&columns)?)
     }
 
-    /// Numbers the distinct keys of this delta and snapshots their prior state.
-    fn record_keys(&self, key_rows: &Rows, len: usize) -> (Vec<Vec<u8>>, Vec<Option<GroupEntry>>) {
-        let mut keys: Vec<Vec<u8>> = Vec::new();
-        let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
-        let mut previous: Vec<Option<GroupEntry>> = Vec::new();
-        for row in 0..len {
-            let bytes = key_rows.row(row).as_ref().to_vec();
-            if let std::collections::hash_map::Entry::Vacant(slot) = index.entry(bytes.clone()) {
-                previous.push(self.groups.get(&bytes).cloned());
-                keys.push(bytes);
-                slot.insert(keys.len() - 1);
-            }
-        }
-        (keys, previous)
-    }
-
     /// Folds every row of the delta into its key's accumulators.
     fn fold(&mut self, z: &ZSetBatch, key_rows: &Rows) -> Result<(), EngineError> {
         let diffs = int64_diffs(z.diff())?;
@@ -150,31 +138,6 @@ impl GroupAggregate {
             fold_row(entry, &self.aggs, &z.batch, row, diff)?;
         }
         Ok(())
-    }
-
-    /// Builds the upsert for one key, or `None` when nothing changed.
-    fn change(&mut self, key: &[u8], previous: Option<GroupEntry>) -> Option<Change> {
-        let current = self
-            .groups
-            .get(key)
-            .cloned()
-            .filter(|entry| entry.rows != 0);
-        if current.is_none() {
-            self.groups.remove(key);
-        }
-        let unchanged = match (&previous, &current) {
-            (Some(previous), Some(current)) => previous.same_output(current),
-            (None, None) => true,
-            _ => false,
-        };
-        if unchanged {
-            return None;
-        }
-        Some(Change {
-            key: key.to_vec(),
-            previous,
-            current,
-        })
     }
 
     /// Defers to [`materialize`] with this reducer's frozen schema.
@@ -197,3 +160,6 @@ mod minmax_tests;
 
 #[cfg(test)]
 mod special_tests;
+
+#[cfg(test)]
+mod copy_tests;

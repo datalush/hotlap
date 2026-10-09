@@ -8,3 +8,7 @@ arrow = "59.2"
 bincode = "1.3"
 serde = { version = "1", features = ["derive"] }
 hotlap-core = { path = "../hotlap-core" }
+
+[dev-dependencies]
+# Enables the deterministic multiset copy counter used by the cost tests.
+hotlap-core = { path = "../hotlap-core", features = ["test-instrumentation"] }

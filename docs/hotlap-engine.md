@@ -198,7 +198,10 @@ Verificación de ausencia (cero referencias):
   No hay recolección de basura ni gestión avanzada de late-data.
 - **`min`/`max` guardan todos los valores distintos**: al no ser invertibles, el
   multiset por clave crece con el nº de valores distintos vivos, no con el
-  resultado. Aceptable para SP6; una poda exigiría otra estructura.
+  resultado. Aceptable para SP6; una poda exigiría otra estructura. Un delta
+  **no clona** el multiset: materializa solo la fila de salida de las claves
+  tocadas y la compara con la anterior, así que su coste depende del delta y no
+  de la cardinalidad de la clave.
 - **Agregados con ventana**: `TumbleCount` solo computa `count(*)`; `sum`/`min`/
   `max`/`avg` por ventana quedan para SP7 (hop/sliding).
 - **Single-worker**: v1 sin exchange, sin *spill* y sin persistencia.

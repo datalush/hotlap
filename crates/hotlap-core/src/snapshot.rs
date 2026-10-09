@@ -17,6 +17,8 @@ use crate::plan::Plan;
 use crate::watermark::WatermarkSpec;
 
 pub use minmax::{ExtremeValue, OrderedMultiset};
+#[cfg(feature = "test-instrumentation")]
+pub use minmax::{copied_entries, reset_copied_entries};
 pub use operator::{
     AggValue, GroupEntry, GroupState, JoinState, OperatorState, WindowBucket, WindowState,
 };

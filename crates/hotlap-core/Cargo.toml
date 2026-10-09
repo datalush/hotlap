@@ -8,3 +8,8 @@ rust-version.workspace = true
 [dependencies]
 arrow = "59.2"
 serde = { version = "1", features = ["derive"] }
+
+[features]
+# Enables a deterministic count of multiset entries copied by `Clone`, used by
+# engine cost tests to prove a delta never copies whole `min`/`max` multisets.
+test-instrumentation = []
