@@ -25,9 +25,11 @@ encoding behind the `hotlap-core` `IncrementalCore` contract, so the
 the Source/Sink SPI and the Fluss source/sink; `hotlap-runtime` is the
 composition root that selects a kernel and drives the engine thread, so the
 connector crate never depends on a concrete engine. `hotlap-sql` translates
-embedded SQL/DDL into engine plans. Durability lives in `hotlap-runtime`:
-checkpoints and recovery, capacity-gated sink 2PC coordination and materialized
-views created after `START` (see [durability](docs/hotlap-durability.md)).
+embedded SQL/DDL into engine plans, including `INNER JOIN`s across two
+independent sources (see [cross-source joins](docs/hotlap-cross-source-joins.md)).
+Durability lives in `hotlap-runtime`: checkpoints and recovery, capacity-gated
+sink 2PC coordination and materialized views created after `START` (see
+[durability](docs/hotlap-durability.md) and [recovery](docs/hotlap-recovery.md)).
 
 The imported Rust client originates at `dc427e1290847b4a569b6745fcb87b256292bf6a`.
 Its Apache licenses/notices remain intact. Java/reference and non-Rust bindings

@@ -17,6 +17,10 @@ SP5 cierra la **API embebida**: un único handle síncrono,
 que un integrador use Hotlap desde Rust sin conocer el hilo del motor, los
 canales de comandos ni la `SessionContext` de DataFusion.
 
+Una sesión puede declarar **varias fuentes** antes de `START` y unir dos de ellas
+en una MV (`INNER JOIN`); el recorrido hasta el checkpoint y la recuperación se
+detallan en `docs/hotlap-cross-source-joins.md`.
+
 ## 2. Dónde vive cada pieza
 
 | Pieza | Ubicación | Rol |
@@ -73,7 +77,7 @@ internamente y nunca se invoca el handle del motor desde un executor ajeno.
 | --- | --- | --- |
 | `open` | `fn open(config: SessionConfig) -> Result<Session, SessionError>` | Abre la sesión; el motor no arranca hasta `START`. |
 | `sql` | `fn sql(&mut self, sql: &str) -> Result<QueryResult, SessionError>` | Ejecuta una sentencia: DDL, `START` o consulta. |
-| `start` | `fn start(&mut self) -> Result<(), SessionError>` | Arranca el motor con el source, las vistas y los sinks declarados. |
+| `start` | `fn start(&mut self) -> Result<(), SessionError>` | Arranca el motor con las fuentes, las vistas y los sinks declarados. |
 | `snapshot` | `fn snapshot(&self, view: &str) -> Result<ZSetBatch, SessionError>` | Lee la salida consolidada de una vista materializada. |
 | `metrics` | `fn metrics(&self) -> MetricsSnapshot` | Copia puntual de las métricas (vacía antes de `START`). |
 | `checkpoint` | `fn checkpoint(&self) -> Result<u64, SessionError>` | Toma un checkpoint **ahora** y devuelve su id. |

@@ -80,7 +80,7 @@ DataFusion planifica cada `SELECT` y `translate::to_kernel_plan` mapea su
 | `Filter` | `Filter` | predicado `col <op> literal` (`=,<>,<,<=,>,>=`), `AND`/`OR`/`NOT`, `IS [NOT] NULL`; el literal puede ir a cualquiera de los dos lados |
 | `Projection` | `Project` | proyección de columnas; la proyección identidad sobre un `Aggregate` se desenvuelve |
 | `Aggregate` | `GroupAggregate` / `TumbleCount` | `count`/`sum`/`min`/`max`/`avg` (con `GROUP BY` de columnas); `count(*)` por ventana con, como mucho, un `tumble(col, size)` |
-| `Join` | `Join` | inner equi-join; ambos lados leen **el mismo** source |
+| `Join` | `Join` | inner equi-join; hasta **dos fuentes distintas** (ver `hotlap-cross-source-joins.md`) |
 
 Tipos de columna admitidos: `Int32`, `Int64`, `Float64`, `Utf8` y `Boolean`.
 `min`/`max` son **solo numéricos** (`Int32`/`Int64`/`Float64`): sobre `Utf8`
@@ -106,7 +106,8 @@ con una traducción parcial o silenciosa:
 - `min`/`max` sobre `Utf8` (solo numéricos), al igual que `sum`/`avg` sobre
   tipos no numéricos.
 - Más de un `tumble`, o agregados de ventana distintos de `count(*)`.
-- **Joins no-equi** (o con `filter`), cross-source o entre sources distintos.
+- **Joins no-equi** (o con `filter`), `OUTER`, con más de dos fuentes distintas o
+  con condiciones residuales en el `ON`.
 
 Los tipos de columna que el kernel no representa también se rechazan: el
 esquema de salida de la MV se valida con `convert::ensure_kernel_types` en el
@@ -157,10 +158,11 @@ planifica como una tabla normal:
 
 El **DDL se declara antes de `START`** (ventana DDL). Crear un source o una MV
 después de `START` se **rechaza** con `SqlError::Unsupported` (no se ignora ni
-se aplica parcialmente). Un **segundo `CREATE SOURCE`** también se rechaza con
-`SqlError::Unsupported("only one source is supported in v1")`: v1 admite una
-única fuente por sesión, y aceptarla sobrescribiría la fuente/watermark vivos
-dejando el primer nombre registrado apuntando a los datos del segundo.
+se aplica parcialmente). Se pueden declarar **varias** fuentes antes de `START`:
+`START` fija los `InputId` en orden canónico, recompila cada MV contra esa
+asignación e ingiere cada fuente con identidad propia. Un `CREATE SOURCE`
+duplicado o con nombre ya usado se rechaza sin sustituir la fuente/watermark
+vivos (ver `hotlap-cross-source-joins.md`).
 
 ## 7. Nota sobre `_event_time`
 
@@ -185,69 +187,10 @@ añadirle operadores en caliente sin un motor de estado/replay. Registrar una MV
 tardía produciría resultados incorrectos, así que se rechaza explícitamente. Es
 un requisito registrado para **SP4**.
 
-## 9. No-goals
+## 9. No-goals, límites y verificación
 
-- Planificador o motor de consultas propio: se delega en DataFusion.
-- Superficie SQL completa: solo el subconjunto descrito; el resto se rechaza.
-- Catálogo persistente o multisesión: el `Catalog` es en memoria y por sesión.
-- Escritura (`Sink`), 2PC o persistencia de estado: SP4.
-- Dynamic views / `CREATE MV` tras `START`: SP4.
-- El kernel `crates/hotlap` no gana dependencias de Arrow ni DataFusion.
+Los no-goals, la lista de límites conocidos de v1 y la cobertura de tests se
+mantienen en `docs/hotlap-sql-limits.md`; los joins entre dos fuentes y su
+recorrido hasta el checkpoint se detallan en
+`docs/hotlap-cross-source-joins.md`.
 
-## 10. Verificación
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
-
-Cobertura: unit (`ddl`, `watermark`, `convert`, `translate`, `mv_schema`,
-`catalog`) e integración (`tests/e2e.rs` — paridad del resultado SQL con una
-recomputación completa de las ventanas tumbling, MV vacía → 0 filas, DDL tras
-`START` rechazado, y drop de la sesión sin pánico en el executor;
-`tests/session_guards.rs` — segundo `CREATE SOURCE` rechazado, tipo de salida
-de MV no representable rechazado en DDL, y nombre de vista no envenenado por un
-`CREATE MATERIALIZED VIEW` fallido). SP6 añade:
-
-- `tests/predicate_translate.rs` — traducción de cada comparación, combinadores
-  booleanos, `IS [NOT] NULL`, literal a la izquierda (inversión) y rechazos.
-- `tests/predicate_differential.rs` — paridad de la semántica de predicados
-  (NULL/casts) contra `PhysicalExpr` de DataFusion.
-- `hotlap-runtime/tests/sql_group_aggregate.rs` — E2E de `sum`/`min`/`max`/`avg`
-  con retracciones contra recomputación completa.
-- `hotlap-engine` (`ops/group_aggregate/tests.rs`, `minmax_tests/`) — cada
-  agregado y sus retracciones, incluida la retracción del extremo actual.
-- `hotlap-core` (`predicate/eval.rs`, `snapshot/minmax.rs`) — evaluación
-  Kleene y multiset de `min`/`max` (`total_cmp` para floats).
-
-La ruta Fluss por defecto (`FlussSourceFactory`) requiere un clúster vivo; en
-este entorno **no** hay uno, así que se verifica en compilación y los tests
-ejercitan el factory inyectado. La integración contra un clúster real queda
-pendiente.
-
-## 11. Límites conocidos (v1, low priority)
-
-Residuos de la implementación de SP3, no bloqueantes (parkeados con ruling). Los
-más sustantivos tienen issue de kata para repararse; el resto queda aquí:
-
-- **Proyección identidad laxa:** la proyección que DataFusion coloca sobre un
-  `Aggregate` se desenvuelve comprobando solo que cada expresión sea una columna
-  resoluble; no se valida que sea una identidad exacta (orden/subconjunto de
-  columnas). `SELECT count(*), k ...` o `SELECT count(*) ...` se aceptan y su
-  orden/subconjunto se descarta en favor del orden normalizado del kernel.
-  (Issue kata pendiente.)
-- **`built==false` enmascara errores:** el snapshot de una MV usa
-  `SnapshotHandle::is_built` (flag de motor, global) y, si el dataflow aún no se
-  ha construido, sirve **vacío** en vez de propagar un error del engine anterior
-  al primer push. Tolerable para el motor single-source de v1; un motor
-  multi-source necesitaría una señal por input. (Issue kata pendiente.)
-- **Escáner DDL minimalista** (`ddl_scan.rs`): reconoce `k='v'` separados por
-  comas; no cubre comillas escapadas ni comas dentro de literales. El anclaje de
-  `WITH` no es estricto (busca la primera aparición) y la normalización de
-  `tumble(...)` es textual (podría casar dentro de un literal).
-- **Opción `table` engañosa:** en `CREATE SOURCE`, `table` es una ruta
-  `<db>/<table>` (la esperada por `FlussSource::open_from_bootstrap`); el nombre
-  del source no se usa. El nombre de la opción sugiere lo contrario.
-- **`session/mod.rs` en 199/200 líneas:** la próxima adición a la sesión debe
-  extraer una unidad antes de crecer.
