@@ -25,7 +25,7 @@ pub use operator::{
 ///
 /// Bump this whenever the meaning of an existing field changes; readers reject
 /// any other version instead of guessing.
-pub const ENGINE_SNAPSHOT_FORMAT_VERSION: u32 = 4;
+pub const ENGINE_SNAPSHOT_FORMAT_VERSION: u32 = 5;
 
 /// An Arrow IPC table plus its signed multiplicity column.
 ///

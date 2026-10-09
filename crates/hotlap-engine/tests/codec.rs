@@ -23,6 +23,19 @@ fn snapshot_round_trips_through_a_binary_frame() {
 }
 
 #[test]
+fn previous_format_version_is_rejected_on_decode() {
+    // Version 4 predates the separate finite-sum/special-count float layout.
+    let mut snapshot = empty_snapshot();
+    snapshot.format_version = 4;
+    let bytes = encode_framed(&snapshot).unwrap();
+    let err = decode_snapshot(&bytes).expect_err("the old layout must be rejected");
+    assert!(
+        matches!(err, hotlap_engine::EngineError::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+}
+
+#[test]
 fn unknown_format_version_is_rejected_on_encode() {
     let mut snapshot = empty_snapshot();
     snapshot.format_version = ENGINE_SNAPSHOT_FORMAT_VERSION + 1;

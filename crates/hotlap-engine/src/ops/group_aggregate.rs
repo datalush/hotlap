@@ -194,3 +194,6 @@ mod tests;
 
 #[cfg(test)]
 mod minmax_tests;
+
+#[cfg(test)]
+mod special_tests;

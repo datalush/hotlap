@@ -36,18 +36,38 @@ pub enum AggValue {
         count: i64,
     },
     /// A float `sum` accumulator plus its non-null count.
+    ///
+    /// `sum` folds only finite inputs; `NaN` and the infinities are not
+    /// invertible from a running float, so each is counted separately and
+    /// recombined with IEEE semantics when the cell is materialized. This lets a
+    /// retraction of a special recover the finite sum that remains.
     SumFloat {
-        /// Running sum.
+        /// Running sum of the finite values.
         sum: f64,
         /// Number of non-null values folded in; zero means the sum is null.
         count: i64,
+        /// Multiplicity of `NaN` inputs.
+        nan: i64,
+        /// Multiplicity of `+Infinity` inputs.
+        pos_inf: i64,
+        /// Multiplicity of `-Infinity` inputs.
+        neg_inf: i64,
     },
-    /// An `avg` accumulator: the running sum plus its non-null count.
+    /// An `avg` accumulator: the running finite sum plus its non-null count.
+    ///
+    /// Like [`AggValue::SumFloat`], special float inputs are kept as separate
+    /// multiplicities so retracting one restores the finite average.
     Avg {
-        /// Running sum of the input values.
+        /// Running sum of the finite input values.
         sum: f64,
         /// Number of non-null values folded in.
         count: i64,
+        /// Multiplicity of `NaN` inputs.
+        nan: i64,
+        /// Multiplicity of `+Infinity` inputs.
+        pos_inf: i64,
+        /// Multiplicity of `-Infinity` inputs.
+        neg_inf: i64,
     },
     /// A retraction-aware `min` over the group's non-null values.
     Min(OrderedMultiset),
@@ -63,12 +83,38 @@ impl PartialEq for AggValue {
                 AggValue::SumInteger { sum: a, count: b },
                 AggValue::SumInteger { sum: c, count: d },
             ) => a == c && b == d,
-            (AggValue::SumFloat { sum: a, count: b }, AggValue::SumFloat { sum: c, count: d }) => {
-                a.total_cmp(c).is_eq() && b == d
-            }
-            (AggValue::Avg { sum: a, count: b }, AggValue::Avg { sum: c, count: d }) => {
-                a.total_cmp(c).is_eq() && b == d
-            }
+            (
+                AggValue::SumFloat {
+                    sum: a,
+                    count: b,
+                    nan: c,
+                    pos_inf: d,
+                    neg_inf: e,
+                },
+                AggValue::SumFloat {
+                    sum: f,
+                    count: g,
+                    nan: h,
+                    pos_inf: i,
+                    neg_inf: j,
+                },
+            ) => a.total_cmp(f).is_eq() && (b, c, d, e) == (g, h, i, j),
+            (
+                AggValue::Avg {
+                    sum: a,
+                    count: b,
+                    nan: c,
+                    pos_inf: d,
+                    neg_inf: e,
+                },
+                AggValue::Avg {
+                    sum: f,
+                    count: g,
+                    nan: h,
+                    pos_inf: i,
+                    neg_inf: j,
+                },
+            ) => a.total_cmp(f).is_eq() && (b, c, d, e) == (g, h, i, j),
             (AggValue::Min(a), AggValue::Min(b)) => a.min() == b.min(),
             (AggValue::Max(a), AggValue::Max(b)) => a.max() == b.max(),
             _ => false,
@@ -158,11 +204,17 @@ mod tests {
         let sum = AggValue::SumFloat {
             sum: f64::NAN,
             count: 1,
+            nan: 1,
+            pos_inf: 0,
+            neg_inf: 0,
         };
         assert_eq!(sum, sum.clone());
         let avg = AggValue::Avg {
             sum: f64::NAN,
             count: 2,
+            nan: 1,
+            pos_inf: 0,
+            neg_inf: 0,
         };
         assert_eq!(avg, avg.clone());
     }

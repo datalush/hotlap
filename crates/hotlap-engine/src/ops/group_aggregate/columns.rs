@@ -42,14 +42,36 @@ impl ColumnBuilder {
             }
             (ColumnBuilder::Int(out), AggValue::Min(m)) => out.push(int64_cell(m.min(), "min")?),
             (ColumnBuilder::Int(out), AggValue::Max(m)) => out.push(int64_cell(m.max(), "max")?),
-            (ColumnBuilder::Float(out), AggValue::SumFloat { sum, count }) => {
-                out.push(if *count == 0 { None } else { Some(*sum) });
-            }
-            (ColumnBuilder::Float(out), AggValue::Avg { sum, count }) => {
+            (
+                ColumnBuilder::Float(out),
+                AggValue::SumFloat {
+                    sum,
+                    count,
+                    nan,
+                    pos_inf,
+                    neg_inf,
+                },
+            ) => {
                 out.push(if *count == 0 {
                     None
                 } else {
-                    Some(*sum / *count as f64)
+                    Some(float_sum(*sum, *nan, *pos_inf, *neg_inf))
+                });
+            }
+            (
+                ColumnBuilder::Float(out),
+                AggValue::Avg {
+                    sum,
+                    count,
+                    nan,
+                    pos_inf,
+                    neg_inf,
+                },
+            ) => {
+                out.push(if *count == 0 {
+                    None
+                } else {
+                    Some(float_sum(*sum, *nan, *pos_inf, *neg_inf) / *count as f64)
                 });
             }
             (ColumnBuilder::Float(out), AggValue::Min(m)) => out.push(float_cell(m.min(), "min")?),
@@ -79,6 +101,24 @@ fn sum_cell(count: i64, sum: i128) -> Result<Option<i64>, EngineError> {
         return Ok(None);
     }
     Ok(Some(range_i64(sum, "sum")?))
+}
+
+/// Recombines the finite running sum with the special-input multiplicities.
+///
+/// Follows IEEE semantics: any `NaN` poisons the result, and mixing `+Inf` with
+/// `-Inf` is `NaN`; a single infinite sign dominates. A finite sum that
+/// overflowed to infinity is returned as-is (finite-only overflow is out of
+/// scope).
+fn float_sum(finite: f64, nan: i64, pos_inf: i64, neg_inf: i64) -> f64 {
+    if nan > 0 || (pos_inf > 0 && neg_inf > 0) {
+        f64::NAN
+    } else if pos_inf > 0 {
+        f64::INFINITY
+    } else if neg_inf > 0 {
+        f64::NEG_INFINITY
+    } else {
+        finite
+    }
 }
 
 /// An `Int32` min/max cell, null when the group holds no values.

@@ -135,7 +135,7 @@ declaración. El core concreto se inyecta con `Hotlap::open_with`.
 |---|---|---|
 | `Filter` | `arrow::compute::filter_record_batch` | Filtra columnas de datos y `diff` juntos, de modo que las retracciones sobreviven si su fila pasa el filtro. `Predicate::Cmp`/`And`/`Or`/`Not`/`IsNull` con lógica de tres valores (Kleene). |
 | `Project` | `arrow::compute` (`ArrayRef::clone`) | Selecciona/reordena columnas compartiendo arrays; O(nº de columnas). Conserva `diff`. |
-| `GroupAggregate` | claves `arrow::row` + reduce incremental | Mantiene `clave → acumuladores` para `count`/`sum`/`min`/`max`/`avg`; actualiza **solo las claves tocadas** por el delta (coste O(delta), no O(keyspace)). El estado es `retraction-aware` (pesos negativos): `count` es `i64`, `sum` entero es `i128` con `checked_add`/`checked_sub` (fail-stop en overflow) y `sum`/`avg` float son `f64` (el `avg` guarda suma + nº de no nulos). `min`/`max` **no son invertibles**, así que por clave guardan un **multiset** `valor→cuenta` (`OrderedMultiset`, `BTreeMap` con `Ord` propio; floats vía `f64::total_cmp`): al retraer el extremo hasta cuenta cero se recalcula el siguiente; retraer más de lo insertado satura en cero. Emite un changelog `(clave..., aggs...)` con `diff` firmado: al cruzar a cero retrae la fila vieja; una clave nueva inserta la suya; una cambiada retrae la vieja e inserta la nueva. La comparación de estado para decidir la emisión ignora la multiplicidad de filas y compara `min`/`max` por el extremo actual (`same_output`). |
+| `GroupAggregate` | claves `arrow::row` + reduce incremental | Mantiene `clave → acumuladores` para `count`/`sum`/`min`/`max`/`avg`; actualiza **solo las claves tocadas** por el delta (coste O(delta), no O(keyspace)). El estado es `retraction-aware` (pesos negativos): `count` es `i64`, `sum` entero es `i128` con `checked_add`/`checked_sub` (fail-stop en overflow); `sum`/`avg` float guardan la **suma de los valores finitos** y cuentan por separado las multiplicidades de `NaN`, `+∞` y `-∞`, de modo que retraer un valor especial recupera la parte finita (el `avg` añade el nº total de no nulos). Al materializar se recombinan con semántica IEEE: cualquier `NaN` o la mezcla `+∞`/`-∞` da `NaN`, un único signo infinito domina; un `avg` con infinitos es infinito. Retraer un especial más veces de las insertadas es un error, no se satura. `min`/`max` **no son invertibles**, así que por clave guardan un **multiset** `valor→cuenta` (`OrderedMultiset`, `BTreeMap` con `Ord` propio; floats vía `f64::total_cmp`): al retraer el extremo hasta cuenta cero se recalcula el siguiente; retraer más de lo insertado satura en cero. Emite un changelog `(clave..., aggs...)` con `diff` firmado: al cruzar a cero retrae la fila vieja; una clave nueva inserta la suya; una cambiada retrae la vieja e inserta la nueva. La comparación para decidir la emisión usa la **fila de salida materializada** (ignora la multiplicidad de filas internas y compara `min`/`max` por el extremo actual). |
 | `Join` (inner equi) | claves `arrow::row` ambos lados | Cada lado acumula en un `KeyedArrangement`; cada `apply` recomputa el join y emite el changelog contra la relación anterior. La fila de salida es `left ‖ right`; las multiplicidades se multiplican. |
 | `TumbleCount` | ventana tumbling sobre event-time | Cubetas abiertas en un `BTreeMap` por `window_start`; `ws = (event_ts / size) * size`. Emite cada ventana **una vez al cerrarse** (append-only) y la libera; las filas por debajo del watermark previo se cuentan como late y se descartan. |
 
@@ -153,8 +153,12 @@ un `GroupAggregate` es `GroupState` → `key bytes -> GroupEntry`, y cada
 
 - `count` → `Count(i64)`;
 - `sum` entero → `SumInteger { sum: i128, count: i64 }` (el `count` distingue
-  «suma = 0» de «sin valores no nulos») y `sum` float → `SumFloat { sum, count }`;
-- `avg` → `Avg { sum: f64, count: i64 }` (suma + nº de no nulos);
+  «suma = 0» de «sin valores no nulos») y `sum` float →
+  `SumFloat { sum, count, nan, pos_inf, neg_inf }`, donde `sum` acumula solo los
+  valores finitos y las otras cuentas llevan las multiplicidades de `NaN`, `+∞`
+  y `-∞`;
+- `avg` → `Avg { sum: f64, count, nan, pos_inf, neg_inf }` (suma finita + nº
+  total de no nulos + las mismas multiplicidades);
 - `min`/`max` → `Min`/`Max(OrderedMultiset)` (el multiset `valor→cuenta`).
 
 Los extremos se serializan con su multiset completo, de modo que un restore no

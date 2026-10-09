@@ -78,18 +78,28 @@ pub(crate) fn fold_row(
                     *count = add(*count, diff, "group sum count")?;
                 }
             }
-            AggValue::SumFloat { sum, count } => {
+            AggValue::SumFloat {
+                sum,
+                count,
+                nan,
+                pos_inf,
+                neg_inf,
+            } => {
                 let col = input(agg)?;
                 if let Some(value) = float_at(batch, col, row)? {
-                    *sum += value * diff as f64;
-                    *count = add(*count, diff, "group sum count")?;
+                    fold_float(sum, count, nan, pos_inf, neg_inf, value, diff, "group sum")?;
                 }
             }
-            AggValue::Avg { sum, count } => {
+            AggValue::Avg {
+                sum,
+                count,
+                nan,
+                pos_inf,
+                neg_inf,
+            } => {
                 let col = input(agg)?;
                 if let Some(value) = float_at(batch, col, row)? {
-                    *sum += value * diff as f64;
-                    *count = add(*count, diff, "group avg count")?;
+                    fold_float(sum, count, nan, pos_inf, neg_inf, value, diff, "group avg")?;
                 }
             }
             AggValue::Min(multiset) | AggValue::Max(multiset) => {
@@ -103,16 +113,55 @@ pub(crate) fn fold_row(
     Ok(())
 }
 
+/// Folds one finite or special float into a `sum`/`avg` accumulator.
+///
+/// Finite values extend the running sum; `NaN`/`+Inf`/`-Inf` extend separate
+/// multiplicities so a later retraction can recover the finite remainder.
+fn fold_float(
+    sum: &mut f64,
+    count: &mut i64,
+    nan: &mut i64,
+    pos_inf: &mut i64,
+    neg_inf: &mut i64,
+    value: f64,
+    diff: i64,
+    what: &str,
+) -> Result<(), EngineError> {
+    if value.is_nan() {
+        *nan = occurrences(*nan, diff, &format!("{what} NaN count"))?;
+    } else if value == f64::INFINITY {
+        *pos_inf = occurrences(*pos_inf, diff, &format!("{what} +inf count"))?;
+    } else if value == f64::NEG_INFINITY {
+        *neg_inf = occurrences(*neg_inf, diff, &format!("{what} -inf count"))?;
+    } else {
+        *sum += value * diff as f64;
+    }
+    *count = add(*count, diff, &format!("{what} count"))?;
+    Ok(())
+}
+
 /// The zero accumulator matching `agg`'s function and input column type.
 fn zeroed(agg: &AggSpec, schema: &SchemaRef) -> Result<AggValue, EngineError> {
     match agg.func {
         AggFunc::Count => Ok(AggValue::Count(0)),
         AggFunc::Sum => match input_type(agg, schema)? {
             DataType::Int32 | DataType::Int64 => Ok(AggValue::SumInteger { sum: 0, count: 0 }),
-            DataType::Float64 => Ok(AggValue::SumFloat { sum: 0.0, count: 0 }),
+            DataType::Float64 => Ok(AggValue::SumFloat {
+                sum: 0.0,
+                count: 0,
+                nan: 0,
+                pos_inf: 0,
+                neg_inf: 0,
+            }),
             other => Err(unsupported(agg, &format!("input type {other:?}"))),
         },
-        AggFunc::Avg => Ok(AggValue::Avg { sum: 0.0, count: 0 }),
+        AggFunc::Avg => Ok(AggValue::Avg {
+            sum: 0.0,
+            count: 0,
+            nan: 0,
+            pos_inf: 0,
+            neg_inf: 0,
+        }),
         AggFunc::Min => Ok(AggValue::Min(OrderedMultiset::default())),
         AggFunc::Max => Ok(AggValue::Max(OrderedMultiset::default())),
     }
@@ -139,6 +188,21 @@ fn field(schema: &Schema, index: usize) -> Result<&FieldRef, EngineError> {
 
 fn add(value: i64, delta: i64, what: &str) -> Result<i64, EngineError> {
     value.checked_add(delta).ok_or_else(|| overflow(what))
+}
+
+/// Applies `delta` to a special-input multiplicity, rejecting a negative result.
+///
+/// Retracting a `NaN`/`+Inf`/`-Inf` more often than it was inserted is an
+/// invalid retraction, not a state to saturate: a negative multiplicity would
+/// silently corrupt the materialized sum.
+fn occurrences(count: i64, delta: i64, what: &str) -> Result<i64, EngineError> {
+    let next = count.checked_add(delta).ok_or_else(|| overflow(what))?;
+    if next < 0 {
+        return Err(EngineError::Infrastructure(format!(
+            "{what} retracted below zero"
+        )));
+    }
+    Ok(next)
 }
 
 fn overflow(what: &str) -> EngineError {
