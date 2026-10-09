@@ -20,7 +20,7 @@ use hotlap_connectors::source::{
 use hotlap_engine::EngineCore;
 use tokio::sync::mpsc;
 
-use super::{Engine, serve};
+use super::{Engine, EngineShared, serve};
 use crate::runtime::command::Command;
 use crate::runtime::pipeline::Pipeline;
 use crate::runtime::sink::SinkPump;
@@ -137,21 +137,18 @@ fn fail_then_ready() -> (Engine, Pipeline, Arc<AtomicBool>, Arc<AtomicUsize>) {
 
 /// Drive `serve` single-threaded until pending and return the recorded error.
 fn drive_until_pending(engine: Engine, pipeline: Pipeline) -> Option<String> {
-    let last_error = Mutex::new(None);
-    let checkpoint_error = Mutex::new(None);
-    let built = AtomicBool::new(false);
+    let last_error = Arc::new(Mutex::new(None));
+    let shared = EngineShared {
+        last_error: Arc::clone(&last_error),
+        checkpoint_error: Arc::new(Mutex::new(None)),
+        close_error: Arc::new(Mutex::new(None)),
+        built: Arc::new(AtomicBool::new(false)),
+    };
     // Keep the sender alive so the command channel stays pending.
     let (_tx, mut rx) = mpsc::unbounded_channel::<Command>();
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
-    let mut serving = Box::pin(serve(
-        engine,
-        pipeline,
-        &mut rx,
-        &last_error,
-        &checkpoint_error,
-        &built,
-    ));
+    let mut serving = Box::pin(serve(engine, pipeline, &mut rx, &shared));
     for _ in 0..5 {
         assert!(
             serving.as_mut().poll(&mut cx).is_pending(),
@@ -159,7 +156,7 @@ fn drive_until_pending(engine: Engine, pipeline: Pipeline) -> Option<String> {
         );
     }
     drop(serving);
-    last_error.into_inner().unwrap()
+    last_error.lock().unwrap().clone()
 }
 
 #[test]

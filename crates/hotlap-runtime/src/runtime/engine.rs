@@ -18,6 +18,21 @@ use hotlap_connectors::error::ConnectorError;
 
 mod serve;
 
+/// State shared between the handle and the engine thread.
+///
+/// Bundled so the engine entry points stay within a readable argument count.
+#[derive(Clone)]
+pub(crate) struct EngineShared {
+    /// First source/ingestion error, kept for the handle to observe.
+    pub(crate) last_error: Arc<Mutex<Option<String>>>,
+    /// First periodic-checkpoint failure, kept separate from source errors.
+    pub(crate) checkpoint_error: Arc<Mutex<Option<String>>>,
+    /// Why the last shutdown could not close cleanly, if it failed.
+    pub(crate) close_error: Arc<Mutex<Option<ConnectorError>>>,
+    /// Whether at least one batch has built the dataflow.
+    pub(crate) built: Arc<AtomicBool>,
+}
+
 /// Run the engine loop until shutdown or channel close.
 ///
 /// `ready` reports the outcome of startup (runtime, kernel open, setup and
@@ -25,9 +40,7 @@ mod serve;
 pub(crate) fn run(
     pipeline: Pipeline,
     mut rx: UnboundedReceiver<Command>,
-    last_error: Arc<Mutex<Option<String>>>,
-    checkpoint_error: Arc<Mutex<Option<String>>>,
-    built: Arc<AtomicBool>,
+    shared: EngineShared,
     metrics: Arc<MetricsRegistry>,
     ready: oneshot::Sender<Result<(), ConnectorError>>,
 ) {
@@ -41,16 +54,9 @@ pub(crate) fn run(
             return;
         }
     };
-    rt.block_on(drive(
-        pipeline,
-        &mut rx,
-        &last_error,
-        &checkpoint_error,
-        &built,
-        metrics,
-        ready,
-    ));
+    rt.block_on(drive(pipeline, &mut rx, &shared, metrics, ready));
 }
+
 
 /// Live state owned by the serving loop after startup.
 struct Engine {
@@ -65,13 +71,11 @@ struct Engine {
 async fn drive(
     mut pipeline: Pipeline,
     rx: &mut UnboundedReceiver<Command>,
-    last_error: &Mutex<Option<String>>,
-    checkpoint_error: &Mutex<Option<String>>,
-    built: &AtomicBool,
+    shared: &EngineShared,
     metrics: Arc<MetricsRegistry>,
     ready: oneshot::Sender<Result<(), ConnectorError>>,
 ) {
-    let engine = match prepare(&mut pipeline, metrics, checkpoint_error).await {
+    let engine = match prepare(&mut pipeline, metrics, shared).await {
         Ok(engine) => engine,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -79,14 +83,14 @@ async fn drive(
         }
     };
     let _ = ready.send(Ok(()));
-    serve::serve(engine, pipeline, rx, last_error, checkpoint_error, built).await;
+    serve::serve(engine, pipeline, rx, shared).await;
 }
 
 /// Open the kernel, merge the source streams and read the checkpoint config.
 async fn prepare(
     pipeline: &mut Pipeline,
     metrics: Arc<MetricsRegistry>,
-    checkpoint_error: &Mutex<Option<String>>,
+    shared: &EngineShared,
 ) -> Result<Engine, ConnectorError> {
     let core = EngineCore::with_metrics(Arc::clone(&metrics));
     let mut hotlap = Hotlap::open_with(Box::new(core));
@@ -109,7 +113,7 @@ async fn prepare(
                 &mut hotlap,
                 &pipeline.sources,
                 &mut checkpointer,
-                checkpoint_error,
+                &shared.checkpoint_error,
                 &metrics,
             )
             .await?;

@@ -9,7 +9,7 @@ use hotlap_engine::MetricsRegistry;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::runtime::command::Command;
-use crate::runtime::engine;
+use crate::runtime::engine::{self, EngineShared};
 use crate::runtime::pipeline::Pipeline;
 use crate::runtime::snapshot_handle::SnapshotHandle;
 use hotlap_connectors::error::ConnectorError;
@@ -18,9 +18,7 @@ use hotlap_connectors::error::ConnectorError;
 pub struct EngineHandle {
     tx: mpsc::UnboundedSender<Command>,
     join: Option<JoinHandle<()>>,
-    last_error: Arc<Mutex<Option<String>>>,
-    checkpoint_error: Arc<Mutex<Option<String>>>,
-    built: Arc<AtomicBool>,
+    shared: EngineShared,
     metrics: Arc<MetricsRegistry>,
 }
 
@@ -34,25 +32,18 @@ impl EngineHandle {
         // no writer, source stream or tap starts for a pipeline that cannot run.
         pipeline.validate()?;
         let (tx, rx) = mpsc::unbounded_channel();
-        let last_error = Arc::new(Mutex::new(None));
-        let engine_error = Arc::clone(&last_error);
-        let checkpoint_error = Arc::new(Mutex::new(None));
-        let engine_checkpoint_error = Arc::clone(&checkpoint_error);
-        let built = Arc::new(AtomicBool::new(false));
-        let engine_built = Arc::clone(&built);
+        let shared = EngineShared {
+            last_error: Arc::new(Mutex::new(None)),
+            checkpoint_error: Arc::new(Mutex::new(None)),
+            close_error: Arc::new(Mutex::new(None)),
+            built: Arc::new(AtomicBool::new(false)),
+        };
+        let engine_shared = shared.clone();
         let metrics = Arc::new(MetricsRegistry::new());
         let engine_metrics = Arc::clone(&metrics);
         let (ready_tx, ready_rx) = oneshot::channel();
         let join = std::thread::spawn(move || {
-            engine::run(
-                pipeline,
-                rx,
-                engine_error,
-                engine_checkpoint_error,
-                engine_built,
-                engine_metrics,
-                ready_tx,
-            )
+            engine::run(pipeline, rx, engine_shared, engine_metrics, ready_tx)
         });
         match ready_rx.blocking_recv() {
             Ok(Ok(())) => {}
@@ -68,9 +59,7 @@ impl EngineHandle {
         Ok(Self {
             tx,
             join: Some(join),
-            last_error,
-            checkpoint_error,
-            built,
+            shared,
             metrics,
         })
     }
@@ -87,7 +76,8 @@ impl EngineHandle {
 
     /// First periodic-checkpoint failure, kept separate from source errors.
     pub fn checkpoint_error(&self) -> Result<Option<String>, ConnectorError> {
-        self.checkpoint_error
+        self.shared
+            .checkpoint_error
             .lock()
             .map(|slot| slot.clone())
             .map_err(|_| ConnectorError::Infrastructure("checkpoint error state poisoned".into()))
@@ -106,8 +96,8 @@ impl EngineHandle {
     pub fn snapshot_handle(&self) -> SnapshotHandle {
         SnapshotHandle {
             tx: self.tx.clone(),
-            last_error: Arc::clone(&self.last_error),
-            built: Arc::clone(&self.built),
+            last_error: Arc::clone(&self.shared.last_error),
+            built: Arc::clone(&self.shared.built),
         }
     }
 
@@ -146,10 +136,11 @@ impl EngineHandle {
         self.snapshot_handle().build_view(view, plan)
     }
 
-    /// Stop the engine and join its thread.
+    /// Stop the engine and join its thread, surfacing any close failure.
     pub fn shutdown(mut self) -> Result<(), ConnectorError> {
-        self.stop();
-        Ok(())
+        let joined = self.stop();
+        let closed = self.take_close_error();
+        joined.and(closed)
     }
 
     /// Ask the engine to stop and join its thread, if still running.
@@ -158,21 +149,42 @@ impl EngineHandle {
     /// tokio executor, so `Drop` could not use it. Joining the engine thread
     /// still blocks until the engine has processed the command and exited, and
     /// `thread::join` is safe to call from within a runtime.
-    fn stop(&mut self) {
-        if let Some(join) = self.join.take() {
-            let (reply, _rx) = oneshot::channel();
-            let _ = self.tx.send(Command::Shutdown { reply });
-            let _ = join.join();
+    ///
+    /// A panic in the engine thread surfaces here instead of being swallowed.
+    fn stop(&mut self) -> Result<(), ConnectorError> {
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        let (reply, _rx) = oneshot::channel();
+        let _ = self.tx.send(Command::Shutdown { reply });
+        match join.join() {
+            Ok(()) => Ok(()),
+            Err(_) => Err(worker_panicked()),
+        }
+    }
+
+    /// Take the sink/close failure the engine recorded, if any.
+    fn take_close_error(&self) -> Result<(), ConnectorError> {
+        let mut slot = self.shared.close_error.lock().map_err(|_| {
+            ConnectorError::Infrastructure("shutdown error state poisoned".into())
+        })?;
+        match slot.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
 
 impl Drop for EngineHandle {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
 pub(super) fn stopped() -> ConnectorError {
     ConnectorError::Infrastructure("engine thread stopped".into())
+}
+
+fn worker_panicked() -> ConnectorError {
+    ConnectorError::Infrastructure("engine thread panicked".into())
 }
