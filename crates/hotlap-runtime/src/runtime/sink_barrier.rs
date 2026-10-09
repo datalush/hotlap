@@ -6,10 +6,10 @@
 //! between the engine-side pump and the sink task, so a checkpoint can never be
 //! marked valid while output deltas are still queued in its channel.
 //!
-//! Any failure before the commit completes aborts the prepared sinks, so the
-//! checkpoint is discarded and the engine keeps its last valid one. The caller
-//! clears the durable commit intent before it aborts, so recovery can never
-//! promote sinks that were rolled back.
+//! A failure in `prepare` aborts the sinks that already prepared, so no sink
+//! keeps a half-open transaction. A failure during `commit` aborts nothing: a
+//! participant may have confirmed, so the caller keeps the durable commit
+//! intent and the body for recovery to re-drive or discard and replay.
 //!
 //! Non-transactional sinks adapt the protocol: `Idempotent` sinks are only
 //! flushed on commit (safe to replay after a crash), and `AtLeastOnce` sinks
@@ -36,23 +36,6 @@ pub struct SinkBarrier {
 /// Indices of the transactional sinks that reached the prepared state.
 pub struct Prepared {
     indices: Vec<usize>,
-}
-
-impl Prepared {
-    /// The full set of prepared sinks, used when no participant committed.
-    fn all(prepared: &Self) -> Self {
-        Self {
-            indices: prepared.indices.clone(),
-        }
-    }
-
-    /// The prepared sinks from `slice` onward, used to abort the failed and
-    /// still-uncommitted participants.
-    fn from(indices: &[usize]) -> Self {
-        Self {
-            indices: indices.to_vec(),
-        }
-    }
 }
 
 impl SinkBarrier {
@@ -110,16 +93,13 @@ impl SinkBarrier {
     /// `Idempotent` and `AtLeastOnce` sinks confirm delivery with `commit`;
     /// neither can be rolled back, so flushing them first means their failure
     /// cannot strand a checkpoint whose transactional sinks already committed
-    /// (which would replay and duplicate). On failure the error carries the
-    /// prepared sinks still to abort: all of them when a non-transactional
-    /// flush fails, otherwise the failed transactional sink and those after it.
-    /// The caller aborts them after clearing the durable commit intent, so no
-    /// sink keeps a half-open transaction and no rolled-back commit stays
-    /// promotable.
-    pub(crate) async fn commit(
-        &self,
-        prepared: &Prepared,
-    ) -> Result<(), (ConnectorError, Prepared)> {
+    /// (which would replay and duplicate).
+    ///
+    /// A failure does **not** abort anything: a participant may already have
+    /// confirmed, and rolling a confirmed commit back would be wrong. The
+    /// caller keeps the durable marker and body so recovery can re-drive or
+    /// discard and replay.
+    pub(crate) async fn commit(&self, prepared: &Prepared) -> Result<(), ConnectorError> {
         for sync in &self.sinks {
             let sink = sync.sink();
             let wait_for_delivery = matches!(
@@ -127,14 +107,11 @@ impl SinkBarrier {
                 SinkCapabilities::Idempotent | SinkCapabilities::AtLeastOnce
             );
             if wait_for_delivery && let Err(error) = sink.commit().await {
-                return Err((error, Prepared::all(prepared)));
+                return Err(error);
             }
         }
-        for (position, &index) in prepared.indices.iter().enumerate() {
-            if let Err(error) = self.sinks[index].sink().commit().await {
-                // The failed sink may not have committed, so abort it too.
-                return Err((error, Prepared::from(&prepared.indices[position..])));
-            }
+        for &index in &prepared.indices {
+            self.sinks[index].sink().commit().await?;
         }
         Ok(())
     }

@@ -1,12 +1,12 @@
 //! Checkpoint barrier: capture engine and source state into a [`StateBackend`].
 //!
-//! A checkpoint becomes visible only after every part is written: the engine
-//! snapshot and source offsets land first, then a `valid` marker, and only then
-//! the `latest` pointer. An interrupted write therefore never exposes a partial
-//! checkpoint as the current one. Older checkpoints are pruned, keeping at
-//! most `retain` of the newest.
+//! A checkpoint is visible only once the body, `valid` marker and `latest`
+//! pointer are written; older ones are pruned to the `retain` newest.
 
 mod commit;
+mod state;
+
+pub use state::CheckpointState;
 
 use std::time::Duration;
 
@@ -55,6 +55,8 @@ pub struct Checkpointer {
     initialized: bool,
     retain: usize,
     sinks: SinkBarrier,
+    state: CheckpointState,
+    failure: Option<String>,
 }
 
 impl Checkpointer {
@@ -66,6 +68,8 @@ impl Checkpointer {
             initialized: false,
             retain,
             sinks: SinkBarrier::new(Vec::new()),
+            state: CheckpointState::Ready,
+            failure: None,
         }
     }
 

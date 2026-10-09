@@ -28,7 +28,7 @@ pub(crate) fn checkpoint_prefix(id: u64) -> String {
 /// Encode the engine snapshot and source offsets under `checkpoint/<id>/`.
 ///
 /// The body is written first and the durable commit marker last, before the
-/// sinks commit; [`mark_valid`] publishes the checkpoint afterwards. An
+/// sinks commit; [`publish_valid`] publishes the checkpoint afterwards. An
 /// interrupted body never becomes the current checkpoint, and a marker left by
 /// a crash tells recovery that the current checkpoint was mid-commit.
 pub(crate) async fn write(
@@ -87,11 +87,14 @@ pub(crate) fn read_body(
     Ok(Some((engine, sources)))
 }
 
-/// Write the `valid` marker and `latest` pointer, then prune older checkpoints.
-pub(crate) fn mark_valid(
+/// Publish `id`: write the `valid` marker, then point `latest` at it.
+///
+/// Publication is separate from pruning so only a failure here leaves the
+/// checkpoint's visibility in doubt; a later cleanup failure cannot un-publish
+/// it.
+pub(crate) fn publish_valid(
     backend: &mut (dyn StateBackend + Send),
     id: u64,
-    retain: usize,
 ) -> Result<(), ConnectorError> {
     let base = checkpoint_prefix(id);
     backend
@@ -99,9 +102,7 @@ pub(crate) fn mark_valid(
         .map_err(state_err)?;
     backend
         .put(LATEST_KEY, id.to_le_bytes().to_vec())
-        .map_err(state_err)?;
-    // The checkpoint is committed; pruning only trims older ones.
-    crate::runtime::retention::prune(backend, retain).map_err(state_err)
+        .map_err(state_err)
 }
 
 /// Durably reserve `id` before any ambiguous checkpoint attempt.

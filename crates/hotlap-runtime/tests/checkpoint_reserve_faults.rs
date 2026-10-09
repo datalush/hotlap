@@ -73,7 +73,12 @@ fn a_commit_marker_after_ack_failure_is_preserved() {
         Some(b"1".to_vec())
     );
     assert_eq!(backend.get(b"checkpoint/1/valid").unwrap(), None);
-    assert_eq!(take(&mut checkpointer, &engine, &pipe.sources), 2);
+    assert!(
+        futures::executor::block_on(checkpointer.take(&engine, &pipe.sources)).is_err(),
+        "the ambiguous marker blocks this runtime"
+    );
+    let mut fresh = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    assert_eq!(take(&mut fresh, &engine, &pipe.sources), 2);
 }
 
 #[test]

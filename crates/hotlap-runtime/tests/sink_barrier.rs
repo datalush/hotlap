@@ -160,13 +160,14 @@ async fn at_least_once_flush_failure_keeps_no_valid_checkpoint() {
 }
 
 #[tokio::test]
-async fn commit_failure_aborts_the_failed_and_remaining_prepared_sinks() {
+async fn commit_failure_preserves_the_marker_and_does_not_abort() {
     let log = events();
     let first = SharedSink::new(Arc::new(FakeSink::new(
         SinkCapabilities::Transactional,
         log.clone(),
     )));
-    // The second fails its commit; it must be aborted along with the first.
+    // The second fails its commit; a participant may already have confirmed, so
+    // no sink may be rolled back and the marker and body stay for recovery.
     let second_log = events();
     let second = SharedSink::new(Arc::new(FakeSink::failing_commit(
         SinkCapabilities::Transactional,
@@ -183,15 +184,19 @@ async fn commit_failure_aborts_the_failed_and_remaining_prepared_sinks() {
     assert_eq!(*log.lock().unwrap(), vec![Event::Prepare, Event::Commit]);
     assert_eq!(
         *second_log.lock().unwrap(),
-        vec![Event::Prepare, Event::Commit, Event::Abort],
-        "the sink whose commit failed must still be aborted"
+        vec![Event::Prepare, Event::Commit],
+        "a failed commit must not roll the sink back"
+    );
+    assert!(
+        backend.get(b"checkpoint/1/commit").unwrap().is_some(),
+        "the commit marker must survive for recovery"
     );
     let reader = Checkpointer::new(Box::new(backend), 3);
     assert_eq!(reader.latest().unwrap(), None);
 }
 
 #[tokio::test]
-async fn idempotent_flush_failure_aborts_prepared_transactional_sinks() {
+async fn idempotent_flush_failure_preserves_the_prepared_transactional_sink() {
     let transactional_log = events();
     let transactional = SharedSink::new(Arc::new(FakeSink::new(
         SinkCapabilities::Transactional,
@@ -212,10 +217,11 @@ async fn idempotent_flush_failure_aborts_prepared_transactional_sinks() {
     assert!(result.is_err());
     assert_eq!(
         *transactional_log.lock().unwrap(),
-        vec![Event::Prepare, Event::Abort],
-        "an idempotent flush failure must abort the prepared transactional sink"
+        vec![Event::Prepare],
+        "a non-reversible flush failure must not roll the transactional sink back"
     );
     assert_eq!(*idempotent_log.lock().unwrap(), vec![Event::Commit]);
+    assert!(backend.get(b"checkpoint/1/commit").unwrap().is_some());
     let reader = Checkpointer::new(Box::new(backend), 3);
     assert_eq!(reader.latest().unwrap(), None);
 }

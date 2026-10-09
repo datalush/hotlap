@@ -56,17 +56,19 @@ fn a_published_id_is_not_overwritten_after_a_valid_ack_ambiguity() {
     assert_eq!(backend.get(b"checkpoint/latest").unwrap(), None);
     let first_engine = backend.get(b"checkpoint/1/engine").unwrap().unwrap();
 
-    // A second, different attempt must get a fresh id and leave id 1 untouched.
+    // The failed attempt blocks this runtime, but a fresh checkpointer over the
+    // same store must still get a new id and leave id 1 untouched.
+    assert!(futures::executor::block_on(checkpointer.take(&engine, &pipe.sources)).is_err());
     let (e2, o2) = advance(&mut engine, &pipe, &mut stream, 2);
     assert_ne!(e1, e2);
     assert_ne!(o1, o2);
-    assert_eq!(take(&mut checkpointer, &engine, &pipe.sources), 2);
+    let mut reader = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    assert_eq!(take(&mut reader, &engine, &pipe.sources), 2);
     assert_eq!(
         backend.get(b"checkpoint/1/engine").unwrap().unwrap(),
         first_engine
     );
 
-    let reader = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let checkpoint = reader.read(2).unwrap();
     assert_eq!(checkpoint.engine.epoch, e2);
     assert_eq!(
@@ -195,5 +197,10 @@ fn an_ambiguous_engine_write_still_advances_the_next_id() {
     assert!(futures::executor::block_on(checkpointer.take(&engine, &pipe.sources)).is_err());
     assert!(backend.get(b"checkpoint/1/engine").unwrap().is_some());
     assert_eq!(backend.get(b"checkpoint/1/sources").unwrap(), None);
-    assert_eq!(take(&mut checkpointer, &engine, &pipe.sources), 2);
+    assert!(
+        futures::executor::block_on(checkpointer.take(&engine, &pipe.sources)).is_err(),
+        "the ambiguous attempt blocks this runtime"
+    );
+    let mut fresh = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    assert_eq!(take(&mut fresh, &engine, &pipe.sources), 2);
 }
