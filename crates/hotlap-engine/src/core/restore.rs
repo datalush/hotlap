@@ -1,5 +1,7 @@
 //! Restore a live engine from an [`EngineSnapshot`].
 
+use std::collections::BTreeSet;
+
 use hotlap_core::snapshot::{
     ENGINE_SNAPSHOT_FORMAT_VERSION, EngineSnapshot, InputSnapshot, ViewSnapshot,
 };
@@ -22,6 +24,7 @@ impl EngineCore {
                 snapshot.format_version, ENGINE_SNAPSHOT_FORMAT_VERSION
             )));
         }
+        Self::reject_duplicate_ids(snapshot)?;
         let mut core = EngineCore::with_registry(std::sync::Arc::clone(&self.metrics.registry));
         core.frozen = snapshot.frozen;
         core.epoch = snapshot.epoch;
@@ -42,6 +45,33 @@ impl EngineCore {
         *self = core;
         self.refresh_windows_open();
         self.metrics.registry.inc("checkpoints_restored");
+        Ok(())
+    }
+
+    /// Reject repeated handles before any insert.
+    ///
+    /// A snapshot that named the same view twice would otherwise be validated
+    /// against the first entry while `restore_view` kept the last, so the check
+    /// must run before the engine is mutated.
+    fn reject_duplicate_ids(snapshot: &EngineSnapshot) -> Result<(), EngineError> {
+        let mut inputs = BTreeSet::new();
+        for input in &snapshot.inputs {
+            if !inputs.insert(input.id) {
+                return Err(EngineError::Unsupported(format!(
+                    "duplicate input id {} in engine snapshot",
+                    input.id.0
+                )));
+            }
+        }
+        let mut views = BTreeSet::new();
+        for view in &snapshot.views {
+            if !views.insert(view.id) {
+                return Err(EngineError::Unsupported(format!(
+                    "duplicate view id {} in engine snapshot",
+                    view.id.0
+                )));
+            }
+        }
         Ok(())
     }
 
