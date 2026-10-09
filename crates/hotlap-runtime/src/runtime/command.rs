@@ -6,7 +6,7 @@ use hotlap::Hotlap;
 use hotlap::{Plan, ZSetBatch};
 use tokio::sync::oneshot;
 
-use crate::runtime::checkpoint::Checkpointer;
+use crate::runtime::checkpoint::{CheckpointState, Checkpointer};
 use crate::runtime::pipeline::record_error;
 use crate::runtime::sources::Sources;
 use hotlap_connectors::error::ConnectorError;
@@ -36,15 +36,18 @@ pub enum Command {
 
 /// Handle one command; returns true when the engine must shut down.
 ///
-/// After a source failure (`failed`), checkpoint and view-build commands are
-/// rejected because the engine state may no longer be consistent. Reads and
-/// shutdown stay available so the caller can still inspect and stop the engine.
+/// `failed` marks an engine state that is no longer consistent. Once set,
+/// checkpoint and view-build commands are rejected and ingestion stops, because
+/// aborting the sinks did not roll the engine or the source offsets back. Reads
+/// and shutdown stay available so the caller can still inspect and stop the
+/// engine. A failed checkpoint sets `failed` before it replies, so the caller
+/// cannot poll a source through the race.
 pub(crate) async fn handle(
     cmd: Option<Command>,
     hotlap: &mut Hotlap,
     sources: &Sources,
     checkpointer: &mut Option<Checkpointer>,
-    failed: bool,
+    failed: &mut bool,
 ) -> bool {
     match cmd {
         Some(Command::Snapshot { view, reply }) => {
@@ -56,15 +59,18 @@ pub(crate) async fn handle(
             false
         }
         Some(Command::Checkpoint { reply }) => {
-            let result = match reject_if_failed(failed) {
+            let result = match reject_if_failed(*failed) {
                 Ok(()) => take(checkpointer, hotlap, sources).await,
                 Err(error) => Err(error),
             };
+            if result.is_err() && checkpointer.as_ref().is_some_and(inconsistent) {
+                *failed = true;
+            }
             let _ = reply.send(result);
             false
         }
         Some(Command::BuildView { view, plan, reply }) => {
-            let result = match reject_if_failed(failed) {
+            let result = match reject_if_failed(*failed) {
                 Ok(()) => hotlap.create_view(&view, plan).map_err(map_err),
                 Err(error) => Err(error),
             };
@@ -79,18 +85,29 @@ pub(crate) async fn handle(
     }
 }
 
-/// Run a periodic checkpoint, recording failures on their own error slot.
+/// Run a periodic checkpoint; returns whether it left the state inconsistent.
 pub(crate) async fn run_periodic(
     checkpointer: &mut Option<Checkpointer>,
     hotlap: &Hotlap,
     sources: &Sources,
     checkpoint_error: &Mutex<Option<String>>,
-) {
-    if let Some(active) = checkpointer
-        && let Err(error) = active.take(hotlap, sources).await
-    {
-        record_error(checkpoint_error, error);
+) -> bool {
+    let Some(active) = checkpointer else {
+        return false;
+    };
+    match active.take(hotlap, sources).await {
+        Ok(_) => false,
+        Err(error) => {
+            let inconsistent = inconsistent(active);
+            record_error(checkpoint_error, error);
+            inconsistent
+        }
     }
+}
+
+/// Whether a checkpointer still refuses new attempts after a failed one.
+fn inconsistent(checkpointer: &Checkpointer) -> bool {
+    checkpointer.state() != CheckpointState::Ready
 }
 
 /// Take a checkpoint, or report that none is configured.

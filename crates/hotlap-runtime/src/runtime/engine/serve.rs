@@ -27,7 +27,7 @@ pub(super) async fn serve(
     let mut failed = false;
     loop {
         tokio::select! {
-            maybe = engine.source.next(), if !source_done => {
+            maybe = engine.source.next(), if !source_done && !failed => {
                 match next_status(&mut engine, &pipeline, maybe, last_error, built).await {
                     FeedStatus::Continue => {}
                     FeedStatus::Exhausted => source_done = true,
@@ -41,10 +41,14 @@ pub(super) async fn serve(
                 }
             }
             _ = tick(&mut engine.ticker), if !failed => {
-                run_periodic(&mut engine, &pipeline, checkpoint_error).await;
+                // A failed checkpoint leaves the engine inconsistent; stop
+                // polling the next source before it can advance the offsets.
+                if run_periodic(&mut engine, &pipeline, checkpoint_error).await {
+                    failed = true;
+                }
             }
             cmd = rx.recv() => {
-                if handle(cmd, &mut engine, &pipeline, failed).await {
+                if handle(cmd, &mut engine, &pipeline, &mut failed).await {
                     close_sinks(engine.sinks, last_error).await;
                     return;
                 }
@@ -72,19 +76,19 @@ async fn next_status(
     .await
 }
 
-/// Run one periodic checkpoint, recording a failure on its own error slot.
+/// Run one periodic checkpoint; returns whether it left the state inconsistent.
 async fn run_periodic(
     engine: &mut Engine,
     pipeline: &Pipeline,
     checkpoint_error: &Mutex<Option<String>>,
-) {
+) -> bool {
     command::run_periodic(
         &mut engine.checkpointer,
         &engine.hotlap,
         &pipeline.sources,
         checkpoint_error,
     )
-    .await;
+    .await
 }
 
 /// Handle one command; returns true when the engine must shut down.
@@ -92,7 +96,7 @@ async fn handle(
     cmd: Option<Command>,
     engine: &mut Engine,
     pipeline: &Pipeline,
-    failed: bool,
+    failed: &mut bool,
 ) -> bool {
     command::handle(
         cmd,
