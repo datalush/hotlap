@@ -1,7 +1,7 @@
 # Hotlap — recovery, dynamic views y verificación de durabilidad
 
 - Fecha: 2026-10-09
-- Estado: implementado (SP4; commit recuperable en SP8), tests verdes
+- Estado: implementado, tests verdes
 - Alcance: recuperación de checkpoint + replay, vistas materializadas creadas
   tras `START` y cobertura de tests.
 - Complementa `docs/hotlap-durability.md` (backend, snapshot, checkpointer) y
