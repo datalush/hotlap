@@ -1,5 +1,7 @@
 //! Source -> kernel pipeline: setup, stream merging and batch ingestion.
 
+mod preflight;
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

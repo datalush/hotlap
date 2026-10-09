@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use harness::{CountedFactory, SharedBackend, ToggleFactory};
+use hotlap::state::StateBackend;
 use hotlap_runtime::runtime::checkpoint::DEFAULT_RETAIN;
 use hotlap_runtime::{Session, SessionConfig, SessionError};
 use hotlap_sql::SqlError;
@@ -16,6 +17,7 @@ use hotlap_sql::SqlError;
 const SOURCE: &str = "CREATE SOURCE src WITH (connector='inmem') WATERMARK FOR \
      _event_time AS _event_time - INTERVAL '1 s';";
 const VIEW_A: &str = "CREATE MATERIALIZED VIEW a AS SELECT k FROM src WHERE k = 1;";
+const VIEW_A_CHANGED: &str = "CREATE MATERIALIZED VIEW a AS SELECT k FROM src WHERE k = 7;";
 const VIEW_B: &str = "CREATE MATERIALIZED VIEW b AS SELECT k FROM src WHERE k = 2;";
 const VIEW_C: &str = "CREATE MATERIALIZED VIEW c AS SELECT k FROM src WHERE k = 1;";
 const SINK_A: &str = "CREATE SINK outa WITH (connector='inmem') AS SELECT * FROM a;";
@@ -117,4 +119,44 @@ fn the_original_view_order_still_starts() {
         .sql("START;")
         .expect("a matching declaration must start");
     session.shutdown().expect("shutdown");
+}
+
+/// A changed view plan is rejected without effects, the checkpoint survives the
+/// rejection for a retry, and a corrected declaration still recovers from it.
+#[test]
+fn a_rejected_changed_view_keeps_the_checkpoint_for_a_corrected_retry() {
+    let backend = SharedBackend::default();
+    seed(&backend);
+    let (session_config, reads, creates) = config(&backend);
+    let mut session = Session::open(session_config).expect("open session");
+    session.sql(SOURCE).expect("create source");
+    session.sql(VIEW_A_CHANGED).expect("create changed a");
+    session.sql(VIEW_B).expect("create b");
+    session.sql(SINK_A).expect("sink a");
+    session.sql(SINK_B).expect("sink b");
+
+    for _ in 0..2 {
+        let error = match session.sql("START;") {
+            Ok(_) => panic!("a changed plan must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SessionError::Sql(SqlError::Unsupported(_))));
+    }
+    assert_eq!(creates.load(Ordering::SeqCst), 0, "no writer may open");
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "no source may open");
+    assert!(
+        backend.get(b"checkpoint/latest").unwrap().is_some(),
+        "the durable checkpoint must survive the rejection"
+    );
+    drop(session);
+
+    let (retry_config, _reads, _creates) = config(&backend);
+    let mut fixed = Session::open(retry_config).expect("open session");
+    fixed.sql(SOURCE).expect("create source");
+    fixed.sql(VIEW_A).expect("create a");
+    fixed.sql(VIEW_B).expect("create b");
+    fixed
+        .sql("START;")
+        .expect("corrected declarations must recover from the retained checkpoint");
+    fixed.shutdown().expect("shutdown");
 }

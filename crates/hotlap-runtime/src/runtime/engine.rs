@@ -96,6 +96,9 @@ async fn prepare(
             .map_err(|error| ConnectorError::Unsupported(error.0))?;
     }
     pipeline::setup(&mut hotlap, pipeline)?;
+    // Reject an incompatible checkpoint before the pump opens any writer or the
+    // recovery re-drives any commit, so a rejected pipeline has no side effect.
+    pipeline.preflight_recovery()?;
     let sinks = SinkPump::start_with_metrics(&pipeline.sinks, Some(Arc::clone(&metrics)));
     let coordinated = sinks.coordinated();
     let (source, checkpointer, ticker) = match pipeline.checkpoint.take() {
