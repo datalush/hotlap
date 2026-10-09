@@ -87,8 +87,8 @@ impl Stream for FailThenReady {
     }
 }
 
-#[test]
-fn a_source_failure_never_polls_the_next_ready_event() {
+/// Engine and pipeline over a source that fails, then offers a ready event.
+fn fail_then_ready() -> (Engine, Pipeline, Arc<AtomicBool>, Arc<AtomicUsize>) {
     let polls = Arc::new(AtomicUsize::new(0));
     let b_polled = Arc::new(AtomicBool::new(false));
     let commits = Arc::new(AtomicUsize::new(0));
@@ -132,13 +132,16 @@ fn a_source_failure_never_polls_the_next_ready_event() {
         checkpointer: None,
         ticker: None,
     };
+    (engine, pipeline, b_polled, commits)
+}
 
+/// Drive `serve` single-threaded until pending and return the recorded error.
+fn drive_until_pending(engine: Engine, pipeline: Pipeline) -> Option<String> {
     let last_error = Mutex::new(None);
     let checkpoint_error = Mutex::new(None);
     let built = AtomicBool::new(false);
     // Keep the sender alive so the command channel stays pending.
     let (_tx, mut rx) = mpsc::unbounded_channel::<Command>();
-
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     let mut serving = Box::pin(serve(
@@ -155,10 +158,15 @@ fn a_source_failure_never_polls_the_next_ready_event() {
             "serve must stay pending after the failure"
         );
     }
-    assert!(
-        last_error.lock().unwrap().is_some(),
-        "the read error must be recorded"
-    );
+    drop(serving);
+    last_error.into_inner().unwrap()
+}
+
+#[test]
+fn a_source_failure_never_polls_the_next_ready_event() {
+    let (engine, pipeline, b_polled, commits) = fail_then_ready();
+    let error = drive_until_pending(engine, pipeline);
+    assert!(error.is_some(), "the read error must be recorded");
     assert!(
         !b_polled.load(Ordering::SeqCst),
         "the ready event must never be polled after a failure"
