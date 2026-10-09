@@ -37,7 +37,10 @@
    snapshot del engine con versión no soportada) o un checkpoint que **no valida**
    contra las fuentes declaradas (ids, schema, watermark, renombrado) es
    `Unsupported` **fatal**: no se prueba un lector viejo, no se cae a un
-   predecesor y nunca arranca en vacío. Un fallo **operativo** del backend
+   predecesor y nunca arranca en vacío. La versión del snapshot se lee del
+   prefijo del cuerpo **antes** de decodificar el layout, así que un snapshot de
+   una versión anterior —cuyo layout ya no decodifica— también es `Unsupported`,
+   no corrupción del formato actual. Un fallo **operativo** del backend
    (lectura/listado/borrado, `Storage`) también es fatal: se **propaga** sin
    borrar markers, sin retroceder a un predecesor y sin arranque limpio
    silencioso. Sin ningún checkpoint válido (y sin error fatal), es un
@@ -140,7 +143,9 @@ follow-up fuera de alcance.
   propaga `Storage`; recovery elige el `valid` más nuevo aunque `latest` se quede
   atrás y un fallo de `get`/`list`/publicación se propaga sin descartar ni borrar
   ni reabrir fuentes, mientras que la corrupción del formato actual se tolera y
-  una versión desconocida sigue siendo fatal.
+  una versión desconocida sigue siendo fatal. `tests/checkpoint_legacy_format.rs`
+  fija además que un snapshot v4 real (no sólo la versión mutada) es fatal: ni
+  cae al checkpoint anterior ni descarta el commit pendiente.
 - **2PC** (`tests/sink_barrier.rs`): transaccional prepara→commit→valid;
   fallo **operativo** de escritura del cuerpo conserva el marker/cuerpo y no
   aborta los sinks preparados; fallo de prepare aborta los ya preparados;

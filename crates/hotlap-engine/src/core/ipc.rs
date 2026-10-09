@@ -97,6 +97,15 @@ pub fn encode_framed<T: Serialize>(value: &T) -> Result<Vec<u8>, EngineError> {
 /// Decodes a value from a binary frame, rejecting a bad magic, an unknown
 /// version, a length mismatch or trailing bytes instead of panicking.
 pub fn decode_framed<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, EngineError> {
+    let (payload, length) = frame_payload(bytes)?;
+    codec()
+        .with_limit(length)
+        .deserialize(payload)
+        .map_err(codec_err)
+}
+
+/// Validates the binary frame header, returning its payload and declared length.
+fn frame_payload(bytes: &[u8]) -> Result<(&[u8], u64), EngineError> {
     if bytes.len() < FRAME_HEADER {
         return Err(corrupt(format!("frame is {} bytes", bytes.len())));
     }
@@ -120,10 +129,7 @@ pub fn decode_framed<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, EngineError
             payload.len()
         )));
     }
-    codec()
-        .with_limit(length)
-        .deserialize(payload)
-        .map_err(codec_err)
+    Ok((payload, length))
 }
 
 /// Encodes an [`EngineSnapshot`] after checking its layout version.
@@ -137,16 +143,37 @@ pub fn encode_snapshot(snapshot: &EngineSnapshot) -> Result<Vec<u8>, EngineError
     encode_framed(snapshot)
 }
 
-/// Decodes an [`EngineSnapshot`] and rejects an unknown layout version.
+/// Decodes an [`EngineSnapshot`], rejecting a foreign layout version.
+///
+/// The version is read from the leading `format_version` field of the body
+/// *before* the body is decoded, so a genuine older snapshot (whose float
+/// layout no longer decodes) is reported as [`EngineError::Unsupported`] rather
+/// than a decode failure. Recovery treats `Unsupported` as fatal instead of
+/// falling back to an older checkpoint.
 pub fn decode_snapshot(bytes: &[u8]) -> Result<EngineSnapshot, EngineError> {
-    let snapshot: EngineSnapshot = decode_framed(bytes)?;
-    if snapshot.format_version != ENGINE_SNAPSHOT_FORMAT_VERSION {
+    let (payload, length) = frame_payload(bytes)?;
+    let version = snapshot_prefix_version(payload)?;
+    if version != ENGINE_SNAPSHOT_FORMAT_VERSION {
         return Err(EngineError::Unsupported(format!(
-            "unknown snapshot format version {}",
-            snapshot.format_version
+            "unknown snapshot format version {version}"
         )));
     }
+    let snapshot: EngineSnapshot = codec()
+        .with_limit(length)
+        .deserialize(payload)
+        .map_err(codec_err)?;
     Ok(snapshot)
+}
+
+/// Reads the leading `format_version` (`u32`, fixed-width little-endian) of a
+/// snapshot body without decoding the rest of the changed layout.
+fn snapshot_prefix_version(payload: &[u8]) -> Result<u32, EngineError> {
+    let prefix = payload
+        .get(..4)
+        .ok_or_else(|| corrupt("snapshot payload is shorter than its version field".into()))?;
+    Ok(u32::from_le_bytes([
+        prefix[0], prefix[1], prefix[2], prefix[3],
+    ]))
 }
 
 /// Fixed, deterministic bincode 1.x configuration: fixed-width integers and no
