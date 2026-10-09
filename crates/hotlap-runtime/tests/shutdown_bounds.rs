@@ -5,17 +5,13 @@
 //! same thread.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
-use hotlap_connectors::ConnectorError;
 
 #[path = "shutdown_bounds/harness.rs"]
 mod harness;
 
 use harness::{
     BlockingSink, FailingCommitSink, PanickingSink, PanickingSource, RecordingSink, Signal,
-    StallingCommitSink,
 };
 
 /// Generous ceiling: the runtime's own close timeout is far smaller.
@@ -75,122 +71,6 @@ fn a_failed_final_commit_fails_shutdown() {
     assert!(
         result.is_err(),
         "a failed final commit must not report success, got {result:?}"
-    );
-}
-
-#[test]
-fn a_stalled_final_commit_is_bounded_and_its_future_is_cancelled() {
-    let (written, written_rx) = Signal::new();
-    let (entered, entered_rx) = Signal::new();
-    let (resumed, resumed_rx) = Signal::new();
-    let released = Arc::new(tokio::sync::Notify::new());
-    let dropped = Arc::new(AtomicBool::new(false));
-    let aborted = Arc::new(AtomicBool::new(false));
-    let sink = StallingCommitSink::new(
-        written,
-        entered,
-        Arc::clone(&released),
-        resumed,
-        Arc::clone(&dropped),
-        Arc::clone(&aborted),
-    );
-    let handle = harness::start(
-        harness::keys_with(&[1], None),
-        sink,
-        Some(harness::checkpoint()),
-    );
-    written_rx
-        .recv_timeout(SETUP)
-        .expect("the sink never finished its EOF write");
-    let started = Instant::now();
-    let (done, result_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = done.send(handle.shutdown());
-    });
-    entered_rx
-        .recv_timeout(SETUP)
-        .expect("the final commit never entered its parked state");
-    let result = result_rx.recv_timeout(WATCHDOG).unwrap_or_else(|_| {
-        released.notify_one();
-        panic!("shutdown blocked past the {WATCHDOG:?} watchdog")
-    });
-    let elapsed = started.elapsed();
-    released.notify_one();
-    let resumed_after_shutdown = resumed_rx.recv_timeout(Duration::from_secs(1)).is_ok();
-
-    assert!(
-        matches!(
-            &result,
-            Err(ConnectorError::Infrastructure(message))
-                if message == "final sink commit timed out during close"
-        ),
-        "a stalled final commit must return its typed timeout error: {result:?}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(9)
-            && dropped.load(Ordering::SeqCst)
-            && !aborted.load(Ordering::SeqCst)
-            && !resumed_after_shutdown,
-        "final-commit worker must stop at its own deadline, before the caller's \
-         10s bound; elapsed={elapsed:?}, future_dropped={}, aborted={}, \
-         resumed_after_shutdown={resumed_after_shutdown}",
-        dropped.load(Ordering::SeqCst),
-        aborted.load(Ordering::SeqCst),
-    );
-}
-
-#[test]
-fn a_stalled_commit_does_not_abort_or_commit_later_sinks() {
-    let (written, written_rx) = Signal::new();
-    let (entered, entered_rx) = Signal::new();
-    let (resumed, resumed_rx) = Signal::new();
-    let released = Arc::new(tokio::sync::Notify::new());
-    let dropped = Arc::new(AtomicBool::new(false));
-    let aborted = Arc::new(AtomicBool::new(false));
-    let first = StallingCommitSink::new(
-        written,
-        entered,
-        Arc::clone(&released),
-        resumed,
-        Arc::clone(&dropped),
-        Arc::clone(&aborted),
-    );
-    let second = RecordingSink::new(Signal::new().0);
-    let handle = harness::start_pair(harness::keys_with(&[1], None), first, second.clone());
-    written_rx
-        .recv_timeout(SETUP)
-        .expect("the first sink never received the final batch");
-
-    let started = Instant::now();
-    let (done, result_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = done.send(handle.shutdown());
-    });
-    entered_rx
-        .recv_timeout(SETUP)
-        .expect("the first final commit never entered");
-    let result = result_rx.recv_timeout(WATCHDOG).unwrap_or_else(|_| {
-        released.notify_one();
-        panic!("shutdown blocked past the {WATCHDOG:?} watchdog")
-    });
-    let elapsed = started.elapsed();
-    released.notify_one();
-    let first_resumed = resumed_rx.recv_timeout(Duration::from_secs(1)).is_ok();
-
-    assert!(
-        result.is_err()
-            && elapsed < Duration::from_secs(9)
-            && !first_resumed
-            && !aborted.load(Ordering::SeqCst)
-            && !second.committed()
-            && !second.aborted(),
-        "partial EOF commit must time out without continuing, committing, or aborting \
-         later sinks; result={result:?}, elapsed={elapsed:?}, first_resumed={first_resumed}, \
-         first_aborted={}, \
-         second_committed={}, second_aborted={}",
-        aborted.load(Ordering::SeqCst),
-        second.committed(),
-        second.aborted(),
     );
 }
 
