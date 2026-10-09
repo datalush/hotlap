@@ -85,7 +85,8 @@ agrega en `assemble.rs` (`with_event_time`) y su índice se reporta por
 - El bucle usa `tokio::select!` entre el **stream del source** (merge de splits
   vía `select_all` e ingestión por lote) y los **comandos**.
 - `EngineHandle` expone `snapshot(view)`, `late_dropped(input)` y `shutdown()`
-  (este último hace join del hilo).
+  (este último libera el checkpointer, cierra los sinks, une el hilo y propaga
+  los fallos de cierre en vez de devolver `Ok` incondicionalmente).
 
 ## 7. Adaptador DataFusion
 

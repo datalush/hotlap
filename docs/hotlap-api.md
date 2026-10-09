@@ -81,7 +81,7 @@ internamente y nunca se invoca el handle del motor desde un executor ajeno.
 | `snapshot` | `fn snapshot(&self, view: &str) -> Result<ZSetBatch, SessionError>` | Lee la salida consolidada de una vista materializada. |
 | `metrics` | `fn metrics(&self) -> MetricsSnapshot` | Copia puntual de las métricas (vacía antes de `START`). |
 | `checkpoint` | `fn checkpoint(&self) -> Result<u64, SessionError>` | Toma un checkpoint **ahora** y devuelve su id. |
-| `shutdown` | `fn shutdown(self) -> Result<(), SessionError>` | Detiene el motor y une su hilo trabajador. |
+| `shutdown` | `fn shutdown(self) -> Result<(), SessionError>` | Detiene el motor, une su hilo trabajador y propaga los errores de cierre (commit final, task de sink o hilo del motor). |
 
 `QueryResult` distingue:
 

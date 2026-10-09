@@ -169,13 +169,20 @@ START;
    `hotlap.tap_view(view)` por cada sink.
 2. Tras cada `ingest`, `SinkPump::pump` drena cada vista suscrita y envía los
    deltas a su canal (backpressure).
-3. En `shutdown` (o cuando el canal de comandos se cierra), `SinkPump::close`
-   **suelta los senders** (cierra los canales), **espera** a cada task y devuelve
-   el primer error. Soltar el sender termina el changelog, de modo que el **último
-   lote se entrega** antes de que el task termine; al aceptar el stream, el task
-   llama a `commit` (o a `abort` si `write` falló). El join de cada task está
-   acotado por un **timeout** de 5 s para que un sink colgado no bloquee
-   `shutdown` indefinidamente; el timeout se reporta como error del sink.
+3. En `shutdown` (o cuando el canal de comandos se cierra), el motor libera
+   primero el checkpointer —y con él los clones del sender que el barrier retiene
+   para drenar— y después `SinkPump::close` suelta los senders, espera a cada task
+   y devuelve el primer error. Sin liberar el checkpointer el canal nunca
+   alcanzaría EOF y el cierre solo terminaría por timeout. Al aceptar el stream,
+   el task llama a `commit` (o a `abort` si `write` falló), de modo que el **último
+   lote se entrega** antes de que el task termine. Si un envío del pump queda
+   bloqueado con el canal lleno, el motor lo cancela antes de esperar: un envío
+   listo siempre gana, así que un cierre limpio no pierde lotes; un envío encolado
+   se abandona y el cierre lo reporta como error. El join de cada task está
+   acotado por un **timeout** de 5 s; al superarlo se aborta y se recoge la task.
+   `EngineHandle::shutdown` propaga el fallo de cierre, el commit final fallido,
+   el panic de una task de sink y el panic del hilo del motor, en vez de devolver
+   `Ok` incondicionalmente.
 
 ## 9. No-goals
 
@@ -206,7 +213,11 @@ START;
   se **rechaza** antes de arrancar/escribir en `Pipeline::validate` y en
   `SqlSession::start`. No se añaden deletes/upserts nuevos.
 - **`SinkPump::close` con timeout.** El join de cada task está acotado a 5 s;
-  superarlo reporta un error de infraestructura en vez de colgar `shutdown`.
+  superarlo aborta y recoge la task y reporta un error de infraestructura en vez
+  de colgar `shutdown`. La cancelación es **cooperativa**: aborta una task
+  parkeada en un `await` (por ejemplo un sink detenido), pero no puede
+  interrumpir trabajo que nunca cede; en ese caso `close` sigue reportando el
+  timeout, no una entrega completada. No se garantiza cancelación.
 - **Parkeado (LOW) — sin drenado final antes de `close`.** `close` no hace un
   último `pump` defensivo: se confía en que el bucle del engine drena tras cada
   `ingest`. Un `close` sin drenado previo podría perder los deltas pendientes;
