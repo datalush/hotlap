@@ -6,6 +6,7 @@ mod fluss_factory;
 mod mv_provider;
 mod runtime;
 mod sink_factory;
+mod sink_preflight;
 mod sources;
 mod view_plans;
 

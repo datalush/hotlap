@@ -76,7 +76,10 @@ async fn retracting_view_with_append_only_sink_rejected_at_start() {
         Err(error) => error,
         Ok(_) => panic!("a retracting plan must be rejected before writes"),
     };
-    assert!(matches!(error, SqlError::Engine(_)), "{error:?}");
+    assert!(
+        matches!(error, SqlError::Unsupported(_) | SqlError::Engine(_)),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]

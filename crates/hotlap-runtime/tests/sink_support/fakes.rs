@@ -103,6 +103,10 @@ impl SinkFactory for FakeSinkFactory {
             accepts_retractions: self.accepts_retractions,
         }))
     }
+
+    fn accepts_retractions(&self, _options: &BTreeMap<String, String>) -> bool {
+        self.accepts_retractions
+    }
 }
 
 /// Build a session wired to a fake source and a retraction-capable sink.

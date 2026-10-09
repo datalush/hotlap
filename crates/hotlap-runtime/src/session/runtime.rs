@@ -88,10 +88,8 @@ impl SqlSession {
 
     /// Build the pipeline, recompiling every view against the final bindings.
     ///
-    /// Input ids are fixed by `bindings`, in canonical name order, and frozen
-    /// by `start` only once the engine is up. Every view is recompiled from its
-    /// logical plan so an early declaration cannot pin a stale id, and each
-    /// sink opens against the schema validated for its view.
+    /// Every view is recompiled from its logical plan so an early declaration
+    /// cannot pin a stale id, and each sink opens against its view's schema.
     async fn build_pipeline(&mut self, bindings: &SourceBindings) -> Result<Pipeline, SqlError> {
         let schemas = self.input_schemas(bindings)?;
         let views = self.compile_views(bindings)?;
@@ -100,18 +98,22 @@ impl SqlSession {
             hotlap_sql::convert::ensure_kernel_types(&schema)?;
             self.mv_schemas.insert(name.clone(), schema);
         }
+        // Refuse unsupported wiring before the factory opens any writer; the
+        // created sinks are re-checked by `validate` so a factory cannot lie.
+        super::sink_preflight::preflight_sinks(&self.sinks, self.sink_factory.as_ref(), &views)?;
         let sinks = self.build_sinks().await?;
         let sources = self.build_sources(bindings)?;
-        let pipeline = Pipeline {
+        let mut pipeline = Pipeline {
             sources,
             views,
             sinks,
-            checkpoint: self.checkpoint.take(),
+            checkpoint: None,
             retention: self.retention,
         };
-        // Refuse an unsupported sink wiring before the engine opens any source
-        // stream or writer, mirroring the public pipeline boundary.
         pipeline.validate().map_err(to_engine)?;
+        // Consume the checkpoint only once every fallible step has succeeded, so
+        // a rejected pipeline never drops the durable config a retry needs.
+        pipeline.checkpoint = self.checkpoint.take();
         Ok(pipeline)
     }
 

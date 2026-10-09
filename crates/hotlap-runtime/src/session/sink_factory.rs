@@ -18,6 +18,15 @@ pub trait SinkFactory: Send + Sync {
         options: &BTreeMap<String, String>,
         schema: SchemaRef,
     ) -> Result<Arc<dyn Sink>, SqlError>;
+
+    /// Whether the sinks this factory builds apply retractions (negative
+    /// diffs). Defaults to `false`: a factory that has not declared support is
+    /// treated as append-only, so a retracting plan is refused before `create`
+    /// opens any writer. The created sink is still re-checked, so a factory
+    /// cannot understate what it builds.
+    fn accepts_retractions(&self, _options: &BTreeMap<String, String>) -> bool {
+        false
+    }
 }
 
 /// Builds a [`FlussSink`] from the DDL options (`bootstrap`, `table`).
@@ -40,6 +49,11 @@ impl SinkFactory for FlussSinkFactory {
             .await
             .map_err(|error| SqlError::Engine(error.to_string()))?;
         Ok(Arc::new(sink))
+    }
+
+    fn accepts_retractions(&self, _options: &BTreeMap<String, String>) -> bool {
+        // Fluss append and upsert writers both reject negative diffs.
+        false
     }
 }
 
