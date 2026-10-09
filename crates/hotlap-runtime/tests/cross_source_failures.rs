@@ -115,9 +115,11 @@ fn read_error_stops_the_session_and_keeps_only_acked_rows() {
             "unexpected error: {error}"
         );
 
-        // The runtime already stopped, so this later `k=1` row (which would
-        // change the join) must neither be read nor published. No sleep: the
-        // failure is observed through a responsive command before it is sent.
+        // This later `k=1` row would change the join if it were applied. The
+        // snapshot below shows it is not published in the immediate observation.
+        // The deterministic serve-loop unit test (`engine/serve/tests.rs`) is
+        // what proves the event is never polled; here the session stays
+        // responsive to commands after the failure.
         send(&factory, "b", rows(schema_right(), &[(1, 999, 0)]));
         assert_eq!(
             factory.source("b").commits().len(),

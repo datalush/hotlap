@@ -120,3 +120,6 @@ async fn close_sinks(sinks: SinkPump, last_error: &Mutex<Option<String>>) {
         record_error(last_error, error);
     }
 }
+
+#[cfg(test)]
+mod tests;
