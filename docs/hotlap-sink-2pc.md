@@ -42,6 +42,15 @@ que pueda retractar (agregado por clave o ventana tumbling) si el sink no
 declara soporte; sólo un sink que de verdad aplica diffs negativos debe
 sobreescribirlo a `true`.
 
+La negociación de la capa SQL ocurre en dos pasos. `SinkFactory::accepts_retractions(options)`
+(por defecto `false`) se comprueba **antes** de `create`, de modo que un plan
+retractor se rechaza sin abrir ningún writer; el sink creado se vuelve a validar
+con `Sink::accepts_retractions`, así que un factory no puede quedarse corto. El
+mismo preflight rechaza dos sinks de una vista antes de abrir ninguno. `START`
+sólo consume la config de checkpoint tras superar todas las comprobaciones, de
+modo que un pipeline rechazado no pierde la durabilidad que un reintento
+necesita.
+
 ## 2. `SinkBarrier`
 
 `SinkBarrier` (`runtime/sink_barrier.rs`) adapta el protocolo por capacidad:

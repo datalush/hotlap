@@ -148,12 +148,18 @@ START;
 - `ddl::CreateSink { name, options, view }`; `view` es el nombre tras `FROM`.
 - `create_sink` valida que la vista exista y que el nombre del sink no esté
   repetido; registra el `SinkDef` en el catálogo. **No** abre el connector aquí.
-- La apertura ocurre en `START`: `build_sinks` resuelve el **schema de la MV** y
-  pide al `SinkFactory` que construya el sink. Así el factory puede ser async y
-  el schema ya está validado.
+- La apertura ocurre en `START`: tras un **preflight** que rechaza vistas
+  repetidas y planes retractores para sinks sin soporte, `build_sinks` resuelve el
+  **schema de la MV** y pide al `SinkFactory` que construya el sink. Así el factory
+  puede ser async y el schema ya está validado.
 - `SinkFactory` (async) abstrae la creación; el default es `FlussSinkFactory`,
   que exige `connector='fluss'`, `bootstrap` y `table`. `SqlSession::open_with_factories`
   inyecta factories fake en tests.
+- `SinkFactory::accepts_retractions(options)` (por defecto `false`) se comprueba
+  antes de `create`, de modo que un plan retractor o una vista repetida se
+  rechazan sin abrir ningún writer; el sink creado se revalida para que un factory
+  no pueda quedarse corto. `START` sólo consume la config de checkpoint tras pasar
+  el preflight y la validación, así un rechazo no pierde la durabilidad.
 - **Ventana DDL:** `CREATE SINK` después de `START` → `SqlError::Unsupported`
   (`reject_after_start`), igual que source/MV.
 
