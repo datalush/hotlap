@@ -12,8 +12,9 @@ use crate::error::SqlError;
 ///
 /// A consolidated snapshot stores one row per distinct value with a signed
 /// multiplicity; the SQL surface expands each positive multiplicity into that
-/// many rows. This bound caps the expansion so an oversized snapshot fails fast
-/// with a typed error instead of exhausting memory.
+/// many rows. This bound caps the number of expanded rows; it is not a byte
+/// bound, so a wide or variable-width schema can still consume significant
+/// memory even within the cap.
 const MAX_SNAPSHOT_ROWS: usize = 1_048_576;
 
 /// Reject schemas with columns the kernel cannot represent.

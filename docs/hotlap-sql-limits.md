@@ -84,8 +84,11 @@ ignorados ni truncados):
 - **Cota de expansión:** la suma de pesos se calcula con **aritmética
   checked** (el desbordamiento de `i64` falla) y se compara con
   `MAX_SNAPSHOT_ROWS = 1_048_576` **antes** de reservar ningún índice. Un
-  snapshot que expanda a más filas falla con error tipado en vez de agotar
-  memoria. La cota es fija; no se expone configuración porque no se necesitó.
+  snapshot que expanda a más filas falla con error tipado. La cota acota el
+  **número de filas**, no los bytes: un esquema ancho o de ancho variable puede
+  consumir bastante memoria aunque respete la cota, así que **no** es una
+  garantía de memoria. La cota es fija; no se expone configuración porque no se
+  necesitó.
 - **La cota se aplica antes de cualquier `LIMIT` de consulta:** el proveedor
   materializa el snapshot completo en un `RecordBatch`, así que un
   `SELECT ... LIMIT n` no evita la expansión; si el snapshot excede la cota, la
@@ -93,6 +96,6 @@ ignorados ni truncados):
 
 El snapshot es la salida **consolidada** del motor
 (`hotlap-engine/src/core/output.rs`), verificado en
-`hotlap-sql/src/convert.rs` (unit) y `hotlap-runtime/tests/sql_cross_source_oracle.rs`
+`hotlap-sql/src/convert.rs` (unit) y `hotlap-runtime/tests/sql_cross_source_bag.rs`
 (paridad de `SELECT`/agregados contra un `VALUES` de DataFusion independiente).
 

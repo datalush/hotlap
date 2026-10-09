@@ -77,9 +77,15 @@ fn join_multiset_expands_to_a_bag_and_matches_values_oracle() {
         recompute(&[(1, 10, 2)], &[(1, 20, 3)])
     );
 
-    // SELECT expands the weight into six identical rows.
-    let select = session.sql("SELECT k, lv, rv FROM j").expect("select");
-    assert_eq!(query_rows(select), vec![vec![1, 10, 20]; 6]);
+    // SELECT expands the weight into six identical rows; an independent
+    // DataFusion `VALUES` query returns the same six rows.
+    let select = query_rows(session.sql("SELECT k, lv, rv FROM j").expect("select"));
+    assert_eq!(select, vec![vec![1, 10, 20]; 6]);
+    let select_oracle = values_oracle(
+        "SELECT k, lv, rv FROM (VALUES (1, 10, 20), (1, 10, 20), (1, 10, 20), \
+         (1, 10, 20), (1, 10, 20), (1, 10, 20)) AS t(k, lv, rv)",
+    );
+    assert_eq!(select, select_oracle);
 
     // Aggregates see the six rows, not one distinct row; the oracle folds the
     // same six literals through DataFusion.
@@ -97,7 +103,7 @@ fn join_multiset_expands_to_a_bag_and_matches_values_oracle() {
     session.shutdown().expect("shutdown");
 }
 
-/// Aggregate `sql` in a fresh DataFusion context and read the integer rows.
+/// Run `sql` in a fresh DataFusion context and read the sorted integer rows.
 fn values_oracle(sql: &str) -> Vec<Vec<i64>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -123,6 +129,7 @@ fn values_oracle(sql: &str) -> Vec<Vec<i64>> {
                 rows.push(columns.iter().map(|column| column.value(row)).collect());
             }
         }
+        rows.sort_unstable();
         rows
     })
 }
