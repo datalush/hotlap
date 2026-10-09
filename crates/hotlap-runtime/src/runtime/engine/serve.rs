@@ -60,7 +60,9 @@ pub(super) async fn serve(
 /// commit; a stalled one is aborted and reported by [`SinkPump::close`].
 async fn shut_down(engine: Engine, shared: &EngineShared) {
     let Engine {
-        sinks, checkpointer, ..
+        sinks,
+        checkpointer,
+        ..
     } = engine;
     drop(checkpointer);
     if let Err(error) = sinks.close().await
@@ -89,11 +91,7 @@ async fn next_status(
 }
 
 /// Run one periodic checkpoint; returns whether it left the state inconsistent.
-async fn run_periodic(
-    engine: &mut Engine,
-    pipeline: &Pipeline,
-    shared: &EngineShared,
-) -> bool {
+async fn run_periodic(engine: &mut Engine, pipeline: &Pipeline, shared: &EngineShared) -> bool {
     command::run_periodic(
         &mut engine.checkpointer,
         &engine.hotlap,

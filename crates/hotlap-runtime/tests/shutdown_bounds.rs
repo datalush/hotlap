@@ -18,9 +18,7 @@ const WATCHDOG: Duration = Duration::from_secs(30);
 const SETUP: Duration = Duration::from_secs(10);
 
 /// Run `task` on its own OS thread and fail the test if it never finishes.
-fn with_watchdog<T: Send + 'static>(
-    task: impl FnOnce() -> T + Send + 'static,
-) -> T {
+fn with_watchdog<T: Send + 'static>(task: impl FnOnce() -> T + Send + 'static) -> T {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(task());
