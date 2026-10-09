@@ -132,6 +132,19 @@ impl SinkBarrier {
         self.sinks.iter().all(|sync| sync.sink().commit_redriable())
     }
 
+    /// Whether every coordinated sink tolerates replay after an interrupted
+    /// commit.
+    ///
+    /// A transactional sink that cannot be re-driven must not be discarded and
+    /// replayed: its commit may already be visible, so replay would duplicate
+    /// it. Idempotent and at-least-once sinks declare their own replay contract
+    /// (deduplication or documented duplication).
+    pub fn replay_safe(&self) -> bool {
+        self.sinks
+            .iter()
+            .all(|sync| sync.sink().capabilities() != SinkCapabilities::Transactional)
+    }
+
     /// Re-drive `commit` for every sink after an interrupted commit.
     ///
     /// Only valid when [`Self::redriable`] holds: `Sink::commit` must tolerate

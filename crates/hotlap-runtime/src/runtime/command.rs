@@ -127,7 +127,7 @@ async fn take(
 fn reject_if_failed(failed: bool) -> Result<(), ConnectorError> {
     if failed {
         return Err(ConnectorError::Infrastructure(
-            "engine stopped after a source failure".into(),
+            "engine stopped after a runtime failure".into(),
         ));
     }
     Ok(())

@@ -19,7 +19,7 @@ use harness::{capability, delete_checkpoint, fallback_id, log, seed_pending, see
 use recovery::{ResumableSource, engine_with, rows, sources};
 
 #[test]
-fn transactional_sink_is_not_redrivable_by_default() {
+fn a_transactional_pending_is_rejected_not_replayed() {
     let backend = seed_valid_one();
     seed_pending(&backend, 1, 2);
     let checkpointer =
@@ -27,14 +27,14 @@ fn transactional_sink_is_not_redrivable_by_default() {
             SinkSync::sink_only(capability(SinkCapabilities::Transactional)),
         ]);
 
+    // A transactional sink is not re-drivable by default, and replaying could
+    // duplicate a commit it already confirmed, so recovery must refuse instead.
     match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
-        RecoveryDecision::Discard {
-            pending, fallback, ..
-        } => {
+        RecoveryDecision::Reject { pending, reason } => {
             assert_eq!(pending, 2);
-            assert_eq!(fallback.expect("fallback").id, 1);
+            assert!(reason.contains("transactional"), "reason: {reason}");
         }
-        other => panic!("expected Discard, got {other:?}"),
+        other => panic!("expected Reject, got {other:?}"),
     }
 }
 

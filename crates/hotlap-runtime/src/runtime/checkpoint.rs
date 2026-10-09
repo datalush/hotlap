@@ -4,11 +4,11 @@
 //! pointer are written; older ones are pruned to the `retain` newest.
 
 mod commit;
+mod config;
 mod state;
 
+pub use config::{CheckpointConfig, DEFAULT_RETAIN};
 pub use state::CheckpointState;
-
-use std::time::Duration;
 
 use hotlap::state::StateBackend;
 use hotlap_engine::{EngineSnapshot, decode_snapshot};
@@ -21,21 +21,6 @@ use crate::runtime::sink::SinkSync;
 use crate::runtime::sink_barrier::SinkBarrier;
 use crate::runtime::source_checkpoint::{SourcesCheckpoint, decode_sources};
 use hotlap_connectors::error::ConnectorError;
-
-/// How many checkpoints [`CheckpointConfig`] keeps by default.
-pub const DEFAULT_RETAIN: usize = 3;
-
-/// Periodic checkpoint settings for a running engine.
-pub struct CheckpointConfig {
-    /// Minimum time between periodic checkpoints.
-    pub interval: Duration,
-    /// Destination store, moved into the engine thread.
-    pub backend: Box<dyn StateBackend + Send>,
-    /// Number of newest checkpoints to keep; older ones are deleted.
-    ///
-    /// Clamped to at least one, so the `latest` checkpoint always survives.
-    pub retain: usize,
-}
 
 /// A decoded checkpoint: engine snapshot plus resumable source offsets.
 #[derive(Debug)]
@@ -133,6 +118,11 @@ impl Checkpointer {
     /// Whether every coordinated sink declares a re-drivable `commit`.
     pub(crate) fn redriable(&self) -> bool {
         self.sinks.redriable()
+    }
+
+    /// Whether discarding and replaying an interrupted commit is safe.
+    pub(crate) fn replay_safe(&self) -> bool {
+        self.sinks.replay_safe()
     }
 
     /// Decode the body of `id` without requiring the `valid` marker.

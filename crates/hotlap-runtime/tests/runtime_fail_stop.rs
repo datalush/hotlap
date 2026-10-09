@@ -150,7 +150,7 @@ fn ack_failure_stops_the_runtime_and_rejects_later_checkpoints() {
 
     // Checkpoint and view-build are rejected; reads and shutdown remain.
     let checkpoint_error = handle.checkpoint().unwrap_err();
-    assert!(checkpoint_error.to_string().contains("source failure"));
+    assert!(checkpoint_error.to_string().contains("runtime failure"));
     let build = handle.build_view(
         "v2",
         Plan::Project {
@@ -158,7 +158,7 @@ fn ack_failure_stops_the_runtime_and_rejects_later_checkpoints() {
             cols: vec![0],
         },
     );
-    assert!(build.unwrap_err().to_string().contains("source failure"));
+    assert!(build.unwrap_err().to_string().contains("runtime failure"));
 
     assert!(b.applied().offsets.is_empty());
     handle.shutdown().unwrap();

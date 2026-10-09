@@ -111,7 +111,7 @@ fn read_error_stops_the_session_and_keeps_only_acked_rows() {
             .expect("source channel open");
         let error = wait_failure(&session);
         assert!(
-            error.contains("source failure"),
+            error.contains("runtime failure"),
             "unexpected error: {error}"
         );
 

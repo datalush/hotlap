@@ -90,9 +90,16 @@ retain**:
 - **Promover**: si **todos** los sinks declaran su commit **re-conducible**,
   recovery **re-conduce** `Sink::commit` (idempotente, ya exigido por el
   contrato), publica `valid` y **resume desde C** sin replay.
-- **Descartar + señal**: si algún sink no es re-conducible, recovery **borra C**,
-  replaya desde el válido anterior y emite una **señal explícita** (warning en el
-  canal de errores + métrica `checkpoints_discarded`), nunca en silencio.
+- **Descartar + señal**: si **ningún** sink es transaccional y alguno no es
+  re-conducible, recovery **borra C**, replaya desde el válido anterior y emite
+  una **señal explícita** (warning en el canal de errores + métrica
+  `checkpoints_discarded`), nunca en silencio. Un sink idempotente deduplica el
+  replay; uno at-least-once documenta la posible duplicación.
+- **Rechazar sin replay**: si un sink **transaccional** no es re-conducible,
+  replayar podría duplicar una transacción que ya está confirmada y no hay forma
+  de deshacerla. Recovery **no descarta**: conserva el marcador y el cuerpo,
+  falla con un error explícito y deja la resolución a un operador. Esto no añade
+  un handle de transacción durable ni 2PC nuevo a Fluss.
 
 **Contrato del sink.** `Sink::commit` **debe tolerar ejecutarse más de una
 vez**: la barrera puede confirmar el mismo sink más de una vez y recovery

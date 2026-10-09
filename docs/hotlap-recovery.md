@@ -16,11 +16,14 @@
 1. **Resolver un commit interrumpido** (`Recovery::inspect` / `start`): si hay
    un marker `commit` sin `valid` con el cuerpo completo, C estaba en curso de
    commit; se **promueve** (re-conducir commit + publicar `valid`) si todos los
-   sinks son re-conducibles, o se **descarta C con señal explícita** y se
-   replaya desde el anterior (ver `docs/hotlap-sink-2pc.md`). Sin marker, este
-   paso no hace nada. Si publicar el commit promovido falla de forma **operativa**
-   (`Storage`), el error **propaga** sin leer un fallback, sin descartar el
-   pending y sin reabrir ninguna fuente.
+   sinks son re-conducibles; si ninguno es transaccional, se **descarta C con
+   señal explícita** y se replaya desde el anterior; y si algún sink es
+   **transaccional** y no re-conducible, se **rechaza** conservando el marcador y
+   el cuerpo, porque replayar podría duplicar una transacción confirmada (ver
+   `docs/hotlap-sink-2pc.md`). Sin marker, este paso no hace nada. Si publicar
+   el commit promovido falla de forma **operativa** (`Storage`), el error
+   **propaga** sin leer un fallback, sin descartar el pending y sin reabrir
+   ninguna fuente.
 2. **Cargar el último checkpoint válido**: `latest` se lee solo para
    clasificarlo, no para elegir. Se escanea el namespace de más nuevo a más
    viejo y se toma el `valid` más nuevo, así un puntero `latest` que se quedó

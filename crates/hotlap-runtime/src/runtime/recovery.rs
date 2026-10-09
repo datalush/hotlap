@@ -7,9 +7,12 @@
 //! before the offsets are replayed, replaying the log from those offsets yields
 //! exactly the state the crashed run had reached.
 
+mod decision;
 mod pending;
 mod restore;
 mod sources;
+
+pub use decision::RecoveryDecision;
 
 use std::sync::Mutex;
 
@@ -26,32 +29,6 @@ use sources::{read_body, read_valid};
 /// The last valid checkpoint, if the store holds one.
 pub struct Recovery;
 
-/// How startup should recover, including a checkpoint interrupted mid-commit.
-///
-/// An interrupted commit is one whose durable `commit` marker is present but
-/// whose `valid` marker is not: the body is complete and the sinks may or may
-/// not have committed before the process stopped.
-#[derive(Debug)]
-pub enum RecoveryDecision {
-    /// No usable checkpoint: start clean.
-    Clean,
-    /// Resume from this already valid checkpoint.
-    Resume(Checkpoint),
-    /// Re-drive the interrupted commit for `Checkpoint` (every sink declares its
-    /// commit re-drivable), publish it and resume from it without replay.
-    Promote(Checkpoint),
-    /// The interrupted checkpoint cannot be re-driven: discard `pending` and
-    /// replay from `fallback` (the newest valid checkpoint, if any).
-    Discard {
-        /// Id of the interrupted checkpoint to discard.
-        pending: u64,
-        /// Newest valid checkpoint to replay from, if one exists.
-        fallback: Option<Checkpoint>,
-        /// Why the commit cannot be re-driven, for the warning signal.
-        reason: &'static str,
-    },
-}
-
 impl Recovery {
     /// Decide how to recover, detecting a checkpoint that was mid-commit when
     /// the process stopped.
@@ -59,7 +36,7 @@ impl Recovery {
     /// The newest valid checkpoint and any pending commit body are validated
     /// against `sources` before a decision is returned, so a promotion or a
     /// resume never runs against an incompatible declaration. An undecodable
-    /// current-format body keeps the SP8 discard path; a foreign or
+    /// current-format body keeps the existing discard path; a foreign or
     /// incompatible format is a fatal `Unsupported`.
     pub fn inspect(
         checkpointer: &Checkpointer,
@@ -72,6 +49,13 @@ impl Recovery {
                     sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
                     if checkpointer.redriable() {
                         return Ok(RecoveryDecision::Promote(checkpoint));
+                    }
+                    if !checkpointer.replay_safe() {
+                        return Ok(RecoveryDecision::Reject {
+                            pending,
+                            reason: "a transactional sink cannot be re-driven; replay could \
+                                     duplicate its committed output",
+                        });
                     }
                     "a sink is not re-drivable"
                 }
@@ -140,6 +124,14 @@ impl Recovery {
                 Some(checkpoint) => checkpoint,
                 None => return sources.stream(),
             },
+            // Refuse rather than replay: a transactional sink may already have
+            // committed, so replay could duplicate it. The marker, the body and
+            // the sink state stay for a manual decision or an operator fix.
+            RecoveryDecision::Reject { pending, reason } => {
+                return Err(ConnectorError::Infrastructure(format!(
+                    "refusing to replay interrupted checkpoint {pending}: {reason}"
+                )));
+            }
         };
         checkpointer.resume_after(checkpoint.id);
         Self::resume(hotlap, sources, &checkpoint)
