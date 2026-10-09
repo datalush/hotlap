@@ -82,6 +82,19 @@ async fn resolves_composite_join_key() {
 }
 
 #[tokio::test]
+async fn rejects_projection_column_alias() {
+    let ctx = ctx_with_src();
+    let bindings = SourceBindings::from([("src".into(), InputId(7))]);
+    // A `SELECT ... AS x` alias is not a bare column, so it is rejected rather
+    // than silently projected without its output name.
+    let df = ctx.sql("SELECT a.k AS renamed FROM src a").await.unwrap();
+    assert!(
+        to_kernel_plan(df.logical_plan(), &bindings).is_err(),
+        "column output aliases are outside the supported subset"
+    );
+}
+
+#[tokio::test]
 async fn rejects_ambiguous_unqualified_column() {
     let ctx = ctx_with_src();
     register_empty_table(&ctx, "other");
