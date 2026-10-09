@@ -14,7 +14,7 @@ use hotlap::state::StateBackend;
 use hotlap_engine::{EngineSnapshot, decode_snapshot};
 
 use crate::runtime::checkpoint_body::{
-    LATEST_KEY, checkpoint_prefix, engine_err, invalid, parse_id, read_body as decode_body,
+    LATEST_KEY, checkpoint_prefix, decode_err, invalid, parse_id, read_body as decode_body,
     state_err,
 };
 use crate::runtime::sink::SinkSync;
@@ -129,7 +129,7 @@ impl Checkpointer {
         let engine_bytes = self
             .get(&format!("{base}/engine"))?
             .ok_or_else(|| invalid(id))?;
-        let engine = decode_snapshot(&engine_bytes).map_err(engine_err)?;
+        let engine = decode_snapshot(&engine_bytes).map_err(decode_err)?;
         let source_bytes = self
             .get(&format!("{base}/sources"))?
             .ok_or_else(|| invalid(id))?;

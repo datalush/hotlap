@@ -49,7 +49,7 @@ impl SourcesCheckpoint {
     pub fn capture(sources: &Sources) -> Result<Self, ConnectorError> {
         let mut entries = Vec::with_capacity(sources.entries().len());
         for input in sources.entries() {
-            let schema = encode_schema(&input.source.schema()).map_err(codec_err)?;
+            let schema = encode_schema(&input.source.schema()).map_err(encode_err)?;
             entries.push(SavedSource {
                 id: input.id,
                 name: input.name.clone(),
@@ -85,14 +85,25 @@ impl SourcesCheckpoint {
     }
 }
 
-/// Map an engine codec error onto the connector error type.
+/// Map an engine encode error onto the connector error type.
 ///
-/// An [`EngineError::Unsupported`] (an unknown inner frame or snapshot version)
-/// stays `Unsupported`, so recovery can treat an incompatible format as fatal
-/// instead of mistaking it for tolerated current-format corruption.
-pub(crate) fn codec_err(error: hotlap_engine::EngineError) -> ConnectorError {
+/// Encoding runs while capturing live state, so a failure is internal, never
+/// persisted corruption that recovery could tolerate.
+pub(crate) fn encode_err(error: hotlap_engine::EngineError) -> ConnectorError {
     match error {
         hotlap_engine::EngineError::Unsupported(message) => ConnectorError::Unsupported(message),
         error => ConnectorError::Infrastructure(error.to_string()),
+    }
+}
+
+/// Map an engine decode error onto the connector error type.
+///
+/// [`EngineError::Unsupported`] (an unknown inner frame or snapshot version)
+/// stays `Unsupported`, so recovery can treat an incompatible format as fatal
+/// instead of mistaking it for tolerated current-format corruption.
+pub(crate) fn decode_err(error: hotlap_engine::EngineError) -> ConnectorError {
+    match error {
+        hotlap_engine::EngineError::Unsupported(message) => ConnectorError::Unsupported(message),
+        error => ConnectorError::Corruption(error.to_string()),
     }
 }

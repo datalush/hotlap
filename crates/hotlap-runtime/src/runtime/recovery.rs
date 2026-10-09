@@ -151,11 +151,18 @@ impl Recovery {
         checkpointer: &Checkpointer,
         sources: &Sources,
     ) -> Result<Option<Checkpoint>, ConnectorError> {
-        if let Some(id) = checkpointer.latest()?
-            && let Some(checkpoint) = read_valid(checkpointer, id)?
-        {
-            sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
-            return Ok(Some(checkpoint));
+        match checkpointer.latest() {
+            Ok(Some(id)) => {
+                if let Some(checkpoint) = read_valid(checkpointer, id)? {
+                    sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
+                    return Ok(Some(checkpoint));
+                }
+            }
+            // A damaged `latest` pointer is current-format corruption: scan the
+            // store for an older valid checkpoint instead of aborting startup.
+            // An operational failure propagates and is never treated as absence.
+            Ok(None) | Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => {}
+            Err(error) => return Err(error),
         }
         for id in checkpointer.ids_descending()? {
             if let Some(checkpoint) = read_valid(checkpointer, id)? {

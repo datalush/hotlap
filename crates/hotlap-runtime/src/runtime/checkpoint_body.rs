@@ -32,7 +32,7 @@ pub(crate) async fn write(
     sources: &Sources,
 ) -> Result<(), ConnectorError> {
     let snapshot = engine.checkpoint().map_err(hotlap_err)?;
-    let engine_bytes = encode_snapshot(&snapshot).map_err(engine_err)?;
+    let engine_bytes = encode_snapshot(&snapshot).map_err(encode_err)?;
     let sources_checkpoint = SourcesCheckpoint::capture(sources)?;
     let source_bytes = encode_sources(&sources_checkpoint)?;
     let base = checkpoint_prefix(id);
@@ -70,7 +70,7 @@ pub(crate) fn read_body(
     else {
         return Ok(None);
     };
-    let engine = decode_snapshot(&engine_bytes).map_err(engine_err)?;
+    let engine = decode_snapshot(&engine_bytes).map_err(decode_err)?;
     let Some(source_bytes) = backend
         .get(format!("{base}/sources").as_bytes())
         .map_err(state_err)?
@@ -102,13 +102,13 @@ pub(crate) fn mark_valid(
 pub(crate) fn parse_id(bytes: &[u8]) -> Result<u64, ConnectorError> {
     let array: [u8; 8] = bytes
         .try_into()
-        .map_err(|_| ConnectorError::Infrastructure("checkpoint id is not 8 bytes".into()))?;
+        .map_err(|_| ConnectorError::Corruption("checkpoint id is not 8 bytes".into()))?;
     Ok(u64::from_le_bytes(array))
 }
 
 /// Error for an unknown or incomplete checkpoint.
 pub(crate) fn invalid(id: u64) -> ConnectorError {
-    ConnectorError::Infrastructure(format!("checkpoint {id} is missing or not valid"))
+    ConnectorError::Missing(format!("checkpoint {id} is missing or not valid"))
 }
 
 /// Map a hotlap facade error onto the connector error type.
@@ -116,12 +116,25 @@ pub(crate) fn hotlap_err(error: hotlap::HotlapError) -> ConnectorError {
     ConnectorError::Infrastructure(error.0)
 }
 
-/// Map an engine codec error onto the connector error type.
+/// Map an engine decode error onto the connector error type.
 ///
-/// An [`EngineError::Unsupported`] (an unknown engine frame or snapshot
-/// version) stays `Unsupported`, so recovery treats an incompatible snapshot as
-/// fatal instead of falling back or starting clean.
-pub(crate) fn engine_err(error: EngineError) -> ConnectorError {
+/// [`EngineError::Unsupported`] (an unknown engine frame or snapshot version)
+/// stays `Unsupported`, so recovery treats an incompatible snapshot as fatal
+/// instead of falling back or starting clean. Any other failure at the decode
+/// boundary is current-format corruption, which recovery may tolerate.
+pub(crate) fn decode_err(error: EngineError) -> ConnectorError {
+    match error {
+        EngineError::Unsupported(message) => ConnectorError::Unsupported(message),
+        error => ConnectorError::Corruption(error.to_string()),
+    }
+}
+
+/// Map an engine encode error onto the connector error type.
+///
+/// Encoding happens while producing a checkpoint from live state, so a failure
+/// is an internal or unsupported-configuration error, never persisted
+/// corruption; it must not be classified as a decodable body.
+pub(crate) fn encode_err(error: EngineError) -> ConnectorError {
     match error {
         EngineError::Unsupported(message) => ConnectorError::Unsupported(message),
         error => ConnectorError::Infrastructure(error.to_string()),
@@ -130,5 +143,5 @@ pub(crate) fn engine_err(error: EngineError) -> ConnectorError {
 
 /// Map a state backend error onto the connector error type.
 pub(crate) fn state_err(error: StateError) -> ConnectorError {
-    ConnectorError::Infrastructure(error.to_string())
+    ConnectorError::Storage(error)
 }

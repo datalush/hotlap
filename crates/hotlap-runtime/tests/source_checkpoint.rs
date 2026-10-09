@@ -118,34 +118,34 @@ fn unknown_inner_frame_version_is_not_supported() {
 }
 
 #[test]
-fn truncated_header_is_infrastructure() {
+fn truncated_header_is_corruption() {
     let bytes = encode_sources(&SourcesCheckpoint { entries: vec![] }).unwrap();
     assert!(matches!(
         decode_sources(&bytes[..4]),
-        Err(ConnectorError::Infrastructure(_))
+        Err(ConnectorError::Corruption(_))
     ));
     assert!(matches!(
         decode_sources(&bytes[..2]),
-        Err(ConnectorError::Infrastructure(_))
+        Err(ConnectorError::Corruption(_))
     ));
 }
 
 #[test]
-fn corrupt_payload_is_infrastructure() {
+fn corrupt_payload_is_corruption() {
     let mut bytes = encode_sources(&SourcesCheckpoint { entries: vec![] }).unwrap();
     bytes[8] ^= 0xff;
     assert!(matches!(
         decode_sources(&bytes),
-        Err(ConnectorError::Infrastructure(_))
+        Err(ConnectorError::Corruption(_))
     ));
 }
 
 #[test]
-fn trailing_bytes_are_infrastructure() {
+fn trailing_bytes_are_corruption() {
     let mut bytes = encode_sources(&SourcesCheckpoint { entries: vec![] }).unwrap();
     bytes.push(0);
     assert!(matches!(
         decode_sources(&bytes),
-        Err(ConnectorError::Infrastructure(_))
+        Err(ConnectorError::Corruption(_))
     ));
 }

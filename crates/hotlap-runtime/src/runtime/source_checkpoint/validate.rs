@@ -9,7 +9,7 @@ use hotlap_engine::{EngineSnapshot, decode_schema};
 
 use crate::runtime::sources::{InputSource, Sources};
 
-use super::{SavedSource, SourcesCheckpoint, codec_err};
+use super::{SavedSource, SourcesCheckpoint, decode_err};
 
 /// Validate `checkpoint` against `sources` and `engine`.
 pub(super) fn validate(
@@ -61,7 +61,7 @@ fn validate_entry(entry: &SavedSource, input: &InputSource) -> Result<(), Connec
     if entry.name != input.name {
         return Err(unsupported(format!("source {:?} was renamed", entry.id)));
     }
-    let saved_schema = decode_schema(&entry.schema).map_err(codec_err)?;
+    let saved_schema = decode_schema(&entry.schema).map_err(decode_err)?;
     if saved_schema != input.source.schema() {
         return Err(unsupported(format!(
             "schema for source {:?} does not match",
@@ -115,8 +115,8 @@ fn validate_snapshot(
     for input in &engine.inputs {
         let entry = saved[&input.id];
         if let Some(bytes) = &input.schema {
-            let materialized = decode_schema(bytes).map_err(codec_err)?;
-            let saved_schema = decode_schema(&entry.schema).map_err(codec_err)?;
+            let materialized = decode_schema(bytes).map_err(decode_err)?;
+            let saved_schema = decode_schema(&entry.schema).map_err(decode_err)?;
             if materialized != saved_schema {
                 return Err(unsupported(format!(
                     "engine schema for {:?} does not match",

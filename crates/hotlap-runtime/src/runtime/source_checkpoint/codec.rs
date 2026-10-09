@@ -8,7 +8,7 @@
 use hotlap_connectors::error::ConnectorError;
 use hotlap_engine::{decode_framed, encode_framed};
 
-use super::{SourcesCheckpoint, codec_err};
+use super::{SourcesCheckpoint, decode_err, encode_err};
 
 /// Magic bytes at the start of every sources checkpoint.
 const MAGIC: [u8; 4] = *b"HLSR";
@@ -19,7 +19,7 @@ const HEADER: usize = 8;
 
 /// Encode `value` as `HLSR` + version + the engine's framed payload.
 pub fn encode_sources(value: &SourcesCheckpoint) -> Result<Vec<u8>, ConnectorError> {
-    let payload = encode_framed(value).map_err(codec_err)?;
+    let payload = encode_framed(value).map_err(encode_err)?;
     let mut out = Vec::with_capacity(HEADER + payload.len());
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
@@ -51,10 +51,10 @@ fn decode_body(bytes: &[u8]) -> Result<SourcesCheckpoint, ConnectorError> {
             "unknown sources checkpoint version {version}"
         )));
     }
-    decode_framed(&bytes[HEADER..]).map_err(codec_err)
+    decode_framed(&bytes[HEADER..]).map_err(decode_err)
 }
 
-/// Build an infrastructure error for a truncated container header.
+/// Build a corruption error for a truncated container header.
 fn truncated(len: usize) -> ConnectorError {
-    ConnectorError::Infrastructure(format!("sources checkpoint header is {len} bytes"))
+    ConnectorError::Corruption(format!("sources checkpoint header is {len} bytes"))
 }

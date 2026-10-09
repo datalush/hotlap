@@ -61,11 +61,13 @@ fn seed_applied(
     Ok(())
 }
 
-/// Read a valid checkpoint, tolerating current-format corruption.
+/// Read a valid checkpoint, tolerating current-format corruption and absence.
 ///
 /// An `Unsupported` error (foreign or incompatible format) is fatal and
-/// propagates; any other decode failure means the current-format body is
-/// corrupt, so this returns `None` and the caller falls back to an older one.
+/// propagates, and so is any operational failure: a store error must never be
+/// mistaken for corruption or absence. Only a `Corruption` of the current
+/// format or a `Missing` marker/part means the caller may fall back to an older
+/// checkpoint.
 pub(super) fn read_valid(
     checkpointer: &Checkpointer,
     id: u64,
@@ -73,7 +75,8 @@ pub(super) fn read_valid(
     match checkpointer.read(id) {
         Ok(checkpoint) => Ok(Some(checkpoint)),
         Err(error @ ConnectorError::Unsupported(_)) => Err(error),
-        Err(_) => Ok(None),
+        Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -85,6 +88,7 @@ pub(super) fn read_body(
     match checkpointer.read_body(id) {
         Ok(body) => Ok(body),
         Err(error @ ConnectorError::Unsupported(_)) => Err(error),
-        Err(_) => Ok(None),
+        Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => Ok(None),
+        Err(error) => Err(error),
     }
 }
