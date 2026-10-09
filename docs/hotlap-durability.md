@@ -169,12 +169,15 @@ como un `SourcesCheckpoint` multifuente en un contenedor `HLSR`
 
 **Un único formato multifuente.** El mismo contenedor sirve para una o varias
 fuentes: cada entrada guarda id, nombre canónico, schema Arrow IPC, lag de
-watermark, columna event-time y `SourceState` (offsets por split). No hay
-**lectores de formatos anteriores**, migraciones ni fallbacks: un checkpoint
-monofuente previo o de versión incompatible produce `Unsupported` (ver
-`hotlap-cross-source-joins.md`). La corrupción del **formato actual** sí es
-tolerada: recovery cae al predecesor válido más nuevo; una versión incompatible
-o un schema que no valida contra las fuentes declaradas es fatal.
+watermark, columna event-time y `SourceState` (offsets por split). Además, el
+contenedor **versión 2** guarda el **registro de vistas** (`nombre↔handle↔plan`)
+para atar cada nombre declarado a su handle numérico y su plan, no solo al
+schema. No hay **lectores de formatos anteriores**, migraciones ni fallbacks: un
+checkpoint monofuente previo o de versión incompatible produce `Unsupported`
+(ver `hotlap-cross-source-joins.md`). La corrupción del **formato actual** sí es
+tolerada: recovery cae al predecesor válido más nuevo; una versión incompatible,
+una vista con nombre/handle/plan desajustado o un schema que no valida contra
+las fuentes declaradas es fatal.
 
 **Layout en disco** (namespace bajo `checkpoint/`):
 

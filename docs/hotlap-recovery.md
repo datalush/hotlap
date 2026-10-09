@@ -57,6 +57,20 @@ que usan `SplitId` 0 mantienen mapas de estado separados y no colapsan sus
 offsets. Un schema, lag o columna event-time incompatible se rechaza **antes** de
 restaurar o consumir.
 
+**Identidad de vistas.** El snapshot del motor guarda los planes por *handle*
+numérico, pero **no** el nombre declarado. Para que un restart no reasigne un
+handle a otra vista con el mismo schema (p. ej. el orden de `CREATE MATERIALIZED
+VIEW` invertido, o el mismo nombre con otro plan), el checkpoint persiste un
+registro `nombre↔handle↔plan` (contenedor `HLSR` versión 2, sin lector legacy).
+Al recuperar se exige que cada vista declarada coincida en nombre, handle y plan
+con el registro guardado y que el snapshot del motor conserve ese plan; un
+desajuste es `Unsupported` **antes** de restaurar el motor, re-conducir un commit
+o abrir cualquier writer. La sesión SQL valida el mismo registro contra las
+vistas compiladas **antes** de que el `SinkFactory` abra un writer, así que un
+rechazo deja `factory creates`, reads y commits en cero. El orden de declaración
+de las **fuentes** sigue siendo libre (ids canónicos y ordenados); solo el orden
+de las **vistas** cambia los handles y puede rechazarse explícitamente.
+
 **Retención explícita.** Si el source ya no puede servir un offset capturado
 (p.ej. el log de Fluss podó registros por debajo del offset), `resume` devuelve
 un error **explícito**: la recuperación falla ruidosamente en lugar de perder
@@ -140,6 +154,13 @@ follow-up fuera de alcance.
   (warning + `checkpoints_discarded`); `commit_redriable` se puede sobreescribir
   por encima/debajo de la capacidad; sin marker, recovery coincide con el
   válido más nuevo.
+- **Identidad de vistas** (`crates/hotlap-runtime/tests/view_identity.rs`,
+  `tests/view_identity_session.rs`, y la guarda del facade en
+  `crates/hotlap/src/engine/tests.rs`): dos vistas con el mismo schema y
+  contenido distinto declaradas en orden invertido, un nombre reutilizado con
+  otro plan y una vista eliminada se rechazan (`Unsupported`) antes de restaurar
+  el motor; la sesión SQL lo rechaza antes de abrir un writer (`factory creates`,
+  reads y commits en cero) y el orden original sigue recuperando ambas vistas.
 - **Dynamic views** (`crates/hotlap-engine/tests/dynamic_view.rs`):
   `late_views_match_full_recomputation_and_keep_updating`,
   `late_view_without_retention_is_rejected`,
