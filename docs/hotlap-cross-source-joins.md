@@ -120,10 +120,13 @@ deshabilita los checkpoints.
 ## 8. Semántica NULL (límite actual)
 
 El engine codifica las claves de join con `arrow::row`, de modo que una clave
-`NULL` **compara igual** a otra `NULL` y no se descarta. Es la semántica de tres
-valores (Kleene) ya existente del kernel/SQL, **sin ampliarla** en este slice: no
-se añaden expresiones SQL ni cambios en las reglas del kernel. El límite se
-caracteriza en `hotlap-engine/tests/cross_source_null_keys.rs`.
+`NULL` **compara igual** a otra `NULL` y no se descarta. Es una propiedad de la
+**codificación de claves del join**, **no** la lógica de predicados **Kleene** de
+tres valores que sí aplica a `WHERE` y agregados (donde `NULL = NULL` es
+«desconocido» y la fila se excluye). Es la semántica existente del engine en este
+slice, **sin ampliarla**: no se añaden expresiones SQL ni se cambian las reglas
+del kernel. El límite se caracteriza en
+`hotlap-engine/tests/cross_source_null_keys.rs`.
 
 ## 9. Fuentes antes y después de `START`
 

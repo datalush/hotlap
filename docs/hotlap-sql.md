@@ -156,13 +156,15 @@ planifica como una tabla normal:
 4. Los `SELECT` se ejecutan con DataFusion; las consultas a MVs leen el
    snapshot consolidado.
 
-El **DDL se declara antes de `START`** (ventana DDL). Crear un source o una MV
-después de `START` se **rechaza** con `SqlError::Unsupported` (no se ignora ni
-se aplica parcialmente). Se pueden declarar **varias** fuentes antes de `START`:
-`START` fija los `InputId` en orden canónico, recompila cada MV contra esa
-asignación e ingiere cada fuente con identidad propia. Un `CREATE SOURCE`
-duplicado o con nombre ya usado se rechaza sin sustituir la fuente/watermark
-vivos (ver `hotlap-cross-source-joins.md`).
+El **DDL se declara antes de `START`** (ventana DDL). Crear un **source** o un
+**sink** después de `START` se **rechaza** con `SqlError::Unsupported`. Una
+**MV** después de `START` (dynamic view) se admite **solo** con retención de
+inputs: usa el mapa de bindings congelado y la retención existente, y **sin
+retención se rechaza** (§8, `hotlap-recovery.md`). Se pueden declarar **varias**
+fuentes antes de `START`: `START` fija los `InputId` en orden canónico, recompila
+cada MV contra esa asignación e ingiere cada fuente con identidad propia. Un
+`CREATE SOURCE` duplicado o con nombre ya usado se rechaza sin sustituir la
+fuente/watermark vivos (ver `hotlap-cross-source-joins.md`).
 
 ## 7. Nota sobre `_event_time`
 
@@ -179,13 +181,13 @@ El `time_col` declarado en `WATERMARK FOR` se resuelve contra el esquema real
 del source; si no existe, la creación falla. El kernel recibe el índice y el
 `lag` derivados, no el texto SQL.
 
-## 8. Límite v1: dynamic views
+## 8. Dynamic views (retención de inputs)
 
-Crear MVs **después** de `START` (*dynamic views*) queda **fuera de v1**: el
-`EngineHandle` arranca un dataflow diferencial ya construido y no admite
-añadirle operadores en caliente sin un motor de estado/replay. Registrar una MV
-tardía produciría resultados incorrectos, así que se rechaza explícitamente. Es
-un requisito registrado para **SP4**.
+Crear MVs **después** de `START` (*dynamic views*) se admite **solo** con
+retención de inputs: el engine reconstruye la vista sobre los deltas retenidos en
+orden y la une al flujo vivo. La retención está **apagada por defecto**, así que
+sin ella (o si está truncada) la MV tardía se **rechaza** (`Unsupported`) en vez
+de devolver un resultado parcial. Detalles en `hotlap-recovery.md`.
 
 ## 9. No-goals, límites y verificación
 
