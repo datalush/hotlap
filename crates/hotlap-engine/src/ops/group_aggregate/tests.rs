@@ -143,3 +143,19 @@ fn work_is_proportional_to_touched_keys() {
         assert_eq!(rows(&out), vec![(key, 1, 1, 1.0, 1)]);
     }
 }
+
+#[test]
+fn out_of_range_integer_sum_is_rejected_atomically() {
+    let mut reducer = reducer();
+    reducer.apply(&zset("v", &[(1, i64::MAX)], &[1])).unwrap();
+
+    // `i64::MAX + 1` fits the `i128` accumulator but not the `Int64` output.
+    assert!(
+        reducer.apply(&zset("v", &[(1, 1)], &[1])).is_err(),
+        "an out-of-range output must be rejected"
+    );
+
+    // The prior state must be intact: retracting `i64::MAX` removes the group.
+    let out = reducer.apply(&zset("v", &[(1, i64::MAX)], &[-1])).unwrap();
+    assert_eq!(rows(&out), vec![(1, 1, i64::MAX, i64::MAX as f64, -1)]);
+}

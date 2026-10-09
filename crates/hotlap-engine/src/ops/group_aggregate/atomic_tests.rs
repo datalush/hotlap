@@ -111,3 +111,71 @@ fn later_special_error_leaves_earlier_min_unchanged() {
     let out = reducer.apply(&zset(&[(1, 5.0, 0.0, -1)])).unwrap();
     assert_eq!(cells(&out), vec![(1, Some(5.0), Some(0.0), -1)]);
 }
+
+/// One `(key, a, b, diff)` row over two `Int64` value columns.
+fn int_zset(rows: &[(i64, i64, i64, i64)]) -> ZSetBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("a", DataType::Int64, true),
+        Field::new("b", DataType::Int64, true),
+    ]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+        )),
+    ];
+    let diffs: Vec<i64> = rows.iter().map(|row| row.3).collect();
+    let batch = RecordBatch::try_new(schema, columns).unwrap();
+    ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs))).unwrap()
+}
+
+/// `(key, first, second, diff)` `Int64` output cells, old-before-new.
+fn int_cells(z: &ZSetBatch) -> Vec<(i64, Option<i64>, Option<i64>, i64)> {
+    let column = |index: usize| {
+        z.batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+    };
+    let (key, first, second) = (column(0), column(1), column(2));
+    let diffs = z.diff.as_any().downcast_ref::<Int64Array>().unwrap();
+    let cell = |array: &Int64Array, i: usize| (!array.is_null(i)).then(|| array.value(i));
+    let mut out: Vec<_> = (0..z.len())
+        .map(|i| {
+            (
+                key.value(i),
+                cell(first, i),
+                cell(second, i),
+                diffs.value(i),
+            )
+        })
+        .collect();
+    out.sort_by_key(|row| (row.0, row.3));
+    out
+}
+
+#[test]
+fn later_out_of_range_sum_leaves_earlier_sum_unchanged() {
+    let mut reducer = GroupAggregate::new(&[0], vec![AggSpec::sum(1), AggSpec::sum(2)]);
+    reducer.apply(&int_zset(&[(1, 0, i64::MAX, 1)])).unwrap();
+
+    // `sum(a)` stays in range while `sum(b)` overflows its `Int64` output.
+    assert!(
+        reducer.apply(&int_zset(&[(1, 5, 1, 1)])).is_err(),
+        "the overflowing slot must reject the whole delta"
+    );
+
+    let out = reducer.apply(&int_zset(&[(1, 0, i64::MAX, -1)])).unwrap();
+    assert_eq!(
+        int_cells(&out),
+        vec![(1, Some(0), Some(i64::MAX), -1)],
+        "the in-range slot must not have been mutated"
+    );
+}

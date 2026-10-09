@@ -13,15 +13,18 @@ use crate::error::EngineError;
 use crate::zset::int64_diffs;
 
 use super::accumulate::empty_entry;
+use super::columns;
 use super::fold::fold_row;
 
 /// Validates that folding `z` cannot fail, without mutating `groups`.
 ///
 /// Every fallible update (row-count overflow, integer-sum overflow, negative
 /// special multiplicity) is simulated on a scalar-only shadow of each touched
-/// group, in input order, so a later error leaves the live state untouched.
-/// `min`/`max` multisets are never copied: the shadow uses empty multisets,
-/// whose `add` cannot fail.
+/// group, in input order, and the shadow's prospective output is rendered to
+/// catch an out-of-range `Int64` sum. A later error therefore leaves the live
+/// state untouched. `min`/`max` multisets are never copied: the shadow uses
+/// empty multisets, whose `add` cannot fail, and their output cells come from
+/// already-typed valid input values.
 pub(super) fn validate_delta(
     groups: &HashMap<Vec<u8>, GroupEntry>,
     aggs: &[AggSpec],
@@ -45,6 +48,15 @@ pub(super) fn validate_delta(
                 .unwrap_or_else(|| empty.clone())
         });
         fold_row(shadow, aggs, &z.batch, row, diff)?;
+    }
+    // Reject an output that cannot be materialized (for example an integer sum
+    // that overflows `i64` though it fits `i128`) before the live fold runs.
+    // `min`/`max` cells come from typed input values and cannot be out of range
+    // here, so rendering the shadow (empty multisets) is sufficient.
+    for shadow in shadows.values() {
+        if shadow.rows != 0 {
+            columns::render(&shadow.values)?;
+        }
     }
     Ok(())
 }
