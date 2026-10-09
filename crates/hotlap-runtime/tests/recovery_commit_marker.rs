@@ -17,7 +17,7 @@ use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::recovery::{Recovery, RecoveryDecision};
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 
-use harness::{FakeSink, log, matching, seed_pending, seed_valid_one, sink};
+use harness::{FakeSink, log, matching, seed_pending, seed_valid_one, sink, sink_with};
 use recovery::{ResumableSource, engine_with};
 
 #[test]
@@ -27,6 +27,7 @@ fn commit_marker_is_durable_before_commit_and_removed_after_valid() {
     let observed = Arc::new(Mutex::new(false));
     let probe = Arc::new(FakeSink {
         capabilities: SinkCapabilities::Transactional,
+        redriable: false,
         commits: Arc::clone(&commits),
         probe: Some((backend.clone(), 1, Arc::clone(&observed))),
     });
@@ -47,10 +48,12 @@ fn commit_marker_is_durable_before_commit_and_removed_after_valid() {
 }
 
 #[test]
-fn recovery_promotes_a_redrivable_interrupted_commit() {
+fn recovery_promotes_an_explicitly_redrivable_interrupted_commit() {
     let backend = seed_valid_one();
     seed_pending(&backend, 1, 2);
-    let (sink, commits) = sink(SinkCapabilities::Idempotent);
+    // Idempotent replay alone is not enough: the sink must declare a durable
+    // commit it can complete after a restart.
+    let (sink, commits) = sink_with(SinkCapabilities::Idempotent, true);
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
         .with_sinks(vec![SinkSync::sink_only(sink)]);
 
@@ -74,6 +77,26 @@ fn recovery_promotes_a_redrivable_interrupted_commit() {
         Recovery::inspect(&checkpointer, &matching()).unwrap(),
         RecoveryDecision::Resume(c) if c.id == 2
     ));
+}
+
+#[test]
+fn an_idempotent_sink_is_not_redrivable_by_default() {
+    let backend = seed_valid_one();
+    seed_pending(&backend, 1, 2);
+    let (sink, commits) = sink(SinkCapabilities::Idempotent);
+    let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+        .with_sinks(vec![SinkSync::sink_only(sink)]);
+
+    match Recovery::inspect(&checkpointer, &matching()).unwrap() {
+        RecoveryDecision::Discard {
+            pending, fallback, ..
+        } => {
+            assert_eq!(pending, 2);
+            assert_eq!(fallback.expect("fallback").id, 1);
+        }
+        other => panic!("expected Discard, got {other:?}"),
+    }
+    assert_eq!(commits.load(Ordering::SeqCst), 0, "must not re-drive");
 }
 
 #[test]

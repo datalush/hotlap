@@ -23,6 +23,7 @@ pub fn log() -> Dataset {
 /// marker was visible (and `valid` absent) while `commit` ran.
 pub struct FakeSink {
     pub capabilities: SinkCapabilities,
+    pub redriable: bool,
     pub commits: Arc<AtomicU32>,
     pub probe: Option<(SharedBackend, u64, Arc<Mutex<bool>>)>,
 }
@@ -35,6 +36,10 @@ impl Sink for FakeSink {
 
     fn capabilities(&self) -> SinkCapabilities {
         self.capabilities
+    }
+
+    fn commit_redriable(&self) -> bool {
+        self.redriable
     }
 
     async fn commit(&self) -> Result<(), ConnectorError> {
@@ -58,11 +63,22 @@ impl Sink for FakeSink {
     }
 }
 
-/// A shared fake sink with the given capability plus its commit counter.
+/// A shared fake sink with the given capability plus its commit counter; it
+/// uses the conservative default re-drivability for its capability.
 pub fn sink(capabilities: SinkCapabilities) -> (Arc<SharedSink>, Arc<AtomicU32>) {
+    sink_with(capabilities, false)
+}
+
+/// Like [`sink`], but the sink explicitly declares whether recovery may
+/// re-drive its commit after an interrupted commit.
+pub fn sink_with(
+    capabilities: SinkCapabilities,
+    redriable: bool,
+) -> (Arc<SharedSink>, Arc<AtomicU32>) {
     let commits = Arc::new(AtomicU32::new(0));
     let sink = Arc::new(FakeSink {
         capabilities,
+        redriable,
         commits: Arc::clone(&commits),
         probe: None,
     });

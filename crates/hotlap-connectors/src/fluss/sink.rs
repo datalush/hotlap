@@ -91,6 +91,14 @@ impl Sink for FlussSink {
         self.writer.capabilities()
     }
 
+    fn commit_redriable(&self) -> bool {
+        // Idempotent upserts make a replay safe, but not a re-driven commit: the
+        // writer only queues writes in memory, so a new writer after a crash
+        // cannot flush what an earlier one accepted. Never inferred from
+        // `Idempotent`; a restarted sink replays instead.
+        false
+    }
+
     async fn commit(&self) -> Result<(), ConnectorError> {
         // Fluss has no sink-side transaction; commit is the awaited flush.
         self.writer.flush().await
