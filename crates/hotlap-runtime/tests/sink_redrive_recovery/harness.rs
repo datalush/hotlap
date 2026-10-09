@@ -1,10 +1,11 @@
-//! A volatile-queue sink and a persistent remote output store.
+//! A volatile-queue sink and a keyed, retraction-aware remote output store.
 
 #[path = "../common/backend.rs"]
 mod backend;
 #[path = "../common/recovery/resumable.rs"]
 mod resumable;
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -17,25 +18,48 @@ use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 pub use resumable::{Dataset, ResumableSource};
 use tokio::sync::Notify;
 
-/// Persistent output shared by every sink instance.
+/// The `Int64Array` of a Z-set column.
+pub fn int_column(zset: &ZSetBatch, index: usize) -> &Int64Array {
+    zset.batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+}
+
+/// The signed multiplicity column of a Z-set.
+pub fn diff_column(zset: &ZSetBatch) -> &Int64Array {
+    zset.diff.as_any().downcast_ref::<Int64Array>().unwrap()
+}
+
+/// Persistent keyed output shared by every sink instance.
+///
+/// Delivery applies the changelog as keyed upserts/retractions: a positive diff
+/// upserts `key -> value`, a negative diff removes the key iff its current value
+/// matches the retracted row. Applying the same changelog twice is idempotent.
 #[derive(Clone, Default)]
-pub struct RemoteStore(Arc<Mutex<Vec<Vec<i64>>>>);
+pub struct RemoteStore(Arc<Mutex<BTreeMap<i64, i64>>>);
 
 impl RemoteStore {
-    pub fn deliver(&self, rows: Vec<Vec<i64>>) {
-        self.0.lock().unwrap().extend(rows);
+    fn apply(&self, key: i64, value: i64, diff: i64) {
+        let mut map = self.0.lock().unwrap();
+        if diff > 0 {
+            map.insert(key, value);
+        } else if diff < 0 && map.get(&key) == Some(&value) {
+            map.remove(&key);
+        }
     }
 
-    pub fn rows(&self) -> Vec<Vec<i64>> {
+    pub fn snapshot(&self) -> BTreeMap<i64, i64> {
         self.0.lock().unwrap().clone()
     }
 }
 
-/// A sink whose writer only queues rows in memory; `commit` delivers them to the
-/// remote store. A pending `commit` blocks after signalling `entered`.
+/// A sink whose writer only queues the changelog in memory; `commit` applies it
+/// to the remote store. A pending `commit` blocks after signalling `entered`.
 pub struct VolatileSink {
     remote: RemoteStore,
-    queue: Mutex<Vec<Vec<i64>>>,
+    queue: Mutex<Vec<(i64, i64, i64)>>,
     pending: AtomicBool,
     entered: Arc<Notify>,
     release: Arc<Notify>,
@@ -60,28 +84,17 @@ impl VolatileSink {
     }
 }
 
-fn row(zset: &ZSetBatch, index: usize) -> Vec<i64> {
-    zset.batch
-        .columns()
-        .iter()
-        .map(|column| {
-            column
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(index)
-        })
-        .collect()
-}
-
 #[async_trait::async_trait]
 impl Sink for VolatileSink {
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         while let Some(item) = changes.next().await {
             let zset = item?;
+            let keys = int_column(&zset, 0);
+            let values = int_column(&zset, 1);
+            let diffs = diff_column(&zset);
             let mut queue = self.queue.lock().unwrap();
             for index in 0..zset.len() {
-                queue.push(row(&zset, index));
+                queue.push((keys.value(index), values.value(index), diffs.value(index)));
             }
         }
         Ok(())
@@ -102,8 +115,9 @@ impl Sink for VolatileSink {
             self.entered.notify_one();
             self.release.notified().await;
         }
-        let rows = std::mem::take(&mut *self.queue.lock().unwrap());
-        self.remote.deliver(rows);
+        for (key, value, diff) in std::mem::take(&mut *self.queue.lock().unwrap()) {
+            self.remote.apply(key, value, diff);
+        }
         Ok(())
     }
 

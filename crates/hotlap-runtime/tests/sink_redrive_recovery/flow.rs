@@ -1,5 +1,6 @@
 //! Deposit and crash/replay drivers over real checkpoints and `Sink::write`.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
@@ -12,7 +13,9 @@ use hotlap_runtime::runtime::recovery::{Recovery, RecoveryDecision};
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 use hotlap_runtime::runtime::sources::{InputSource, InputStream, SourceEvent, Sources};
 
-use super::harness::{Dataset, RemoteStore, ResumableSource, SharedBackend, VolatileSink};
+use super::harness::{
+    Dataset, RemoteStore, ResumableSource, SharedBackend, VolatileSink, diff_column, int_column,
+};
 
 fn group_count() -> (String, Plan) {
     (
@@ -75,9 +78,21 @@ fn log() -> Dataset {
     Dataset::new(vec![vec![1], vec![1], vec![2], vec![3]]).with_retention(0)
 }
 
+/// The engine's consolidated view as `key -> count`.
+fn snapshot_map(engine: &mut Hotlap) -> BTreeMap<i64, i64> {
+    let zset = engine.snapshot("c").unwrap();
+    let keys = int_column(&zset, 0);
+    let values = int_column(&zset, 1);
+    let diffs = diff_column(&zset);
+    (0..zset.len())
+        .filter(|&index| diffs.value(index) > 0)
+        .map(|index| (keys.value(index), values.value(index)))
+        .collect()
+}
+
 /// Commit three events, then crash while the fourth event's commit is pending;
-/// returns the rows delivered before the crash.
-pub async fn crash_mid_commit(backend: &SharedBackend, remote: &RemoteStore) -> Vec<Vec<i64>> {
+/// returns the output delivered before the crash.
+pub async fn crash_mid_commit(backend: &SharedBackend, remote: &RemoteStore) -> BTreeMap<i64, i64> {
     let pipeline = pipeline(log());
     let mut engine = open(&pipeline);
     let (sink, entered, _release) = VolatileSink::new(remote.clone());
@@ -91,7 +106,7 @@ pub async fn crash_mid_commit(backend: &SharedBackend, remote: &RemoteStore) -> 
     }
     let id = block_on(checkpointer.take(&engine, &pipeline.sources)).unwrap();
     assert_eq!(id, 1, "the first checkpoint is valid");
-    let delivered = remote.rows();
+    let delivered = remote.snapshot();
 
     sink.set_pending(true);
     let event = next(&mut stream);
@@ -109,8 +124,11 @@ pub async fn crash_mid_commit(backend: &SharedBackend, remote: &RemoteStore) -> 
 }
 
 /// A fresh writer with an empty queue recovers, discards the pending commit and
-/// replays; returns the offsets it read.
-pub async fn replay_after_crash(backend: &SharedBackend, remote: &RemoteStore) -> Vec<i64> {
+/// replays; returns the offsets it read and the engine's restored snapshot.
+pub async fn replay_after_crash(
+    backend: &SharedBackend,
+    remote: &RemoteStore,
+) -> (Vec<i64>, BTreeMap<i64, i64>) {
     let pipeline = pipeline(log());
     let mut engine = open(&pipeline);
     let (sink, _, _) = VolatileSink::new(remote.clone());
@@ -142,5 +160,14 @@ pub async fn replay_after_crash(backend: &SharedBackend, remote: &RemoteStore) -
         feed(&shared, &mut engine, &pipeline.sources, &event).await;
         block_on(shared.commit()).unwrap();
     }
-    offsets
+
+    let expected = snapshot_map(&mut engine);
+    let before = remote.snapshot();
+    block_on(shared.commit()).unwrap();
+    assert_eq!(
+        remote.snapshot(),
+        before,
+        "a repeated commit must not change the output"
+    );
+    (offsets, expected)
 }

@@ -22,20 +22,25 @@ async fn a_fresh_volatile_writer_cannot_promote_and_replay_redelivers() {
     );
     assert!(backend.get(b"checkpoint/2/valid").unwrap().is_none());
     assert_eq!(
-        remote.rows(),
+        remote.snapshot(),
         delivered,
         "the pending row was never delivered"
     );
     assert!(
-        !remote.rows().contains(&vec![3, 1]),
-        "the fresh writer must not already hold the pending row"
+        !remote.snapshot().contains_key(&3),
+        "the fresh writer must not already hold the pending key"
     );
 
-    let offsets = flow::replay_after_crash(&backend, &remote).await;
+    let (offsets, expected) = flow::replay_after_crash(&backend, &remote).await;
     assert_eq!(offsets, vec![3], "replay must start at the fallback offset");
-    assert!(
-        remote.rows().contains(&vec![3, 1]),
-        "the pending row must be redelivered, got {:?}",
-        remote.rows()
+    assert_eq!(
+        remote.snapshot(),
+        expected,
+        "the remote output must equal the restored+replayed engine snapshot"
+    );
+    assert_eq!(
+        expected,
+        [(1, 2), (2, 1), (3, 1)].into_iter().collect(),
+        "the engine snapshot must hold the replayed counts"
     );
 }
