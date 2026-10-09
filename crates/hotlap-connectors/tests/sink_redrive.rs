@@ -1,4 +1,4 @@
-//! Commit re-drive: replay idempotent writes is safe, but only a genuinely
+//! Commit re-drive: replaying idempotent writes is safe, but only a genuinely
 //! durable staged state (or a true no-op) may complete an interrupted commit
 //! after a restart.
 
@@ -66,13 +66,26 @@ impl Sink for VolatileQueueSink {
     }
 }
 
-/// A sink whose staged writes live in a store shared across instances, so a
-/// restarted instance can still complete the commit.
+/// Persistent staged input, shared across sink instances.
 #[derive(Clone, Default)]
 struct StagedStore(Arc<Mutex<Vec<i64>>>);
 
+/// Persistent delivered output, distinct from the staged input.
+#[derive(Clone, Default)]
+struct DeliveredStore(Arc<Mutex<Vec<i64>>>);
+
+impl DeliveredStore {
+    fn values(&self) -> Vec<i64> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// A sink whose staged writes persist across instances and whose `commit`
+/// transfers them into the delivered output, clearing the stage only after the
+/// transfer so a repeated commit cannot duplicate.
 struct DurableStagedSink {
-    store: StagedStore,
+    staged: StagedStore,
+    delivered: DeliveredStore,
 }
 
 #[async_trait::async_trait]
@@ -87,10 +100,12 @@ impl Sink for DurableStagedSink {
         true
     }
     async fn commit(&self) -> Result<(), ConnectorError> {
-        self.store.0.lock().unwrap().clear();
+        let mut staged = self.staged.0.lock().unwrap();
+        self.delivered.0.lock().unwrap().extend(staged.drain(..));
         Ok(())
     }
     async fn abort(&self) -> Result<(), ConnectorError> {
+        self.staged.0.lock().unwrap().clear();
         Ok(())
     }
 }
@@ -124,19 +139,31 @@ fn a_new_instance_cannot_complete_a_volatile_queue_commit() {
 }
 
 #[test]
-fn a_shared_durable_store_makes_a_new_instance_redrivable() {
-    let store = StagedStore::default();
+fn a_new_instance_delivers_durable_staged_writes_without_duplicating() {
+    let staged = StagedStore::default();
+    let delivered = DeliveredStore::default();
     let crashed = DurableStagedSink {
-        store: store.clone(),
+        staged: staged.clone(),
+        delivered: delivered.clone(),
     };
-    crashed.store.0.lock().unwrap().push(7);
+    staged.0.lock().unwrap().push(7);
     assert!(crashed.commit_redriable());
+    assert!(delivered.values().is_empty(), "nothing delivered yet");
 
-    // A new instance over the same durable store still sees the staged write,
-    // so re-driving its commit is safe.
+    // A new instance over the same durable stores still sees the staged write,
+    // so re-driving its commit delivers it.
     let restarted = DurableStagedSink {
-        store: store.clone(),
+        staged: staged.clone(),
+        delivered: delivered.clone(),
     };
-    assert_eq!(restarted.store.0.lock().unwrap().as_slice(), &[7]);
-    assert!(restarted.commit_redriable());
+    futures::executor::block_on(restarted.commit()).unwrap();
+    assert_eq!(delivered.values(), vec![7]);
+    assert!(
+        staged.0.lock().unwrap().is_empty(),
+        "stage cleared on delivery"
+    );
+
+    // A repeated commit drains nothing, so it cannot duplicate the value.
+    futures::executor::block_on(restarted.commit()).unwrap();
+    assert_eq!(delivered.values(), vec![7]);
 }
