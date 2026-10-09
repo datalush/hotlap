@@ -3,9 +3,11 @@
 
 use hotlap::ViewId;
 use hotlap_connectors::error::ConnectorError;
+use std::sync::Arc;
 
 use super::Pipeline;
 use crate::runtime::checkpoint::{CheckpointConfig, Checkpointer};
+use crate::runtime::sink::{SharedSink, SinkSync};
 use crate::runtime::source_checkpoint::SavedView;
 
 impl Pipeline {
@@ -30,6 +32,12 @@ impl Pipeline {
             })
             .collect();
         let checkpointer = Checkpointer::new(config.backend, config.retain);
+        let checkpointer = checkpointer.with_sinks(
+            self.sinks
+                .iter()
+                .map(|spec| SinkSync::sink_only(SharedSink::new(Arc::clone(&spec.sink))))
+                .collect(),
+        );
         let result = checkpointer.validate_views(&declared);
         self.checkpoint = Some(CheckpointConfig {
             interval: config.interval,

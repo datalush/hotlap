@@ -14,9 +14,16 @@ impl Checkpointer {
                 .validate_views(declared, &checkpoint.engine)?;
         }
         let floor = valid.as_ref().map(|checkpoint| checkpoint.id);
-        if let Some(id) = self.pending_commit(floor)?
-            && let Some(checkpoint) = self.read_body(id)?
-        {
+        if let Some(id) = self.pending_commit(floor)? {
+            let Some(checkpoint) = self.read_body_for_recovery(id)? else {
+                if !self.replay_safe() {
+                    return Err(ConnectorError::Unsupported(
+                        "a transactional sink cannot safely recover a corrupt pending checkpoint"
+                            .into(),
+                    ));
+                }
+                return Ok(());
+            };
             checkpoint
                 .sources
                 .validate_views(declared, &checkpoint.engine)?;

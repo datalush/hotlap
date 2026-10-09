@@ -6,7 +6,6 @@
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::source::{Offset, Source, Split, SplitId};
 
-use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
 use crate::runtime::source_checkpoint::SourcesCheckpoint;
 use crate::runtime::sources::Sources;
 
@@ -59,17 +58,4 @@ fn seed_applied(
         source.commit(split, offset)?;
     }
     Ok(())
-}
-
-/// Read a checkpoint body without its `valid` marker, same tolerance as above.
-pub(super) fn read_body(
-    checkpointer: &Checkpointer,
-    id: u64,
-) -> Result<Option<Checkpoint>, ConnectorError> {
-    match checkpointer.read_body(id) {
-        Ok(body) => Ok(body),
-        Err(error @ ConnectorError::Unsupported(_)) => Err(error),
-        Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => Ok(None),
-        Err(error) => Err(error),
-    }
 }

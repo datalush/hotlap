@@ -26,7 +26,6 @@ use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
 use crate::runtime::sources::{InputStream, Sources};
 use hotlap_connectors::error::ConnectorError;
 use pending::{discard, pending_commit, prepare_decision};
-use sources::read_body;
 
 /// The last valid checkpoint, if the store holds one.
 pub struct Recovery;
@@ -57,7 +56,7 @@ impl Recovery {
             if let Some(decision) = prepare_decision(checkpointer, pending, &mut fallback)? {
                 return Ok(decision);
             }
-            let reason = match read_body(checkpointer, pending)? {
+            let reason = match checkpointer.read_body_for_recovery(pending)? {
                 Some(checkpoint) => {
                     sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
                     if checkpointer.redriable() {

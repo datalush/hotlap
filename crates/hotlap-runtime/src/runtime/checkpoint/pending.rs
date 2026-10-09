@@ -45,6 +45,19 @@ impl Checkpointer {
         }))
     }
 
+    /// Treat only missing or corrupt current-format bodies as absent.
+    pub(crate) fn read_body_for_recovery(
+        &self,
+        id: u64,
+    ) -> Result<Option<Checkpoint>, ConnectorError> {
+        match self.read_body(id) {
+            Ok(body) => Ok(body),
+            Err(error @ ConnectorError::Unsupported(_)) => Err(error),
+            Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Whether `key` is present in the store.
     pub(crate) fn has_key(&self, key: &str) -> Result<bool, ConnectorError> {
         Ok(self.get(key)?.is_some())
