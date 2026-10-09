@@ -14,6 +14,7 @@ mod fold;
 mod materialize;
 mod read;
 mod snapshot;
+mod validate;
 
 use std::collections::HashMap;
 
@@ -62,6 +63,9 @@ impl GroupAggregate {
     pub fn apply(&mut self, z: &ZSetBatch) -> Result<ZSetBatch, EngineError> {
         self.ensure_schema(z)?;
         let key_rows = self.encode_keys(z)?;
+        // Reject an invalid delta before any accumulator is mutated, so a
+        // failed `apply` leaves the prior state exactly as it was.
+        validate::validate_delta(&self.groups, &self.aggs, &z.schema(), z, &key_rows)?;
         let (keys, mut previous) = self.record_keys(&key_rows, z.len())?;
         #[cfg(test)]
         {
@@ -163,3 +167,6 @@ mod special_tests;
 
 #[cfg(test)]
 mod copy_tests;
+
+#[cfg(test)]
+mod atomic_tests;
