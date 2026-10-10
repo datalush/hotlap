@@ -111,27 +111,37 @@ pub(super) fn create_dirs_synced_with(ops: &impl FsOps, dir: &Path) -> io::Resul
 /// its own parent modified, so the walk syncs it on the next step. The walk stops
 /// at `root`, which is never pruned but is synced when it loses an entry.
 pub(super) fn remove_file_pruning(ops: &impl FsOps, file: &Path, root: &Path) -> io::Result<bool> {
-    match ops.remove_file(file) {
-        Ok(()) => {}
-        Err(e) if is_absent(e.kind()) => return Ok(false),
+    let removed = match ops.remove_file(file) {
+        Ok(()) => true,
+        Err(e) if is_absent(e.kind()) => false,
         Err(e) => return Err(e),
-    }
+    };
+    // Even an absent file can mean an earlier attempt unlinked it but failed
+    // syncing its parent. Retry all surviving directory links to the root.
     let mut modified = file.parent();
     while let Some(path) = modified {
-        // The file or a removed child directory just left `path`.
-        ops.sync_dir(path)?;
+        if ops.exists(path) {
+            ops.sync_dir(path)?;
+            if removed && path != root {
+                match ops.remove_dir(path) {
+                    Ok(()) => modified = path.parent(),
+                    // A non-empty dir keeps its ancestors non-empty too.
+                    Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => break,
+                    Err(e) if is_absent(e.kind()) => {
+                        // Another actor pruned it; its parent entry may need sync.
+                        modified = path.parent();
+                    }
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
+        }
         if path == root {
             break;
         }
-        match ops.remove_dir(path) {
-            Ok(()) => modified = path.parent(),
-            // A non-empty dir keeps its ancestors non-empty too.
-            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => break,
-            // Absence after a delete (or any other failure) is not idempotency.
-            Err(e) => return Err(e),
-        }
+        modified = path.parent();
     }
-    Ok(true)
+    Ok(removed)
 }
 
 /// Missing ancestors of `dir`, deepest first.

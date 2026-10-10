@@ -18,11 +18,12 @@ struct FakeFs {
     synced: RefCell<Vec<PathBuf>>,
     absent: bool,
     fail_sync: Option<(PathBuf, io::ErrorKind)>,
+    present: Vec<PathBuf>,
 }
 
 impl FsOps for FakeFs {
     fn exists(&self, _path: &Path) -> bool {
-        false
+        self.present.iter().any(|present| present == _path)
     }
 
     fn create_dir(&self, dir: &Path) -> io::Result<()> {
@@ -95,6 +96,7 @@ fn absent_file_is_reported_without_pruning() {
 fn sync_failure_after_delete_propagates_not_absent() {
     let ops = FakeFs {
         fail_sync: Some((PathBuf::from("root/a/b"), io::ErrorKind::NotFound)),
+        present: vec![PathBuf::from("root/a/b")],
         ..Default::default()
     };
 

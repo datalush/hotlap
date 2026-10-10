@@ -282,3 +282,70 @@ fn delete_propagates_sync_failure() {
 
     assert!(remove_file_pruning(&ops, &dir.join("k1"), scratch.path()).is_err());
 }
+
+#[test]
+fn delete_retry_syncs_absent_file_parent_chain_before_idempotent_success() {
+    let scratch = Scratch::new("delete-retry");
+    let dir = scratch.path().join("a");
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("k");
+    fs::write(&file, b"v").unwrap();
+
+    let first = RecordingFs::failing_on(dir.clone());
+    assert_eq!(
+        remove_file_pruning(&first, &file, scratch.path())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(!file.exists());
+    assert!(dir.is_dir());
+
+    let second = RecordingFs::failing_on_kind(dir.clone(), io::ErrorKind::NotFound);
+    assert_eq!(
+        remove_file_pruning(&second, &file, scratch.path())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(!file.exists());
+    assert!(dir.is_dir());
+
+    let retry = RecordingFs::default();
+    assert!(!remove_file_pruning(&retry, &file, scratch.path()).unwrap());
+    assert_eq!(
+        &*retry.synced.borrow(),
+        &[dir.clone(), scratch.path().to_path_buf()]
+    );
+    assert!(dir.is_dir());
+
+    let failing_retry = RecordingFs::failing_on_kind(dir.clone(), io::ErrorKind::Unsupported);
+    assert_eq!(
+        remove_file_pruning(&failing_retry, &file, scratch.path())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Unsupported
+    );
+}
+
+#[test]
+fn delete_retry_repairs_pruned_directories_from_nearest_existing_ancestor() {
+    let scratch = Scratch::new("delete-pruned-retry");
+    let inner = scratch.path().join("a").join("b");
+    fs::create_dir_all(&inner).unwrap();
+    let file = inner.join("k");
+    fs::write(&file, b"v").unwrap();
+
+    let first = RecordingFs::failing_on(scratch.path().to_path_buf());
+    assert_eq!(
+        remove_file_pruning(&first, &file, scratch.path())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(!inner.exists());
+
+    let retry = RecordingFs::default();
+    assert!(!remove_file_pruning(&retry, &file, scratch.path()).unwrap());
+    assert_eq!(&*retry.synced.borrow(), &[scratch.path().to_path_buf()]);
+}
