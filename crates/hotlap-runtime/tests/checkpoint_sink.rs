@@ -234,8 +234,8 @@ async fn failed_sink_drain_marks_checkpointer_inconsistent() {
         sink,
     }]);
     let hotlap = engine_with_pending_delta(&pump).await;
-    let mut checkpointer = Checkpointer::new(Box::new(JournalBackend::default()), 3)
-        .with_sinks(pump.coordinated());
+    let mut checkpointer =
+        Checkpointer::new(Box::new(JournalBackend::default()), 3).with_sinks(pump.coordinated());
     let sources = Sources::new(vec![InputSource {
         id: InputId(0),
         name: "in".into(),
@@ -245,7 +245,10 @@ async fn failed_sink_drain_marks_checkpointer_inconsistent() {
     .unwrap();
 
     assert!(checkpointer.take(&hotlap, &sources).await.is_err());
-    assert!(aborted.load(Ordering::SeqCst), "writer failure must roll back");
+    assert!(
+        aborted.load(Ordering::SeqCst),
+        "writer failure must roll back"
+    );
     assert_eq!(checkpointer.state(), CheckpointState::Failed);
     assert!(checkpointer.take(&hotlap, &sources).await.is_err());
 }

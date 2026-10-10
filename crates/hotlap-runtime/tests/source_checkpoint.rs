@@ -148,7 +148,7 @@ fn corrupt_payload_is_corruption() {
         views: vec![],
     })
     .unwrap();
-    bytes[8] ^= 0xff;
+    bytes[24] ^= 0xff;
     assert!(matches!(
         decode_sources(&bytes),
         Err(ConnectorError::Corruption(_))
