@@ -124,6 +124,10 @@ fn failed_flush_stops_later_filtered_source_ack_and_view_build() {
         handle.checkpoint().is_err(),
         "Flush must report writer failure"
     );
+    assert!(
+        handle.checkpoint().is_err(),
+        "a later checkpoint must be rejected"
+    );
 
     assert!(
         handle
