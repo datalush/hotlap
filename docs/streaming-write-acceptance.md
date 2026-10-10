@@ -1,91 +1,90 @@
-# Native continuous INSERT acceptance — bsjm
+# Aceptación de INSERT continuo nativo
 
-Scope is the same Rust DataFusion sink used by finite INSERT, with unbounded
-input toward log append and full-row KV upsert. RecordBatch is its processing
-unit, not a finite-query requirement. DELETE uses finite KV selection and MERGE
-requires finite input. Engine checkpoints/job retry/reconciliation remain external.
+Se usa el mismo sink Rust/DataFusion que INSERT finito, con entrada no acotada hacia
+append log y upsert KV de fila completa. `RecordBatch` es unidad de procesamiento,
+no requisito de consulta finita. DELETE selecciona KV finito y MERGE requiere
+entrada finita. Checkpoints/reintentos/conciliación del motor son externos.
 
-## Real Fluss source to log/KV destinations
+## Fuente Fluss real hacia destinos log/KV
 
 `tests/write_sql.rs::streaming_source_routes_log_kv_confirms_sparse_batches_and_replays_explicitly`
-creates an isolated one-bucket log source and two partitioned destinations:
-`north` retains **2 buckets**, `west` is created with **3 after rescale**. It runs
-two concurrent `INSERT ... SELECT ... FROM feed WHERE id % 2 = 0` statements using
-the native Fluss streaming provider and supplied DataFusion pool.
+crea fuente log aislada de un bucket y dos destinos particionados: `north` conserva
+**2 buckets**; `west` se crea con **3 tras rescale**. Ejecuta dos sentencias INSERT
+SELECT concurrentes con `id % 2 = 0`, usando provider streaming Fluss nativo y pool
+DataFusion suministrado.
 
-- A single 24-row Arrow append interleaves destination partitions and bucket keys.
-  Each sink confirms 12 filtered operations before input EOF, with distinct write
-  execution IDs. Stored rows total 12, six per north/west for both destinations.
-- Idle lasts **1.3s**, longer than the configured **1s ACK allowance**, while both
-  statements stay live and emit no final SQL count.
-- A sparse singleton yields cumulative ACK13 for both sinks without filling an
-  ideal client batch. Cancelling the log INSERT during input wait reports
-  confirmed13/uncertain0 and closes that private writer only.
-- A further singleton is delivered to the KV peer, which stays live and confirms14.
-  The log destination stays at13. KV idle cancellation reports confirmed14/uncertain0.
-- All owned source/sink/client reservations return to zero within the established
-  bounded observation after cancellation.
+- Un append Arrow de 24 filas intercala particiones destino y claves bucket. Cada
+  sink confirma 12 operaciones filtradas antes del EOF, con IDs de ejecución
+  distintos. Se almacenan 12 filas, seis por destino north/west.
+- Idle dura **1,3 s**, más que el allowance ACK de **1 s**; ambas sentencias siguen
+  activas y no emiten conteo SQL final.
+- Un singleton disperso lleva ACK acumulado a 13 sin llenar lote cliente ideal.
+  Cancelar INSERT log mientras espera entrada informa confirmed13/uncertain0 y solo
+  cierra ese writer privado.
+- Otro singleton llega al peer KV activo y confirma14. Destino log queda en13;
+  cancelar KV idle informa confirmed14/uncertain0.
+- Reservas propias source/sink/cliente vuelven a cero dentro del plazo observado tras cancelar.
 
-## Explicit replay is not exactly-once
+## El replay explícito no es exactly-once
 
-Fresh executions start explicitly from source earliest, with new IDs. Both sinks
-confirm **14 operations**. The append log now has **27 rows** (13 old plus14 replay),
-while the KV destination still has **14 keys**. Upsert replay's operation count is
-not a net-key count or a guarantee of business-level deduplication. Both replay
-statements still require explicit cancellation because their input is continuous.
+Ejecuciones nuevas comienzan explícitamente en earliest de fuente, con IDs nuevos.
+Ambos sinks confirman **14 operaciones**. Log append queda con **27 filas** (13
+previas +14 replay); destino KV conserva **14 claves**. Conteo upsert no es conteo
+neto de claves ni garantiza deduplicación de negocio. Ambas sentencias replay
+requieren cancelación explícita porque su entrada es continua.
 
-For an explicit-offset restart the engine must provide complete valid bucket
-positions and retain its own processed/checkpoint knowledge. Offered read progress,
-ACK observations and process-local write IDs are not coordinated engine commits.
-Replaying uncertain requests may duplicate append rows or overwrite PK values;
-the connector does not retry the statement or reconcile automatically.
+Para reiniciar con offsets explícitos, el motor debe aportar posiciones completas
+y válidas por bucket y conservar conocimiento propio de procesamiento/checkpoint.
+Progreso ofrecido, ACK e IDs write locales no son commits coordinados del motor.
+Reproducir solicitudes inciertas puede duplicar filas append o sobrescribir PK; el
+conector no reintenta sentencia ni concilia automáticamente.
 
-## Joint acceptance matrix and evidence reuse
+## Matriz conjunta de aceptación y reutilización de evidencia
 
-| Requirement | Verified evidence on the final Rust route |
+| Requisito | Evidencia verificada en ruta Rust final |
 | --- | --- |
-| Real continuous source, multi-partition/bucket old/new routing | New native-sni source→log/KV test above; finite routing counterpart compares native row API bucket membership/order/nulls |
-| Small/sparse confirmation and visibility before EOF | Native source test, original continuous log SQL test and both-target Docker feed matrix |
-| Idle, no fabricated completion/count | Real 1.3s>ACK1s idle; Docker log/KV idle>ACK2s; terminal/EOF summary tested independently |
-| Faster producer/backpressure | Final Docker matrix proves exhausted64KiB client buffer/32KiB target with1MiB input under paused server, then cooperative producer cancellation and pool recovery; finite4MiB/2MiB regression remains passing |
-| Source/sink/client buffer ownership | Existing read `w8ap` pressure/retained-consumer tests and write `yeqf`/`bqrq` owner gauges/actual pool admission remain valid; one-batch source pulls and Arrow leases are unchanged |
-| Failure after confirmations | Both log/KV Docker source-error-after-ACK retains confirmed1; later blocked ACK yields failed SQL, confirmed1/uncertain1, original cause retained |
-| Cancel waiting input | Real source log/KV and explicit replay executions stop without erasing ACKs |
-| Cancel with buffer full | Both-target Docker matrix, confirmed1/uncertain256; source/worker/frame/routing guards release in observed bound |
-| Cancel waiting ACK | New explicit both-target singleton case proves terminal stage `Ack`, cancelled status, confirmed1/uncertain1 and pool release, separate from timeout and buffer admission |
-| Independent executions | Real same-source/same-context distinct write IDs; log cancellation does not stop KV delivery; Docker private peer survives cancellation during a paused destination |
-| Replay/duplicates/uncertainty | Explicit earliest replay checks log27/KV14 with14 ACKed operations per new execution; documented upper-bound batch uncertainty and no rollback/automatic restart |
+| Fuentes continuas reales, routing old/new de múltiples particiones/buckets | Prueba native-sni source→log/KV; contraparte finita compara pertenencia/orden/NULL de buckets con API nativa por filas |
+| Confirmación pequeña/dispersa visible antes de EOF | Prueba fuente nativa, prueba SQL log continuo original y matriz Docker de ambos destinos |
+| Idle sin finalización/conteo inventado | Idle real 1,3 s > ACK 1 s; idle Docker log/KV > ACK 2 s; resumen terminal/EOF probado aparte |
+| Contrapresión ante productor rápido | Matriz Docker agota buffer cliente 64 KiB/objetivo 32 KiB con entrada 1 MiB y servidor pausado; luego cancelación cooperativa y recuperación pool. Sigue pasando regresión finita 4 MiB/2 MiB |
+| Propiedad buffers source/sink/cliente | Pruebas de presión lectura/consumidor retenido y gauges escritura/propiedad/admisión pool; pulls fuente de un lote y leases Arrow sin cambios |
+| Fallo tras confirmaciones | Error fuente Docker log/KV tras ACK conserva confirmed1; ACK bloqueado posterior causa fallo SQL, confirmed1/uncertain1 y causa original |
+| Cancelación esperando entrada | Ejecuciones source log/KV reales y replay explícito paran sin borrar ACK |
+| Cancelación con buffer lleno | Matriz Docker ambos destinos, confirmed1/uncertain256; guards source/worker/frame/routing liberados dentro del plazo observado |
+| Cancelación esperando ACK | Caso singleton explícito ambos destinos verifica etapa terminal `Ack`, estado cancelado, confirmed1/uncertain1 y pool liberado; separado de timeout/admisión buffer |
+| Ejecuciones independientes | IDs write distintos en misma fuente/contexto real; cancelar log no detiene entrega KV; peer Docker privado sobrevive a cancelación con destino pausado |
+| Replay/duplicados/incertidumbre | Replay explícito earliest comprueba log27/KV14 con 14 operaciones ACK por ejecución; documenta incertidumbre máxima por lote sin rollback/reinicio automático |
 
-The Docker feed uses native DataFusion StreamingTable and the same connector
-execution, with an instrumented real GreedyMemoryPool for deterministic fault
-placement. It does not replace the production Fluss source. Pairing those controlled
-fault cases with actual Fluss-source delivery/routing avoids another transport,
-writer, scheduler, pool policy or generic event framework.
+La fuente Docker usa StreamingTable DataFusion nativa y misma ejecución conector,
+con GreedyMemoryPool real instrumentado para ubicar fallos determinísticamente. No
+sustituye fuente Fluss de producción. Combinar esos fallos controlados con entrega/
+routing de fuente Fluss real evita otro transporte, writer, scheduler, política de
+pool o framework de eventos genérico.
 
-## Resource/observation limits
+## Límites de recursos/observación
 
-Input retention ceiling, native queue limits and caller-selected shared pool remain
-their existing policies. Arrow decode/gather/frame admission is not a global
-allocator/RSS ceiling. Externally retained buffers/operators stay charged after
-query cancellation until their last owners drop. Native partial-frame send/drain
-has its own30s bound; tests observing small-frame recovery<=3s do not assert that
-every kernel/socket can be forcibly killed in3s.
+Se mantienen límites existentes de retención de entrada, colas nativas y pool
+compartido elegido por llamador. Admisión decode/gather/frame Arrow no limita
+asignador global/RSS. Buffers/operadores retenidos externamente siguen cobrados tras
+cancelación hasta liberar owners. Envío/drenado de frame parcial nativo tiene límite
+propio de 30 s; recuperar frames pequeños ≤3 s no prueba que cada kernel/socket se
+pueda terminar forzosamente en 3 s.
 
-Broadcast observers are bounded; Lagged/missing terminal events mean incomplete
-history. Earlier ACKs remain known, attempted current-batch outcomes remain
-conservatively uncertain. `count` only appears on EOF and successful cleanup.
-No replacement/transitory streaming writer remains: log uses the client Arrow
-route, KV uses its required native row-format encoding, both through DataSinkExec.
+Observadores broadcast son acotados; Lagged/terminal ausente implica historial
+incompleto. ACK previos siguen conocidos; lote actual intentado queda incierto
+conservadoramente. `count` aparece solo tras EOF y limpieza exitosa. No queda writer
+streaming transitorio: log usa ruta Arrow cliente, KV codificación nativa por filas;
+ambos mediante DataSinkExec.
 
 See [write-observation-contract.md](write-observation-contract.md),
 [write-pressure-verification.md](write-pressure-verification.md) and
 [read-pressure-verification.md](read-pressure-verification.md) for exact boundaries.
 
-## Verification
+## Verificación registrada
 
-Final native-sni SQL suite: **8 tests passed**, including the new real-source test.
-Final owned Docker matrix passed with added explicit ACK cancellation for both
-targets. Core clippy all-targets/all-features `-D warnings`, package formatting and
-`git diff --check` passed. DEBUG/8jobs; no release profile/benchmark, bindings rebuild
-or wheel replacement is part of this acceptance. Fault permissions/failover matrix
-`cf5y` and sustained profiles/Rust final acceptance `dqar` remain separate gates.
+Suite SQL native-sni final: **8 pruebas aprobadas**, incluida nueva prueba con fuente
+real. Matriz Docker propia pasó con cancelación ACK explícita añadida a ambos destinos.
+Clippy core all-targets/all-features `-D warnings`, formato de paquete y
+`git diff --check` pasaron. DEBUG/ocho jobs; no incluye perfil benchmark RELEASE,
+rebuild bindings ni reemplazo wheel. Matriz permisos/failover, perfiles sostenidos
+y aceptación final Rust siguen siendo gates independientes.

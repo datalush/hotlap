@@ -1,135 +1,133 @@
-# Native write observations and metrics — bqrq
+# Observaciones y métricas nativas de escritura
 
-`FlussLogTable::subscribe_writes()` and `FlussKvTable::subscribe_writes()` return
-the standard Tokio broadcast receiver for `FlussWriteProgress`. Subscribe before
-execution. Capacity is **128 events per provider**, shared by its planned writes;
-cloned providers share that channel. Each physical execution gets a distinct
-process-local ID, including reexecution of the same plan and concurrent queries.
+`FlussLogTable::subscribe_writes()` y `FlussKvTable::subscribe_writes()` devuelven
+el receptor Tokio broadcast estándar de `FlussWriteProgress`. Suscríbase antes de
+la ejecución. Capacidad: **128 eventos por provider**, compartida por sus escrituras
+planificadas; providers clonados comparten canal. Cada ejecución física recibe un
+ID distinto local al proceso, incluso al reejecutar el mismo plan o ejecutar consultas
+concurrentes.
 
-This reports application knowledge of append/upsert/delete/MERGE operations.
-It is not an engine checkpoint, a persistent job ledger, transaction isolation,
-exactly-once delivery, or net changed-row accounting.
+Esto informa el conocimiento de la aplicación sobre operaciones append/upsert/delete/MERGE.
+No es checkpoint del motor, registro persistente de trabajos, aislamiento transaccional,
+entrega exactly-once ni contabilidad de filas netas modificadas.
 
-## Events and final summary
+## Eventos y resumen final
 
-| Event | Meaning |
+| Evento | Significado |
 | --- | --- |
-| `Initialized` | Execution ID, destination path/table/schema, operation, declared ACK policy and write option budgets, before input/preparation |
-| `BatchReceived` | A nonempty input batch was seen, with sequential batch ID and cumulative received/pending operations; admission may still reject it |
-| `BatchOutcome::Confirmed` | Whole batch's native `flush()` completed successfully under declared ACK mode; published before waiting for more input/EOF |
-| `BatchOutcome::RejectedBeforeEnqueue` | Metadata, validation, quota or other preparation rejected this received batch before its enqueue worker started |
-| `BatchOutcome::Uncertain` | Enqueue was attempted but whole-batch confirmation was not established; some, all or none of its operations may have applied |
-| `Terminated(FlussWriteSummary)` | Complete cumulative snapshot of received operations and execution termination, including stage and whether source EOF was observed |
+| `Initialized` | ID de ejecución, ruta/tabla/esquema destino, operación, política ACK declarada y presupuestos de opciones writer; se emite antes de input/preparación |
+| `BatchReceived` | Se observó lote de entrada no vacío, con ID secuencial y operaciones acumuladas recibidas/pendientes; la admisión aún puede rechazarlo |
+| `BatchOutcome::Confirmed` | `flush()` nativo del lote completo terminó con éxito según modo ACK declarado; se publica antes de esperar más input/EOF |
+| `BatchOutcome::RejectedBeforeEnqueue` | Metadatos, validación, cuota u otra preparación rechazó lote recibido antes de iniciar worker enqueue |
+| `BatchOutcome::Uncertain` | Se intentó enqueue, pero no se confirmó el lote completo; pudieron aplicarse algunas, todas o ninguna operación |
+| `Terminated(FlussWriteSummary)` | Snapshot acumulado completo de operaciones recibidas y terminación, incluida fase y si se observó EOF fuente |
 
-`FlussWriteCounts` separates `received`, `confirmed`, `rejected_before_enqueue`,
-`uncertain` and `pending`. During execution these form a partition of the received
-prefix; at termination pending is zero. Uncertain is a **conservative upper bound
-on operations possibly applied without whole-batch confirmation**, not proof that
-they failed or were submitted. Unread source rows are not part of received counts.
+`FlussWriteCounts` separa `received`, `confirmed`, `rejected_before_enqueue`,
+`uncertain` y `pending`. Durante ejecución forman una partición del prefijo recibido;
+al terminar, pending es cero. `uncertain` es **límite superior conservador de
+operaciones quizá aplicadas sin confirmar el lote entero**, no prueba de que fallaran
+o siquiera se enviaran. Filas fuente no leídas no forman parte de esos conteos.
 
-The native client currently exposes an aggregate flush outcome for this route.
-An enqueue can submit some bucket groups before failing, and a failed flush can
-contain ACKed and unknown groups. The connector does not infer a row-level split
-from that error or from retry counts. It preserves earlier whole-batch ACKs and
-classifies the current attempted batch as uncertain. No per-row result handles
-or unbounded retained batch history are introduced.
+El cliente nativo expone resultado agregado de flush para esta ruta. Enqueue puede
+enviar algunos grupos bucket antes de fallar; flush fallido puede contener grupos ACK
+y desconocidos. El conector no infiere división por fila del error ni de reintentos.
+Conserva ACK completos de lotes previos y clasifica como incierto el lote actual
+intentado. No se introducen handles por fila ni historial ilimitado de lotes retenidos.
 
-Failed/cancelled **execution status** is separate from operation knowledge:
+El **estado de ejecución** fallida/cancelada es distinto del conocimiento de operaciones:
 
-- ACKed batch 1 plus timeout/cancellation in batch 2 preserves batch 1 as confirmed.
-- Source error after ACK, while waiting for more input, has no uncertain current batch.
-- Metadata/validation/quota rejection before enqueue is known not submitted.
-- Cleanup failure after EOF/ACK keeps confirmed operations and `input_exhausted=true`.
-- Cancellation before any input can report zero received operations.
-- Planning failures happen before sink execution and therefore produce no initialization.
-- Proven-empty optimized DELETE/UPDATE plans return SQL count zero without invoking
-  a sink, so they also emit no Fluss sink observations; no missing sink execution
-  is inferred from that upstream no-op.
+- ACK de lote 1 seguido de timeout/cancelación en lote 2 conserva lote 1 como confirmado.
+- Error fuente tras ACK, mientras espera más input, no deja lote actual incierto.
+- Rechazo metadatos/validación/cuota antes de enqueue significa que no se envió.
+- Error limpieza tras EOF/ACK conserva operaciones confirmadas e `input_exhausted=true`.
+- Cancelación antes de recibir input puede informar cero operaciones recibidas.
+- Fallos planificación ocurren antes de ejecución sink y no producen inicialización.
+- Plan DELETE/UPDATE optimizado y probado vacío devuelve conteo SQL cero sin invocar
+  sink; por tanto tampoco emite observaciones Fluss. No se infiere ejecución faltante
+  a partir de ese no-op upstream.
 
-ACK policy is `FlussWriteAck::{All, Leader}`. Leader corresponds to `writer_acks=1`
-and is not the same replication guarantee as all/-1. Unsupported modes remain
-rejected by the existing write validation; initialization records no supported ACK
-policy for those attempts.
+Política ACK: `FlussWriteAck::{All, Leader}`. `Leader` corresponde a `writer_acks=1`
+y no ofrece la misma garantía de réplica que `all/-1`. La validación existente rechaza
+modos no admitidos; la inicialización no declara política soportada en esos intentos.
 
-Confirmation is a historical ACK fact, not proof that a server checkpoint or
-disk flush completed. An immediate crash of the single-replica `.6` fixture lost
-its just-ACKed prefix; the recovery test preserves it after a six-second server
-checkpoint window. See [native failure verification](native-failure-verification.md)
-for the observed boundary and the exact recovery profile.
+Confirmación es hecho histórico de ACK, no prueba de checkpoint servidor ni flush a
+disco. Crash inmediato de fixture `.6` de réplica única perdió prefijo recién ACKed;
+prueba recuperación lo conserva tras ventana checkpoint servidor de seis segundos.
+Ver [verificación de fallos nativos](native-failure-verification.md) para límite
+observado y perfil exacto.
 
-## SQL compatibility and errors
+## Compatibilidad SQL y errores
 
-DataFusion's final `count` still counts confirmed operations, appears only after
-EOF and successful cleanup, and is not produced as a successful partial count on
-failure. Continuous INSERT emits confirmations while its SQL count remains pending.
-KV repeated upserts may count twice while leaving one key; DELETE counts acknowledged
-selected-key operations; MERGE counts modifying actions, not join/no-op rows.
+El `count` final DataFusion sigue contando operaciones confirmadas, aparece solo tras
+EOF y limpieza exitosa, y no se devuelve como conteo parcial exitoso ante fallo.
+INSERT continuo emite confirmaciones mientras el conteo SQL sigue pendiente. Upserts
+KV repetidos pueden contar dos veces con una sola clave final; DELETE cuenta operaciones
+ACK de claves seleccionadas; MERGE cuenta acciones modificadoras, no filas join/no-op.
 
-The observer is independent of normal SQL execution. Original DataFusion/Fluss
-errors, typed write timeout phases and their source chains remain unchanged.
-Observations carry no row buffers, SQL text, error payloads or credentials.
-Applications can retain the native error alongside the structured terminal snapshot.
+Observador es independiente de ejecución SQL normal. Errores originales DataFusion/
+Fluss, fases tipadas timeout write y sus cadenas de origen no cambian. Observaciones
+no llevan buffers fila, texto SQL, payload error ni credenciales. Aplicación puede
+conservar error nativo junto al snapshot terminal estructurado.
 
-## Loss and reconciliation
+## Pérdida y conciliación
 
-Handle `RecvError::Lagged` / `TryRecvError::Lagged` as missing batch detail. Never
-silently drain past it and claim a complete observation history. A later terminal
-snapshot has its own cumulative totals but cannot restore lost per-batch events.
-If a terminal event or initialization is missing, the observer cannot infer successful
-completion from silence or from a closed/dropped receiver. Events from different
-execution IDs must not be combined into one execution's counts.
+Trate `RecvError::Lagged` / `TryRecvError::Lagged` como pérdida de detalle por lote.
+Nunca continúe leyendo en silencio y declare historial completo. Snapshot terminal
+posterior aporta totales acumulados, pero no recupera eventos individuales perdidos.
+Si falta evento terminal/inicialización, observador no puede inferir éxito por silencio
+ni por receptor cerrado/descartado. No combine IDs de ejecuciones distintas.
 
-To reconcile an uncertain result, the engine needs the destination identity, ACK
-policy, its own source/input lineage, confirmed prefix, attempted uncertain upper
-bound and actual stored-data checks appropriate to append vs PK upsert/delete.
-Neither job replay nor reconnect erases possibly applied requests. This connector
-does not retain input keys/rows for reconciliation or automatically retry the job.
-Execution IDs are process-local diagnostic identities, not durable resume tokens.
+Para conciliar resultado incierto, motor necesita identidad destino, política ACK,
+linaje de input/fuente propio, prefijo confirmado, límite superior del lote intentado
+y comprobaciones de datos almacenados adecuadas a append vs upsert/delete PK. Ni
+replay del trabajo ni reconexión borran requests posiblemente aplicadas. Este conector
+no retiene claves/filas input para conciliar ni reintenta automáticamente trabajo.
+IDs de ejecución son diagnósticos locales al proceso, no tokens de reanudación durable.
 
-## Native metrics
+## Métricas nativas
 
-The sink implements DataFusion `DataSink::metrics`; its standard `DataSinkExec`
-exposes them to execution-plan metrics/EXPLAIN ANALYZE. One fixed set is created
-per planned sink. Reexecutions aggregate that plan's counters, and concurrently
-running instances add/subtract shared gauges. Execution IDs are in observations,
-not metric labels, so repeated execution does not grow metric cardinality.
+Sink implementa `DataSink::metrics` de DataFusion; `DataSinkExec` estándar las expone
+en métricas de plan/EXPLAIN ANALYZE. Un conjunto fijo se crea por sink planificado.
+Reejecuciones acumulan contadores de ese plan; ejecuciones concurrentes suman/restan
+gauges compartidos. IDs de ejecución están en observaciones, no labels de métricas,
+por lo que reejecuciones no aumentan cardinalidad.
 
-- Operation counters: `fluss_write_received_operations`,
+- Contadores de operaciones: `fluss_write_received_operations`,
   `fluss_write_confirmed_operations`, `fluss_write_rejected_before_enqueue_operations`,
   `fluss_write_uncertain_operations`, `fluss_write_confirmed_batches`.
-- Execution counters/gauges: `fluss_write_failed_executions`,
+- Contadores/gauges ejecución: `fluss_write_failed_executions`,
   `fluss_write_cancelled_executions`, `fluss_write_active_executions`,
   `fluss_write_pending_operations`.
-- Owner-lifetime gauges: `fluss_write_retained_arrow_bytes`, `fluss_write_encoded_bytes`,
+- Gauges de vida de owners: `fluss_write_retained_arrow_bytes`, `fluss_write_encoded_bytes`,
   `fluss_write_transport_bytes`, `fluss_write_routing_metadata_bytes`,
   `fluss_write_routing_scratch_bytes`, `fluss_write_kv_scratch_bytes`,
   `fluss_write_merge_key_bytes`.
-- Times: `fluss_write_preparation_time`, `fluss_write_metadata_time`,
+- Tiempos: `fluss_write_preparation_time`, `fluss_write_metadata_time`,
   `fluss_write_input_wait_time`, `fluss_write_enqueue_time`, `fluss_write_ack_time`,
   `fluss_write_cleanup_time`.
 
-Byte gauges follow existing buffer/Bytes/frame/worker reservations through their
-actual owners. A cancelled execution can be inactive with bytes still retained by
-a finishing worker/frame; they stay visible until their owners drop. Idle routing
-and KV scratch remain legitimately charged. These are cooperative admission values,
-including conservative estimates/overlap from [write-pressure-verification.md](write-pressure-verification.md),
-not unique allocated bytes, native queue slots or process RSS. Pool admission policy
-still belongs to the supplied DataFusion pool; metric guards do not create another pool.
+Gauges bytes siguen reservas existentes de buffer/Bytes/frame/worker a través de owners
+reales. Una ejecución cancelada puede estar inactiva aunque un worker/frame termine de
+retener bytes; siguen visibles hasta liberar owners. Scratch routing/KV permanece
+cobrado legítimamente durante idle. Son valores de admisión cooperativa, con estimación/
+solapamiento conservadores descritos en [presión de escritura](write-pressure-verification.md),
+no bytes únicos asignados, slots cola nativa ni RSS. Política de admisión pool sigue
+perteneciendo al pool DataFusion suministrado; guards métricas no crean otro pool.
 
-## Verification
+## Verificación registrada
 
-Core tests cover rejected vs attempted cancellation, ACK preservation after idle
-cancel/cleanup error, detectable observer lag with terminal totals, distinct IDs and
-fixed metric cardinality across 200 executions. The real Docker log/KV matrix now
-also observes ACK before EOF, source failure after ACK, whole-batch uncertainty on
-blocked ACK and saturated cancellation, pre-enqueue quota rejection, EOF completion
-and native sink metrics/owner-byte recovery. SQL INSERT/DELETE/MERGE regression counts
-remain the established contract. Joint streaming acceptance `bsjm` and final native
-fault/profile/consuming-engine acceptance remain their own gates.
+Pruebas core cubren cancelación rechazada vs intentada, conservación de ACK tras
+cancelación idle/error limpieza, lag detectable con totales terminales, IDs distintos
+y cardinalidad fija tras 200 ejecuciones. Matriz Docker real log/KV también observa
+ACK antes EOF, error fuente tras ACK, incertidumbre lote completo con ACK bloqueado y
+cancelación saturada, rechazo cuota previo a enqueue, terminación EOF y métricas/bytes
+owner del sink nativo. Conteos de regresión INSERT/DELETE/MERGE siguen siendo contrato.
+Aceptación conjunta streaming y aceptación final de fallos/perfiles/motor consumidor
+se evalúan por separado.
 
-Verification: **29 core tests, the complete dual log/KV Docker matrix and all four
-native-sni SQL regressions passed**; core clippy all-targets/all-features
-`-D warnings`, package formatting and `git diff --check` passed. The combined
-verification command exceeded its outer limit during SQL after the other suites
-passed; the SQL suite was rerun separately and all four passed. The exact owned
-table pair left by that timeout was removed; no Docker pressure fixtures remain.
+Evidencia registrada: **29 pruebas core, matriz Docker completa log/KV y cuatro
+regresiones SQL native-sni**. Clippy core all-targets/all-features `-D warnings`,
+formato paquete y `git diff --check` pasaron. El comando combinado excedió su límite
+externo durante SQL tras pasar las otras suites; SQL se repitió aparte y pasaron las
+cuatro. Se eliminó la pareja exacta de tablas que dejó ese timeout; no quedan fixtures
+Docker propios de presión.

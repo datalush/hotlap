@@ -1,93 +1,91 @@
-# Arrow read materialization inventory — gpze
+# Inventario de materialización de lecturas Arrow
 
-2026-10-04, Rust working tree after `28454fd`. This records concrete boundaries,
-not a claim of universal zero-copy or a throughput benchmark. Core source leases
-and native planning remain the contracts in [rust-contract.md](rust-contract.md).
+Inventario de límites concretos de materialización en la ruta Rust; no afirma
+zero-copy universal ni es benchmark de throughput. Leases fuente del núcleo y
+planificación nativa siguen siendo contratos en [contrato Rust](rust-contract.md).
 
-## Data paths and disposition
+## Rutas de datos y disposición
 
-| Boundary | Before / retained behavior | Change or justification |
+| Límite | Comportamiento anterior/conservado | Cambio o justificación |
 | --- | --- | --- |
-| Log RPC/file → IPC batch | Parse/decompress wire data and resolve write-time schema | Format/compression can allocate. No second protocol decoder in connector |
-| Log scanner → bounded/streaming reader | Individual batches with offsets; reader queues and clips ranges | Clipping uses Arrow slices. Native DataFusion source does not concatenate these batches |
-| Initial-schema log projection/pruning | Requested projection at source; whole-batch pruning | Exact residual SQL filters remain necessary; do not duplicate them in client |
-| Evolved-schema log alignment | Decode with write-time schema, align target fields; absent fields become NULL | Existing arrays are reused where compatible; new null/type-normalization data is required where representation changes |
-| Log preview `LimitBatchScanner` | Singleton batch fast path; multiple batches concatenate to satisfy its single-result API | This concat is not the DataFusion source path; removing it changes preview API semantics |
-| KV wire records → current logical row | FixedSchemaDecoder aligns original field IDs; previously converted whole rows at first access | Projection now selects physical source fields. Traversed unselected fields advance through checked wire boundaries without conversion |
-| KV logical row → Arrow | Previously built all columns then projected | Build only unique requested fields; reorder/duplicate with native Arrow reference projection |
-| KV preview limit | Previously built all rows then sliced last `limit` | Select suffix record ranges before converting/building; server framing/schema-ID discovery remains unchanged |
-| KV COUNT projection | Previously decoded full value columns and stripped them in connector | KV batch readers accept zero-column projection; preserve row count explicitly and build no Arrow value columns |
-| Source admission/output | Original backing storage charged; Arrow custom owners preserve source leases | Headers/owners allocate metadata, but payload/null/offset/child buffers keep pointers and geometry |
-| DataFusion exact filters, casts, sort/aggregate results | May materialize different output arrays | Native SQL semantics, not gratuitous connector copies; their output accounting belongs to operators |
+| RPC/archivo log → lote IPC | Parsear/descomprimir wire y resolver esquema de escritura | Formato/compresión pueden asignar memoria. No hay segundo decoder de protocolo en conector |
+| Scanner log → reader acotado/streaming | Lotes individuales con offsets; reader encola y recorta rangos | Recorte usa slices Arrow. Fuente DataFusion nativa no concatena esos lotes |
+| Proyección/pruning log con esquema inicial | Proyección solicitada en fuente; poda de lote completo | Filtros SQL residuales exactos siguen siendo necesarios; no duplicarlos en cliente |
+| Alineación log con esquema evolucionado | Decode con esquema al escribir, alinear campos destino; faltantes pasan a NULL | Se reutilizan arrays compatibles; representación distinta requiere nuevos nulls/normalización de tipo |
+| Preview log `LimitBatchScanner` | Ruta rápida de lote único; varios lotes se concatenan para API de resultado único | No es ruta fuente DataFusion; quitar concat altera semántica API preview |
+| Registros wire KV → fila lógica actual | `FixedSchemaDecoder` alinea field IDs originales; antes convertía filas completas al primer acceso | Proyección selecciona ahora campos físicos fuente. Campos no seleccionados se recorren por límites wire comprobados sin convertirlos |
+| Fila lógica KV → Arrow | Antes construía todas las columnas y luego proyectaba | Construye solo campos únicos solicitados; reordena/duplica con proyección nativa por referencias Arrow |
+| Límite preview KV | Antes construía todas las filas y luego cortaba `limit` final | Selecciona rangos sufijo antes de convertir/construir; framing/schema-ID servidor no cambia |
+| Proyección COUNT KV | Antes decodificaba valores completos y los quitaba en conector | Batch readers KV admiten proyección cero columnas, conservan conteo explícito y no construyen columnas de valores Arrow |
+| Admisión/salida fuente | Se cobra almacenamiento respaldo original; owners Arrow custom conservan leases | Headers/owners asignan metadatos; payload/null/offset/child conservan punteros/geometría |
+| Filtros exactos, casts, sort/agregados DataFusion | Pueden materializar arrays salida distintos | Semántica SQL nativa, no copias arbitrarias del conector; contabilización salida corresponde a operadores |
 
-Relevant client paths under `clients/rust/crates/fluss/src/`:
+Rutas cliente relevantes bajo `clients/rust/crates/fluss/src/`:
 `client/table/{batch_scanner,reader,kv_scanner}.rs`,
 `client/table/scanner/{batches,builder,polling}.rs`,
 `row/{fixed_schema_decoder,row_decoder}.rs`,
-`row/compacted/compacted_row_reader.rs`, `record/arrow.rs` and
-`client/table/read_context_resolver.rs`. Connector paths:
+`row/compacted/compacted_row_reader.rs`, `record/arrow.rs` y
+`client/table/read_context_resolver.rs`. Rutas conector:
 `crates/fluss-datafusion/src/{scan,kv_scan,resources,filter,log_table,kv_table}.rs`.
 
-## KV implementation decisions
+## Decisiones de implementación KV
 
-- Use the existing compacted deserializer and its checked scalar/byte readers.
-  Float/double fields are fixed-width; integral/date/time fields use their actual
-  variable encoding; timestamp/decimal widths follow format/precision. Do not
-  infer byte widths from Arrow types or introduce a connector-side wire parser.
-- Selected source fields are derived through the existing source→current schema
-  field-ID mapping. Missing current fields remain NULL. Arrow builder projection
-  then maps the aligned current row to requested fields, including reorder.
-- The internal logical row still has original positional slots for compatibility;
-  unselected slots need no converted values. This and schemas/index masks/builders
-  are metadata allocations, not eliminated by the optimization.
-- Requested duplicate columns materialize once and share the resulting ArrayRef.
-  No `take`/gather of values is needed merely to duplicate or reorder columns.
-- Projection does not validate logical contents of unrequested values. For example,
-  an unselected string is not UTF-8 converted. Record/schema framing is still
-  checked; traversed variable field lengths must fit the payload. A query selecting
-  that string still receives its original conversion error. Row-only COUNT does
-  not deserialize value contents, analogous to counting records rather than
-  checking every field's logical validity.
-- Empty projections are admitted for primary-key batch reads, not log/changelog
-  readers. COUNT still receives snapshot pages/record headers; no server count RPC,
-  global snapshot or filter/limit pushdown has been added.
-- Empty Arrow schemas need explicit row counts. The shared row builder preserves
-  its existing nonempty-schema behavior; only empty schemas need that count.
-- The connector's post-decode empty projection workaround is removed. The client
-  now returns the requested schema directly. EXPLAIN distinguishes KV
-  `row_count_only` from logs' retained `full_rows_for_count` fallback.
+- Usar deserializador compactado existente y sus readers escalares/bytes comprobados.
+  Float/double tienen ancho fijo; enteros/date/time usan codificación variable real;
+  anchos timestamp/decimal siguen formato/precisión. No inferir ancho por tipo Arrow
+  ni introducir parser wire en conector.
+- Campos seleccionados fuente se derivan del mapeo existente source→current por
+  field ID. Campos actuales ausentes siguen NULL. Proyección builder Arrow mapea luego
+  fila actual alineada a campos solicitados, incluido reordenamiento.
+- La fila lógica interna conserva posiciones originales por compatibilidad; slots
+  no seleccionados no requieren valores convertidos. Esto, schemas/máscaras/builder
+  son asignaciones metadatos que la optimización no elimina.
+- Columnas duplicadas solicitadas se materializan una vez y comparten `ArrayRef`.
+  No hace falta `take`/gather de valores solo para duplicar/reordenar.
+- Proyección no valida contenido lógico de valores no solicitados. Por ejemplo, no
+  convierte UTF-8 una cadena no seleccionada. Framing registro/esquema sí se verifica;
+  longitudes variables recorridas deben caber en payload. Si query selecciona cadena,
+  conserva su error de conversión. COUNT solo filas no deserializa valores, análogo a
+  contar registros sin validar lógica de cada campo.
+- Proyecciones vacías se admiten para lecturas batch PK, no readers log/changelog.
+  COUNT sigue recibiendo páginas snapshot/headers de registros; no se añadió RPC count
+  servidor, snapshot global ni pushdown filter/limit.
+- Schemas Arrow vacíos requieren conteo explícito filas. Builder común conserva
+  comportamiento anterior para schemas no vacíos; solo schema vacío requiere conteo.
+- Se retiró workaround del conector de proyección vacía post-decode. Cliente devuelve
+  ahora schema solicitado. EXPLAIN distingue KV `row_count_only` de fallback log
+  `full_rows_for_count` conservado.
 
-## Evidence
+## Evidencia registrada
 
-- Client `batch_scanner` tests: selected values, duplicate/reordered ArrayRef
-  sharing, invalid indices, empty COUNT output with three rows/zero Arrow bytes,
-  limits, and old/new schemas with selected absent fields.
-- A deliberately invalid UTF-8 value in an unselected column fails full conversion
-  but allows the selected integer through the projected decoder. Truncating that
-  field's wire payload still fails projected traversal. This tests avoided work,
-  not merely a smaller final result (which the old post-projection already had).
-- Compacted decoder tests cover skipping fixed-width float/double versus variable
-  integers, alongside primitive/null/nested existing round trips.
-- Core lease test now compares pointers, offsets and lengths recursively, including
-  validity bitmaps and nested child buffers, across slicing/projection/retention.
-- Real bounded log/KV SQL checks COUNT source batches: rows remain nonzero, columns
-  are zero and `arrow_decoded_bytes` is zero. SQL output COUNT remains correct.
-- Real KV snapshot/schema-evolution and four write SQL integrations cover the
-  changed decoder under SELECT, DELETE and MERGE. Existing Arrow encoding/schema
-  round-trip tests ensure row-builder changes do not disturb writes.
+- Pruebas cliente `batch_scanner`: valores seleccionados, sharing `ArrayRef` duplicado/
+  reordenado, índices inválidos, COUNT vacío con tres filas/cero bytes Arrow, límites
+  y schemas antiguo/nuevo con campos seleccionados ausentes.
+- UTF-8 deliberadamente inválido en columna no seleccionada falla conversión completa,
+  pero permite leer entero seleccionado con decoder proyectado. Truncar payload wire de
+  ese campo aún falla recorrido. Prueba trabajo evitado, no solo resultado final menor.
+- Pruebas decoder compactado cubren skip de float/double fijos vs enteros variables,
+  además de round trips primitivos/NULL/nested.
+- Prueba lease core compara punteros/offsets/longitudes recursivamente, incluso mapas
+  validez y buffers hijos nested, en slicing/proyección/retención.
+- Consultas SQL reales log/KV acotadas comprueban COUNT en lotes fuente: filas no cero,
+  columnas cero y `arrow_decoded_bytes` cero. COUNT SQL salida sigue correcto.
+- Integraciones reales snapshot KV/evolución schema y cuatro escrituras SQL cubren
+  decoder modificado en SELECT/DELETE/MERGE. Round trips Arrow existentes comprueban
+  que cambios row-builder no afectan escrituras.
 
-Functional evidence uses DEBUG and eight jobs. This is structural evidence of
-reduced materialization, not a measured throughput/latency improvement.
+Evidencia funcional usa DEBUG/ocho jobs. Demuestra reducción estructural de
+materialización, no mejora medida throughput/latencia.
 
-## Remaining limits
+## Límites conservados
 
-Network bytes, raw page buffers, decompression/unfinished-poll peaks and format
-conversion for selected values are not eliminated. Admission occurs after decode;
-`w8ap` and subsequent resource profiles verify hard bounds/pressure. Compatible
-Arrow views do not imply every allocation is charged to the source pool.
+Bytes red, páginas raw, picos descompresión/poll incompleto y conversión de formato
+para valores seleccionados no se eliminan. Admisión ocurre tras decode; perfiles de
+recursos verifican límites/pressure acotados. Vistas Arrow compatibles no implican
+que toda asignación se cobre al pool fuente.
 
-Log COUNT retains its current full-read fallback; a client log row-count-only
-contract needs separate offset/framing/schema/pruning validation, not a shortcut
-based on unchecked header counts. Log schema normalization and preview concat
-are explicit retained materializations. No custom mmap, alternate decoder/runtime,
-Python/FFI builds or a global allocation registry is added here.
+COUNT log conserva fallback de lectura completa; contrato cliente de conteo solo filas
+requiere validar offsets/framing/esquema/pruning, no atajo con conteos header sin
+verificar. Normalización esquema log y concat preview son materializaciones explícitas
+conservadas. No se añade mmap custom, decoder/runtime alternativo, build Python/FFI ni
+registro global de asignaciones.

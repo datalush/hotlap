@@ -1,116 +1,115 @@
-# Native KV DELETE contract and verification — jwyv
+# Contrato y verificación de DELETE KV nativo
 
-DELETE uses the existing `UpsertWriter::delete` and DataFusion operators to
-select/filter keys from finite per-bucket KV snapshots. There is no separate SQL
-parser, row evaluator, transaction coordinator or DELETE transport.
+DELETE usa `UpsertWriter::delete` y operadores DataFusion existentes para seleccionar
+/filtrar claves desde snapshots KV finitos por bucket. No tiene parser SQL,
+evaluador de filas, coordinador transaccional ni transporte DELETE propio.
 
-## Selection and count
+## Selección y conteo
 
-- No WHERE selects all rows visible to the snapshot scans. No matching keys
-  produces the standard UInt64 count zero.
-- Predicates follow DataFusion SQL null logic: `value = NULL`, `FALSE`, `1 = 2`
-  and an impossible null conjunction affect zero rows, not every row.
-- UDFs, exact residual filters, OR/IS NULL and table-name qualifiers use the
-  caller's planner/function registry. Unqualified predicates on a DELETE target
-  alias work. DataFusion 55.1 rejects predicates qualified by the target alias
-  during SQL resolution; there is no connector alias rewriting workaround.
-- Count is acknowledged **selected-key deletion operations**, not net removed
-  rows. A key removed by a concurrent statement still counts if its delete
-  request ACKs. A subsequent SQL DELETE whose snapshot selects no keys counts zero.
-- PK encoding/routing remains native. Composite `(region,id)` keys with the same
-  id in another partition are distinct; old2/new3 effective bucket layouts remain
-  respected after rescale.
-- Append-only logs reject individual DELETE. Clearing log rows through another
-  API, retention or an administrative operation is not SQL row deletion.
+- Sin `WHERE`, selecciona todas las filas visibles a los scans snapshot. Si no hay
+  claves coincidentes, devuelve conteo estándar UInt64 cero.
+- Predicados siguen lógica NULL SQL de DataFusion: `value = NULL`, `FALSE`, `1 = 2`
+  y una conjunción NULL imposible afectan cero filas, no todas.
+- UDF, filtros residuales exactos, OR/IS NULL y qualifiers de tabla usan planner y
+  registro de funciones del llamador. Predicados sin calificar sobre alias destino
+  funcionan. DataFusion 55.1 rechaza durante resolución SQL predicados calificados
+  por alias destino; el conector no reescribe alias.
+- Conteo es número de **operaciones de borrado de claves seleccionadas confirmadas**,
+  no filas netas removidas. Si otra sentencia elimina una clave después de selección,
+  cuenta si ACK de su request llega. DELETE posterior cuyo snapshot no selecciona
+  claves cuenta cero.
+- Codificación/routing PK permanecen nativos. Claves compuestas `(region,id)` con
+  mismo id en otra partición son distintas; layouts efectivos old2/new3 se respetan
+  tras rescale.
+- Logs append-only rechazan DELETE individual. Limpiar filas log mediante otra API,
+  retención o administración no equivale a borrado SQL de filas.
 
-Snapshot selection and key deletion are **not atomic or conditional**. A value
-matching the WHERE predicate can be replaced after selection, and the native
-key delete can remove that replacement. Each bucket opens its own snapshot;
-there is no common transaction across buckets/partitions. The engine owns
-conflict policy, job retry/reconciliation and isolation requirements.
+Selección snapshot y borrado de claves **no son atómicos ni condicionales**. Un valor
+que cumple WHERE puede reemplazarse tras selección y el borrado nativo de clave puede
+eliminar ese reemplazo. Cada bucket abre su propio snapshot; no hay transacción común
+entre buckets/particiones. El motor posee política de conflictos, reintentos/conciliación
+trabajo y requisitos de aislamiento.
 
-## Table policies
+## Políticas de tabla
 
-The connector checks effective metadata when planning and executing DELETE and
-before batch submission. Only `table.delete.behavior=allow` is accepted. It
-rejects `ignore`/`disable` instead of converting an ignored request's ACK into a
-successful SQL deletion count.
+El conector comprueba metadatos efectivos al planificar, ejecutar DELETE y antes de
+enviar lotes. Solo acepta `table.delete.behavior=allow`. Rechaza `ignore`/`disable`,
+en vez de convertir ACK de petición ignorada en conteo SQL exitoso.
 
-Regular PK tables default to allow. Configured first_row/versioned/aggregation
-merge engines default to ignore when no delete policy is specified; the server
-materializes the effective property for supported descriptors. First_row/versioned
-do not permit an allow descriptor; aggregation's explicit allow follows server
-validation. Unknown/non-allow effective behavior is rejected conservatively.
+Tablas PK normales permiten por defecto. Motores merge `first_row`/`versioned`/
+`aggregation` configurados usan `ignore` por defecto cuando no se declara política;
+el servidor materializa propiedad efectiva para descriptores admitidos. `first_row`/
+`versioned` no permiten descriptor `allow`; `aggregation` con allow explícito sigue
+validación del servidor. Conducta efectiva desconocida/no-allow se rechaza
+conservadoramente.
 
-The pinned server does **not** support in-place ALTER of `table.delete.behavior`.
-The live test verifies that rejection and that the original allow plan remains
-valid; it does not simulate a policy transition the server cannot perform.
-Cached capabilities are descriptive, not authorization or future metadata proof.
-Permissions and the full failover matrix remain the separate `cf5y` acceptance.
+Servidor fijado **no** admite ALTER in-place de `table.delete.behavior`. Prueba live
+verifica rechazo y que plan allow original sigue válido; no simula transición que el
+servidor no soporta. Capacidades cacheadas son descriptivas, no autorización ni prueba
+de metadatos futuros. Permisos y matriz completa de failover están en
+[verificación de fallos nativos](native-failure-verification.md).
 
-## Partial execution
+## Ejecución parcial
 
-The `bqrq` observation contract applies with `FlussWriteOperation::Delete`.
-Whole input batches ACKed before a later failure stay confirmed. A subsequent
-attempted batch without successful aggregate flush remains uncertain; SQL returns
-the original error and no successful partial count. Some or all uncertain keys
-may be deleted after timeout/cancellation. No compensating inserts or rollback
-are attempted. See [write-observation-contract.md](write-observation-contract.md).
+Contrato de observación de escritura aplica con `FlussWriteOperation::Delete`. Lotes
+completos con ACK anteriores a fallo permanecen confirmados. Lote intentado posterior
+sin flush agregado exitoso sigue incierto; SQL devuelve error original y no conteo
+parcial exitoso. Algunas o todas las claves inciertas podrían borrarse tras timeout/
+cancelación. No hay inserts compensatorios ni rollback. Ver
+[contrato de observación de escritura](write-observation-contract.md).
 
-## Required native DataFusion backport
+## Backport requerido de DataFusion nativo
 
-The new `value = NULL` regression exposed DataFusion 55.1 turning optimized
-`EmptyRelation` into an empty filter vector passed to `delete_from`, which means
-unconditional deletion to the provider. It deleted all three isolated fixture
-rows rather than zero. This information is lost before the connector hook, so a
-provider-only fix cannot distinguish the case from legitimate DELETE without WHERE.
+Regresión nueva `value = NULL` reveló que DataFusion 55.1 convertía `EmptyRelation`
+optimizada en vector de filtros vacío entregado a `delete_from`, que para provider
+significa borrado sin condición. Borró las tres filas fixture aisladas, no cero. La
+información se pierde antes del hook del conector, por lo que solo provider no puede
+distinguirlo de DELETE legítimo sin WHERE.
 
-With user authorization the workspace now patches the **published DataFusion
-55.1 core crate**, retaining Arrow 59/catalog/session/FFI versions:
+Con autorización, workspace aplica patch al core **publicado DataFusion 55.1** y
+conserva versiones Arrow 59/catalog/session/FFI:
 
-- Backport upstream PR [24657](https://github.com/apache/datafusion/pull/24657),
+- Backport PR upstream [24657](https://github.com/apache/datafusion/pull/24657),
   commit `2306a4b7599dc88490c0b39f082b4cdf554a5fb9`.
-- Proven empty DELETE/UPDATE input returns zero without invoking the provider.
-- Joins/unsupported optimized restrictions reject instead of losing selection.
-- Generic fail-closed `Limit` rejection covers upstream issue
-  [24998](https://github.com/apache/datafusion/issues/24998); DELETE LIMIT is not
-  implemented. IN/EXISTS subquery join plans are not supported by filter-only hooks.
+- Entrada DELETE/UPDATE probadamente vacía devuelve cero sin invocar provider.
+- Joins/restricciones optimizadas no soportadas se rechazan en vez de perder selección.
+- Rechazo genérico fail-closed de `Limit` sigue manejo de restricción no soportada;
+  DELETE LIMIT no está implementado. Planes subquery IN/EXISTS con join no son
+  soportados por hooks que solo filtran.
 
-The only changed upstream source is `vendor/datafusion-55.1.0/src/physical_planner.rs`.
-Archive checksum/license/source provenance and removal conditions are in
-[vendor/README.md](../vendor/README.md). A direct pin to the merged upstream
-workspace would require Arrow 60; this backport avoids that unrelated migration.
+Única fuente upstream modificada: `vendor/datafusion-55.1.0/src/physical_planner.rs`.
+Checksum/aviso/proveniencia del archivo y condiciones de retiro constan en
+[README vendor](../vendor/README.md). Fijar directamente workspace upstream fusionado
+exigiría Arrow 60; este backport evita esa migración ajena.
 
-An optimized proven-empty statement never invokes the native sink: it returns
-SQL count zero and has no Fluss write observation events. This is distinct from
-an executed sink receiving an empty snapshot, which initializes/terminates with
-zero received/confirmed counts. Do not invent a sink execution ID for an upstream
-no-op plan.
+Sentencia optimizada y probadamente vacía nunca invoca sink nativo: devuelve conteo
+SQL cero y no emite eventos Fluss de observación escritura. Distinto de sink ejecutado
+que recibe snapshot vacío y termina con cero recibidas/confirmadas. No inventar ID de
+ejecución sink para plan no-op upstream.
 
-## Evidence
+## Evidencia registrada
 
-- `tests/delete_planner.rs`: three transport-independent native MemTable tests
-  for empty DELETE, empty UPDATE and rejected subquery/LIMIT restrictions, with
-  rows preserved and zero/normal counts.
-- `tests/write_sql.rs`: five native-sni tests. The expanded existing cases cover
-  FALSE/NULL/contradiction, no WHERE/cero, UDF/OR/null/alias, append-only rejection,
-  composite PK and old2/new3 data preservation. New policy coverage exercises
-  default/allow/ignore/disable/first_row, proves ignored native ACKs leave a row,
-  checks SQL rejection/capabilities, native missing-key ACK and unsupported ALTER.
-- `tests/write_pressure.rs`: the owned Docker matrix adds deterministic
-  snapshot-vs-upsert and concurrent-delete races, both returning selected-key
-  ACK count one; it then confirms an initial snapshot batch before a paused
-  subsequent ACK, verifies failed SQL plus confirmed/uncertain DELETE summary,
-  checks remaining rows and releases pool reservations.
+- `tests/delete_planner.rs`: tres pruebas nativas independientes de transporte con
+  MemTable: DELETE vacío, UPDATE vacío y restricciones subquery/LIMIT rechazadas;
+  verifican filas preservadas y conteos cero/normal.
+- `tests/write_sql.rs`: cinco pruebas native-sni. Casos ampliados cubren FALSE/NULL/
+  contradicción, sin WHERE/cero, UDF/OR/NULL/alias, rechazo append-only, PK compuesta
+  y preservación datos old2/new3. Política cubre default/allow/ignore/disable/
+  first_row, ACK ignorado sin borrar fila, rechazo SQL/capacidades, ACK de clave ausente
+  y ALTER no soportado.
+- `tests/write_pressure.rs`: matriz Docker propia añade carreras snapshot-vs-upsert y
+  DELETE concurrente deterministas; ambas devuelven conteo ACK de clave seleccionada
+  uno. Luego confirma primer lote snapshot antes de ACK posterior pausado, verifica
+  SQL fallido con resumen DELETE confirmado/incierto, filas restantes y liberación pool.
 
-Functional checks use DEBUG/8 jobs. Bindings remain in their later migration
-phase. No native client/connector route was replaced or kept as a reserve path:
-the fix belongs to the generic native planner which originally lost selection.
+Pruebas funcionales usan DEBUG/ocho jobs. Bindings pertenecen a migración separada.
+No se reemplazó ruta cliente/conector ni se retuvo como fallback: fix pertenece al
+planner nativo genérico que originalmente perdía selección.
 
-Final evidence on the patched dependency: **5 native-sni SQL tests, 3 generic
-planner regressions and the complete Docker matrix including DELETE races/partial
-ACK passed**. Core clippy all-targets/all-features `-D warnings`, package formatting,
-upstream-width vendor-source formatting and `git diff --check` passed. Archive
-comparison confirmed only `physical_planner.rs` differs in the vendored package.
-The two exact table pairs left by failed regression assertions were removed;
-owned Docker pressure fixtures were torn down. No bindings were rebuilt.
+Evidencia final registrada con dependencia parcheada: **5 pruebas SQL native-sni,
+3 regresiones planner genérico y matriz Docker completa con carreras/ACK parcial**.
+Clippy core all-targets/all-features `-D warnings`, formato paquete, formato fuente
+vendor upstream y `git diff --check` pasaron. Comparación archivo confirmó que solo
+`physical_planner.rs` difiere en paquete vendorizado. Se limpiaron dos pares exactos
+de tablas que dejaron aserciones fallidas; fixtures Docker propios fueron derribados.
+No se reconstruyeron bindings.

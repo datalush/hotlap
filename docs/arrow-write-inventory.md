@@ -1,11 +1,11 @@
-# Arrow write routing and ownership — 3etr
+# Routing y propiedad Arrow en escrituras
 
-Scope: Rust log INSERT optimization, finite and continuous, and a separate
-evaluation of KV upsert/delete. Functional verification uses DEBUG/8 jobs.
-This is materialization/correctness evidence, not the sustained throughput or
-RSS acceptance owned by `pc5n`.
+Alcance: optimización Rust INSERT log finita/continua y evaluación separada de
+upsert/delete KV. Verificación funcional DEBUG/ocho jobs. Esto cubre materialización
+y corrección, no throughput sostenido; evidencia RSS está en
+[perfiles nativos](native-profile-plan.md).
 
-## Route and materialization boundaries
+## Límites de ruta y materialización
 
 ```text
 DataFusion input → schema/null validation → input backing lease
@@ -16,94 +16,92 @@ DataFusion input → schema/null validation → input backing lease
   → IPC/statistics/compression → sender/retries → flush/ACK
 ```
 
-The log sink no longer calls row append or rebuilds Arrow columns through
-`RowAppendRecordBatchBuilder`. A reusable ColumnarRow in the client reads routing
-keys; it does not convert every payload field into a new Arrow column.
+El sink log ya no llama append por filas ni reconstruye columnas Arrow mediante
+`RowAppendRecordBatchBuilder`. Un `ColumnarRow` reutilizable del cliente lee claves
+de routing; no convierte cada campo payload en una nueva columna Arrow.
 
-| Boundary | Allocation/copy behavior | Evidence |
+| Límite | Asignación/copia | Evidencia |
 | --- | --- | --- |
-| Compatible schema normalization | Clones column references; no payload copy | Existing client normalization/type/null tests |
-| Lossless encoding normalization | Arrow casts may materialize; caller retainer admits resulting buffers | Same existing normalization, now called before grouping; callback also covers casts |
-| Homogeneous or contiguous destination | Slice shares backing buffers | New client pointer/null/nested test |
-| Interleaved destination | One Arrow take per destination, preserving relative input order | New client semantic test; 96-row live native-row comparison covers all five old2/new3 groups |
-| Oversized input group | Binary-search logical slice size and submit byte-target slices; original backings remain retained | 20 × 200,000-byte values split into four slices with identical value-buffer pointers; live 4 MiB input / 2 MiB client buffer |
-| Wire batch | IPC/statistics/compression and encoded bytes still materialize | Existing builder/size/statistics/type tests; no end-to-end zero-copy claim |
+| Normalización de esquema compatible | Clona referencias de columnas, no payload | Pruebas cliente existentes de normalización/tipos/NULL |
+| Normalización de codificación sin pérdida | Casts Arrow pueden materializar; retainer llamador admite buffers resultantes | Misma normalización existente antes de agrupar; callback cubre casts |
+| Destino homogéneo/contiguo | Slice comparte buffers respaldo | Nueva prueba cliente punteros/NULL/nested |
+| Destino intercalado | Un Arrow take por destino, conserva orden relativo de entrada | Nueva prueba semántica; comparación nativa por filas activa de 96 filas cubre cinco grupos old2/new3 |
+| Grupo de entrada sobredimensionado | Búsqueda binaria del tamaño lógico de slices y envío por bytes objetivo; respaldos originales siguen retenidos | 20 valores de 200.000 bytes divididos en cuatro slices con punteros idénticos; prueba activa entrada 4 MiB/buffer cliente 2 MiB |
+| Lote wire | IPC/estadísticas/compresión y bytes codificados siguen materializándose | Pruebas builder/tamaño/estadísticas/tipos; no se afirma zero-copy integral |
 
-Gathers are justified for interleaved rows: using separate prebuilt singleton
-batches would multiply IPC framing/requests. Groups keep indices in input order;
-no global order across destinations is promised. Groups are processed in first
-destination appearance order. Row indices use checked Fluss i32 record-count
-admission before conversion to u32, without an additional gather-index copy.
+Gather está justificado para filas intercaladas: usar lotes singleton preconstruidos
+los lotes singleton multiplicarían framing IPC/requests. Grupos mantienen índices
+en orden de entrada; no se garantiza orden global entre destinos. Se procesan según
+primera aparición del destino. Índices de fila validan límite i32 de Fluss antes de
+convertir a u32, sin copia adicional de índices gather.
 
-Grouping calls the existing `WriterClient::assign_bucket`, which resolves
-effective per-partition counts. `send_assigned` reuses that assigner and the
-same immutable Cluster snapshot for enqueue. It does not re-hash a representative
-key against a newer layout. Native sticky/round-robin/hash behavior, accumulator
-admission, retries and ACK/error propagation remain in the client. Unknown
-post-rescale partition metadata fails instead of guessing a table default.
+Agrupar llama a `WriterClient::assign_bucket`, que resuelve conteos efectivos por
+partición. `send_assigned` reutiliza assigner y el mismo snapshot Cluster inmutable
+para enqueue; no vuelve a hashear una clave representativa contra layout nuevo.
+Comportamiento nativo sticky/round-robin/hash, admisión accumulator, reintentos y
+propagación ACK/error siguen en cliente. Metadatos desconocidos de partición tras
+rescale fallan en vez de adivinar default de tabla.
 
-## Pool and client accounting
+## Contabilidad del pool y cliente
 
-The connector reuses `resources::reserve_batch` buffer owners for log inputs and
-newly materialized cast/gather buffers. Reservations survive worker/query drop
-while the client still holds any corresponding buffer. Slices keep the original
-whole-batch lease; gathers have independent leases. Other providers and VALUES
-receive the same sink admission, not an assumption that source leases exist.
+El conector reutiliza owners buffer `resources::reserve_batch` para entradas log y
+buffers cast/gather materializados. Reservas sobreviven drop worker/query mientras
+cliente retiene buffer; slices conservan lease de lote original y gathers tienen
+leases independientes. Otros providers/VALUES reciben la misma admisión sink, sin
+suponer que existan leases source.
 
-The native client exposes a conservative routing scratch hint: row indices,
-possible destination metadata and selected routing-key backing bytes. The sink
-admits that hint against the supplied DataFusion pool for the worker lifetime.
-Before rescale, unresolved partitions can make the group allowance conservative;
-after rescale, effective cached partition counts bound possible destinations.
-This hint is not a separate pool or an Arrow allocator.
+Cliente nativo expone hint conservador de scratch routing: índices filas, metadatos
+posibles destino y bytes respaldo claves seleccionadas. Sink admite hint contra pool
+DataFusion suministrado durante worker. Antes de rescale, particiones sin resolver
+pueden volver conservadora la allowance; después, conteos efectivos cacheados limitan
+destinos posibles. No es otro pool ni asignador Arrow.
 
-`append_arrow_batch_with_retainer` is a resource ownership hook around
-materialized Arrow batches. Its callback must preserve schema, values, count and
-order. Plain native `append_arrow_batch` uses the same route with identity
-retention. There is no legacy first-partition/bucket grouping route or alternate
-writer. Admission of casts/gathers occurs **after** Arrow allocation, so it
-does not prevent allocation peaks. Errors can occur after earlier groups were
-submitted; they are not statement rollback.
+`append_arrow_batch_with_retainer` es hook de propiedad recursos alrededor de lotes
+Arrow materializados. Callback debe preservar esquema, valores, conteo y orden.
+`append_arrow_batch` nativo usa misma ruta con retención identidad. No queda ruta
+antigua primera-partición/bucket ni writer alternativo. Admisión cast/gather ocurre
+**después** de asignar Arrow y no evita picos. Puede haber errores tras enviar grupos
+anteriores; no constituyen rollback de sentencia.
 
-Client batch permits now include a logical Arrow batch size hint and existing
-framing, rather than treating prebuilt batches as zero-byte records. Slice
-estimation uses Arrow's `ArrayData::get_slice_memory_size`, falling back
-conservatively to backing bytes for unsupported layouts. Nested child storage
-may also make estimates conservative. Request/buffer admission remains estimated,
-not a process-RSS bound; encoder scratch and actual encoded buffers retain the
-`yeqf`/`pc5n` audit obligation. A singleton may exceed the batch target but must
-pass buffer admission and the uncompressed request-size estimate check.
+Permisos batch del cliente incluyen ahora hint lógico de tamaño Arrow y framing
+existente; no tratan lotes preconstruidos como registros de cero bytes. Estimación
+slice usa `ArrayData::get_slice_memory_size` de Arrow, con fallback conservador a
+bytes respaldo para layouts no admitidos. Almacenamiento hijo anidado también puede
+elevar estimación. Admisión request/buffer sigue estimada, no limita RSS; scratch
+encoder y buffers codificados reales requieren perfil. Singleton puede exceder
+objetivo de lote, pero debe pasar admisión buffer y estimación de tamaño request
+sin comprimir.
 
-## KV decision
+## Decisión KV
 
-KV is not an Arrow-log batch format. `UpsertWriter::upsert` encodes PK/bucket keys
-and required row bytes, and `delete` emits keys without value bytes. ColumnarRow
-does not supply already encoded KV bytes, so row encoding is necessary. Existing
-encoders/accumulator reuse their own buffers. Replacing these calls with the log
-append API would violate protocol/PK/delete semantics.
+KV no usa formato de lote Arrow-log. `UpsertWriter::upsert` codifica claves PK/bucket
+ y bytes de fila requeridos; `delete` emite claves sin valores. ColumnarRow no
+proporciona bytes KV ya codificados, por lo que hace falta codificación por filas.
+Encoders/accumulator existentes reutilizan buffers propios. Sustituir por append
+log violaría protocolo/semántica PK/delete.
 
-Keep the single reusable typed row view for KV/MERGE actions and existing worker
-reservation. Preserve per-key input order, null/type validation, full-row upsert,
-delete policy and old/new layouts. Further KV batch API work requires a measured
-benefit beyond required wire encoding; no duplicate KV writer or false zero-copy
-claim is introduced here.
+Se conserva una vista de fila tipada reutilizable para acciones KV/MERGE y reserva
+worker existente. Preservar orden por clave, validación NULL/tipos, upsert de fila
+completa, política delete y layouts antiguos/nuevos. Otra API batch KV exige medir
+beneficio adicional a codificación wire requerida; no se añade writer duplicado ni
+falsa afirmación zero-copy.
 
-## Verification
+## Verificación registrada
 
-- Client library: **831 passed, 2 ignored**, including new contiguous/gather and
-  byte-slice tests; existing encoder/builder/null/nested/statistics/limiter tests.
-- Core library: **23 passed**, including a new sink lease test retaining a slice
-  and an independent gather after worker drop, then freeing both reservations.
-- Four native-sni `write_sql` tests: INSERT log/KV, SQL source/concurrent/repeated
-  execution, DELETE/MERGE regressions, 4 MiB/2 MiB pressure and tiny-pool rejection,
-  mixed/rescaled partitions, continuous singleton confirmation before EOF and
-  cancellation. The rescale test compares exact bucket membership, per-bucket
-  order and null values against 96 native row writes, and verifies the pool
-  returns to its pre-INSERT baseline after ACK. Earlier retained KV SELECT
-  results keep their legitimate source leases; they must not be freed by INSERT.
-- Core and client clippy with `-D warnings`; package formatting checks.
+- Biblioteca cliente: **831 aprobadas, 2 ignoradas**, incluidas pruebas nuevas
+  contiguo/gather y byte-slice, más encoder/builder/null/nested/statistics/limiter.
+- Biblioteca core: **23 aprobadas**, incluye prueba lease sink que retiene slice y
+  gather independiente tras drop worker, luego libera ambas reservas.
+- Cuatro pruebas `write_sql` native-sni: INSERT log/KV, fuente SQL/concurrencia/
+  reejecución, regresiones DELETE/MERGE, presión entrada 4 MiB/buffer 2 MiB y rechazo
+  pool pequeño, particiones mixtas/rescale, confirmación singleton continua previa
+  a EOF y cancelación. Prueba rescale compara pertenencia exacta a buckets, orden
+  por bucket y valores NULL con 96 escrituras nativas por fila, y comprueba pool
+  vuelve a nivel previo a INSERT tras ACK. Resultados SELECT KV retenidos previamente
+  conservan leases fuente legítimos; INSERT no debe liberarlos.
+- Clippy core/cliente con `-D warnings`; formato de paquetes.
 
-Commands (from repository root):
+Comandos desde la raíz del repositorio:
 
 ```sh
 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 cargo test -p fluss-datafusion --locked --lib
@@ -113,6 +111,10 @@ CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 cargo clippy -p fluss-datafusion --
 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 CARGO_TARGET_DIR="$PWD/target" cargo clippy --manifest-path clients/rust/Cargo.toml -p fluss-rs --all-targets --locked -- -D warnings
 ```
 
-Sparse KV streaming, idle beyond ACK timeout, ACK-loss/saturated cancellation,
-structured confirmations and explicit restart acceptance remain `yeqf`, `bqrq`
-and `bsjm`; the existing streaming regression is not their complete acceptance.
+La cobertura de KV disperso en streaming, espera idle mayor que el ACK timeout,
+pérdida de ACK/cancelación saturada, confirmaciones estructuradas y aceptación
+de reinicio se registra por separado en
+[aceptación de escrituras](streaming-write-acceptance.md),
+[observabilidad de escritura](write-observation-contract.md) y
+[verificación de presión](write-pressure-verification.md). La regresión de
+streaming existente no demuestra por sí sola toda esa aceptación.
