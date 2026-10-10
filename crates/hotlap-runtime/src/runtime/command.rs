@@ -66,15 +66,16 @@ pub(crate) async fn handle(
                 Ok(()) => take(checkpointer, hotlap, sources).await,
                 Err(error) => Err(error),
             };
-            if result.is_err() && checkpointer.as_ref().is_some_and(inconsistent) {
+            let inconsistent = result.is_err() && checkpointer.as_ref().is_some_and(inconsistent);
+            if inconsistent {
                 close_clean.store(false, Ordering::SeqCst);
-            }
-            if result.is_err() && checkpointer.as_ref().is_some_and(inconsistent) {
-                *failed = true;
-                if let Err(error) = &result
-                    && let Ok(mut slot) = checkpoint_error.lock()
-                {
-                    slot.get_or_insert_with(|| error.to_string());
+                if !*failed {
+                    *failed = true;
+                    if let Err(error) = &result
+                        && let Ok(mut slot) = checkpoint_error.lock()
+                    {
+                        *slot = Some(error.to_string());
+                    }
                 }
             }
             let _ = reply.send(result);
@@ -113,8 +114,12 @@ pub(crate) async fn run_periodic(
             let inconsistent = inconsistent(active);
             if inconsistent {
                 close_clean.store(false, Ordering::SeqCst);
+                if let Ok(mut slot) = checkpoint_error.lock() {
+                    *slot = Some(error.to_string());
+                }
+            } else {
+                record_error(checkpoint_error, error);
             }
-            record_error(checkpoint_error, error);
             inconsistent
         }
     }
