@@ -9,6 +9,7 @@ use hotlap_connectors::source::{Offset, Source, SourceState, SourceStream, Split
 /// Delegates to an inner source and records how often `resume` ran and which
 /// offset it was asked to reopen, so a test can prove recovery reached the
 /// right state instead of only checking an id.
+#[derive(Clone)]
 pub struct SpySource {
     inner: Arc<dyn Source>,
     resumed: Arc<AtomicU32>,

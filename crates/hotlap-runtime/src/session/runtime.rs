@@ -102,8 +102,13 @@ impl SqlSession {
         // created sinks are re-checked by `validate` so a factory cannot lie.
         super::sink_preflight::preflight_sinks(&self.sinks, self.sink_factory.as_ref(), &views)?;
         // Refuse an incompatible checkpoint before the factory opens a writer.
-        self.validate_recovery_views(&views)?;
+        let replay_safe = self
+            .sinks
+            .iter()
+            .all(|sink| !self.sink_factory.may_create_transactional(&sink.options));
+        self.validate_recovery_views(&views, replay_safe)?;
         let sinks = self.build_sinks().await?;
+        self.validate_sink_recovery_declarations(&sinks)?;
         let sources = self.build_sources(bindings)?;
         let mut pipeline = Pipeline {
             sources,
@@ -117,6 +122,24 @@ impl SqlSession {
         // a rejected pipeline never drops the durable config a retry needs.
         pipeline.checkpoint = self.checkpoint.take();
         Ok(pipeline)
+    }
+
+    /// Ensure the opened sink did not contradict its preflight declaration.
+    fn validate_sink_recovery_declarations(&self, sinks: &[SinkSpec]) -> Result<(), SqlError> {
+        for (definition, sink) in self.sinks.iter().zip(sinks) {
+            if !self
+                .sink_factory
+                .may_create_transactional(&definition.options)
+                && sink.sink.capabilities()
+                    == hotlap_connectors::sink::SinkCapabilities::Transactional
+            {
+                return Err(SqlError::Unsupported(format!(
+                    "sink factory declared `{}` non-transactional but created a transactional sink",
+                    definition.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Open every declared sink via the factory, resolving its view schema.

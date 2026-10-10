@@ -27,6 +27,15 @@ pub trait SinkFactory: Send + Sync {
     fn accepts_retractions(&self, _options: &BTreeMap<String, String>) -> bool {
         false
     }
+
+    /// Whether this factory may produce a transactional sink for `options`.
+    ///
+    /// Unknown factories default to `true`, so recovery rejects an unsafe
+    /// pending checkpoint before opening a writer unless the factory can prove
+    /// it only creates replay-safe non-transactional sinks.
+    fn may_create_transactional(&self, _options: &BTreeMap<String, String>) -> bool {
+        true
+    }
 }
 
 /// Builds a [`FlussSink`] from the DDL options (`bootstrap`, `table`).
@@ -53,6 +62,10 @@ impl SinkFactory for FlussSinkFactory {
 
     fn accepts_retractions(&self, _options: &BTreeMap<String, String>) -> bool {
         // Fluss append and upsert writers both reject negative diffs.
+        false
+    }
+
+    fn may_create_transactional(&self, _options: &BTreeMap<String, String>) -> bool {
         false
     }
 }

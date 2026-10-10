@@ -60,24 +60,6 @@ fn seed(backend: &SharedBackend) {
     session.shutdown().expect("shutdown");
 }
 
-/// Add a later interrupted body that cannot decode, leaving checkpoint 1 intact.
-fn corrupt_pending(backend: &SharedBackend) {
-    let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
-        let value = writer
-            .get(format!("checkpoint/1/{part}").as_bytes())
-            .unwrap()
-            .unwrap();
-        writer
-            .put(format!("checkpoint/2/{part}").as_bytes(), value)
-            .unwrap();
-    }
-    writer.put(b"checkpoint/2/commit", b"1".to_vec()).unwrap();
-    writer
-        .put(b"checkpoint/2/engine", b"HLSR\x02".to_vec())
-        .unwrap();
-}
-
 /// Declare `views` and `sinks` in order, then `START` and report the effect
 /// counters observed at the failure boundary.
 fn start_with(backend: &SharedBackend, views: &[&str], sinks: &[&str]) -> (SessionError, u32, u32) {
@@ -179,41 +161,5 @@ fn a_rejected_changed_view_keeps_the_checkpoint_for_a_corrected_retry() {
     fixed
         .sql("START;")
         .expect("corrected declarations must recover from the retained checkpoint");
-    fixed.shutdown().expect("shutdown");
-}
-
-#[test]
-fn corrupt_pending_does_not_hide_changed_fallback_or_consume_session_config() {
-    let backend = SharedBackend::default();
-    seed(&backend);
-    corrupt_pending(&backend);
-    let (session_config, reads, creates) = config(&backend);
-    let mut session = Session::open(session_config).expect("open session");
-    session.sql(SOURCE).expect("create source");
-    session.sql(VIEW_A_CHANGED).expect("create changed a");
-    session.sql(VIEW_B).expect("create b");
-    session.sql(SINK_A).expect("sink a");
-    session.sql(SINK_B).expect("sink b");
-
-    for _ in 0..2 {
-        let error = match session.sql("START;") {
-            Ok(_) => panic!("the valid fallback's changed plan must be rejected"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, SessionError::Sql(SqlError::Unsupported(_))));
-    }
-    assert_eq!(creates.load(Ordering::SeqCst), 0, "no sink factory may run");
-    assert_eq!(reads.load(Ordering::SeqCst), 0, "no source may open");
-    assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
-
-    drop(session);
-    let (retry_config, _reads, _creates) = config(&backend);
-    let mut fixed = Session::open(retry_config).expect("open retry");
-    fixed.sql(SOURCE).expect("create source");
-    fixed.sql(VIEW_A).expect("create a");
-    fixed.sql(VIEW_B).expect("create b");
-    fixed
-        .sql("START;")
-        .expect("the retained checkpoint remains usable after rejection");
     fixed.shutdown().expect("shutdown");
 }

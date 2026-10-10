@@ -99,6 +99,7 @@ impl SqlSession {
     pub(super) fn validate_recovery_views(
         &mut self,
         views: &[(String, Plan)],
+        replay_safe: bool,
     ) -> Result<(), SqlError> {
         let Some(config) = self.checkpoint.take() else {
             return Ok(());
@@ -114,7 +115,7 @@ impl SqlSession {
             .collect();
         let checkpointer = Checkpointer::new(config.backend, config.retain);
         let result = checkpointer
-            .validate_views(&declared)
+            .validate_views_with_replay_safety(&declared, replay_safe)
             .map_err(view_identity_err);
         self.checkpoint = Some(CheckpointConfig {
             interval: config.interval,
