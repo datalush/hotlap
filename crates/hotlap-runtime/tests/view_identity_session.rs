@@ -35,10 +35,12 @@ fn config(backend: &SharedBackend) -> (SessionConfig, Arc<AtomicU32>, Arc<Atomic
     let config = SessionConfig::new()
         .with_source_factory(Arc::new(CountedFactory {
             reads: Arc::clone(&reads),
+            starts: Arc::default(),
         }))
         .with_sink_factory(Arc::new(ToggleFactory {
             creates: Arc::clone(&creates),
             accepts,
+            writes: Arc::default(),
         }))
         .with_checkpoint(
             Duration::from_secs(3600),

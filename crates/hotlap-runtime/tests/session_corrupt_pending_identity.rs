@@ -30,10 +30,14 @@ fn config(
     creates: Arc<AtomicU32>,
 ) -> SessionConfig {
     SessionConfig::new()
-        .with_source_factory(Arc::new(CountedFactory { reads }))
+        .with_source_factory(Arc::new(CountedFactory {
+            reads,
+            starts: Arc::default(),
+        }))
         .with_sink_factory(Arc::new(ToggleFactory {
             creates,
             accepts: Arc::new(AtomicBool::new(true)),
+            writes: Arc::default(),
         }))
         .with_checkpoint(
             Duration::from_secs(3600),
