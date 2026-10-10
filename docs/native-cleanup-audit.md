@@ -1,116 +1,110 @@
-# Native source/cleanup inventory — rm21, prad, 7yt8
+# Inventario de fuente nativa y limpieza
 
-For original SHA identifiers in this audit, see [the history commit map](history-commit-map.tsv).
-The later filtering removes retired paths from reachable history while preserving
-this native implementation, its licensing and the original evidence identity.
+Este inventario conserva la historia de fuentes, licencias y evidencia de la
+implementación nativa.
 
-This records the verified native-acceptance cycle before the Hotlap layout change.
-Current source disposition is in [Hotlap layout](hotlap-layout.md): the formerly
-excluded imported bindings and Java/reference tree are now removed from the
-working tree, with their history/licensing provenance preserved in Git.
+Registra ciclo de aceptación nativa y disposición actual de fuentes en
+[estructura Hotlap](hotlap-layout.md): los bindings importados y árbol Java/referencia
+antes excluidos se retiraron del árbol de trabajo; historial/licencias permanecen en Git.
 
-Working-tree audit, 2026-10-05. Phase 4 accepts the actual native DataFusion engine;
-phase 6 removes substituted infrastructure and prepares native delivery. Neither
-phase implements or accepts Python/FFI bindings.
+Auditoría del árbol de trabajo, 2026-10-05. Se validaron providers DataFusion nativos
+e integraciones de motor; se retiró infraestructura sustituida para preparar entrega
+nativa. Ninguna etapa implementa ni acepta bindings Python/FFI.
 
-The source series is now versioned: `2a85deb` retirement, `043a346` faults,
-`1a4556b` native engine/example, `4b78eca` profiles/instrumentation. Export results
-below remain historical evidence; final clean Git verification follows this series.
+Cambios y mediciones describen snapshots registrados; verificación Git limpia final
+se documenta por separado.
 
-## Resolved inventory
+## Inventario resuelto
 
-| Piece | Disposition and evidence |
+| Componente | Disposición y evidencia |
 | --- | --- |
-| Former active Python/FFI crate, host extensions/adapters, build scripts, Python examples/tests and root Python manifests | Removed in `e38t` working tree; root workspace contains only `fluss-datafusion`. No fallback references to FlussPlanner/OpaqueQueryPlanner/ResourceProvider/RuntimePlan/session_with_runtime/PyCapsule remain in active connector Rust sources. |
-| Imported upstream Python/C++/Elixir binding source | Retained as imported history/reference, explicitly excluded from the client workspace. No active dependency/gate. Imported licenses/notices are retained. |
-| Native client | Necessary single implementation of protocol/auth, metadata, bucket routing, codecs, scanners, writer buffers/queues/ACK/retries. Root execution and independent client validation use their own pinned locks. |
-| DataFusion provider/execution adapters and catalog | Necessary TableProvider/ExecutionPlan integration, identity/offset/snapshot contracts and optional metadata catalog; real caller sessions/planners/runtime execute them. No alternate engine, transport or scheduler. |
-| Native MERGE extension | Necessary adaptation for the pinned DataFusion API. Its helper graph uses caller planning and standard join/filter/CASE operators, not a second SQL/runtime implementation. Native UDF/planner tests and action/NULL/data checks exercise it. |
-| `resources.rs`, native WriterMemoryAccounting and Arrow owner leases | Necessary admission/ownership adapters over the caller's real MemoryPool and native client owners. Last-buffer/worker/frame lifetime tests and pressure/cancel profiles justify retention; not a global allocator/RSS limiter. |
-| Offsets, partition discovery and progress/terminal summaries | Necessary finite/continuous execution identity and conservative application knowledge. Reexecution/overlap/invalidation/lag/partial-ACK tests justify retention; not persistent checkpoints/replay. |
-| Typed errors/options and fixed-label metrics | Necessary operation bounds and original error propagation. ScanKv now participates in the existing RPC metrics path, fixing unreported KV read bytes. No alternate retry hierarchy. |
-| Vendored DataFusion core override | Necessary generic empty DELETE/UPDATE and unsupported-restriction protection for 55.1/Arrow59. Provenance/checksum and removal condition remain in `vendor/README.md`; three generic planner tests and real native DELETE tests verify it. |
-| Profile-only Feed/collector/histograms | Necessary controlled StreamingTable input and bounded measurement over standard interfaces. They live only in tests/support, introduce no production pool/allocator/decoder/transport, and replace resetting debug-recorder measurements in the writer profile. |
-| Native query example | Standard SessionContext/RuntimeEnv/providers, separate Fluss and engine configuration, output streamed by batch. No external application/scheduler is required for acceptance. |
+| Crate activa Python/FFI, extensiones/adaptadores host, scripts build, ejemplos/pruebas Python y manifests raíz Python | Retirados; workspace raíz contiene crates Rust nativas. Sources activos del conector ya no tienen referencias fallback FlussPlanner/OpaqueQueryPlanner/ResourceProvider/RuntimePlan/session_with_runtime/PyCapsule. |
+| Fuentes upstream importadas Python/C++/Elixir | Conservadas como historial/referencia importada y excluidas explícitamente del workspace cliente. Sin dependencia/gate activo; avisos/licencias importados se conservan. |
+| Cliente nativo | Implementación única necesaria de protocolo/auth, metadatos, routing bucket, codecs, scanners, buffers/colas writer, ACK/reintentos. Ejecución raíz y validación cliente independiente usan locks fijados propios. |
+| Providers/adaptadores ejecución DataFusion y catálogo | Integración necesaria `TableProvider`/`ExecutionPlan`, contratos identidad/offset/snapshot y catálogo metadatos opcional; ejecutan sesiones/planners/runtime reales del llamador. Sin motor/transporte/scheduler alternativo. |
+| Extensión MERGE nativa | Adaptación necesaria a API DataFusion fijada. Grafo auxiliar usa planner llamador y operadores estándar join/filter/CASE, no otra implementación SQL/runtime. Pruebas nativas UDF/planner y acción/NULL/datos la ejercitan. |
+| `resources.rs`, `WriterMemoryAccounting` nativo y leases owners Arrow | Adaptadores de admisión/propiedad sobre `MemoryPool` real del llamador y owners cliente nativos. Pruebas vida buffer/worker/frame y perfiles pressure/cancel justifican mantenerlos; no son allocator global ni límite RSS. |
+| Offsets, descubrimiento particiones y resúmenes progreso/terminal | Necesarios para identidad ejecución finita/continua y conocimiento conservador de aplicación. Pruebas reejecución/solapamiento/invalidación/lag/ACK parcial los sustentan; no son checkpoints persistentes/replay. |
+| Errores/opciones tipados y métricas labels fijos | Necesarios para límites por operación y propagación error original. `ScanKv` usa ahora camino métricas RPC existente, corrigiendo bytes lectura KV sin reportar. Sin jerarquía retry alternativa. |
+| Override core DataFusion vendorizado | Protección genérica necesaria de DELETE/UPDATE vacío y restricciones no soportadas para 55.1/Arrow59. Proveniencia/checksum/condición retiro en `vendor/README.md`; lo verifican tres pruebas planner genéricas y DELETE nativo real. |
+| Feed/collector/histogramas exclusivos perfiles | Entrada `StreamingTable` controlada y medición acotada con interfaces estándar. Solo viven en tests/support; no añaden pool/allocator/decoder/transporte producción y sustituyen mediciones debug-recorder reiniciadas del perfil writer. |
+| Ejemplo query nativo | Usa `SessionContext`/`RuntimeEnv`/providers estándar, configuración Fluss y motor separada, y emite por lote. Aceptación no necesita aplicación/scheduler externo. |
 
-Historical FFI findings remain identified in `rust-implementation-audit.md`. Lab
-installations, wheels and external credentials are not project delivery artifacts
-and were not removed or modified as a cleanup shortcut.
+Hallazgos FFI históricos siguen identificados en `rust-implementation-audit.md`.
+Instalaciones de laboratorio, wheels y credenciales externas no son artefactos de
+entrega y no se retiraron/modificaron como atajo de limpieza.
 
-## Dependency graph and isolated-source evidence
+## Grafo de dependencias y evidencia de fuente aislada
 
-An export of git-visible current source (tracked surviving files plus untracked
-source/tests/docs, excluding ignored caches/secrets and `.git`) contained 4,281
-files and SHA256 `a376f2ab58d320b580c4f7e97390236aa0eb67a151b448d5b5f608fb6f59273c`.
-It was copied to `/tmp/opencode/native-source-a773908601384a5fb6cb43d308dde670`.
-An initially empty, separate `CARGO_TARGET_DIR` rebuilt the native graph **offline
-and locked**, using already fetched registry dependencies, in 4m30s.
+Export de fuentes visibles para Git (archivos rastreados conservados más fuentes/
+tests/docs sin rastrear, excluyendo caches/secrets ignorados y `.git`) contenía 4.281
+archivos, SHA256 `a376f2ab58d320b580c4f7e97390236aa0eb67a151b448d5b5f608fb6f59273c`.
+Se copió a `/tmp/opencode/native-source-a773908601384a5fb6cb43d308dde670`. Un
+`CARGO_TARGET_DIR` separado inicialmente vacío reconstruyó el grafo nativo **offline
+con lock**, usando dependencias registry ya descargadas, en 4m30s.
 
-- Root resolved graph: 453 packages; workspace `fluss-datafusion`; DataFusion
-  55.1.0, Arrow 59.3.0, Fluss Rust client 1.0.0.
-- Client resolved graph: 431 packages; workspace `fluss-rs`, `gen`,
-  `fluss-test-cluster`, `fluss-examples`; its independent lock pins Arrow 59.0.0.
-  As a root dependency, the client instead uses the root lock's Arrow 59.3.0.
-  Both are Arrow59; this is not a bindings ABI/parity claim.
-- Neither active resolved graph contains PyO3, arrow-pyarrow, datafusion-ffi,
-  datafusion-ffi-ext, datafusion-python-util, fluss-datafusion-python, Stabby or
-  Rustler. Optional/imported manifests are not mistaken for active resolved nodes.
-- From the isolated source/target: **29 core + 3 planner**, **8 real write SQL
-  (41.57s)** and **9 real live read SQL (78.83s)** passed. Credentials/CA/kubeconfig
-  are external lab inputs, not copied into the export.
+- Grafo resuelto raíz: 453 paquetes; workspace `fluss-datafusion`; DataFusion 55.1.0,
+  Arrow 59.3.0, cliente Fluss Rust 1.0.0.
+- Grafo cliente: 431 paquetes; workspaces `fluss-rs`, `gen`, `fluss-test-cluster`,
+  `fluss-examples`; lock independiente fija Arrow 59.0.0. Como dependencia raíz usa
+  Arrow 59.3.0 del lock raíz. Ambos son Arrow59; esto no afirma ABI/paridad bindings.
+- Ningún grafo resuelto activo contiene PyO3, arrow-pyarrow, datafusion-ffi,
+  datafusion-ffi-ext, datafusion-python-util, fluss-datafusion-python, Stabby o
+  Rustler. Manifests opcionales/importados no se confunden con nodos resueltos activos.
+- Desde fuente/target aislados pasaron **29 core + 3 planner**, **8 SQL escritura real
+  (41,57 s)** y **9 SQL lectura live real (78,83 s)**. Credenciales/CA/kubeconfig son
+  entradas externas de laboratorio, no se copiaron al export.
 
-This proves an isolated build/run of that exported native working-tree snapshot.
-The allocation-control option and native example were added after that export.
-A final code snapshot of 4,284 files at
-`/tmp/opencode/native-source-7027470b6d924c44999d3e2c27d8140b` has SHA256
-`e1033ccaf11a6211ffab63206bbead9fd04e9cedb190f816bf4001d100222c80`.
-The unchanged native code reused the isolated target cache; its 29+3 core/planner
-tests pass. The example was built offline from that source and run as a separate
-process against both log and KV tables in the isolated DML fixture: expected
-counts 6 and 1, 16 MiB pool/target partitions 2, successful context/connection
-cleanup. The DML/example case passed in 12.25s. Root all-target clippy with warnings
-denied also passed offline from the final source (2m27s); original-tree checks pass.
+Esto prueba build/ejecución aislados de ese snapshot nativo del árbol de trabajo.
+Opción allocation-control y ejemplo nativo se añadieron después. Snapshot final de
+4.284 archivos en `/tmp/opencode/native-source-7027470b6d924c44999d3e2c27d8140b`
+tiene SHA256 `e1033ccaf11a6211ffab63206bbead9fd04e9cedb190f816bf4001d100222c80`.
+Código nativo sin cambios reutilizó cache target aislado; pasaron sus pruebas core/
+planner 29+3. El ejemplo se compiló offline desde esa fuente y se ejecutó como proceso
+separado contra tablas log y KV del fixture DML aislado: conteos esperados 6 y 1,
+pool 16 MiB/particiones destino 2, limpieza contexto/conexión correcta. Caso DML/
+ejemplo pasó en 12,25 s. Clippy all-target raíz con warnings denegados pasó offline
+sobre fuente final (2m27s); comprobaciones árbol original pasaron.
 
-After building the example in that source copy:
+Comandos ejecutados tras compilar ejemplo en esa copia de fuentes:
 
 ```sh
 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 CARGO_TARGET_DIR=/tmp/opencode/native-repro-target-a7739086 cargo build -p fluss-datafusion --offline --locked --example native_query
 FLUSS_NATIVE_QUERY_EXAMPLE=/tmp/opencode/native-repro-target-a7739086/debug/examples/native_query DATAFUSION_POOL_MIB=16 DATAFUSION_TARGET_PARTITIONS=2 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 CARGO_TARGET_DIR=/tmp/opencode/native-repro-target-a7739086 uv run --no-project --env-file /home/midnattsol/code/datalush/fluss/lab/.env cargo test -p fluss-datafusion --offline --locked --test write_sql insert_log_and_upsert_kv_from_sql -- --ignored --test-threads=1
 ```
 
-Documentation result updates after export do not change its tested native code.
-After adding the measured continuous-reader mode, the latest export is
-`/tmp/opencode/native-source-8881fb542df84f43b689e4291533af43`, 4,284 files,
-SHA256 `4ac0ada63aefeb5f7e635e62ad4f058772215117ef66a8738b47e50b31e82103`.
-Its offline all-target clippy and example build pass using the isolated target;
-the new unbounded reader/INSERT RELEASE profile also passed its full 60s/300s run.
-One equivalent divisibility expression was changed to `is_multiple_of` after
-clippy identified it; no profile policy/data path was changed. All source checks
-and the client/test-cluster all-target clippy, formatting and diff checks pass.
+Actualizar resultados documentales tras export no cambia el código nativo probado.
+Tras añadir modo reader continuo medido, último export fue
+`/tmp/opencode/native-source-8881fb542df84f43b689e4291533af43`, 4.284 archivos,
+SHA256 `4ac0ada63aefeb5f7e635e62ad4f058772215117ef66a8738b47e50b31e82103`. Su clippy
+all-target offline y build ejemplo pasaron con target aislado; perfil RELEASE nuevo
+reader no acotado/INSERT pasó ejecución completa 60s/300s. Luego clippy identificó
+expresión divisibilidad equivalente, cambiada a `is_multiple_of`; no cambió política
+ni ruta de medición. Comprobaciones de fuentes y clippy all-target cliente/test-cluster,
+formato y diff pasaron.
 
-These exports are not a clean Git checkout
-of an authorized commit. They are historical source evidence, not a replacement
-for the clean Git/profile verification recorded below.
+Estos exports no son checkout Git limpio de un commit autorizado: son evidencia
+histórica de fuentes, no sustituto de verificación Git/perfiles limpios documentados abajo.
 
-## Canonical documentation
+## Documentación canónica
 
-- API/capabilities/delivery boundaries: `rust-contract.md`, with read/DML details
-  in `reading-semantics.md`, `delete-contract.md`, `merge-contract.md`.
-- Observations/metric meanings: `write-observation-contract.md`.
-- Engine acceptance map: `native-engine-acceptance.md`.
-- Permission/fault and pressure evidence: `native-failure-verification.md`,
+- Contratos API/capacidades/entrega: `rust-contract.md`; detalle lectura/DML en
+  `reading-semantics.md`, `delete-contract.md`, `merge-contract.md`.
+- Observaciones/significado de métricas: `write-observation-contract.md`.
+- Mapa aceptación motor: `native-engine-acceptance.md`.
+- Evidencia permisos/fallos/pressure: `native-failure-verification.md`,
   `read-pressure-verification.md`, `write-pressure-verification.md`.
-- Measured workloads/results: `native-profile-plan.md`; historical remote/STS
-  results stay in `production-readiness.md` with their actual scope/build mode.
-- Entry points/build/example commands: root README. Its acceptance scope names
-  native DataFusion directly rather than requiring an external Rust job engine.
+- Cargas/resultados medidos: `native-profile-plan.md`; resultados remotos/STS
+  históricos están en `production-readiness.md` con alcance/modo de build reales.
+- Entradas/comandos build/ejemplo: README raíz. Su alcance de aceptación nombra
+  DataFusion nativo, no exige motor de trabajos Rust externo.
 
-This inventory resolves the native cleanup dispositions. Acceptance is supported
-by the versioned source, scoped profiles and final clean-checkout verification;
-release/delivery outside this native cycle retains its own gates.
+Este inventario resuelve disposiciones de limpieza nativa. Aceptación se sustenta en
+fuente versionada, perfiles acotados y verificación final checkout limpio; release/
+entrega fuera de ciclo nativo mantiene gates propios.
 
-The now-versioned series has [clean Git verification](native-checkout-verification.md).
-All listed native/code/example/fault checks passed. The initial RustFS preflight
-failure is preserved as history; the unchanged remote smoke subsequently passed
-after the user restored the endpoint. No external lab installations or settings
-were modified to obtain that result, and no owned fixtures remain.
+Serie versionada tiene [verificación Git limpia](native-checkout-verification.md).
+Las comprobaciones enumeradas de código nativo/ejemplo/fallos pasaron. Fallo inicial
+preflight RustFS se conserva como historia; smoke remoto sin cambios pasó después de
+que usuario restauró endpoint existente. No se modificaron instalaciones/configuración
+externas para lograrlo y no quedan fixtures propios.

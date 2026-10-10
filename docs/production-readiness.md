@@ -1,251 +1,84 @@
-# Production-readiness status
+# Estado de preparación para producción
 
-The native DataFusion providers scan Fluss logs and current KV state, and
-implement SQL `INSERT INTO` through the existing Rust Fluss writers. Their
-consistency guarantees are described in
-[reading-semantics.md](reading-semantics.md). A KV scan has one snapshot **per
-bucket**, not an atomic cross-bucket snapshot.
+Los providers nativos de DataFusion leen logs Fluss y estado KV vigente, e
+implementan SQL `INSERT INTO` mediante los writers Rust existentes de Fluss.
+Sus garantías de consistencia se describen en
+[semántica de lectura](reading-semantics.md). Un scan KV tiene un snapshot
+**por bucket**, no un snapshot atómico entre buckets.
 
-Active scope is native Rust plus validation of DataFusion in this repository.
-FFI/Python packages and experimental host integration have been removed; their
-historical checks do not constitute current acceptance. Native permission/fault,
-engine lifecycle and sustained-profile evidence is recorded in
-`native-failure-verification.md`, `native-engine-acceptance.md` and
-`native-profile-plan.md`. Clean Git reproduction of the versioned series remains
-the final gate; deployment guarantees stay scoped to the recorded server profile.
+El alcance activo es Rust nativo y validación de providers DataFusion. Su
+aceptación no certifica el runtime de Hotlap. Se retiraron paquetes FFI/Python e
+integración experimental con host; sus verificaciones históricas no constituyen
+aceptación actual. La evidencia nativa de permisos/fallos, ciclo de vida del motor
+y perfiles sostenidos se registra en
+`native-failure-verification.md`, `native-engine-acceptance.md` y
+`native-profile-plan.md`. La reproducción Git limpia está registrada aparte; las
+garantías de despliegue se limitan al perfil de servidor documentado.
 
-## Verified in the isolated native-sni laboratory
+## Evidencia de integración nativa
 
-- Mixed-layout partitions: existing two-bucket partitions remain readable
-  after changing the table default to three buckets. The live test writes to
-  bucket 2 of the new partition and reads it through both SQL providers.
-- A pre-existing Rust writer writes to both old and new partitions, and point
-  lookups find the written KV keys using each partition's routing count.
-- Awaiting a write reports its ACK. `flush()` reports a failed ACK even if it
-  arrived before the flush began; cancelling a flush releases flush mode.
-- KV pagination, updates, deletes, schema evolution and cancellation. Losing
-  the tabletserver leader invalidates an open KV snapshot; a *new* scanner
-  succeeds after recovery, rather than continuing on a different snapshot.
-- DataFusion's memory pool accounts for decoded reader queues and retained
-  source backing buffers after admission. Leases follow the last Arrow buffer
-  owner, including clones/slices/projections retained after stream cancellation.
-  Restrictive pools fail explicitly; transient decode/raw client allocations
-  remain outside pre-allocation protection and total RSS is not bounded by this
-  counter. A stalled KV consumer does not pull another page.
-- Batch logs capture earliest retained and latest offsets. If retention passes a
-  captured start before subscription, the read fails. A unit test injects an
-  out-of-range response *after* another bucket produced data and checks that
-  the Arrow batch reader fails instead of swallowing the error.
-- The streaming source declares itself unbounded and waits through idle polls;
-  an isolated log created in native-sni delivered rows appended after the
-  query started, without EOF between writes. Source-side delivery events
-  carried the correct next offsets and execution ID. Pausing its consumer left
-   the shared 8 MiB DataFusion pool reservation stable. Dropping the stream
-   releases its queue; retained output buffers remain charged until released.
-   An explicit batch scan resumed from offset 1 without replaying
-  row 0, while an invalid offset failed; a fresh partition added during an
-  open partitioned streaming scan caused an explicit topology error instead
-   of disappearing silently. The filtered stream used DataFusion session
-   `batch_size=1`; its default `FilterExec` coalescing can delay small
-  nonterminating results until more rows arrive (see reading semantics).
-  This is not an engine checkpoint, continuous KV changelog, or a sustained
-  streaming resource profile.
-- Evolved log schemas read historical rows without pushing newly added fields
-  into the server projection. A fresh DataFusion provider returns those
-  fields as null for older rows; an old plan keeps its original schema or
-  fails. After dropping and recreating a table with the same name, old log
-  and KV plans reject the new table identity. Concurrent executions of one
-  physical log source with distinct TaskContexts return complete results.
-- An ignored failover test in the isolated native-sni lab restarts only the
-  active coordinator while a bounded log stream is open. The original stream
-  completes with every captured bucket row or fails; once cluster health is
-  Green, a fresh scan returns all 512 rows. A separate test rejects an
-  untrusted TLS CA without displaying the SASL password.
-- An execution-time budget (default 16,384 selected partition/bucket pairs)
-  rejects larger scans instead of silently omitting buckets. Use
-  `with_max_assigned_buckets` to choose a deliberate larger budget.
-- SQL `INSERT INTO` appended log rows, performed an `INSERT ... SELECT`
-  between Fluss tables and upserted KV keys; counts reflected acknowledged
-  inputs, while subsequent SQL scans checked actual values. Two concurrent
-  inserts used separate writers. A physical INSERT plan refused to write to
-  a table dropped and recreated under the same path. Mixed-partition Arrow
-  batches routed across old two-bucket and new three-bucket layouts for both
-  log and KV. A 4 MiB SQL input completed with only a 2 MiB Fluss writer
-  buffer (routing rows on Tokio's blocking pool instead of stalling its
-  sender). One `INSERT ... SELECT` from an unbounded Fluss log delivered
-  and acknowledged each batch before source EOF; cancellation stopped the
-   query and later source writes did not reach the destination.
-   Partial writes cannot be rolled back or reported as
-  a fully successful operation.
-- Subsequent Rust working-tree hardening charges retained sink batches to the
-  query pool and shares a deadline between enqueue/ACK. The 4 MiB input still
-  completed with a 2 MiB writer buffer, released pool reservations, and a
-  one-byte DataFusion pool rejected an INSERT before its row was written.
-  Unit tests reject fire-and-forget ACK policies and nulls in required columns.
-  SQL DELETE KV passed exact filtering, no matches, all rows and partitioned
-  deletion after rescale; configured/implicit ignore policies are rejected.
-   The final native Docker matrix verifies cancellation under blocked ACK and
-   saturated buffers, independent writers, timed preparation/metadata and pool
-   recovery. Detailed current ownership/bounds are in [write pressure](write-pressure-verification.md).
-- Rust working-tree MERGE passed a finite VALUES source combining UPDATE,
-  DELETE and INSERT, a false-predicate/no-op clause, first-clause precedence,
-  NOT MATCHED BY SOURCE deletion, and explicit rejection of duplicate
-  modifying keys with the tested current batch left unapplied. It composes
-  DataFusion join/filter/CASE operators; no new SQL evaluator was added.
-  Primary-key changes, incomplete INSERT column lists and unbounded MERGE
-   sources are explicitly unsupported. Final late-duplicate/concurrency/partial
-   ACK and source/key/scratch ownership cases pass; [MERGE contract](merge-contract.md)
-   records the native non-CAS and nontransactional boundaries.
-- Final [continuous INSERT acceptance](streaming-write-acceptance.md) uses the
-  real Fluss source toward log/KV old2/new3 destinations, sparse ACK/idle/cancel
-  and explicit earliest replay. The final SQL suite has eight opt-in cases;
-  controlled native Docker faults complement actual-source delivery/routing.
-- [Write observations](write-observation-contract.md) keep previous ACKs and
-  classify attempted unconfirmed batches conservatively. [DELETE](delete-contract.md)
-  includes the generic native DataFusion empty-input/restriction backport, whose
-  source/version/checksum provenance is in [vendor/README.md](../vendor/README.md).
+Los casos de providers, consultas SQL, escrituras y runtime del laboratorio se
+conservan en [evidencia nativa](production-native-evidence.md).
 
-Rust-first planning cleanup (`re7r`, working tree) passed 15 unit tests and all
-four real `write_sql` integrations in debug with eight jobs. DELETE/MERGE helper
-graphs invoke a caller-installed planner; DELETE uses its native UDF registry,
-and MERGE uses a three-partition MemTable source with aliases. Native sink
-distribution consumes every partition without connector-inserted coalescing;
-the same physical INSERT plan was executed twice and all six operations verified.
-Capabilities are exposed as an immutable metadata/mode view, not authorization.
-See [the audit resolution](rust-implementation-audit.md#7-resolution-in-re7r-2026-10-04-working-tree)
-for dispositions and the upstream DELETE alias limitation. This does not certify
-the consuming engine or resolve the remaining whole-system acceptance tasks.
+## Evidencia de almacenamiento remoto
 
-## Verified in a separate Docker server profile
+Los ensayos Docker de retención, S3/STS y fallos HTTP se conservan en
+[evidencia remota](production-remote-evidence.md).
 
-The ignored `remote_retention` tests use the Fluss 1.0 server image, either a
-local filesystem shared with its tabletserver or the existing RustFS S3
-endpoint, 120-byte log segments and one-second tiering/retention checks. The
-S3 test isolates objects under a unique prefix in `fluss-lab` and removes
-that prefix afterward. Both tests verify the **actual remote-download byte
-counter** while DataFusion returns exactly the projected and filtered rows.
-With a stalled remote consumer it checks the four-file prefetch bound, stable
-DataFusion reservation and cleanup of temporary files after cancellation.
-With `table.log.ttl` changed from disabled to two seconds mid-read, a scanner
-limited to one prefetched remote segment and one row per pull keeps unread
-segments out of its cache. After retention advances, that in-progress scan
-fails with an out-of-range or missing-segment error instead of returning an
-incomplete result; a new query returns exactly the rows still retained. A
-continuous log scan paused on its first remote row also fails explicitly
-after that retention advance, instead of silently skipping lost records.
-This was verified in the RustFS profile with the published `.6` image and
-the prefix-scoped read-only STS policy. A one-segment pending-request budget
-and a one-byte remote prefetch budget both fail a large remote scan rather
-than silently truncating it. Remote request slots are released on
-cancellation, and temporary S3
-credentials received as either `security_token` or `session_token` are passed
-to OpenDAL as its S3 `session_token` property. If both names are present with
-different values, the client rejects them without logging either token.
-The credential manager publishes Fluss's token expiration with each update.
-If refresh fails and the previous token expires, new remote downloads wait
-up to `scanner_remote_log_operation_timeout_ms` for a valid replacement;
-the manager also bounds its own token-fetch RPC with this setting, and
-shutdown interrupts a blocked fetch. Credentials' `Debug` output redacts
-access keys and session tokens. Readers never send the stale token to
-OpenDAL. The scanner's overall DataFusion
-timeout still bounds the full read, including credential waits and retries.
-Unit tests inject temporary OpenDAL failures, confirm recovery within the
-configured retry budget and a subsequent successful read, then separately
-exercise the exhausted budget and a blocked credential refresh.
-An ignored fault profile routes S3 HTTP through a short-lived test proxy to
-the **existing** RustFS. It injects two 503 responses followed by recovery,
-persistent 503 until the retry budget is exhausted, and a held response for
-timeout/cancellation; a new DataFusion query succeeds afterward. STS calls
-still go directly to RustFS, and only STS-signed reads under the test prefix
-receive injected failures. The same profile also made an **unbounded** log
-scan fail explicitly after exhausting three real HTTP 503 attempts, without
-returning a partial batch. This test ran in about 36 seconds with 32 rows
-against the published `.6` image.
+## Límites de runtime que configurar
 
-The separate ignored real-expiry profile pauses an active log scan after its
-first STS-signed remote row. Fluss's default AssumeRole request lasts one hour;
-for this profile a test-only STS endpoint requests genuine **900-second**
-sessions from the same RustFS, preserving the inline read-only policy. The
-initial server-issued token listed the test prefix before expiry and was
-rejected by live RustFS afterward (`InvalidRequest`); Fluss fetched a second
-session, and the *same paused scan* returned all 32 rows. The S3 proxy observed
-different session-token fingerprints before and after expiry. This completed
-against the published `.6` image in approximately 938 seconds.
+La [matriz nativa de permisos/fallos](native-failure-verification.md) verifica
+SQL real SASL/ACL de solo lectura, causas tipadas de autorización, escrituras
+parciales, pérdida de socket y recuperación explícita tras reiniciar el mismo
+tablet. Su prueba de crash `.6` con una réplica requiere una ventana de checkpoint
+del servidor de seis segundos para el prefijo ACKed: un crash inmediato recuperó
+antes offset cero. ACK no es checkpoint del motor ni promesa de durabilidad
+inmediata ante crash. Promoción de líder replicado y durabilidad en disco requieren
+aceptación del perfil de servidor elegido.
 
-The RustFS lab also has a bucket-scoped `fluss-read` IAM **user** and policy:
-its direct and assumed credentials read but cannot write (403). This user is
-not the Fluss server's uploader. RustFS accepts `RoleArn` for compatibility,
-but sessions signed with server root keys still inherit root permissions
-unless the `AssumeRole` call also carries an inline `Policy`. The published
-`ghcr.io/midnattsol/fluss:1.0.0-midnattsol.6` image contains the optional
-`s3.assumed.role.policy` fix (revision `ff40eadf0`). With a policy restricted
-to the isolated test prefix, it uploaded log segments and issued tokens that
-read a real RustFS object but were denied PutObject and DeleteObject; the
-DataFusion S3/TTL scan passed. The same published `.6` image also passed the
-S3/TTL scan with no policy, preserving the default behavior. The `.5` image
-still issues unrestricted root-derived sessions; `.6` requires explicit
-policy configuration before claiming least privilege in production.
-The remote downloader reports a missing segment as an incomplete scan (the
-object may have expired or been removed); it preserves the storage error as
-the cause without assuming that TTL was the reason. Permanent storage errors
-are not retried.
-
-## Runtime limits to configure
-
-The native [permissions/failure matrix](native-failure-verification.md) verifies
-real read-only SASL/ACL SQL, typed authorization causes, partial write outcomes,
-socket loss and explicit recovery after same-tablet restart. Its single-replica
-`.6` crash test requires a six-second server checkpoint window for the initial
-ACKed prefix: an immediate crash previously recovered offset zero. An ACK is not
-an engine checkpoint or a promise of immediate crash durability. Replicated leader
-promotion and disk durability require acceptance under the chosen server profile.
-
-The default DataFusion memory pool is unbounded. Supply a bounded
-`RuntimeEnv` memory pool, set `target_partitions` (and optionally
-`with_max_partitions`), and choose a positive scan timeout. A reservation
-covers **one decoded source batch per active stream**; it does not include
-Fluss's compressed fetch buffer, remote prefetch or memory held by downstream
-operators. Set the Rust client's `scanner_log_fetch_max_bytes`,
+El pool de memoria DataFusion predeterminado no tiene límite. Configure un pool
+acotado en `RuntimeEnv`, ajuste `target_partitions` (y opcionalmente
+`with_max_partitions`) y use timeout positivo de scan. Una reserva cubre **un
+lote fuente decodificado por stream activo**; no incluye buffer fetch comprimido
+de Fluss, prefetch remoto ni memoria de operadores downstream. Ajuste
+`scanner_log_fetch_max_bytes`,
 `scanner_log_fetch_max_bytes_for_bucket`,
-`scanner_remote_log_prefetch_num` (downloaded file slots) and
-`scanner_remote_log_max_pending_segments` (outstanding request cap, default
-8192), and `scanner_remote_log_max_prefetch_bytes` (downloaded remote bytes
-per scanner, default 64 MiB). An oversized remote segment fails the scan
-rather than bypassing the limit: the scanner initially reserves its advertised
-size, then reserves any extra bytes **before writing each downloaded chunk**.
-Failure or cancellation removes partial files and releases the reservation.
-This limits the scanner's remote temporary files, not other users of the same
-disk or temporary memory used by OpenDAL's read chunks. A single oversized
-server record can exceed a fetch size hint before the pool rejects its decoded
-Arrow batch.
-`scanner_remote_log_read_chunk_bytes` (default 8 MiB, maximum 64 MiB) sets
-the per-reader chunk size; combine it with `scanner_remote_log_read_concurrency`
-and `remote_file_download_thread_num` (defaults 4 and 3) when budgeting memory
-outside the DataFusion pool. At the defaults their product is 96 MiB of
-potential in-flight chunk data **per scanner**. This is a sizing input, not
-a strict process-memory bound: decompression, fetch responses and OpenDAL's
-internal allocations are additional. Set
-`scanner_remote_log_operation_timeout_ms` (default 30000ms) for individual
-remote reader/open/read operations and credential fetch/wait; this is not a
-query-wide timeout.
-`scanner_remote_log_max_retries` controls retries *after* the first attempt
-(default 10; `0` means one attempt). `scanner_remote_log_retry_backoff_base_ms`
-and `scanner_remote_log_retry_backoff_max_ms` configure exponential backoff
-with jitter (defaults 100ms and 5000ms); base must be positive and max at
-least base, up to 3600000ms. These settings apply only to retriable remote
-download failures.
-Cancelling a scan interrupts a queued retry instead of waiting for its
-backoff. The DataFusion scan timeout still bounds the complete source read.
+`scanner_remote_log_prefetch_num` (slots de archivos descargados) y
+`scanner_remote_log_max_pending_segments` (límite de solicitudes pendientes,
+8192 por defecto) y `scanner_remote_log_max_prefetch_bytes` (bytes remotos por
+scanner, 64 MiB por defecto). Segmento remoto sobredimensionado falla el scan:
+scanner reserva tamaño anunciado y reserva bytes extra **antes de escribir cada
+  chunk descargado**. Fallo/cancelación elimina archivos parciales y libera reserva.
+Esto limita temporales remotos del scanner, no a otros usuarios del disco ni
+memoria temporal de chunks OpenDAL. Un registro servidor sobredimensionado puede
+superar hint de fetch antes de que pool rechace batch Arrow decodificado.
+`scanner_remote_log_read_chunk_bytes` (8 MiB por defecto, máximo 64 MiB) define
+tamaño de chunk por reader; combínelo con `scanner_remote_log_read_concurrency`
+y `remote_file_download_thread_num` (4 y 3 por defecto) al estimar memoria fuera
+del pool DataFusion. Por defecto, su producto es 96 MiB de datos potencialmente en
+vuelo **por scanner**. Es referencia de dimensionamiento, no
+límite estricto de memoria del proceso: descompresión, respuestas fetch y
+asignaciones internas OpenDAL son adicionales. Configure
+`scanner_remote_log_operation_timeout_ms` (30.000 ms por defecto) para cada
+operación remota reader/open/read y fetch/espera de credenciales; no es un
+timeout global de consulta.
+`scanner_remote_log_max_retries` controla reintentos *tras* el primer intento
+(10 por defecto; `0` significa un intento). `scanner_remote_log_retry_backoff_base_ms`
+y `scanner_remote_log_retry_backoff_max_ms` configuran backoff exponencial con
+jitter (100/5000 ms por defecto); base positiva
+y máximo no menor que base, hasta 3.600.000 ms. Solo aplican a fallos reintentables
+de descarga remota. Cancelar scan interrumpe reintento en cola, sin esperar backoff.
+Timeout DataFusion sigue limitando lectura de fuente completa.
 
-The source uses the Rust client copied in this repository. The Rust integration
-pins DataFusion 55.1 and Arrow 59 in `Cargo.lock`, with the documented native core
-backport. Do not substitute a bounded preview for a complete SQL table scan.
+La fuente usa cliente Rust integrado en el repo. La integración fija DataFusion
+55.1 y Arrow 59 en `Cargo.lock`, con backport nativo documentado. No sustituya
+scan completo de tabla SQL por preview acotado.
 
-## Verification commands
+## Comandos de verificación
 
-Functional compilation uses `CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0`.
-The complete native engine coverage and caller runtime/planner/UDF checks are
-mapped in [native engine acceptance](native-engine-acceptance.md).
+Compilación funcional usa `CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0`.
+Cobertura del motor nativo y verificaciones de runtime/planner/UDF del llamador
+están en [aceptación del motor nativo](native-engine-acceptance.md).
 
 ```bash
 cargo fmt --all --check
@@ -257,20 +90,19 @@ cargo test --manifest-path clients/rust/Cargo.toml -p fluss-rs --lib client::tab
 cargo test --manifest-path clients/rust/Cargo.toml -p fluss-rs --lib client::write::
 ```
 
-With the isolated native-sni lab running and ignored credentials in
-`../lab/.env`:
+Con laboratorio native-sni aislado activo y credenciales ignoradas en `../lab/.env`:
 
 ```bash
 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 KUBECONFIG=/tmp/opencode/native-sni.kubeconfig uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --test live_log_sql -- --ignored --test-threads=1
 KUBECONFIG=/tmp/opencode/native-sni.kubeconfig CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test --manifest-path clients/rust/Cargo.toml -p fluss-rs --lib client::table::kv_scanner::tests::leader_restart_invalidates_snapshot_without_restarting_reader -- --ignored
 ```
 
-The first command restarts **only** the active coordinator pod for its failover
-test; the second restarts **only** a tabletserver pod. Both require the isolated
-`k3d-native-sni` context and wait for recovery.
+El primer comando reinicia **solo** el pod coordinador activo para failover; el
+segundo reinicia **solo** un pod tabletserver. Ambos requieren contexto aislado
+`k3d-native-sni` y esperan recuperación.
 
-Run the independent Docker storage profile separately from the native-sni
-tests (both may bind port 9123):
+Ejecute perfil Docker de almacenamiento aparte de pruebas native-sni (ambos pueden
+usar puerto 9123):
 
 ```bash
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 cargo test -p fluss-datafusion --locked --test remote_retention datafusion_reads_remote_and_rejects_lost_retention -- --ignored
@@ -278,88 +110,28 @@ FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 CARGO_BUIL
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_STS_READONLY_POLICY=1 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_reads_and_expires_rustfs_s3 -- --ignored
 ```
 
-The third command enables a policy limited to the test's unique prefix and
-verifies **the token returned by Fluss**, including a successful GetObject and
-denied PutObject/DeleteObject. The published `.6` also passed this test without
-`FLUSS_STS_READONLY_POLICY`, exercising the backward-compatible default.
+El tercer comando habilita política limitada al prefijo único de prueba y verifica
+**el token devuelto por Fluss**, con GetObject exitoso y PutObject/DeleteObject
+denegados. Imagen `.6` publicada también pasó sin `FLUSS_STS_READONLY_POLICY`,
+verificando default retrocompatible.
 
-Run the short real-HTTP fault profile separately, using a host IP reachable
-from Docker for `FLUSS_FAULT_PROXY_HOST` (the reference host used
+Ejecute aparte el perfil corto de fallos HTTP reales, usando IP host accesible
+desde Docker para `FLUSS_FAULT_PROXY_HOST` (host de referencia:
 `192.168.68.55`):
 
 ```bash
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_FAULT_PROXY_HOST=<host-IP> CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_handles_real_rustfs_http_failures -- --ignored
 ```
 
-Run the separate, approximately 16-minute real STS-expiry profile only when
-that long verification is needed. Add `FLUSS_STS_PREFLIGHT=1` for a short setup
-check that stops before expiry:
+Ejecute el perfil separado de expiración STS real (~16 min) solo si hace falta
+esa verificación larga. Añada `FLUSS_STS_PREFLIGHT=1` para validar setup y parar
+antes de expirar:
 
 ```bash
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 FLUSS_FAULT_PROXY_HOST=<host-IP> CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --test remote_retention datafusion_renews_real_rustfs_sts_after_expiry -- --ignored --nocapture
 ```
 
-## Reference resource-pressure profile
+## Perfil de presión de recursos
 
-The ignored `datafusion_resource_pressure_rustfs` test creates its **own**
-Docker Fluss cluster and a unique, removable prefix in the existing RustFS
-bucket. It runs against the native Rust DataFusion provider.
-Its default profile writes 4,800 log rows of 128 KiB (600 MiB decoded, larger
-than the 512 MiB pool) and 64 KV rows (8 MiB). Four queries run concurrently
-(two logs, two KV), with two physical partitions per query. It uses a shared
-512 MiB DataFusion pool, 1 MiB remote chunks, two read operations and two
-downloads per scanner, and two prefetched segments/64 MiB per scanner. After
-five minutes of warmup it measures for 30 minutes; a scan wave completes
-before another starts. Every scan checks row IDs, values and duplicates;
-each wave exercises early cancellation and checks that Arrow reservations and
-remote temporary files are released. The test also forces an explicit memory
-pool rejection using a separate tiny pool.
-
-On the reference machine with the test process pinned to four permitted CPUs
-(`taskset -c 0-3`), two full runs passed. The latest run measured 112 scans in
-1,854 seconds, 832,049,024 remote bytes fetched, sampled RSS peak 170 MiB,
-kernel-reported RSS high-water mark about 169 MiB, sampled pool peak 19 MiB,
-and sampled remote temporary-file peak 636,819 bytes. RSS after warmup was
-120 MiB and after measurement 122 MiB. The test rejects RSS above 1.5 GiB,
-remote temporary-file bytes above 2 GiB, nonzero reservations or temporary
-bytes after each wave, or an RSS increase above 256 MiB after warmup. The 2 GiB memory
-budget was **checked by RSS/high-water mark**, not imposed as a cgroup limit;
-the temporary-file limit covers the client scanner, not all process disk use.
-The two RSS measurements are separate kernel observations and are rounded to
-MiB; do not treat a one-MiB difference as an exact ordering of peaks.
-
-Those measurements are the historical DEBUG baseline. Final-route performance
-acceptance uses RELEASE; [the native profile plan](native-profile-plan.md) fixes
-the new measured workload and limits before running it. Do not compare build modes
-as if only the connector implementation changed.
-
-Run the long profile alone, with four CPU IDs allowed by the host affinity:
-
-```bash
-FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 CARGO_BUILD_JOBS=8 uv run --no-project --env-file ../lab/.env taskset -c 0-3 cargo test -p fluss-datafusion --locked --release --test remote_retention datafusion_resource_pressure_rustfs -- --ignored --nocapture
-```
-
-For a functional smoke run before committing to 35 minutes, set
-`FLUSS_PRESSURE_ROWS=64 FLUSS_PRESSURE_WARMUP_SECS=2 FLUSS_PRESSURE_MEASURE_SECS=5`.
-Its output is marked `full=false` and **does not** meet the resource-profile
-acceptance criterion.
-
-## Remaining verification before a general production claim
-
-The measured profile is evidence for this **Rust, Docker Fluss, RustFS**
-configuration, not a strict bound on every transient allocation or another
-deployment. Compressed fetch buffers and OpenDAL remain outside the DataFusion
-pool; an Arrow batch is decoded before the pool can reserve it. The native-sni
-coordinator failover test covers a live two-coordinator lab, not the Docker
-profile's single coordinator. The short HTTP profile verifies real transport
-503/timeout/cancellation. The separate 900-second STS profile verifies actual
-expiry and successful renewal on one paused scan; failed credential renewal
-and the deadline after expiry are covered by deterministic client tests.
-A `.6` deployment must explicitly configure
-`s3.assumed.role.policy` to restrict root-signed STS sessions. The recorded
-35-minute Rust/Docker/RustFS workload is scoped evidence, not complete engine
-acceptance. Native DataFusion validation covers caller planning/runtime policy,
-concurrency, source/sink backpressure, cancellation/reexecution and recovery.
-Persistent jobs/checkpoints/reconciliation remain application responsibilities;
-no new scheduler is required for this gate. Other deployment profiles require their
-own acceptance evidence. Bindings are not an active deliverable or prerequisite.
+Resultados y valores medidos del perfil de referencia: [evidencia de presión de
+recursos](production-profile-evidence.md).

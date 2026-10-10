@@ -1,94 +1,89 @@
-# Native DataFusion engine acceptance — ydvk
+# Aceptación de providers nativos de DataFusion
 
-Original verification SHA identifiers are preserved below. Resolve them in the
-current cleaned Git history using [the old→new map](history-commit-map.tsv);
-upstream DataFusion/provenance identifiers are unaffected.
+Los identificadores históricos de verificación y la proveniencia de providers
+se registran a continuación.
 
-For the `ydvk` gate the engine was this repository's DataFusion
-SessionContext/SessionState and RuntimeEnv, executing the real Fluss Rust
-providers. No external application or new scheduler/checkpoint implementation was
-required for this gate. Hotlap now ships its own Arrow-native incremental engine
-(`crates/hotlap-engine`) behind `crates/hotlap-core`, with `crates/hotlap` as the
-facade; the earlier `differential-dataflow` spike was removed.
+El motor probado fue `SessionContext`/`SessionState` y `RuntimeEnv` de DataFusion
+de este repositorio, ejecutando los providers Rust reales de Fluss. Estas pruebas
+no requirieron aplicación externa ni nueva implementación de planificador/checkpoints.
+El runtime de Hotlap es otra capa de integración; estos resultados no lo certifican.
 
-> **Superseded framing (2026-10-06):** for the `ydvk` gate the engine was the
-> in-repo DataFusion session. A later decision makes Hotlap an explicit engine
-> built on DataFusion, with the Arrow-native `hotlap-engine` kernel as its
-> incremental core (the earlier `differential-dataflow` spike was replaced);
-> `ydvk`'s scope and evidence are unchanged. See
-> [incremental core decision and boundary](hotlap-incremental-core.md).
+> Estos resultados corresponden solo a providers nativos de DataFusion y sesiones
+> del llamador; no son evidencia de aceptación del runtime Hotlap.
 
-## Stack and reproducibility boundary
+## Stack y límite de reproducibilidad
 
-Working-tree evidence on 2026-10-05, based on
-`adc4f70f760904e795a9cd81a7ce728581286f55` (changes not committed): DataFusion
-55.1.0, resolved Arrow 59.3.0, Fluss Rust client 1.0.0 and Docker Fluss
-`ghcr.io/midnattsol/fluss:1.0.0-midnattsol.6`. The native DataFusion planner
-backport and original archive checksum are documented in [vendor provenance](../vendor/README.md).
-The root and client Cargo locks pin the active native graphs.
+Evidencia del árbol de trabajo del 2026-10-05, basado en
+`adc4f70f760904e795a9cd81a7ce728581286f55` (cambios sin commit): DataFusion
+55.1.0, Arrow 59.3.0 resuelto, cliente Fluss Rust 1.0.0 y Fluss Docker
+`ghcr.io/midnattsol/fluss:1.0.0-midnattsol.6`. El backport del planner nativo
+DataFusion y el checksum del archivo original
+están documentados en [proveniencia vendor](../vendor/README.md). Los Cargo.lock
+raíz y del cliente fijan los grafos nativos activos.
 
-Caller-session/operator/example coverage is versioned in `1a4556b`, following
-retirement `2a85deb` and failure hardening `043a346`. Profile harnesses and the
-ScanKv instrumentation are versioned in `4b78eca`. The recorded working-tree runs
-below precede those commits; clean Git verification is reported separately.
+La cobertura de sesión del llamador/operadores/ejemplos está versionada en commits
+`2a85deb`, `043a346` y `1a4556b`, posteriores al retiro, endurecimiento de fallos y trabajo
+del motor. Los harnesses de perfiles e instrumentación ScanKv están en `19dca49`.
+Las ejecuciones del árbol registradas abajo preceden esos commits; la verificación
+Git limpia se informa aparte.
 
-Clean-checkout reproduction remains `rm21`, after authorized commits include
-the source/test changes and `e38t` removal. Running this working tree is not
-evidence that the current HEAD alone reproduces the new tests.
+Hace falta reproducir desde checkout limpio con los cambios fuente y el retiro ya
+confirmados. Ejecutar este árbol no demuestra que el HEAD actual por sí solo
+reproduzca las nuevas pruebas.
 
-## Engine-level coverage
+## Cobertura a nivel de motor
 
-| Contract | Actual engine execution / assertion |
+| Contrato | Ejecución/assertion real del motor |
 | --- | --- |
-| Caller session/planner/UDF/runtime | `write_sql::insert_log_and_upsert_kv_from_sql` combines RecordingPlanner, registered `is_two` UDF, target partitions 4 and the caller's bounded 16 MiB GreedyMemoryPool. Pool identity is checked. DELETE and MERGE helper graphs pass through the caller's planner; both use its UDF. |
-| Native sink distribution | That test supplies three input partitions; the standard optimizer enforces the sink's single-partition requirement. Executing the same physical INSERT twice stores two copies, with explicit final-data checks. |
-| Operators and NULL semantics | `live_log_sql::empty_log_and_new_offsets_on_each_query` compares seven real Fluss SELECTs against the same engine reading an Arrow reference: projections, residual comparisons, NULL filters, grouped COUNT/SUM, inner/left joins and ORDER BY NULLS FIRST/LIMIT. |
-| Host resource policy | The reference test uses target partitions 2, batch size 64, a 16 MiB pool and native sort spill reservations of 1 MiB per partition. Reservations return to zero after results, operators, reexecutions and failures drop. |
-| Catalog / metadata / projection / metrics | `bounded_log_and_kv_sql_against_native_sni`, `partitioned_logs_and_kv_discover_each_execution` and their helpers exercise catalog registration, source schema/projection, effective bucket counts, physical parallelism and EXPLAIN ANALYZE metrics. |
-| Finite and continuous lifecycle | The live suite exercises empty starts, fresh stopping offsets per execution, three overlapping executions of one source plan, slow retained consumers, late appends, idle waits and cancellation. |
-| Snapshot/schema/topology identity | The live suite checks KV snapshot isolation/evolution, recreated/changed table rejection and streaming topology invalidation, rather than silently switching identities. |
-| Native DML and partial effects | The write SQL, authorization and pressure suites exercise INSERT/DELETE/MERGE, NULL/action ordering, routing, peer isolation, cancellation, ACK uncertainty and final stored data. See [native failure evidence](native-failure-verification.md). |
-| Failure and recovery | The live suite exercises isolated coordinator failover and explicit fresh-query recovery. Memory rejection, table invalidation and socket-loss/restart use native errors and cleanup; remote/STS evidence is linked from production readiness. |
+| Sesión/planner/UDF/runtime llamador | `write_sql::insert_log_and_upsert_kv_from_sql` combina `RecordingPlanner`, UDF `is_two` registrada, cuatro particiones destino y `GreedyMemoryPool` acotado de 16 MiB del llamador. Comprueba identidad del pool. Grafos auxiliares DELETE/MERGE pasan por planner llamador y usan su UDF. |
+| Distribución sink nativo | Esa prueba suministra tres particiones entrada; optimizador estándar impone requisito sink single-partition. Ejecutar dos veces mismo INSERT físico almacena dos copias, con comprobaciones explícitas de datos finales. |
+| Operadores y semántica NULL | `live_log_sql::empty_log_and_new_offsets_on_each_query` compara siete SELECT Fluss reales con el mismo motor leyendo referencia Arrow: proyecciones, comparaciones residuales, filtros NULL, COUNT/SUM agrupados, joins inner/left y ORDER BY NULLS FIRST/LIMIT. |
+| Política de recursos host | Prueba referencia usa dos particiones destino, lote 64, pool 16 MiB y reservas spill sort nativo de 1 MiB/partición. Reservas vuelven a cero al liberar resultados, operadores, reejecuciones y fallos. |
+| Catálogo/metadatos/proyección/métricas | `bounded_log_and_kv_sql_against_native_sni`, `partitioned_logs_and_kv_discover_each_execution` y helpers prueban registro catálogo, esquema/proyección fuente, conteos efectivos bucket, paralelismo físico y métricas EXPLAIN ANALYZE. |
+| Ciclo de vida finito/continuo | Suite live ejercita starts vacíos, offsets fin finitos nuevos por ejecución, tres ejecuciones solapadas de un plan fuente, consumidores lentos reteniendo, appends tardíos, espera idle y cancelación. |
+| Identidad snapshot/esquema/topología | Suite live comprueba aislamiento/evolución snapshot KV, rechazo de tabla recreada/modificada e invalidación topología streaming, sin cambio silencioso de identidad. |
+| DML nativo y efectos parciales | Suites SQL escritura, autorización y pressure ejercitan INSERT/DELETE/MERGE, orden NULL/acciones, routing, aislamiento peers, cancelación, incertidumbre ACK y datos finales. Ver [fallos nativos](native-failure-verification.md). |
+| Fallo y recuperación | Suite live ejercita failover coordinador aislado y recuperación explícita con consulta nueva. Rechazo memoria, invalidación tabla y pérdida socket/reinicio usan errores/limpieza nativos; evidencia remota/STS está enlazada desde preparación para producción. |
 
-### Discovered host sort-policy limit
+### Límite descubierto en la política de ordenamiento del host
 
-The first expanded live-suite run passed eight tests but its reference-operator
-test failed with ResourcesExhausted: two default 10 MiB sort spill reservations
-do not fit a 16 MiB pool. The host SessionConfig now sets
-`execution.sort_spill_reservation_bytes = 1 MiB` for these tiny reference rows.
-The provider does not modify runtime policy. This is a real cooperative pool
-rejection, not a source decoder failure or evidence of a process RSS bound.
-The targeted test then passed, followed by all nine live tests.
+La primera ejecución ampliada de suite live pasó ocho pruebas, pero la prueba de
+operador referencia falló con `ResourcesExhausted`: dos reservas sort spill default
+de 10 MiB no caben en pool 16 MiB. `SessionConfig` host configura ahora
+`execution.sort_spill_reservation_bytes = 1 MiB` para estas filas de referencia pequeñas.
+El provider no modifica política runtime. Es rechazo real de pool cooperativo, no
+fallo decoder fuente ni prueba de límite RSS proceso. Prueba dirigida pasó después,
+seguida de las nueve pruebas live.
 
-## Verified commands/results
+## Comandos y resultados verificados
 
-Functional builds: DEBUG, eight compilation jobs. The changed DML session test
-passed in **10.63s**; the complete live engine suite passed **9/9 in 81.55s**.
-The failure/permission verification separately records eight write SQL tests,
-pressure/recovery, authorization and native core/client/planner regressions.
+Builds funcionales: DEBUG, ocho jobs compilación. Prueba DML sesión modificada pasó
+en **10,63s**; suite engine live completa pasó **9/9 en 81,55s**. Verificación de
+fallos/permisos registra aparte ocho pruebas SQL escritura, presión/recuperación,
+autorización y regresiones core/cliente/planner nativas.
 
 ```sh
 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --locked --test write_sql insert_log_and_upsert_kv_from_sql -- --ignored --test-threads=1
 KUBECONFIG=/tmp/opencode/native-sni.kubeconfig CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --locked --test live_log_sql -- --ignored --test-threads=1
 ```
 
-The failover test restarts only the active coordinator in the isolated native-sni
-namespace. Table fixtures use unique names and remove their own tables. Lab
-credentials stay in the ignored environment file.
+Prueba failover reinicia solo coordinador activo en namespace native-sni aislado.
+Fixtures tabla usan nombres únicos y eliminan sus tablas. Credenciales de laboratorio
+permanecen en archivo entorno ignorado.
 
-The [short final-route RELEASE read profile](native-profile-plan.md) also passed:
-four concurrent log/KV SELECTs over a log dataset larger than the pool, slow
-consumers, repeated waves/cancellation and explicit resource cleanup. It measured
-128 scans in 120.3s, process VmHWM 118 MiB and reservation peak 32 MiB. This adds
-measured runtime evidence; it does not replace sustained/write-route profiles.
+También pasó [perfil corto lectura RELEASE de ruta final](native-profile-plan.md):
+cuatro SELECT log/KV concurrentes sobre dataset log mayor que pool, consumidores
+lentos, olas repetidas/cancelación y limpieza recursos explícita. Midió 128 scans en
+120,3 s, VmHWM proceso 118 MiB y pico reserva 32 MiB. Añade evidencia medida runtime,
+no sustituye perfiles sostenidos/ruta escritura.
 
-Final-route profiles now pass: the 60s/300s four-case continuous writer matrix and
-5+30-minute reader, with latency/resource/data/cleanup checks and direct allocation
-controls. The final isolated-source example also executes native log/KV SQL with
-separate host/runtime policy; see [source evidence](native-cleanup-audit.md).
+Perfiles ruta final registrados pasaron: matriz writer continuo cuatro casos 60s/
+300s y reader 5+30 min, con comprobaciones latencia/recursos/datos/limpieza y controles
+directos de asignación. Ejemplo final fuente aislada ejecuta también SQL log/KV nativo
+con política host/runtime separada; ver [evidencia de fuente](native-cleanup-audit.md).
 
-Clean Git execution of the versioned series is [recorded](native-checkout-verification.md),
-including the passing RustFS remote smoke after endpoint recovery. The native
-functional, profile and clean-source acceptance gates have verified evidence;
-profile-specific guarantees stay scoped to the recorded setup. ACK/offered offsets
-remain observations, not durable engine checkpoints or exactly-once recovery.
+Ejecución Git limpia de la serie versionada está [registrada](native-checkout-verification.md),
+incluido smoke remoto RustFS aprobado tras recuperar endpoint. Aceptación funcional
+nativa, perfiles y fuente limpia tiene evidencia verificada; garantías de perfil se
+limitan a setup registrado. ACK/offsets ofrecidos son observaciones, no checkpoints
+durables del motor ni recuperación exactly-once.

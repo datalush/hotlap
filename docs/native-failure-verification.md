@@ -1,101 +1,96 @@
-# Native permissions, failures and recovery — cf5y
+# Permisos, fallos y recuperación nativos
 
-Working-tree verification on 2026-10-05, after `adc4f70`. Functional builds use
-DEBUG and `CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0`. These results exercise
-the native Fluss client and DataFusion providers/planner/runtime.
+Verificación del árbol de trabajo 2026-10-05. Builds funcionales DEBUG con
+`CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0`. Resultados ejercitan cliente Fluss
+nativo y providers/planificador/runtime DataFusion.
 
-The implementation and tests are versioned in `043a346`; the original run results
-below are retained as pre-commit evidence. Clean-checkout results will identify
-the final tested series separately.
+Los resultados son evidencia histórica del árbol indicado. Resultados de checkout
+limpio se registran por separado.
 
-## Real permissions and preserved causes
+## Permisos reales y causas preservadas
 
-`tests/authorization.rs` creates a uniquely named, owned SASL/ACL Docker fixture
-with authorization enabled. Its admin/reader/writer credentials are fixture-only.
-The reader has Describe/Read permissions and the writer additionally has Write.
+`tests/authorization.rs` crea fixture Docker SASL/ACL propio con nombre único y
+autorización activa. Credenciales admin/reader/writer son exclusivas del fixture;
+reader tiene permisos Describe/Read y writer además Write.
 
-- Reader SELECT returns the seeded log and KV rows.
-- Reader log INSERT, KV INSERT, DELETE and MERGE fail with native
-  `AuthorizationException` available through the DataFusion error source chain.
-  This is checked with native writer idempotence both disabled and enabled.
-- Failed KV executions publish Failed terminal summaries with zero confirmed
-  operations. Both tables retain their original data after denied writes.
-- Authorized INSERT, MERGE and DELETE return their expected counts. Final KV
-  contents are exactly `(1, 'authorized')` and `(3, 'new')`.
-- Each completed/failed query releases its owned pool reservations within the
-  fixture's three-second observation bound.
+- SELECT del reader devuelve filas log/KV sembradas.
+- INSERT log/KV, DELETE y MERGE del reader fallan con `AuthorizationException`
+  nativa en cadena de errores DataFusion; se verifica con idempotencia writer
+  nativa desactivada y activada.
+- Ejecuciones KV fallidas publican resumen terminal Failed con cero operaciones
+  confirmadas; ambas tablas conservan datos originales tras denegación.
+- INSERT/MERGE/DELETE autorizados devuelven conteos esperados; KV final contiene
+  exactamente `(1, 'authorized')` y `(3, 'new')`.
+- Consulta completada/fallida libera reservas pool propias dentro de observación
+  fixture de tres segundos.
 
-This exposed three client defects: ACL result code `0` was treated as an error;
-send/connect failures could replace an API error with NetworkException; writer-ID
-allocation aborts could discard the native cause in favor of a generic broadcast
-diagnostic. ACL result parsing now accepts absent/zero codes, sender handling
-retains API error codes, and accumulator flush prioritizes its stored native cause.
-The ACL regression covers create/drop/filter results with absent, zero and nonzero
-codes; the real authorization fixture covers both writer initialization and send.
+Esto reveló tres defectos cliente: código ACL `0` se trataba como error; fallos
+send/connect podían reemplazar error API por NetworkException; abortar asignación
+writer-ID podía perder causa nativa por diagnóstico genérico broadcast. Parser ACL
+acepta ahora códigos ausentes/cero, sender conserva errores API y flush accumulator
+prioriza causa nativa almacenada. Regresión ACL cubre create/drop/filter con códigos
+ausentes/cero/no-cero; fixture autorización cubre inicialización y envío writer.
 
-## Real socket loss and explicit recovery
+## Pérdida real de socket y recuperación explícita
 
-`tests/write_pressure.rs::real_writer_connection_loss_and_recovery` is separate
-from the saturation/timeout matrix and owns its own single-tablet Docker fixture.
-For both log append and KV upsert it:
+`tests/write_pressure.rs::real_writer_connection_loss_and_recovery` es independiente
+de matriz saturación/timeout y usa fixture Docker propio de un tablet. Para
+append log y upsert KV:
 
-1. Confirms row `9900` before source EOF and gives that prefix a six-second server
-   checkpoint window.
-2. Gates row `9901` after metadata admission, stops its tablet immediately (real
-   sockets close), then releases encoding. The container filesystem is retained.
-3. Requires failed SQL with an External cause, a Failed terminal summary with one
-   confirmed and one conservatively uncertain operation, and pool cleanup.
-4. Restarts the same tablet and waits up to 60 seconds for leader/offset recovery,
-   retaining the last observed offset/error in the failure diagnostic.
-5. Uses a fresh connection and explicit new execution to write row `9902`.
-   Final SELECT is exactly `[9900, 9902]`; the gated batch never reached the stopped
-   server. Source/sink pool reservations return to zero after results are dropped.
+1. Confirma fila `9900` antes de EOF y da al prefijo ventana checkpoint server de seis segundos.
+2. Retiene fila `9901` tras admitir metadatos; detiene tablet de inmediato (cierra
+   sockets reales) y luego libera codificación. Conserva filesystem del contenedor.
+3. Exige SQL fallido con causa External, resumen terminal Failed con una operación
+   confirmada y otra conservadoramente incierta, y limpieza pool.
+4. Reinicia mismo tablet y espera hasta 60 s recuperación líder/offset; conserva
+   último offset/error observado en diagnóstico.
+5. Usa conexión fresca y nueva ejecución explícita para escribir `9902`. SELECT final
+   es `[9900, 9902]`; lote retenido no alcanzó server detenido. Reservas pool source/
+   sink vuelven a cero al liberar resultados.
 
-The recovery matrix has a 180-second fixture deadline and panic/error teardown.
-The separate pressure matrix retains its 90-second deadline and covers actual
-buffer exhaustion, blocked ACK, timeout, cancellation, peer isolation, input error
-after ACK, topology/schema invalidation and DELETE/MERGE partial-ACK races.
+Matriz recuperación tiene deadline fixture 180 s y teardown panic/error. Matriz
+presión separada conserva deadline 90 s y cubre agotamiento buffers, ACK bloqueado,
+timeout, cancelación, aislamiento peers, error input tras ACK, invalidación topología/
+esquema y carreras ACK parcial de DELETE/MERGE.
 
-### ACK versus crash durability: observed boundary
+### ACK frente a durabilidad ante crash: límite observado
 
-The first version stopped this one-replica `.6` server immediately after its warm
-ACK. After restart it repeatedly reported offset `0` for 60 seconds. Increasing
-the leader wait did not recover that prefix. With the six-second checkpoint
-window, both log and KV preserved the prefix and the final-data checks passed.
-The server's default `log.replica.high-watermark.checkpoint-interval` is five
-seconds. The test gives that window; it does not inspect checkpoint contents or
-establish a universal fsync/durability guarantee.
+Primera versión detuvo server `.6` de una réplica justo tras ACK. Tras reinicio
+reportó offset `0` durante 60 s; aumentar espera del líder no recuperó prefijo.
+Con ventana checkpoint de seis segundos, log y KV conservaron prefijo y pasaron
+comprobaciones finales. Default server `log.replica.high-watermark.checkpoint-interval`
+es cinco segundos. Prueba concede esa ventana; no inspecciona checkpoint ni demuestra
+garantía universal fsync/durabilidad.
 
-Confirmed observations remain historical ACK facts under the declared policy.
-They are not proof of an engine checkpoint or immediate crash persistence.
-Recovery in this fixture is same-tablet restart, not replicated leader promotion.
-Replication/disk durability and reconciliation must be accepted for the chosen
-server profile; this fixture does not establish those stronger guarantees.
+Observaciones confirmadas siguen siendo hechos ACK históricos bajo política
+declarada. No prueban checkpoint del motor ni persistencia inmediata ante crash.
+Recuperación aquí reinicia mismo tablet, no promueve líder replicado. Durabilidad
+de réplica/disco y conciliación requieren aceptación del perfil de servidor elegido;
+esta fixture no prueba garantías mayores.
 
-## Evidence reuse and remaining gates
+## Evidencia reutilizada y límites pendientes
 
-- Current pressure/SQL cases cover lost/blocked ACK, exhausted attempts, input
-  failure after confirmed batches, write cancellation, peer isolation and final
-  data/resource checks. The client suite also covers bounded cancelled-frame drain.
-- [Read pressure verification](read-pressure-verification.md) retains the verified
-  source cancellation, retained-buffer ownership, invalidation and native-sni
-  coordinator failover/fresh-query evidence. These scanner paths were not changed
-  by the ACL/sender fixes.
-- [Production readiness](production-readiness.md) retains the real S3 transient/
-  permanent HTTP, retention and STS expiry/renewal evidence. This pass did not
-  repeat the historical 900-second STS run or sustained resource profile.
-- `cf5y` scope is this recorded native matrix, with the explicit crash-durability
-  boundary above. Profiles, engine coverage and clean Git reproduction retain
-  their own evidence rather than expanding ACK semantics.
+- Casos presión/SQL cubren ACK perdido/bloqueado, intentos agotados, error de
+  entrada tras lotes confirmados, cancelación escritura, aislamiento peers y
+  comprobación final datos/recursos. Suite cliente cubre drenado acotado de frames cancelados.
+- [Verificación de presión de lectura](read-pressure-verification.md) conserva
+  cancelación fuente, propiedad buffers retenidos, invalidación y failover
+  coordinador native-sni/consulta nueva. Fixes ACL/sender no cambiaron esos scanners.
+- [Preparación para producción](production-readiness.md) conserva
+  HTTP transitorio/permanente, retención y expiración/renovación STS. Esta pasada no
+  no repitió perfil histórico STS de 900 s ni perfil sostenido de recursos.
+- El alcance es esta matriz nativa registrada, con el límite de durabilidad anterior.
+  Perfiles, cobertura motor y reproducción Git limpia conservan
+  evidencia propia, sin ampliar semántica ACK.
 
-## Verification
+## Verificación registrada
 
-Final runs on the changed sources: authorization **1 passed (6.20s)**; pressure
-and recovery **2 passed (121.68s)**; native-sni write SQL **8 passed (41.38s)**;
-client **836 passed, 2 ignored**; connector core **29 passed**; generic DataFusion
-DELETE/UPDATE planner **3 passed**. Root and affected client/test-cluster clippy
-all-targets passed with `-D warnings`. No owned authorization, pressure or recovery
-containers remain after the runs.
+Ejecuciones finales en fuentes modificadas: autorización **1 aprobada (6,20 s)**;
+presión/recuperación **2 aprobadas (121,68 s)**; SQL escritura native-sni **8
+aprobadas (41,38 s)**; cliente **836 aprobadas, 2 ignoradas**; core conector **29
+aprobadas**; planner genérico DELETE/UPDATE DataFusion **3 aprobadas**. Clippy
+all-targets de raíz/cliente/test-cluster afectado pasó con `-D warnings`. No quedan
+contenedores propios de autorización/presión/recuperación.
 
 ```sh
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 cargo test -p fluss-datafusion --locked --test authorization -- --ignored --test-threads=1

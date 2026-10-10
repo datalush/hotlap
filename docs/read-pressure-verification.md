@@ -1,98 +1,95 @@
-# Native read pressure/cancellation — w8ap
+# Verificación nativa de presión y cancelación de lectura
 
-2026-10-04. Rust working-tree evidence after `f63a4f5` / `6f0ef1d`.
-This is functional hardening, not final sustained performance acceptance.
+Evidencia de árbol de trabajo 2026-10-04, posterior a `f63a4f5` / `6f0ef1d`.
+Endurecimiento funcional, no aceptación final de rendimiento sostenido.
 
-## Changes and actual bounds
+## Cambios y límites efectivos
 
-| Resource / wait | Enforced behavior | Limit of the claim |
+| Recurso/espera | Comportamiento aplicado | Límite de la afirmación |
 | --- | --- | --- |
-| Decoded Arrow batches per source poll | DataFusion streaming and bounded log reader use native `poll_with_batch_limit(..., 1)` | One batch may still be large; decode precedes pool admission |
-| Streaming decoded queue | Removed the connector VecDeque; a poll returns zero/one batch directly, excess is an explicit error | Raw fetches and remote download queues are separate client resources |
-| Bulk client poll | Existing `poll()` keeps its max-100-batch behavior; limited API validates 1..=100 | Existing 64 MiB raw/decoded bulk cap remains soft |
-| Delivered buffers | Existing pool leases survive consumer retention, clones/slices and stream cancellation | Whole-batch charges conservative; not every SQL output allocation or RSS |
-| Cancellation after decode | Batch poll returns decoded data without awaiting another fetch/metadata operation | More fetches are initiated when existing buffered data is drained; throughput impact needs R2 profiling |
-| Missing schema | Existing collector returns already-decoded batches before awaiting schema lookup, preserving the raw cursor on cancellation | Metadata caches/transport still use their client mechanisms |
-| Source execution | Shared batch/KV deadline remains unchanged | Not a whole SQL-query deadline |
-| Streaming initialization/topology | Finite timeout using the connection's `scanner_remote_log_operation_timeout_ms` | This existing operation allowance is explicitly reused, not a second retry loop |
-| Streaming poll | Same operation allowance plus the normal idle-poll interval | Idle is not a completion timeout; source can idle indefinitely over successive polls |
-| Disk/prefetch | Existing remote slot and actual-written-byte permits are retained | Separate from Arrow RAM; existing readonly/isolated S3 prefixes retained |
+| Lotes Arrow decodificados por poll fuente | Streaming DataFusion y reader log acotado usan `poll_with_batch_limit(..., 1)` nativo | Lote aún puede ser grande; decode precede admisión pool |
+| Cola streaming decodificada | Se retiró VecDeque conector; poll devuelve cero/un lote; exceso es error explícito | Fetch raw/colas descarga remota son recursos cliente aparte |
+| Poll bulk cliente | `poll()` conserva máximo 100 lotes; API limitada valida 1..=100 | Cap bulk 64 MiB raw/decodificado sigue siendo blando |
+| Buffers entregados | Leases pool sobreviven retención consumidor, clones/slices y cancelación stream | Cargo por lote conservador; no cubre toda salida SQL ni RSS |
+| Cancelación tras decode | Poll batch devuelve datos decodificados sin esperar otro fetch/metadatos | Fetch nuevo inicia al drenar buffer existente; efecto throughput requiere perfil |
+| Esquema ausente | Collector devuelve lotes decodificados antes de esperar esquema y conserva cursor raw al cancelar | Cachés/transporte metadatos siguen mecanismos cliente |
+| Ejecución fuente | Deadline batch/KV compartido sin cambios | No es deadline de consulta SQL completa |
+| Inicialización/topología streaming | Timeout finito usa `scanner_remote_log_operation_timeout_ms` de conexión | Reutiliza allowance existente, no segunda pila reintentos |
+| Poll streaming | Mismo allowance más intervalo normal idle | Idle no es timeout final; fuente puede permanecer idle entre polls |
+| Disco/prefetch | Se conservan permisos remotos de slots y bytes realmente escritos | Recurso distinto de RAM Arrow; prefijos S3 aislados/solo lectura siguen vigentes |
 
-There is no network await while the batch poll holds already-consumed decoded
-output. Previously `send_fetches().await` ran after collecting batches, so an
-error/cancellation at that await could discard data while consumed offsets had
-advanced. Fetch initiation now happens on an empty/drained poll, not behind a
-paused consumer holding newly decoded output. The bounded reader's public output
-remains one batch at a time; no alternate scanner or transport is introduced.
+No hay espera de red mientras batch poll conserva salida decodificada lista para
+consumidor. Antes, `send_fetches().await` ocurría después de recopilar lotes; error/
+cancelación allí podía descartar datos con offsets consumidos avanzados. Fetch inicia
+ahora con poll vacío/drenado, no tras pausar consumidor con salida nueva. Salida
+reader acotado sigue siendo un lote por vez; no se añade scanner ni transporte.
 
-Local source errors now live in `error.rs`, separate from buffer ownership:
-`FlussScanTimeout`, `FlussOperationTimeout`, `FlussReadInvalidated` and its small
-Identity/Schema/Topology/Retention reason enum are boxed in native DataFusion
-External errors. Original Fluss/RPC/storage errors keep their existing source
-chain rather than being rewrapped in a duplicate hierarchy. Display messages
-remain compatible; invalidation never silently switches table/snapshot/offsets.
+Errores locales de fuente están en `error.rs`, separados de propiedad buffers:
+`FlussScanTimeout`, `FlussOperationTimeout`, `FlussReadInvalidated` y sus causas
+Identity/Schema/Topology/Retention se alojan en errores External DataFusion nativos.
+Errores Fluss/RPC/storage conservan cadena original, sin wrapper en jerarquía duplicada.
+Mensajes Display siguen compatibles; invalidación nunca cambia tabla/snapshot/offsets
+silenciosamente.
 
-## Fresh functional evidence (DEBUG, eight jobs)
+## Evidencia funcional registrada (DEBUG, ocho jobs)
 
-- **21 core unit tests**, including typed retention/source expiry, leases,
-  deadline generations, offset completeness and safe progress frontiers.
-- **14 client fetching tests**, including single-batch decode preserving the
-  other completed bucket for a later poll, configured fetch limits, pruned tails,
-  retention failure and error after decoding another bucket.
-- **All nine native-sni read integrations**: batch log/KV, snapshot/evolution,
-  empty/reexecution/concurrency, partition discovery/rescale, recreated/schema-
-  changed tables, TLS rejection, streaming topology changes, idle/cancellation
-  and coordinator failover with fresh-query recovery.
-- Streaming pressure fixture produces **100 unique rows in 20 acknowledged
-  groups**, while the consumer pauses 70 ms per batch and the producer keeps
-  appending. Source pool capacity is 1 MiB. Reservations stay stable during the
-  pause, return to zero after each last batch owner is dropped, and stream drop
-  leaves no active source streams. Every expected ID is verified without duplicates.
-- **Four write SQL integrations** pass with the changed input-source cadence:
-  native planner, multipartition input, backpressure, continuous INSERT and
-  old/new partition layouts.
-- **Three Docker/RustFS/remote integrations** passed on the existing `.6` image:
-  filesystem retention/remote cleanup, S3 retention/readonly profile, and real S3
-  transient/permanent HTTP failures with cancellation and isolated object cleanup.
-  Slow remote-consumer assertions now retain the batch explicitly: dropping the
-  stream does not erase a lease for data the consumer still holds.
-- Core clippy all-targets/all-features with warnings denied and formatting pass.
+- **21 pruebas unitarias core**, incluidas retención/expiración fuente tipada, leases,
+  generaciones deadline, offsets completos y fronteras progreso seguras.
+- **14 pruebas de fetch cliente**, incluido decode de lote único que conserva otro
+  bucket completo para poll posterior, límites fetch configurados, colas podadas,
+  error retención y error tras decodificar otro bucket.
+- **Las nueve integraciones native-sni de lectura**: log/KV batch, snapshot/evolución,
+  vacío/reejecución/concurrencia, descubrimiento particiones/rescale, tabla recreada/
+  esquema cambiado, rechazo TLS, cambios topología streaming, idle/cancelación y
+  failover coordinador con recuperación consulta nueva.
+- Fixture pressure streaming produce **100 filas únicas en 20 grupos confirmados**,
+  consumidor pausa 70 ms/lote mientras productor sigue append. Pool fuente 1 MiB.
+  Reservas estables durante pausa; vuelven a cero al soltar último owner lote; drop
+  stream deja cero streams activos. Verifica cada ID esperado sin duplicados.
+- **Cuatro integraciones SQL escritura** pasan con cadencia fuente input cambiada:
+  planner nativo, input multipartición, contrapresión, INSERT continuo y layouts
+  partición antiguo/nuevo.
+- **Tres integraciones Docker/RustFS/remotas** pasaron en imagen existente `.6`:
+  retención filesystem/limpieza remota, perfil S3 retención/solo lectura y fallos HTTP
+  S3 transitorios/permanentes con cancelación/limpieza de objetos aislados. Aserciones
+  consumidor remoto lento retienen lote explícitamente: drop stream no elimina lease
+  de datos aún retenidos por consumidor.
+- Clippy core all-targets/all-features con warnings denegados y formato pasaron.
 
-The first full native-sni run had an unlabeled failover `Elapsed` while eight
-other tests passed. The pod had been replaced and was Ready. Added contextual
-timeout diagnostics without increasing or suppressing the bounds; the targeted
-rerun and subsequent two full nine-test runs passed. The original timeout's
-precise stage was not captured; report this environmental/functional observation
-instead of claiming the first run passed or inferring a proven root cause.
+Primera corrida native-sni completa tuvo timeout `Elapsed` sin etiqueta de fase en
+failover, mientras otras ocho pruebas pasaron. Pod había sido reemplazado y estaba
+Ready. Se añadieron diagnósticos de timeout con contexto sin ampliar/suprimir límites;
+rerun dirigido y dos corridas completas posteriores de nueve pruebas pasaron. La fase
+precisa del timeout inicial no quedó registrada; se conserva como observación
+ambiental/funcional, sin afirmar éxito de esa corrida ni causa raíz probada.
 
-## Reused evidence and follow-up
+## Evidencia reutilizada y seguimiento
 
-Connector retention controls added after scope clarification: log/KV
-`with_max_retained_batch_bytes` defaults to 64 MiB, rejects zero, checks summed
-backing capacities with overflow protection and fails before taking a lease when
-the batch exceeds it. It does not parse IPC or replace native MemoryPool policy.
-EXPLAIN reports the configured ceiling; the native retained-source-bytes gauge
-balances with lease lifetimes. Tests cover exact admission, sliced views retaining
-larger backing storage, rejection without disturbing other live leases and real
-log/KV rejection with an unbounded host pool. Updated unit count: 22; bounded
-log/KV, continuous pressure/cancel and all four write integrations pass.
+Controles retención conector añadidos tras aclarar alcance: log/KV
+`with_max_retained_batch_bytes` por defecto 64 MiB, rechaza cero, comprueba suma de
+capacidades respaldo con overflow protegido y falla antes de adquirir lease si lote
+excede límite. No parsea IPC ni reemplaza política `MemoryPool` nativa. EXPLAIN
+informa límite; gauge nativo retained-source-bytes se equilibra con vida leases.
+Pruebas cubren admisión exacta, views slice que retienen respaldo mayor, rechazo sin
+afectar leases activos ajenos y rechazo real log/KV con pool host no acotado. Conteo
+unitario actualizado: 22; pasan log/KV acotados, presión/cancelación continua y las
+cuatro integraciones escritura.
 
-Policy/concurrency is configured by the engine/application. Ownership/admission
-is connector responsibility; allocation-time format/decompression limits belong
-to client/Arrow. No connector-side IPC estimator or duplicate decoder is added.
+Motor/aplicación configura política/concurrencia. Ownership/admisión es responsabilidad
+conector; límites asignación-time formato/descompresión pertenecen cliente/Arrow. No
+se añade estimador IPC en conector ni decoder duplicado.
 
-- `knx0` sustained 5+30-minute Rust profile remains historical baseline, not a
-  fresh benchmark of the new pull cadence.
-- `a7fy` / `7306be7` real 900-second STS expiry/renewal remains reused: auth/token
-  code did not change and the long renewal run was not repeated. Short real
-  HTTP/retention/download-cleanup cases were repeated because polling changed.
-- `sz09` mode/idle/topology contracts remain in place, with current live cases
-  repeated. Progress is source offered/excluded work, not processed checkpoints.
+- Perfil sostenido Rust de 5+30 min sigue siendo baseline histórico, no benchmark
+  nuevo de cadencia pull.
+- Evidencia real expiración/renovación STS 900 s se reutiliza: auth/token no cambió y
+  corrida larga renovación no se repitió. Casos cortos reales HTTP/retención/limpieza
+  descarga se repitieron por cambio polling.
+- Contratos modo/idle/topología continúan; casos live actuales se repitieron. Progreso
+  representa trabajo source ofrecido/excluido, no checkpoints procesados.
 
-`pc5n` measures sustained latency/throughput/RAM/disk under the final pipeline.
-`cf5y` covers the complete integrated failure/permission matrix. Large single
-batch decode, raw replies, compression expansion and client metadata allocations
-remain explicitly outside pre-allocation pool protection; do not turn a hard
-batch-count bound or a stable representative profile into a universal RSS cap.
-No Python/FFI build, mmap scheme, global allocation manager or new retry policy
-is part of this work.
+Perfiles nativos miden latencia/throughput/RAM/disco sostenidos bajo pipeline final.
+Verificación fallos cubre matriz integrada fallos/permisos. Decode lote único grande,
+respuestas raw, expansión compresión y asignaciones metadatos cliente siguen fuera de
+protección pool preasignación; límite conteo lotes o perfil representativo estable no
+son techo RSS universal. No incluye build Python/FFI, mmap, gestor global asignaciones
+ni política reintentos nueva.
