@@ -66,11 +66,13 @@ async fn create_sink_unknown_view_rejected() {
 #[tokio::test]
 async fn retracting_view_with_append_only_sink_rejected_at_start() {
     let sink_batches = Arc::new(Mutex::new(Vec::new()));
-    // A sink that does not accept retractions cannot target the grouped,
-    // tumbling view; START must refuse before any write.
+    // A changing grouped aggregate still retracts and must be refused before writes.
     let mut session = session_with(vec![source_batch(&[1], &[1000])], &sink_batches, false);
     session.sql(SOURCE).await.unwrap();
-    session.sql(VIEW).await.unwrap();
+    session
+        .sql("CREATE MATERIALIZED VIEW mv AS SELECT k, count(*) FROM src GROUP BY k;")
+        .await
+        .unwrap();
     session.sql(SINK).await.unwrap();
     let error = match session.sql("START;").await {
         Err(error) => error,
@@ -80,6 +82,41 @@ async fn retracting_view_with_append_only_sink_rejected_at_start() {
         matches!(error, SqlError::Unsupported(_) | SqlError::Engine(_)),
         "{error:?}"
     );
+}
+
+#[tokio::test]
+async fn closed_window_writes_one_append_to_append_only_sink() {
+    let sink_batches = Arc::new(Mutex::new(Vec::new()));
+    let data = vec![source_batch(&[1, 1, 1], &[1_000, 2_000, 12_000])];
+    let mut session = session_with(data, &sink_batches, false);
+    session.sql(SOURCE).await.unwrap();
+    session.sql(VIEW).await.unwrap();
+    session.sql(SINK).await.unwrap();
+
+    if let Err(error) = session.sql("START;").await {
+        panic!("final window output is append-only: {error}");
+    }
+    let rows = wait_for_sink(&sink_batches, &[(1, 0, 2)]).await;
+    assert_eq!(rows, vec![(1, 0, 2)]);
+
+    let batches = sink_batches.lock().unwrap();
+    let diffs: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .diff
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(diffs, vec![1]);
+    drop(batches);
+    session.shutdown().await.unwrap();
 }
 
 #[tokio::test]

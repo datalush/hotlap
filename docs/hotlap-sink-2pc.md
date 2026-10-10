@@ -38,9 +38,11 @@ o **descartar** la ventana de crash (ver `docs/hotlap-recovery.md`).
 
 El sink también **negocia retracciones**: `accepts_retractions()` por defecto es
 `false` (append-only). El runtime **rechaza antes de arrancar/escribir** un plan
-que pueda retractar (agregado por clave o ventana tumbling) si el sink no
-declara soporte; sólo un sink que de verdad aplica diffs negativos debe
-sobreescribirlo a `true`.
+que pueda retractar (por ejemplo, un agregado por clave) si el sink no declara
+soporte; sólo un sink que de verdad aplica diffs negativos debe sobreescribirlo
+a `true`. Una ventana tumbling incorpora deltas mientras está abierta, pero al
+cerrar emite su resultado final una sola vez con diff positivo, por lo que esa
+agregación final es compatible con un sink append-only.
 
 La negociación de la capa SQL ocurre en dos pasos. `SinkFactory::accepts_retractions(options)`
 (por defecto `false`) se comprueba **antes** de `create`, de modo que un plan

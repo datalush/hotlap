@@ -38,7 +38,7 @@ pub trait Sink: Send + Sync {
     ///
     /// Defaults to `false`: a sink that has not declared support is treated as
     /// append-only, so the runtime refuses a plan that may retract (e.g. a
-    /// grouped aggregate or a tumbling window) before any write or ingestion.
+    /// grouped aggregate) before any write or ingestion.
     /// Override to `true` only when the sink truly handles deletes.
     fn accepts_retractions(&self) -> bool {
         false
