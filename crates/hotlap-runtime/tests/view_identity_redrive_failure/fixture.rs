@@ -3,16 +3,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
+use hotlap::state::StateBackend;
+use hotlap::{Hotlap, Plan};
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_connectors::source::Source;
+use hotlap_engine::EngineCore;
+use hotlap_runtime::runtime::checkpoint::Checkpointer;
 use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, DEFAULT_RETAIN};
+use hotlap_runtime::runtime::pipeline;
 use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
 
-use super::support::{
-    Dataset, ResumableSource, SharedBackend, SpySource, copy_as_pending_commit, filter,
-    seed_registry, sources,
-};
+use super::support::{Dataset, ResumableSource, SharedBackend, SpySource, filter, sources};
+
+#[path = "../common/recovery/ops.rs"]
+mod ops;
+pub use ops::rows;
 
 #[derive(Default)]
 pub struct DurableRemote {
@@ -90,6 +96,52 @@ pub fn seeded_registries() -> (SharedBackend, Dataset) {
     );
     copy_as_pending_commit(&backend, &pending);
     (backend, dataset)
+}
+
+pub fn seeded_compatible_registries() -> (SharedBackend, Dataset) {
+    let backend = SharedBackend::default();
+    let dataset = Dataset::new(vec![vec![1], vec![2], vec![1], vec![2], vec![3]]);
+    let views = vec![("a".into(), filter(1)), ("b".into(), filter(2))];
+    seed_registry(&backend, views.clone(), dataset.clone(), 3);
+    let pending = SharedBackend::default();
+    seed_registry(&pending, views, dataset.clone(), 4);
+    copy_as_pending_commit(&backend, &pending);
+    (backend, dataset)
+}
+
+fn seed_registry(
+    backend: &SharedBackend,
+    views: Vec<(String, Plan)>,
+    dataset: Dataset,
+    consumed: usize,
+) {
+    let pipe = Pipeline {
+        sources: sources(Arc::new(ResumableSource::new(dataset))),
+        views,
+        sinks: vec![],
+        checkpoint: None,
+        retention: None,
+    };
+    let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
+    pipeline::setup(&mut hotlap, &pipe).unwrap();
+    let mut stream = pipe.sources.stream().unwrap();
+    ops::drain(&mut hotlap, &pipe.sources, &mut stream, consumed);
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    ops::take(&mut checkpointer, &hotlap, &pipe.sources);
+}
+
+fn copy_as_pending_commit(valid: &SharedBackend, pending: &SharedBackend) {
+    let mut writer = valid.clone();
+    for part in ["engine", "sources"] {
+        let body = pending
+            .get(format!("checkpoint/1/{part}").as_bytes())
+            .unwrap()
+            .unwrap();
+        writer
+            .put(format!("checkpoint/2/{part}").as_bytes(), body)
+            .unwrap();
+    }
+    writer.put(b"checkpoint/2/commit", b"1".to_vec()).unwrap();
 }
 
 pub fn pipeline(
