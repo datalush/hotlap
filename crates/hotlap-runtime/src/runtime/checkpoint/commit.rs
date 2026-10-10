@@ -37,11 +37,10 @@ impl Checkpointer {
         reserve(self.backend.as_mut(), id)?;
 
         if let Err(error) = self.sinks.drain(&self.cancel).await {
-            // An abandoned drain has prepared nothing, but the attempt was
-            // interrupted: block continuation until a restart resolves it.
-            if self.cancel.tripped() {
-                self.fail(CheckpointState::Failed, &error);
-            }
+            // The engine and source offsets may already have advanced, and a
+            // writer may have rolled back after a write failure. No drain error
+            // is safe to retry on this runtime, whether or not it was cancelled.
+            self.fail(CheckpointState::Failed, &error);
             return Err(error);
         }
         if let Err(error) = mark_prepare_intent(self.backend.as_mut(), id) {

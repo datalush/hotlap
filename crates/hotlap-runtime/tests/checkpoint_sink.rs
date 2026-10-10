@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, Int64Array};
@@ -11,7 +12,7 @@ use hotlap_connectors::sink::{Sink, SinkCapabilities};
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError};
 use hotlap_engine::EngineCore;
-use hotlap_runtime::runtime::checkpoint::Checkpointer;
+use hotlap_runtime::runtime::checkpoint::{CheckpointState, Checkpointer};
 use hotlap_runtime::runtime::pipeline::SinkSpec;
 use hotlap_runtime::runtime::sink::SinkPump;
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
@@ -33,6 +34,31 @@ impl Journal {
 /// A sink that records one `write` per batch it receives.
 struct JournalSink {
     journal: Journal,
+}
+
+struct FailingSink {
+    aborted: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Sink for FailingSink {
+    async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
+        while changes.next().await.is_some() {}
+        Err(ConnectorError::Infrastructure("write failed".into()))
+    }
+
+    fn capabilities(&self) -> SinkCapabilities {
+        SinkCapabilities::Transactional
+    }
+
+    async fn commit(&self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    async fn abort(&self) -> Result<(), ConnectorError> {
+        self.aborted.store(true, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -195,4 +221,31 @@ async fn checkpoint_drains_queued_sink_deltas_before_valid() {
         "the sink output must be applied before `valid`: {entries:?}"
     );
     assert_eq!(checkpointer.latest().unwrap(), Some(1));
+}
+
+#[tokio::test]
+async fn failed_sink_drain_marks_checkpointer_inconsistent() {
+    let aborted = Arc::new(AtomicBool::new(false));
+    let sink = Arc::new(FailingSink {
+        aborted: Arc::clone(&aborted),
+    });
+    let pump = SinkPump::start(&[SinkSpec {
+        view: "c".into(),
+        sink,
+    }]);
+    let hotlap = engine_with_pending_delta(&pump).await;
+    let mut checkpointer = Checkpointer::new(Box::new(JournalBackend::default()), 3)
+        .with_sinks(pump.coordinated());
+    let sources = Sources::new(vec![InputSource {
+        id: InputId(0),
+        name: "in".into(),
+        source: Arc::new(EmptySource),
+        watermark: None,
+    }])
+    .unwrap();
+
+    assert!(checkpointer.take(&hotlap, &sources).await.is_err());
+    assert!(aborted.load(Ordering::SeqCst), "writer failure must roll back");
+    assert_eq!(checkpointer.state(), CheckpointState::Failed);
+    assert!(checkpointer.take(&hotlap, &sources).await.is_err());
 }

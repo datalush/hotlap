@@ -91,14 +91,16 @@ confirmado, así que se preserva la evidencia para recovery. La limpieza de un
 marcador `commit` obsoleto (checkpoint ya `valid`) también propaga un fallo de
 borrado como `Storage`.
 
-**Estado explícito y detención segura.** Un intento que falla tras `prepare` deja el
+**Estado explícito y detención segura.** Un error al drenar el sink o un intento
+que falla tras `prepare` deja el
 runtime inconsistente: el motor y los offsets de las fuentes **no** se revierten
 con los sinks, así que abortar los sinks no restaura el estado. El
 `Checkpointer` mantiene estado explícito (`Ready`, `Failed`, `CommitUncertain`) y
 **rechaza nuevos intentos** hasta reiniciar; el bucle de servicio deja de sondear
 fuentes y de aceptar checkpoints/vistas posteriores a `START`. Solo los fallos
-de reserva o previos a `prepare` (que no
-descartan ninguna escritura) quedan reintentables. Al reiniciar, recovery
+de reserva, antes de drenar el sink, quedan reintentables. Un error de drain puede
+ocurrir tras avanzar el motor y los offsets, o después de que un writer revierta
+una escritura; tampoco es seguro continuar sin reiniciar. Al reiniciar, recovery
 resuelve el marcador pendiente: vuelve a conducir commit y promueve si todos los
 sinks permiten esa operación. Si cualquier sink es transaccional, incluso
 re-conducible, promoción fallida/cuerpo ilegible conserva evidencia disponible y
