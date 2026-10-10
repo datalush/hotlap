@@ -82,8 +82,16 @@ impl Sink for RedriveSink {
 }
 
 pub fn redrive_sink() -> (Arc<RedriveSink>, Arc<Mutex<DurableRemote>>) {
+    redrive_sink_with_failure(true)
+}
+
+pub fn ready_redrive_sink() -> (Arc<RedriveSink>, Arc<Mutex<DurableRemote>>) {
+    redrive_sink_with_failure(false)
+}
+
+fn redrive_sink_with_failure(fail_next: bool) -> (Arc<RedriveSink>, Arc<Mutex<DurableRemote>>) {
     let remote = Arc::new(Mutex::new(DurableRemote {
-        fail_next: true,
+        fail_next,
         ..DurableRemote::default()
     }));
     let initial_process_sink = RedriveSink {
@@ -185,6 +193,15 @@ pub fn pipeline(
     dataset: Dataset,
     sink: Option<Arc<dyn Sink>>,
 ) -> (Pipeline, Arc<SpySource>) {
+    pipeline_retaining(backend, dataset, sink, DEFAULT_RETAIN)
+}
+
+pub fn pipeline_retaining(
+    backend: &SharedBackend,
+    dataset: Dataset,
+    sink: Option<Arc<dyn Sink>>,
+    retain: usize,
+) -> (Pipeline, Arc<SpySource>) {
     let source: Arc<dyn Source> = Arc::new(ResumableSource::new(dataset));
     let spy = Arc::new(SpySource::new(source));
     let as_source: Arc<dyn Source> = spy.clone();
@@ -203,7 +220,7 @@ pub fn pipeline(
         checkpoint: Some(CheckpointConfig {
             interval: Duration::from_secs(3600),
             backend: Box::new(backend.clone()),
-            retain: DEFAULT_RETAIN,
+            retain,
         }),
         retention: None,
     };

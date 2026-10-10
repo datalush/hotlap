@@ -2,7 +2,7 @@
 //! declaration, before the engine is restored or a commit is re-driven.
 
 use crate::runtime::checkpoint::Checkpoint;
-use hotlap::Hotlap;
+use hotlap::{CoreError, Hotlap};
 use hotlap_connectors::error::ConnectorError;
 
 use super::RecoveryDecision;
@@ -20,8 +20,21 @@ pub(super) fn validate(hotlap: &Hotlap, decision: &RecoveryDecision) -> Result<(
     };
     if let Some(checkpoint) = checkpoint {
         validate_checkpoint(&declared, checkpoint)?;
+        validate_engine_for_hotlap(hotlap, checkpoint)?;
     }
     Ok(())
+}
+
+fn validate_engine_for_hotlap(
+    hotlap: &Hotlap,
+    checkpoint: &Checkpoint,
+) -> Result<(), ConnectorError> {
+    hotlap
+        .validate_snapshot(&checkpoint.engine)
+        .map_err(|error| match error {
+            CoreError::Unsupported(message) => ConnectorError::Unsupported(message),
+            CoreError::Infrastructure(message) => ConnectorError::Corruption(message),
+        })
 }
 
 pub(super) fn validate_checkpoint(

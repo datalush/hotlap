@@ -125,8 +125,9 @@ por el texto del mensaje:
    marcador `valid`. La recuperación puede saltarlo y buscar un predecesor.
 - **Corrupción del formato actual** (`Corruption`): los bytes tienen el formato
   vigente pero están dañados (cabecera truncada, longitud incoherente, payload
-  ilegible). Es el **único** caso de bytes que la recuperación tolera al caer al
-  predecesor válido más nuevo.
+  ilegible), incluidos IPC internos que no pueden reconstruir schema, grafos,
+  estado de operadores, salida o changelog pendiente. Es el **único** caso de
+  bytes que la recuperación tolera al caer al predecesor válido más nuevo.
 - **Incompatibilidad fatal** (`Unsupported`): magic ajeno o versión desconocida
   en el contenedor de fuentes, en el frame interno del motor o en el snapshot.
   Es fatal: no hay lector antiguo, no se cae a un predecesor y nunca arranca en
@@ -138,6 +139,15 @@ por el texto del mensaje:
 
 Un error de **codificación** (al producir frame desde estado vivo) es interno, no
 corrupción persistida ni se clasifica como decodificable.
+
+Antes de re-conducir un commit, publicar `valid`, podar o borrar evidencia, el
+motor reconstruye el snapshot completo en un core scratch mediante el mismo
+camino que `restore`. La validación no cambia el motor activo ni sus métricas.
+Un candidato pendiente que no sea restaurable falla sin confirmar el sink ni
+eliminar sus marcadores; la selección de checkpoints válidos puede saltar una
+corrupción del formato actual y conservar el predecesor restaurable. La API
+pública `Checkpointer::promote(id)` repite esta validación antes de re-conducir,
+por lo que no depende de que un caller externo haya ejecutado preflight.
 
 **Retención** (`runtime/retention.rs`): tras publicar, se **podan** los
 checkpoints más antiguos para conservar los `retain` más nuevos. El borrado solo

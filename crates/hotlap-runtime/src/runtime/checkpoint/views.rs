@@ -74,6 +74,9 @@ impl Checkpointer {
             PendingPhase::Commit => {}
         }
         let pending = self.read_body_for_recovery(id)?;
+        if let Some(checkpoint) = &pending {
+            crate::runtime::checkpoint_body::validate_engine_snapshot(&checkpoint.engine)?;
+        }
         if redriable && pending.is_some() {
             return Ok(pending);
         }

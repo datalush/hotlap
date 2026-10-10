@@ -83,6 +83,24 @@ pub fn seed_output(backend: &SharedBackend) {
     assert_eq!(ops::take(&mut checkpointer, &hotlap, &pipe.sources), 1);
 }
 
+pub fn seed_two_outputs(backend: &SharedBackend) {
+    let pipe = Pipeline {
+        sources: sources(Arc::new(ResumableSource::new(log()))),
+        views: vec![("a".into(), filter(1))],
+        sinks: vec![],
+        checkpoint: None,
+        retention: None,
+    };
+    let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
+    pipeline::setup(&mut hotlap, &pipe).unwrap();
+    let mut input = pipe.sources.stream().unwrap();
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    ops::drain(&mut hotlap, &pipe.sources, &mut input, 1);
+    assert_eq!(ops::take(&mut checkpointer, &hotlap, &pipe.sources), 1);
+    ops::drain(&mut hotlap, &pipe.sources, &mut input, 1);
+    assert_eq!(ops::take(&mut checkpointer, &hotlap, &pipe.sources), 2);
+}
+
 pub fn corrupt_pending(backend: &SharedBackend) {
     let mut writer = backend.clone();
     for part in ["engine", "sources"] {

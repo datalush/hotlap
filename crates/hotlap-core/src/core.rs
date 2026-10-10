@@ -94,4 +94,11 @@ pub trait IncrementalCore {
     /// Rebuild this engine's state from a [`EngineSnapshot`] captured by
     /// [`checkpoint`](Self::checkpoint). Rejects an unknown layout version.
     fn restore(&mut self, snapshot: &EngineSnapshot) -> Result<(), CoreError>;
+
+    /// Validate full snapshot restorability without changing this live core.
+    fn validate_snapshot(&self, _snapshot: &EngineSnapshot) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported(
+            "snapshot validation is not supported by this core".into(),
+        ))
+    }
 }

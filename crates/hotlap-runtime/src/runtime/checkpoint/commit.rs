@@ -135,6 +135,10 @@ impl Checkpointer {
     /// `commit` (idempotent, only valid when every sink is re-drivable), publish
     /// `valid`, prune and clear the marker.
     pub async fn promote(&mut self, id: u64) -> Result<(), ConnectorError> {
+        let checkpoint = self
+            .read_body(id)?
+            .ok_or_else(|| crate::runtime::checkpoint_body::invalid(id))?;
+        crate::runtime::checkpoint_body::validate_engine_snapshot(&checkpoint.engine)?;
         self.sinks.redrive_commit().await?;
         publish_valid(self.backend.as_mut(), id)?;
         prune(self.backend.as_mut(), self.retain).map_err(state_err)?;
@@ -164,6 +168,7 @@ impl Checkpointer {
                 && (self.has_key(&format!("{base}/commit"))?
                     || self.has_key(&format!("{base}/prepare"))?)
             {
+                self.read(id)?;
                 clear_commit(self.backend.as_mut(), id).map_err(state_err)?;
             }
         }

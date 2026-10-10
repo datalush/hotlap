@@ -2,7 +2,8 @@
 
 use super::{Checkpoint, Checkpointer};
 use crate::runtime::checkpoint_body::{
-    COMMIT_MARKER, PREPARE_MARKER, checkpoint_prefix, decode_err, invalid, read_body as decode_body,
+    COMMIT_MARKER, PREPARE_MARKER, checkpoint_prefix, decode_err, invalid,
+    read_body as decode_body, validate_engine_snapshot,
 };
 use crate::runtime::source_checkpoint::decode_sources;
 use hotlap_connectors::error::ConnectorError;
@@ -82,6 +83,7 @@ impl Checkpointer {
             .get(&format!("{base}/engine"))?
             .ok_or_else(|| invalid(id))?;
         let engine = decode_snapshot(&engine).map_err(decode_err)?;
+        validate_engine_snapshot(&engine)?;
         let sources = self
             .get(&format!("{base}/sources"))?
             .ok_or_else(|| invalid(id))?;

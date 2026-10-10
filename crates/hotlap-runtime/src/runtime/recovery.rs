@@ -60,6 +60,7 @@ impl Recovery {
             }
             let reason = match checkpointer.read_body_for_recovery(pending)? {
                 Some(checkpoint) => {
+                    crate::runtime::checkpoint_body::validate_engine_snapshot(&checkpoint.engine)?;
                     sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
                     if checkpointer.redriable() {
                         return Ok(RecoveryDecision::Promote(checkpoint));
@@ -113,9 +114,9 @@ impl Recovery {
         signal: &Mutex<Option<String>>,
         metrics: &MetricsRegistry,
     ) -> Result<InputStream, ConnectorError> {
-        checkpointer.sweep_stale_commits()?;
         let decision = Self::inspect(checkpointer, sources)?;
         views::validate(hotlap, &decision)?;
+        checkpointer.sweep_stale_commits()?;
         match Self::resolve(decision, hotlap, sources, checkpointer, signal, metrics).await? {
             Resolved::Stream => sources.stream(),
             Resolved::Checkpoint(checkpoint) => {
@@ -184,6 +185,16 @@ impl Recovery {
                         &hotlap.view_registry(),
                     );
                     views::validate_checkpoint(&declared, checkpoint)?;
+                    hotlap
+                        .validate_snapshot(&checkpoint.engine)
+                        .map_err(|error| match error {
+                            hotlap::CoreError::Unsupported(message) => {
+                                ConnectorError::Unsupported(message)
+                            }
+                            hotlap::CoreError::Infrastructure(message) => {
+                                ConnectorError::Corruption(message)
+                            }
+                        })?;
                 }
                 let reason = format!("commit re-drive failed ({error})");
                 match discard(

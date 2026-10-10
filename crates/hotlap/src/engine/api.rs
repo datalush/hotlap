@@ -1,6 +1,8 @@
 //! Public [`Hotlap`](super::Hotlap) declaration and data-plane methods.
 
-use hotlap_core::{EngineSnapshot, InputId, Plan, SplitId, ViewId, WatermarkSpec, ZSetBatch};
+use hotlap_core::{
+    CoreError, EngineSnapshot, InputId, Plan, SplitId, ViewId, WatermarkSpec, ZSetBatch,
+};
 
 use super::{Hotlap, HotlapError};
 
@@ -190,6 +192,13 @@ impl Hotlap {
             self.next_view = self.next_view.max(view.id.0 + 1);
         }
         Ok(())
+    }
+
+    /// Validate that a snapshot can be restored by the core without mutating it.
+    pub fn validate_snapshot(&self, snapshot: &EngineSnapshot) -> Result<(), CoreError> {
+        self.check_view_identity(snapshot)
+            .map_err(|error| CoreError::Unsupported(error.0))?;
+        self.core.validate_snapshot(snapshot)
     }
 
     /// Shut the engine down. Dropping `Hotlap` also releases the core.

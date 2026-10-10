@@ -2,7 +2,7 @@
 
 use hotlap::Hotlap;
 use hotlap::state::{StateBackend, StateError};
-use hotlap_engine::{EngineError, EngineSnapshot, decode_snapshot, encode_snapshot};
+use hotlap_engine::{EngineCore, EngineError, EngineSnapshot, decode_snapshot, encode_snapshot};
 
 use crate::runtime::source_checkpoint::{
     SavedView, SourcesCheckpoint, decode_sources, encode_sources,
@@ -186,6 +186,15 @@ pub(crate) fn decode_err(error: EngineError) -> ConnectorError {
     match error {
         EngineError::Unsupported(message) => ConnectorError::Unsupported(message),
         error => ConnectorError::Corruption(error.to_string()),
+    }
+}
+
+/// Prove an engine body is fully reconstructable before selection or promotion.
+pub(crate) fn validate_engine_snapshot(snapshot: &EngineSnapshot) -> Result<(), ConnectorError> {
+    match EngineCore::new().validate_snapshot(snapshot) {
+        Ok(()) => Ok(()),
+        Err(EngineError::Unsupported(message)) => Err(ConnectorError::Unsupported(message)),
+        Err(error) => Err(ConnectorError::Corruption(error.to_string())),
     }
 }
 

@@ -1,6 +1,7 @@
 //! Restore a live engine from an [`EngineSnapshot`].
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use hotlap_core::snapshot::{
     ENGINE_SNAPSHOT_FORMAT_VERSION, EngineSnapshot, InputSnapshot, ViewSnapshot,
@@ -18,6 +19,26 @@ impl EngineCore {
     /// Rejects an unknown format version. The engine is only mutated once the
     /// whole snapshot has been decoded, so a corrupt snapshot leaves it intact.
     pub fn restore(&mut self, snapshot: &EngineSnapshot) -> Result<(), EngineError> {
+        let mut core = Self::rebuild_snapshot(snapshot, Arc::clone(&self.metrics.registry))?;
+        // Retention history is not persisted; keep settings but invalidate it.
+        core.retention = std::mem::take(&mut self.retention);
+        core.retention.invalidate();
+        *self = core;
+        self.refresh_windows_open();
+        self.metrics.registry.inc("checkpoints_restored");
+        Ok(())
+    }
+
+    /// Validate with restore's exact scratch reconstruction and isolated metrics.
+    pub fn validate_snapshot(&self, snapshot: &EngineSnapshot) -> Result<(), EngineError> {
+        Self::rebuild_snapshot(snapshot, Arc::new(hotlap_core::MetricsRegistry::new()))?;
+        Ok(())
+    }
+
+    fn rebuild_snapshot(
+        snapshot: &EngineSnapshot,
+        metrics: Arc<hotlap_core::MetricsRegistry>,
+    ) -> Result<EngineCore, EngineError> {
         if snapshot.format_version != ENGINE_SNAPSHOT_FORMAT_VERSION {
             return Err(EngineError::Unsupported(format!(
                 "unknown engine snapshot format version {} (expected {})",
@@ -25,7 +46,7 @@ impl EngineCore {
             )));
         }
         Self::reject_duplicate_ids(snapshot)?;
-        let mut core = EngineCore::with_registry(std::sync::Arc::clone(&self.metrics.registry));
+        let mut core = EngineCore::with_registry(metrics);
         core.frozen = snapshot.frozen;
         core.epoch = snapshot.epoch;
         for input in &snapshot.inputs {
@@ -34,18 +55,11 @@ impl EngineCore {
         for view in &snapshot.views {
             core.restore_view(view)?;
         }
-        // Retention settings survive, but the input history behind the restored
-        // state was not persisted, so a post-start build must be rejected. The
-        // take happens once decoding succeeded, keeping restore all-or-nothing.
-        core.retention = std::mem::take(&mut self.retention);
-        core.retention.invalidate();
         // Restored windows carry their dropped-closed counts; seed the publish
         // baseline so the first later push does not re-count them as new.
         core.metrics.late_closed_seen = core.late_closed_total();
-        *self = core;
-        self.refresh_windows_open();
-        self.metrics.registry.inc("checkpoints_restored");
-        Ok(())
+        core.refresh_windows_open();
+        Ok(core)
     }
 
     /// Reject repeated handles before any insert.

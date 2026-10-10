@@ -195,4 +195,8 @@ impl IncrementalCore for EngineCore {
         // Method-call syntax picks the inherent `EngineCore::restore`.
         self.restore(snapshot).map_err(CoreError::from)
     }
+
+    fn validate_snapshot(&self, snapshot: &EngineSnapshot) -> Result<(), CoreError> {
+        EngineCore::validate_snapshot(self, snapshot).map_err(CoreError::from)
+    }
 }

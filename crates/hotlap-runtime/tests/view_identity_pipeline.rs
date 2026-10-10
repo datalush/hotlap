@@ -18,7 +18,7 @@ use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
 
 use support::{
     RecordingSink, ResumableSource, SharedBackend, SpySource, corrupt_pending, filter, log, rows,
-    seed, seed_output, sources,
+    seed, seed_output, seed_two_outputs, sources,
 };
 
 #[test]
@@ -124,4 +124,42 @@ fn corrupt_transactional_pending_is_rejected_before_pipeline_effects() {
     assert_eq!(spy.resumed(), 0);
     assert_eq!(spy.offset(), None);
     assert!(backend.get(b"checkpoint/2/commit").unwrap().is_some());
+}
+
+#[test]
+fn corrupt_latest_valid_internal_ipc_falls_back_to_restorable_predecessor() {
+    let backend = SharedBackend::default();
+    seed_two_outputs(&backend);
+    corrupt_valid_output(&backend, 2);
+    let inner: Arc<dyn Source> = Arc::new(ResumableSource::new(log()));
+    let spy = Arc::new(SpySource::new(inner));
+    let pipeline = Pipeline {
+        sources: sources(spy.clone()),
+        views: vec![("a".into(), filter(1))],
+        sinks: vec![],
+        checkpoint: Some(CheckpointConfig {
+            interval: Duration::from_secs(3600),
+            backend: Box::new(backend.clone()),
+            retain: 1,
+        }),
+        retention: None,
+    };
+
+    let handle = EngineHandle::start(pipeline).expect("fallback checkpoint remains usable");
+
+    assert_eq!(rows(&handle.snapshot("a").unwrap()), vec![vec![1]]);
+    assert_eq!(spy.offset(), Some(1));
+    assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
+    assert!(backend.get(b"checkpoint/2/valid").unwrap().is_some());
+    handle.shutdown().unwrap();
+}
+
+fn corrupt_valid_output(backend: &SharedBackend, id: u64) {
+    let key = format!("checkpoint/{id}/engine");
+    let bytes = backend.get(key.as_bytes()).unwrap().unwrap();
+    let mut snapshot = hotlap_engine::decode_snapshot(&bytes).unwrap();
+    snapshot.views[0].output.as_mut().unwrap().ipc = b"not an Arrow IPC stream".to_vec();
+    let bytes = hotlap_engine::encode_snapshot(&snapshot).unwrap();
+    let mut writer = backend.clone();
+    writer.put(key.as_bytes(), bytes).unwrap();
 }
