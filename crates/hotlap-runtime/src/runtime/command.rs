@@ -71,10 +71,10 @@ pub(crate) async fn handle(
             }
             if result.is_err() && checkpointer.as_ref().is_some_and(inconsistent) {
                 *failed = true;
-                if let Err(error) = &result {
-                    if let Ok(mut slot) = checkpoint_error.lock() {
-                        slot.get_or_insert_with(|| error.to_string());
-                    }
+                if let Err(error) = &result
+                    && let Ok(mut slot) = checkpoint_error.lock()
+                {
+                    slot.get_or_insert_with(|| error.to_string());
                 }
             }
             let _ = reply.send(result);
