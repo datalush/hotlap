@@ -68,16 +68,16 @@ pub(crate) fn read_participant_manifest(
 pub(crate) async fn write_body(
     backend: &mut (dyn StateBackend + Send),
     id: u64,
+    snapshot: &hotlap_engine::EngineSnapshot,
     engine: &Hotlap,
     sources: &Sources,
 ) -> Result<(), ConnectorError> {
-    let snapshot = engine.checkpoint().map_err(hotlap_err)?;
-    let engine_bytes = encode_snapshot(&snapshot).map_err(encode_err)?;
+    let engine_bytes = encode_snapshot(snapshot).map_err(encode_err)?;
     let views = SavedView::from_registry(&engine.view_registry());
     let sources_checkpoint = SourcesCheckpoint::capture_with_views(sources, &views)?;
     let manifest = read_participant_manifest(backend, id)?;
     manifest.matches_saved_sources(&sources_checkpoint.entries)?;
-    manifest.validate_tapped_views(&views, &snapshot)?;
+    manifest.validate_tapped_views(&views, snapshot)?;
     let source_bytes = encode_sources(&sources_checkpoint)?;
     let base = checkpoint_prefix(id);
     backend

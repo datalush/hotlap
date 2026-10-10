@@ -17,6 +17,7 @@ use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_connectors::source::Source;
 use hotlap_engine::EngineCore;
+use hotlap_engine::MetricsRegistry;
 use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, Checkpointer, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline;
@@ -441,6 +442,23 @@ fn transactional_start_rejects_corrupt_latest_ipc_without_replay_or_effects() {
 fn transactional_pending_internal_corruption_preserves_evidence() {
     let backend = SharedBackend::default();
     let remote = seed_transactional_checkpoints(&backend);
+    // The promotion control proves the pristine pending transaction is redrivable
+    // with its exact original sink binding before testing the corrupted sibling.
+    let control_sink = Arc::new(DurableTxnSink::new(Arc::clone(&remote)));
+    let control = Pipeline {
+        sources: sources(Arc::new(ResumableSource::new(log()))),
+        views: vec![("a".into(), Plan::Source(InputId(0)))],
+        sinks: vec![SinkSpec::named("a", "a", control_sink.clone())],
+        checkpoint: Some(CheckpointConfig {
+            interval: Duration::from_secs(3600),
+            backend: Box::new(backend.clone()),
+            retain: 1,
+        }),
+        retention: None,
+    };
+    EngineHandle::start(control).expect("undamaged pending transaction promotes");
+    assert!(control_sink.commits.load(Ordering::SeqCst) > 0);
+    assert_eq!(remote.lock().unwrap().committed, vec![(1, 1), (2, 1)]);
     corrupt_valid_output(&backend, 2);
     let corrupt_body = backend.get(b"checkpoint/2/engine").unwrap().unwrap();
     let source_body = backend.get(b"checkpoint/2/sources").unwrap();
@@ -453,10 +471,7 @@ fn transactional_pending_internal_corruption_preserves_evidence() {
     let pipeline = Pipeline {
         sources: sources(spy.clone()),
         views: vec![("a".into(), Plan::Source(InputId(0)))],
-        sinks: vec![SinkSpec {
-            view: "a".into(),
-            sink: restarted_sink.clone(),
-        }],
+        sinks: vec![SinkSpec::named("a", "a", restarted_sink.clone())],
         checkpoint: Some(CheckpointConfig {
             interval: Duration::from_secs(3600),
             backend: Box::new(backend.clone()),
@@ -483,6 +498,42 @@ fn transactional_pending_internal_corruption_preserves_evidence() {
         Some(b"1".to_vec())
     );
     assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
+}
+
+#[test]
+fn checkpoint_capture_is_reused_for_persisted_body() {
+    let backend = SharedBackend::default();
+    let pipe = Pipeline {
+        sources: sources(Arc::new(ResumableSource::new(log()))),
+        views: vec![("a".into(), Plan::Source(InputId(0)))],
+        sinks: vec![],
+        checkpoint: None,
+        retention: None,
+    };
+    let metrics = Arc::new(MetricsRegistry::new());
+    let core = EngineCore::with_metrics(Arc::clone(&metrics));
+    let mut engine = Hotlap::open_with(Box::new(core));
+    pipeline::setup(&mut engine, &pipe).unwrap();
+    let mut input = pipe.sources.stream().unwrap();
+    let event = futures::executor::block_on(input.next()).unwrap().unwrap();
+    pipeline::ingest_event(&mut engine, &pipe.sources, &event).unwrap();
+    pipe.sources
+        .get(event.input)
+        .unwrap()
+        .source
+        .commit(event.batch.split, event.batch.next_offset)
+        .unwrap();
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 1);
+
+    futures::executor::block_on(checkpointer.take(&engine, &pipe.sources)).unwrap();
+
+    assert_eq!(metrics.snapshot().get("checkpoints_taken"), Some(&1));
+    let bytes = backend.get(b"checkpoint/1/engine").unwrap().unwrap();
+    let saved = hotlap_engine::decode_snapshot(&bytes).unwrap();
+    let sources_bytes = backend.get(b"checkpoint/1/sources").unwrap().unwrap();
+    let saved_sources = decode_sources(&sources_bytes).unwrap();
+    assert_eq!(saved_sources.entries[0].state.offsets.get(&0), Some(&1));
+    assert_eq!(saved.epoch, 1);
 }
 
 fn corrupt_valid_output(backend: &SharedBackend, id: u64) {

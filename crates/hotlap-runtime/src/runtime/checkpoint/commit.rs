@@ -87,7 +87,8 @@ impl Checkpointer {
             return self.capture_failed(id, prepared, error).await;
         }
 
-        if let Err(error) = write_body(self.backend.as_mut(), id, engine, sources).await {
+        if let Err(error) = write_body(self.backend.as_mut(), id, &snapshot, engine, sources).await
+        {
             return self.capture_failed(id, prepared, error).await;
         }
         if let Err(error) = mark_commit_intent(self.backend.as_mut(), id) {
