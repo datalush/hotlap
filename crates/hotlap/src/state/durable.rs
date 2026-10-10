@@ -15,15 +15,17 @@ use super::path::{decode_segment, encode_segment, join_segments, split_prefix, v
 /// Key segments become hex-encoded path components, so a namespace prefix maps
 /// to a subdirectory and `scan`/`list` only walk the relevant subtree. `put`
 /// writes `<name>.tmp`, fsyncs it, atomically renames it over the final name,
-/// then fsyncs the parent directory and any freshly created ancestors, so an
-/// interrupted write never exposes a half-written value and a crash does not
-/// lose a committed one.
+/// then fsyncs the parent directory and any freshly created ancestors. Opening
+/// the backend also syncs its existing directory chain through its topmost
+/// path ancestor, allowing a retry to complete parent-link syncs left pending by an
+/// earlier failed open. Filesystem sync guarantees remain platform-dependent.
 pub struct DurableStateBackend {
     root: PathBuf,
 }
 
 impl DurableStateBackend {
-    /// Open a backend rooted at `root`, creating the directory if needed.
+    /// Open a backend rooted at `root`, creating the directory if needed and
+    /// syncing its directory chain through its topmost path ancestor.
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         create_dirs_synced(&root)?;

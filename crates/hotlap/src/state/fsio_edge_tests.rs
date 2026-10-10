@@ -70,6 +70,15 @@ fn create_syncs_dot_for_a_relative_empty_anchor() {
 }
 
 #[test]
+fn create_syncs_dot_only_once() {
+    let ops = FakeFs::default();
+
+    create_dirs_synced_with(&ops, Path::new(".")).unwrap();
+
+    assert_eq!(&*ops.synced.borrow(), &[PathBuf::from(".")]);
+}
+
+#[test]
 fn absent_file_is_reported_without_pruning() {
     let ops = FakeFs {
         absent: true,

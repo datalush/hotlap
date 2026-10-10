@@ -56,36 +56,49 @@ pub(super) fn write_atomic(path: &Path, value: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Create `dir` and any missing ancestors, fsyncing every directory that was
-/// newly created so a fresh namespace survives a crash. Newly created dirs are
-/// synced deepest-first, after their children exist.
+/// Create `dir` and any missing ancestors, syncing the directory chain through
+/// its topmost path ancestor (`.` for relative paths). An earlier open may have
+/// created entries but failed before syncing their parents, so existence alone
+/// cannot discharge this work.
 pub(super) fn create_dirs_synced(dir: &Path) -> io::Result<()> {
     create_dirs_synced_with(&RealFs, dir)
 }
 
 /// [`create_dirs_synced`] against injected [`FsOps`].
 ///
-/// The mapping from the first existing ancestor into the new top directory is a
-/// modification of that ancestor, so it is synced after the new dirs. A relative
-/// path with no existing component has an empty anchor, which names the current
-/// directory and is spelled `.`.
+/// Directory syncs run deepest-first through the topmost path ancestor,
+/// including existing ancestors: a prior failed open may have left directory
+/// entries behind without durably syncing their parent links. A relative path's
+/// empty parent names the current directory and is spelled `.`.
 pub(super) fn create_dirs_synced_with(ops: &impl FsOps, dir: &Path) -> io::Result<()> {
-    let (missing, anchor) = missing_ancestors(ops, dir);
-    if missing.is_empty() {
-        return Ok(());
-    }
+    let missing = missing_ancestors(ops, dir);
     for path in missing.iter().rev() {
         ops.create_dir(path)?;
     }
-    for path in &missing {
-        ops.sync_dir(path)?;
-    }
-    let anchor = if anchor.as_os_str().is_empty() {
+
+    let mut current = if dir.as_os_str().is_empty() {
         Path::new(".")
     } else {
-        anchor.as_path()
+        dir
     };
-    ops.sync_dir(anchor)?;
+    loop {
+        ops.sync_dir(current)?;
+        if current == Path::new(".") {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        if parent.as_os_str().is_empty() {
+            current = Path::new(".");
+            ops.sync_dir(current)?;
+            break;
+        }
+        current = parent;
+    }
     Ok(())
 }
 
@@ -121,9 +134,8 @@ pub(super) fn remove_file_pruning(ops: &impl FsOps, file: &Path, root: &Path) ->
     Ok(true)
 }
 
-/// Missing ancestors of `dir`, deepest first, plus the first existing ancestor
-/// that will link the new subtree.
-fn missing_ancestors(ops: &impl FsOps, dir: &Path) -> (Vec<PathBuf>, PathBuf) {
+/// Missing ancestors of `dir`, deepest first.
+fn missing_ancestors(ops: &impl FsOps, dir: &Path) -> Vec<PathBuf> {
     let mut missing = Vec::new();
     let mut current = dir;
     while !current.as_os_str().is_empty() && !ops.exists(current) {
@@ -133,7 +145,7 @@ fn missing_ancestors(ops: &impl FsOps, dir: &Path) -> (Vec<PathBuf>, PathBuf) {
             None => break,
         }
     }
-    (missing, current.to_path_buf())
+    missing
 }
 
 /// Fsync a directory. Some filesystems reject directory fsync; those errors are
