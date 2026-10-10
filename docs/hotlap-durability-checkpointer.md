@@ -4,12 +4,12 @@ Detalle técnico complementario de [durabilidad Hotlap](hotlap-durability.md).
 
 ## Checkpointer: barrera, formato binario y retención
 
-`Checkpointer` (`crates/hotlap-connectors/src/runtime/checkpoint.rs`) escribe
+`Checkpointer` (`crates/hotlap-runtime/src/runtime/checkpoint.rs`) escribe
 checkpoints **coherentes y versionados** en un `StateBackend`:
 
 - `Checkpointer::new(backend, retain)` fija el almacenamiento y cuántos checkpoints
   conservar (`DEFAULT_RETAIN = 3`, recortado a ≥1).
-- `with_sinks(Vec<Arc<SharedSink>>)` añade sinks a la barrera 2PC.
+- `with_sinks(Vec<SinkSync>)` añade sinks a la barrera 2PC.
 - `resume_after(id)`: continúa secuencia tras checkpoint recuperado, para
   no sobrescribirlo.
 - `take(engine, sources)` captura y persiste checkpoint nuevo (asíncrono).
