@@ -16,6 +16,7 @@ use hotlap::{Hotlap, InputId, Plan, ZSetBatch};
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_connectors::source::Source;
+use hotlap_connectors::source::{Offset, SourceState, SourceStream, Split, SplitId};
 use hotlap_engine::EngineCore;
 use hotlap_engine::MetricsRegistry;
 use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, Checkpointer, DEFAULT_RETAIN};
@@ -442,29 +443,51 @@ fn transactional_start_rejects_corrupt_latest_ipc_without_replay_or_effects() {
 fn transactional_pending_internal_corruption_preserves_evidence() {
     let backend = SharedBackend::default();
     let remote = seed_transactional_checkpoints(&backend);
-    // The promotion control proves the pristine pending transaction is redrivable
-    // with its exact original sink binding before testing the corrupted sibling.
-    let control_sink = Arc::new(DurableTxnSink::new(Arc::clone(&remote)));
+    let control_backend = SharedBackend::default();
+    let control_remote = seed_transactional_checkpoints(&control_backend);
+    make_pending(&control_backend, 2);
+    // Hold the source open after its resumed rows so EOF shutdown cannot add
+    // another sink commit before promotion assertions inspect the live handle.
+    let control_sink = Arc::new(DurableTxnSink::new(Arc::clone(&control_remote)));
+    let control_source = Arc::new(SpySource::new(Arc::new(HoldOpenSource(
+        ResumableSource::new(log()),
+    ))));
     let control = Pipeline {
-        sources: sources(Arc::new(ResumableSource::new(log()))),
+        sources: sources(control_source.clone()),
         views: vec![("a".into(), Plan::Source(InputId(0)))],
         sinks: vec![SinkSpec::named("a", "a", control_sink.clone())],
         checkpoint: Some(CheckpointConfig {
             interval: Duration::from_secs(3600),
-            backend: Box::new(backend.clone()),
+            backend: Box::new(control_backend.clone()),
             retain: 1,
         }),
         retention: None,
     };
-    EngineHandle::start(control).expect("undamaged pending transaction promotes");
-    assert!(control_sink.commits.load(Ordering::SeqCst) > 0);
-    assert_eq!(remote.lock().unwrap().committed, vec![(1, 1), (2, 1)]);
+    let control_handle =
+        EngineHandle::start(control).expect("undamaged pending transaction promotes");
+    assert_eq!(control_sink.commits.load(Ordering::SeqCst), 1);
+    assert_eq!(control_source.offset(), Some(2));
+    assert_eq!(control_source.reads(), 1);
+    assert_eq!(
+        rows(&control_handle.snapshot("a").unwrap()),
+        vec![vec![1], vec![2]]
+    );
+    assert_eq!(
+        control_remote.lock().unwrap().committed,
+        vec![(1, 1), (2, 1)]
+    );
+    assert_eq!(
+        control_backend.get(b"checkpoint/2/valid").unwrap(),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(control_backend.get(b"checkpoint/2/commit").unwrap(), None);
+    control_handle.shutdown().unwrap();
+
+    // Corrupt a separate seeded pending transaction with the same exact binding.
     corrupt_valid_output(&backend, 2);
     let corrupt_body = backend.get(b"checkpoint/2/engine").unwrap().unwrap();
     let source_body = backend.get(b"checkpoint/2/sources").unwrap();
-    let mut writer = backend.clone();
-    writer.delete(b"checkpoint/2/valid").unwrap();
-    writer.put(b"checkpoint/2/commit", b"1".to_vec()).unwrap();
+    make_pending(&backend, 2);
     let restarted_sink = Arc::new(DurableTxnSink::new(Arc::clone(&remote)));
     let source: Arc<dyn Source> = Arc::new(ResumableSource::new(log()));
     let spy = Arc::new(SpySource::new(source));
@@ -482,7 +505,13 @@ fn transactional_pending_internal_corruption_preserves_evidence() {
 
     let result = EngineHandle::start(pipeline);
 
-    assert!(matches!(result, Err(ConnectorError::Unsupported(_))));
+    let Err(ConnectorError::Unsupported(reason)) = result else {
+        panic!("corrupt pending checkpoint must fail with Unsupported");
+    };
+    assert!(
+        !reason.contains("sink participants"),
+        "corruption must not be confused with a binding mismatch: {reason}"
+    );
     assert_eq!(restarted_sink.writes.load(Ordering::SeqCst), 0);
     assert_eq!(restarted_sink.commits.load(Ordering::SeqCst), 0);
     assert_eq!(spy.resumed(), 0);
@@ -534,6 +563,51 @@ fn checkpoint_capture_is_reused_for_persisted_body() {
     let saved_sources = decode_sources(&sources_bytes).unwrap();
     assert_eq!(saved_sources.entries[0].state.offsets.get(&0), Some(&1));
     assert_eq!(saved.epoch, 1);
+    let mut restored = Hotlap::open_with(Box::new(EngineCore::new()));
+    pipeline::setup(&mut restored, &pipe).unwrap();
+    restored.restore(&saved).unwrap();
+    assert_eq!(rows(&restored.snapshot("a").unwrap()), vec![vec![1]]);
+}
+
+fn make_pending(backend: &SharedBackend, id: u64) {
+    let mut writer = backend.clone();
+    writer
+        .delete(format!("checkpoint/{id}/valid").as_bytes())
+        .unwrap();
+    writer
+        .put(format!("checkpoint/{id}/commit").as_bytes(), b"1".to_vec())
+        .unwrap();
+}
+
+struct HoldOpenSource(ResumableSource);
+
+impl Source for HoldOpenSource {
+    fn physical_identity(&self) -> Option<String> {
+        self.0.physical_identity()
+    }
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.0.schema()
+    }
+    fn splits(&self) -> Result<Vec<hotlap_connectors::source::Split>, ConnectorError> {
+        self.0.splits()
+    }
+    fn read(&self, split: &Split) -> Result<SourceStream, ConnectorError> {
+        Ok(Box::pin(
+            self.0.read(split)?.chain(futures::stream::pending()),
+        ))
+    }
+    fn commit(&self, split: SplitId, offset: Offset) -> Result<(), ConnectorError> {
+        self.0.commit(split, offset)
+    }
+    fn state(&self) -> SourceState {
+        self.0.state()
+    }
+    fn event_time_column(&self) -> Option<usize> {
+        self.0.event_time_column()
+    }
+    fn resume(&self, state: &SourceState) -> Result<Vec<Split>, ConnectorError> {
+        self.0.resume(state)
+    }
 }
 
 fn corrupt_valid_output(backend: &SharedBackend, id: u64) {
@@ -594,6 +668,10 @@ impl Sink for DurableTxnSink {
 
     fn capabilities(&self) -> SinkCapabilities {
         SinkCapabilities::Transactional
+    }
+
+    fn commit_redriable(&self) -> bool {
+        true
     }
 
     async fn commit(&self) -> Result<(), ConnectorError> {
