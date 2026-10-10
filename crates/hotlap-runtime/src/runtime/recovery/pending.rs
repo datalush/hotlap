@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use hotlap_engine::MetricsRegistry;
 
-use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
+use crate::runtime::checkpoint::{Checkpoint, Checkpointer, PendingPhase};
 use crate::runtime::pipeline;
 use crate::runtime::recovery::RecoveryDecision;
 use hotlap_connectors::error::ConnectorError;
@@ -38,21 +38,25 @@ pub(super) fn prepare_decision(
     pending: u64,
     fallback: &mut Option<Checkpoint>,
 ) -> Result<Option<RecoveryDecision>, ConnectorError> {
-    if !checkpointer.prepare_pending(pending)? {
-        return Ok(None);
-    }
-    if !checkpointer.replay_safe() {
-        return Ok(Some(RecoveryDecision::Reject {
+    match checkpointer.pending_phase(pending)? {
+        PendingPhase::Missing | PendingPhase::Commit => Ok(None),
+        PendingPhase::Invalid => Ok(Some(RecoveryDecision::Reject {
             pending,
-            reason: "an interrupted prepare has no commit decision; transactional \
-                     rollback was not durably confirmed",
-        }));
+            reason: "an interrupted checkpoint has an invalid or unrecognized phase marker",
+        })),
+        PendingPhase::Prepare if !checkpointer.replay_safe() => {
+            Ok(Some(RecoveryDecision::Reject {
+                pending,
+                reason: "an interrupted prepare has no commit decision; transactional \
+                         rollback was not durably confirmed",
+            }))
+        }
+        PendingPhase::Prepare => Ok(Some(RecoveryDecision::Discard {
+            pending,
+            fallback: fallback.take(),
+            reason: "an interrupted prepare did not enter commit",
+        })),
     }
-    Ok(Some(RecoveryDecision::Discard {
-        pending,
-        fallback: fallback.take(),
-        reason: "an interrupted prepare did not enter commit",
-    }))
 }
 
 /// Record the discard of `pending`, delete it, and return the checkpoint to

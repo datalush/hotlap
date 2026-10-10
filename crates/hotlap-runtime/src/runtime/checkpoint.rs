@@ -10,6 +10,7 @@ mod state;
 mod views;
 
 pub use config::{CheckpointConfig, DEFAULT_RETAIN};
+pub(super) use pending::PendingPhase;
 pub use state::CheckpointState;
 
 use hotlap::state::StateBackend;

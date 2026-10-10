@@ -1,6 +1,6 @@
 //! Selection and validation of checkpoint views.
 
-use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
+use crate::runtime::checkpoint::{Checkpoint, Checkpointer, PendingPhase};
 use crate::runtime::source_checkpoint::SavedView;
 use crate::runtime::sources::Sources;
 use hotlap_connectors::error::ConnectorError;
@@ -55,13 +55,23 @@ impl Checkpointer {
         let Some(id) = self.pending_commit(floor)? else {
             return Ok(valid);
         };
-        if self.prepare_pending(id)? {
-            if !replay_safe {
-                return Err(ConnectorError::Unsupported(
-                    "an interrupted prepare cannot be recovered with transactional sinks".into(),
-                ));
+        match self.pending_phase(id)? {
+            PendingPhase::Invalid => {
+                return Err(ConnectorError::Unsupported(format!(
+                    "interrupted checkpoint {id} has an invalid or unrecognized phase marker"
+                )));
             }
-            return Ok(valid);
+            PendingPhase::Prepare => {
+                if !replay_safe {
+                    return Err(ConnectorError::Unsupported(
+                        "an interrupted prepare cannot be recovered with transactional sinks"
+                            .into(),
+                    ));
+                }
+                return Ok(valid);
+            }
+            PendingPhase::Missing => return Ok(valid),
+            PendingPhase::Commit => {}
         }
         let pending = self.read_body_for_recovery(id)?;
         if redriable && pending.is_some() {

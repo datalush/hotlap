@@ -2,7 +2,7 @@
 
 use super::{Checkpoint, Checkpointer};
 use crate::runtime::checkpoint_body::{
-    PREPARE_MARKER, checkpoint_prefix, decode_err, invalid, read_body as decode_body,
+    COMMIT_MARKER, PREPARE_MARKER, checkpoint_prefix, decode_err, invalid, read_body as decode_body,
 };
 use crate::runtime::source_checkpoint::decode_sources;
 use hotlap_connectors::error::ConnectorError;
@@ -28,11 +28,20 @@ impl Checkpointer {
     }
 
     /// Whether an interrupted attempt has not durably entered commit.
-    pub(crate) fn prepare_pending(&self, id: u64) -> Result<bool, ConnectorError> {
+    pub(crate) fn pending_phase(&self, id: u64) -> Result<PendingPhase, ConnectorError> {
         let base = checkpoint_prefix(id);
-        let preparing = self.get(&format!("{base}/prepare"))?;
-        let committing = self.has_key(&format!("{base}/commit"))?;
-        Ok(!committing && preparing.as_deref() == Some(PREPARE_MARKER))
+        if let Some(commit) = self.get(&format!("{base}/commit"))? {
+            return Ok(if commit == COMMIT_MARKER {
+                PendingPhase::Commit
+            } else {
+                PendingPhase::Invalid
+            });
+        }
+        Ok(match self.get(&format!("{base}/prepare"))? {
+            None => PendingPhase::Missing,
+            Some(prepare) if prepare == PREPARE_MARKER => PendingPhase::Prepare,
+            Some(_) => PendingPhase::Invalid,
+        })
     }
 
     /// Decode a body without requiring its `valid` marker.
@@ -83,4 +92,12 @@ impl Checkpointer {
             sources,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingPhase {
+    Missing,
+    Prepare,
+    Commit,
+    Invalid,
 }
