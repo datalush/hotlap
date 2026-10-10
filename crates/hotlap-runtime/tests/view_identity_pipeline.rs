@@ -469,8 +469,8 @@ fn transactional_pending_internal_corruption_preserves_evidence() {
     assert_eq!(control_source.offset(), Some(2));
     assert_eq!(control_source.reads(), 1);
     assert_eq!(
-        rows(&control_handle.snapshot("a").unwrap()),
-        vec![vec![1], vec![2]]
+        weighted_rows(&control_handle.snapshot("a").unwrap()),
+        vec![(vec![1], 1), (vec![2], 1)]
     );
     assert_eq!(
         control_remote.lock().unwrap().committed,
@@ -566,7 +566,30 @@ fn checkpoint_capture_is_reused_for_persisted_body() {
     let mut restored = Hotlap::open_with(Box::new(EngineCore::new()));
     pipeline::setup(&mut restored, &pipe).unwrap();
     restored.restore(&saved).unwrap();
-    assert_eq!(rows(&restored.snapshot("a").unwrap()), vec![vec![1]]);
+    assert_eq!(
+        weighted_rows(&restored.snapshot("a").unwrap()),
+        vec![(vec![1], 1)]
+    );
+}
+
+fn weighted_rows(zset: &ZSetBatch) -> Vec<(Vec<i64>, i64)> {
+    let columns: Vec<&Int64Array> = zset
+        .batch
+        .columns()
+        .iter()
+        .map(|column| column.as_any().downcast_ref::<Int64Array>().unwrap())
+        .collect();
+    let diffs = zset.diff.as_any().downcast_ref::<Int64Array>().unwrap();
+    let mut rows: Vec<_> = (0..zset.len())
+        .map(|row| {
+            (
+                columns.iter().map(|column| column.value(row)).collect(),
+                diffs.value(row),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
 }
 
 fn make_pending(backend: &SharedBackend, id: u64) {
