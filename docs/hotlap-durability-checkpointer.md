@@ -126,8 +126,10 @@ por el texto del mensaje:
 - **Corrupción del formato actual** (`Corruption`): los bytes tienen el formato
   vigente pero están dañados (cabecera truncada, longitud incoherente, payload
   ilegible), incluidos IPC internos que no pueden reconstruir schema, grafos,
-  estado de operadores, salida o changelog pendiente. Es el **único** caso de
-  bytes que la recuperación tolera al caer al predecesor válido más nuevo.
+  estado de operadores, salida o changelog pendiente. Solo se puede caer al
+  predecesor restaurable cuando todos los sinks participantes declaran replay
+  seguro; con sinks transaccionales se rechaza antes de abrir writers o reanudar
+  fuentes, pues replay podría duplicar una transacción confirmada.
 - **Incompatibilidad fatal** (`Unsupported`): magic ajeno o versión desconocida
   en el contenedor de fuentes, en el frame interno del motor o en el snapshot.
   Es fatal: no hay lector antiguo, no se cae a un predecesor y nunca arranca en
@@ -144,8 +146,11 @@ Antes de re-conducir un commit, publicar `valid`, podar o borrar evidencia, el
 motor reconstruye el snapshot completo en un core scratch mediante el mismo
 camino que `restore`. La validación no cambia el motor activo ni sus métricas.
 Un candidato pendiente que no sea restaurable falla sin confirmar el sink ni
-eliminar sus marcadores; la selección de checkpoints válidos puede saltar una
-corrupción del formato actual y conservar el predecesor restaurable. La API
+eliminar sus marcadores cuando replay no es seguro. Si todos los participantes
+permiten replay, recovery valida completamente el predecesor antes de descartar
+el intento y reanudar desde sus offsets. La selección de checkpoints válidos
+aplica la misma política de capacidad; la limpieza tolerante conserva cualquier
+marcador redundante unido a un checkpoint corrupto. La API
 pública `Checkpointer::promote(id)` repite esta validación antes de re-conducir,
 por lo que no depende de que un caller externo haya ejecutado preflight.
 

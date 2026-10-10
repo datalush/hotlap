@@ -13,8 +13,9 @@ impl Recovery {
     /// tolerated, but an operational read failure is fatal. Selection always
     /// scans the namespace newest-first, so a pointer that lags behind a
     /// checkpoint already published as `valid` cannot hide it. A checkpoint that
-    /// fails to decode as the current format is skipped; an incompatible one is a
-    /// fatal `Unsupported` rather than a silent skip.
+    /// is corrupted is skipped only when this checkpointer's participants declare
+    /// replay safe. Otherwise corruption is fatal to prevent transaction replay.
+    /// An incompatible checkpoint is always fatal `Unsupported`.
     pub fn load(
         checkpointer: &Checkpointer,
         sources: &Sources,

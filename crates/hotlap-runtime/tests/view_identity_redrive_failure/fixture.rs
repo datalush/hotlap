@@ -136,6 +136,31 @@ pub fn seeded_compatible_registries() -> (SharedBackend, Dataset) {
     seed_registry(&backend, views.clone(), dataset.clone(), 3);
     let pending = SharedBackend::default();
     seed_registry(&pending, views, dataset.clone(), 4);
+    let fallback = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+        .read(1)
+        .unwrap();
+    let interrupted = Checkpointer::new(Box::new(pending.clone()), DEFAULT_RETAIN)
+        .read(1)
+        .unwrap();
+    assert_ne!(fallback.engine, interrupted.engine);
+    assert_eq!(
+        fallback.sources.entries[0]
+            .state
+            .offsets
+            .values()
+            .copied()
+            .next(),
+        Some(3)
+    );
+    assert_eq!(
+        interrupted.sources.entries[0]
+            .state
+            .offsets
+            .values()
+            .copied()
+            .next(),
+        Some(4)
+    );
     copy_as_pending_commit(&backend, &pending);
     (backend, dataset)
 }

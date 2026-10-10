@@ -162,13 +162,28 @@ impl Checkpointer {
     /// marker is redundant. A storage failure while deleting it propagates
     /// rather than being ignored.
     pub fn sweep_stale_commits(&mut self) -> Result<(), ConnectorError> {
+        self.sweep_stale_commits_with_replay_safety(self.replay_safe())
+    }
+
+    pub(crate) fn sweep_stale_commits_with_replay_safety(
+        &mut self,
+        replay_safe: bool,
+    ) -> Result<(), ConnectorError> {
         for id in self.ids_descending()? {
             let base = checkpoint_prefix(id);
             if self.has_key(&format!("{base}/valid"))?
                 && (self.has_key(&format!("{base}/commit"))?
                     || self.has_key(&format!("{base}/prepare"))?)
             {
-                self.read(id)?;
+                match self.read(id) {
+                    Ok(_) => {}
+                    Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_))
+                        if replay_safe =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
                 clear_commit(self.backend.as_mut(), id).map_err(state_err)?;
             }
         }

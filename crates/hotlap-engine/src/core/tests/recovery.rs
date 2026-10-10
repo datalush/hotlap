@@ -68,6 +68,23 @@ fn snapshot_validation_rejects_corrupt_ipc_and_unknown_layout() {
     assert_eq!(core.checkpoint().unwrap(), before);
 }
 
+#[test]
+fn snapshot_validation_rejects_corrupt_pending_changelog_ipc() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &Plan::Source(InputId(0)))
+        .unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+    core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+    let mut snapshot = core.checkpoint().unwrap();
+    snapshot.views[0].pending.as_mut().unwrap().ipc = b"broken pending IPC".to_vec();
+
+    assert!(matches!(
+        core.validate_snapshot(&snapshot),
+        Err(crate::EngineError::Infrastructure(_))
+    ));
+}
+
 /// A failing push in one view must not surface the other views' partial state.
 #[test]
 fn failed_push_poisons_snapshot_push_and_take_changes() {

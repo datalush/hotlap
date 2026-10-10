@@ -50,7 +50,7 @@ impl Checkpointer {
         replay_safe: bool,
         redriable: bool,
     ) -> Result<Option<Checkpoint>, ConnectorError> {
-        let valid = self.newest_valid()?;
+        let valid = self.newest_valid_with_replay_safety(replay_safe)?;
         let floor = valid.as_ref().map(|checkpoint| checkpoint.id);
         let Some(id) = self.pending_commit(floor)? else {
             return Ok(valid);
@@ -74,9 +74,6 @@ impl Checkpointer {
             PendingPhase::Commit => {}
         }
         let pending = self.read_body_for_recovery(id)?;
-        if let Some(checkpoint) = &pending {
-            crate::runtime::checkpoint_body::validate_engine_snapshot(&checkpoint.engine)?;
-        }
         if redriable && pending.is_some() {
             return Ok(pending);
         }
@@ -88,13 +85,32 @@ impl Checkpointer {
         Ok(valid)
     }
 
-    /// Newest checkpoint with a valid marker that decodes, or `None`.
+    /// Newest restorable checkpoint under this checkpointer's sink capabilities.
+    /// Current-format corruption is skipped only when replay is declared safe.
     pub fn newest_valid(&self) -> Result<Option<Checkpoint>, ConnectorError> {
+        self.newest_valid_with_replay_safety(self.replay_safe())
+    }
+
+    /// Select the newest restorable checkpoint under the caller's declared
+    /// replay capability. Incomplete non-valid attempts are left to pending
+    /// recovery; published current-format corruption is skippable only when safe.
+    pub(crate) fn newest_valid_with_replay_safety(
+        &self,
+        replay_safe: bool,
+    ) -> Result<Option<Checkpoint>, ConnectorError> {
         for id in self.ids_descending()? {
+            if !self.has_key(&format!("checkpoint/{id}/valid"))? {
+                continue;
+            }
             match self.read(id) {
                 Ok(checkpoint) => return Ok(Some(checkpoint)),
                 Err(error @ ConnectorError::Unsupported(_)) => return Err(error),
-                Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => continue,
+                Err(error @ (ConnectorError::Corruption(_) | ConnectorError::Missing(_))) => {
+                    if replay_safe {
+                        continue;
+                    }
+                    return Err(error);
+                }
                 Err(error) => return Err(error),
             }
         }

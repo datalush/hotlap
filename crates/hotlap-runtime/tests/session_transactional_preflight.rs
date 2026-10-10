@@ -104,6 +104,44 @@ fn an_actual_transactional_sink_cannot_contradict_preflight() {
 }
 
 #[test]
+fn corrupt_published_snapshot_rejects_session_before_factories_or_source() {
+    let backend = TestBackend::default();
+    seed(&backend);
+    let engine_key = b"checkpoint/1/engine";
+    let original = backend.get(engine_key).unwrap().unwrap();
+    let mut snapshot = hotlap_engine::decode_snapshot(&original).unwrap();
+    snapshot.views[0].output.as_mut().unwrap().ipc = b"broken output IPC".to_vec();
+    let corrupt = hotlap_engine::encode_snapshot(&snapshot).unwrap();
+    let mut writer = backend.clone();
+    writer.put(engine_key, corrupt.clone()).unwrap();
+
+    let reads = Arc::new(AtomicU32::new(0));
+    let creates = Arc::new(AtomicU32::new(0));
+    let mut session = Session::open(config(
+        &backend,
+        reads.clone(),
+        creates.clone(),
+        true,
+        Arc::new(Mutex::new(Vec::new())),
+        SessionSignals::default(),
+    ))
+    .unwrap();
+    declare(&mut session);
+
+    let error = match session.sql("START;") {
+        Ok(_) => panic!("transactional recovery must reject an unrestorable published snapshot"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, SessionError::Sql(SqlError::Engine(_))));
+    assert_eq!(creates.load(Ordering::SeqCst), 0);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.get(engine_key).unwrap(), Some(corrupt));
+    assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
+    session.shutdown().unwrap();
+}
+
+#[test]
 fn invalid_prepare_rejects_session_before_sink_factory_or_source_read() {
     let backend = TestBackend::default();
     seed(&backend);

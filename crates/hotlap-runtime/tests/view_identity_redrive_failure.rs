@@ -66,7 +66,7 @@ fn compatible_fallback_is_discarded_and_replayed_after_redrive_error() {
 }
 
 #[test]
-fn unrestorable_pending_snapshot_keeps_staged_commit_and_last_checkpoint() {
+fn replay_safe_unrestorable_pending_discards_and_replays_only_after_fallback_validation() {
     let (backend, dataset) = seeded_compatible_registries();
     corrupt_pending_output(&backend);
     let (sink, remote) = ready_redrive_sink();
@@ -81,19 +81,17 @@ fn unrestorable_pending_snapshot_keeps_staged_commit_and_last_checkpoint() {
     assert!(backend.get(b"checkpoint/2/commit").unwrap().is_some());
     let (pipeline, spy) = pipeline_retaining(&backend, dataset, Some(sink), 1);
 
-    let result = EngineHandle::start(pipeline);
+    let handle = EngineHandle::start(pipeline).expect("safe replay from full valid fallback");
 
-    assert!(
-        matches!(result, Err(ConnectorError::Corruption(_))),
-        "an unrestorable pending snapshot must preserve its typed corruption"
-    );
     assert_eq!(remote.lock().unwrap().staged, vec![(1, 1)]);
     assert_eq!(remote.lock().unwrap().committed, Vec::<(i64, i64)>::new());
     assert!(backend.get(b"checkpoint/2/valid").unwrap().is_none());
     assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
-    assert!(backend.get(b"checkpoint/2/commit").unwrap().is_some());
-    assert!(backend.get(b"checkpoint/2/engine").unwrap().is_some());
-    assert_eq!(spy.resumed(), 0);
+    assert!(backend.get(b"checkpoint/2/commit").unwrap().is_none());
+    assert!(backend.get(b"checkpoint/2/engine").unwrap().is_none());
+    assert_snapshot(&handle, "a", 1);
+    assert_eq!(spy.offset(), Some(3));
+    handle.shutdown().unwrap();
 }
 
 fn corrupt_pending_output(backend: &SharedBackend) {

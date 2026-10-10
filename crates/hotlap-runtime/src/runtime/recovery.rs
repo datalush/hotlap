@@ -60,7 +60,6 @@ impl Recovery {
             }
             let reason = match checkpointer.read_body_for_recovery(pending)? {
                 Some(checkpoint) => {
-                    crate::runtime::checkpoint_body::validate_engine_snapshot(&checkpoint.engine)?;
                     sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
                     if checkpointer.redriable() {
                         return Ok(RecoveryDecision::Promote(checkpoint));

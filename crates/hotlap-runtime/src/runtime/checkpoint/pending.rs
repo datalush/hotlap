@@ -60,7 +60,13 @@ impl Checkpointer {
         &self,
         id: u64,
     ) -> Result<Option<Checkpoint>, ConnectorError> {
-        match self.read_body(id) {
+        let body = self.read_body(id).and_then(|body| match body {
+            Some(checkpoint) => {
+                validate_engine_snapshot(&checkpoint.engine).map(|()| Some(checkpoint))
+            }
+            None => Ok(None),
+        });
+        match body {
             Ok(body) => Ok(body),
             Err(error @ ConnectorError::Unsupported(_)) => Err(error),
             Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => Ok(None),
