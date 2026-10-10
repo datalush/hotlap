@@ -1,8 +1,8 @@
 //! Counting source and sink factories for the rejected-start tests.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use futures::{StreamExt, stream};
@@ -22,6 +22,7 @@ fn session_schema() -> SchemaRef {
 /// Counts reads so a refused start can prove it never opened the source.
 struct CountedSource {
     reads: Arc<AtomicU32>,
+    starts: Arc<Mutex<Vec<i64>>>,
 }
 
 impl Source for CountedSource {
@@ -31,8 +32,9 @@ impl Source for CountedSource {
     fn splits(&self) -> Result<Vec<Split>, ConnectorError> {
         Ok(vec![Split { id: 0, start: 0 }])
     }
-    fn read(&self, _split: &Split) -> Result<SourceStream, ConnectorError> {
+    fn read(&self, split: &Split) -> Result<SourceStream, ConnectorError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        self.starts.lock().unwrap().push(split.start);
         Ok(Box::pin(stream::empty()))
     }
     fn state(&self) -> SourceState {
@@ -46,6 +48,7 @@ impl Source for CountedSource {
 /// Builds a read-counting source for every name.
 pub struct CountedFactory {
     pub reads: Arc<AtomicU32>,
+    pub starts: Arc<Mutex<Vec<i64>>>,
 }
 
 #[async_trait::async_trait]
@@ -57,6 +60,7 @@ impl SourceFactory for CountedFactory {
     ) -> Result<Box<dyn Source>, SqlError> {
         Ok(Box::new(CountedSource {
             reads: Arc::clone(&self.reads),
+            starts: Arc::clone(&self.starts),
         }))
     }
 }
@@ -64,11 +68,13 @@ impl SourceFactory for CountedFactory {
 /// A sink whose retraction capability can be flipped between attempts.
 struct ToggleSink {
     accepts: Arc<AtomicBool>,
+    writes: Arc<AtomicU32>,
 }
 
 #[async_trait::async_trait]
 impl Sink for ToggleSink {
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
         while changes.next().await.is_some() {}
         Ok(())
     }
@@ -87,6 +93,7 @@ impl Sink for ToggleSink {
 pub struct ToggleFactory {
     pub creates: Arc<AtomicU32>,
     pub accepts: Arc<AtomicBool>,
+    pub writes: Arc<AtomicU32>,
 }
 
 #[async_trait::async_trait]
@@ -100,6 +107,7 @@ impl SinkFactory for ToggleFactory {
         self.creates.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(ToggleSink {
             accepts: Arc::clone(&self.accepts),
+            writes: Arc::clone(&self.writes),
         }))
     }
 

@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use hotlap_sql::SqlError;
 
 use sink_support::{
-    consolidate, recompute, session, session_with, source_batch, wait_for_rows, wait_for_sink,
+    consolidate, recompute, session, session_with, session_with_effects, source_batch,
+    wait_for_rows, wait_for_sink,
 };
 
 const SOURCE: &str = "CREATE SOURCE src WITH (connector='inmem') WATERMARK FOR \
@@ -67,7 +68,8 @@ async fn create_sink_unknown_view_rejected() {
 async fn retracting_view_with_append_only_sink_rejected_at_start() {
     let sink_batches = Arc::new(Mutex::new(Vec::new()));
     // A changing grouped aggregate still retracts and must be refused before writes.
-    let mut session = session_with(vec![source_batch(&[1], &[1000])], &sink_batches, false);
+    let (mut session, effects) =
+        session_with_effects(vec![source_batch(&[1], &[1000])], &sink_batches, false);
     session.sql(SOURCE).await.unwrap();
     session
         .sql("CREATE MATERIALIZED VIEW mv AS SELECT k, count(*) FROM src GROUP BY k;")
@@ -79,8 +81,29 @@ async fn retracting_view_with_append_only_sink_rejected_at_start() {
         Ok(_) => panic!("a retracting plan must be rejected before writes"),
     };
     assert!(
-        matches!(error, SqlError::Unsupported(_) | SqlError::Engine(_)),
+        matches!(
+            error,
+            SqlError::Unsupported(ref reason) if reason.contains("cannot apply retractions")
+        ),
         "{error:?}"
+    );
+    assert_eq!(
+        effects
+            .sink_creates
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        effects
+            .sink_writes
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        effects
+            .source_reads
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
     );
 }
 
@@ -99,23 +122,24 @@ async fn closed_window_writes_one_append_to_append_only_sink() {
     let rows = wait_for_sink(&sink_batches, &[(1, 0, 2)]).await;
     assert_eq!(rows, vec![(1, 0, 2)]);
 
-    let batches = sink_batches.lock().unwrap();
-    let diffs: Vec<i64> = batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .diff
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .unwrap()
-                .values()
-                .iter()
-                .copied()
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    assert_eq!(diffs, vec![1]);
-    drop(batches);
+    {
+        let batches = sink_batches.lock().unwrap();
+        let diffs: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .diff
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(diffs, vec![1]);
+    }
     session.shutdown().await.unwrap();
 }
 

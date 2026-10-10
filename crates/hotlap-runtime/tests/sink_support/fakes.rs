@@ -1,6 +1,7 @@
 //! Fake source/sink factories shared by the `CREATE SINK` tests.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, Int64Array};
@@ -17,6 +18,7 @@ use hotlap_sql::SqlError;
 pub struct FakeSource {
     schema: SchemaRef,
     batches: Vec<SourceBatch>,
+    reads: Arc<SinkTestEffects>,
 }
 
 impl Source for FakeSource {
@@ -27,6 +29,7 @@ impl Source for FakeSource {
         Ok(vec![Split { id: 0, start: 0 }])
     }
     fn read(&self, _split: &Split) -> Result<SourceStream, ConnectorError> {
+        self.reads.source_reads.fetch_add(1, Ordering::SeqCst);
         let items: Vec<Result<SourceBatch, ConnectorError>> =
             self.batches.iter().cloned().map(Ok).collect();
         Ok(Box::pin(stream::iter(items)))
@@ -43,6 +46,7 @@ impl Source for FakeSource {
 struct FakeFactory {
     schema: SchemaRef,
     batches: Vec<SourceBatch>,
+    effects: Arc<SinkTestEffects>,
 }
 
 #[async_trait::async_trait]
@@ -55,6 +59,7 @@ impl SourceFactory for FakeFactory {
         Ok(Box::new(FakeSource {
             schema: self.schema.clone(),
             batches: self.batches.clone(),
+            reads: Arc::clone(&self.effects),
         }))
     }
 }
@@ -63,11 +68,13 @@ impl SourceFactory for FakeFactory {
 struct FakeSink {
     batches: Arc<Mutex<Vec<ZSetBatch>>>,
     accepts_retractions: bool,
+    effects: Arc<SinkTestEffects>,
 }
 
 #[async_trait::async_trait]
 impl Sink for FakeSink {
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
+        self.effects.sink_writes.fetch_add(1, Ordering::SeqCst);
         while let Some(item) = changes.next().await {
             self.batches.lock().unwrap().push(item?);
         }
@@ -88,6 +95,7 @@ impl Sink for FakeSink {
 struct FakeSinkFactory {
     batches: Arc<Mutex<Vec<ZSetBatch>>>,
     accepts_retractions: bool,
+    effects: Arc<SinkTestEffects>,
 }
 
 #[async_trait::async_trait]
@@ -98,9 +106,11 @@ impl SinkFactory for FakeSinkFactory {
         _options: &BTreeMap<String, String>,
         _schema: SchemaRef,
     ) -> Result<Arc<dyn Sink>, SqlError> {
+        self.effects.sink_creates.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(FakeSink {
             batches: Arc::clone(&self.batches),
             accepts_retractions: self.accepts_retractions,
+            effects: Arc::clone(&self.effects),
         }))
     }
 
@@ -120,15 +130,35 @@ pub fn session_with(
     sink_batches: &Arc<Mutex<Vec<ZSetBatch>>>,
     accepts_retractions: bool,
 ) -> SqlSession {
+    session_with_effects(batches, sink_batches, accepts_retractions).0
+}
+
+/// Counts observable startup effects for an append-only preflight test.
+#[derive(Default)]
+pub struct SinkTestEffects {
+    pub source_reads: AtomicU32,
+    pub sink_creates: AtomicU32,
+    pub sink_writes: AtomicU32,
+}
+
+/// Build a session and expose source-read, sink-create and sink-write counters.
+pub fn session_with_effects(
+    batches: Vec<SourceBatch>,
+    sink_batches: &Arc<Mutex<Vec<ZSetBatch>>>,
+    accepts_retractions: bool,
+) -> (SqlSession, Arc<SinkTestEffects>) {
+    let effects = Arc::new(SinkTestEffects::default());
     let source = Arc::new(FakeFactory {
         schema: kv_schema(),
         batches,
+        effects: Arc::clone(&effects),
     });
     let sink = Arc::new(FakeSinkFactory {
         batches: Arc::clone(sink_batches),
         accepts_retractions,
+        effects: Arc::clone(&effects),
     });
-    SqlSession::open_with_factories(source, sink)
+    (SqlSession::open_with_factories(source, sink), effects)
 }
 
 fn kv_schema() -> SchemaRef {
