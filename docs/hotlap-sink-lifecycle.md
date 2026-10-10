@@ -12,7 +12,9 @@ Detalle complementario de [sink Hotlap](hotlap-sink.md).
    primero el checkpointer y sus senders, luego cierra el pump y espera las tareas.
    El EOF de los writers **solo autoriza el commit final si el estado global de
    cierre sigue sano**: fallo/cancelación de source, ingest, envío, ACK/writer o
-   checkpoint marca el cierre como no limpio y no permite commit implícito. Así,
+   checkpoint marca el cierre como no limpio y no permite commit implícito. El
+   fallo original queda observable en `EngineHandle::shutdown` y `Session::shutdown`
+   (los diagnósticos de error no lo consumen). Así,
    un prepare incierto no se convierte en publicación por EOF. El commit final
    tiene un límite de **5 s**; las tareas también tienen espera acotada y se
    abortan/recogen al vencer. El hilo motor corre en un runtime *current-thread*;
@@ -31,7 +33,7 @@ Detalle complementario de [sink Hotlap](hotlap-sink.md).
   frontera pública, `Pipeline::validate` lo rechaza antes de abrir writers,
   streams o taps (ver límites de esta versión).
 - `CREATE SINK` tras `START`.
-- Persistencia de estado / recuperación desde checkpoint.
+- Garantía general exactly-once o terminación forzada de trabajo que no coopera.
 - **Proyección explícita**: solo `AS SELECT * FROM <mv>`; cualquier otra
   proyección (`SELECT k ...`) se **rechaza** con `SqlError::Unsupported`.
 

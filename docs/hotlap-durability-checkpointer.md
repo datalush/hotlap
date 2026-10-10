@@ -47,7 +47,7 @@ declaradas es fatal.
 | --- | --- |
 | `checkpoint/<id>/engine` | snapshot del motor (frame binario) |
 | `checkpoint/<id>/sources` | `SourcesCheckpoint` multifuente (contenedor `HLSR`) |
-| `checkpoint/<id>/prepare` | marcador `1`: intención durable escrita antes de invocar `Sink::prepare` |
+| `checkpoint/<id>/prepare` | marcador `prepare-v1`: intención durable escrita antes de invocar `Sink::prepare` |
 | `checkpoint/<id>/commit` | marcador `1`: intención durable escrita antes de invocar `Sink::commit` |
 | `checkpoint/<id>/valid` | marcador `1`: el checkpoint está completo |
 | `checkpoint/latest` | id (8 bytes LE) del checkpoint nuevo más reciente |
@@ -61,6 +61,9 @@ fallo pre-commit solo se elimina después de que todos los `abort` confirmen éx
 Un error/cancelación de rollback conserva el marcador. El marcador `commit` se
 borra tras publicar `valid`: un `commit` presente **sin** `valid` indica a
 recovery una fase de commit incierta (`hotlap-sink-2pc.md`).
+Recovery reconoce únicamente `prepare-v1` y el valor `1` en `commit`; un marcador
+presente vacío, truncado o desconocido no se interpreta como ausencia de decisión.
+Se rechaza sin promover, descartar ni modificar el cuerpo o los marcadores.
 
 **Publicación y limpieza son pasos distintos.** Publicar (`valid` + `latest`) y
 podar los antiguos son operaciones separadas: un fallo al escribir `latest` o al
