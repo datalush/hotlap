@@ -116,7 +116,7 @@ impl Recovery {
         checkpointer.sweep_stale_commits()?;
         let decision = Self::inspect(checkpointer, sources)?;
         views::validate(hotlap, &decision)?;
-        match Self::resolve(decision, sources, checkpointer, signal, metrics).await? {
+        match Self::resolve(decision, hotlap, sources, checkpointer, signal, metrics).await? {
             Resolved::Stream => sources.stream(),
             Resolved::Checkpoint(checkpoint) => {
                 checkpointer.resume_after(checkpoint.id);
@@ -128,6 +128,7 @@ impl Recovery {
     /// Turn a recovery decision into a checkpoint to resume or a clean start.
     async fn resolve(
         decision: RecoveryDecision,
+        hotlap: &Hotlap,
         sources: &Sources,
         checkpointer: &mut Checkpointer,
         signal: &Mutex<Option<String>>,
@@ -137,7 +138,7 @@ impl Recovery {
             RecoveryDecision::Clean => Ok(Resolved::Stream),
             RecoveryDecision::Resume(checkpoint) => Ok(Resolved::Checkpoint(checkpoint)),
             RecoveryDecision::Promote(checkpoint) => {
-                Self::promote(checkpoint, sources, checkpointer, signal, metrics).await
+                Self::promote(checkpoint, hotlap, sources, checkpointer, signal, metrics).await
             }
             RecoveryDecision::Discard {
                 pending,
@@ -158,6 +159,7 @@ impl Recovery {
     /// Re-drive a promoted commit, discarding and replaying only when safe.
     async fn promote(
         checkpoint: Checkpoint,
+        hotlap: &Hotlap,
         sources: &Sources,
         checkpointer: &mut Checkpointer,
         signal: &Mutex<Option<String>>,
@@ -177,6 +179,12 @@ impl Recovery {
                     return Err(error);
                 }
                 let fallback = Self::load(checkpointer, sources)?;
+                if let Some(checkpoint) = &fallback {
+                    let declared = crate::runtime::source_checkpoint::SavedView::from_registry(
+                        &hotlap.view_registry(),
+                    );
+                    views::validate_checkpoint(&declared, checkpoint)?;
+                }
                 let reason = format!("commit re-drive failed ({error})");
                 match discard(
                     checkpointer,

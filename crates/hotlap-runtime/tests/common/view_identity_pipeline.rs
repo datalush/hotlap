@@ -83,6 +83,41 @@ pub fn seed_output(backend: &SharedBackend) {
     assert_eq!(ops::take(&mut checkpointer, &hotlap, &pipe.sources), 1);
 }
 
+pub fn seed_registry(
+    backend: &SharedBackend,
+    views: Vec<(String, Plan)>,
+    dataset: Dataset,
+    consumed: usize,
+) {
+    let pipe = Pipeline {
+        sources: sources(Arc::new(ResumableSource::new(dataset))),
+        views,
+        sinks: vec![],
+        checkpoint: None,
+        retention: None,
+    };
+    let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
+    pipeline::setup(&mut hotlap, &pipe).unwrap();
+    let mut stream = pipe.sources.stream().unwrap();
+    ops::drain(&mut hotlap, &pipe.sources, &mut stream, consumed);
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    ops::take(&mut checkpointer, &hotlap, &pipe.sources);
+}
+
+pub fn copy_as_pending_commit(valid: &SharedBackend, pending: &SharedBackend) {
+    let mut writer = valid.clone();
+    for part in ["engine", "sources"] {
+        let body = pending
+            .get(format!("checkpoint/1/{part}").as_bytes())
+            .unwrap()
+            .unwrap();
+        writer
+            .put(format!("checkpoint/2/{part}").as_bytes(), body)
+            .unwrap();
+    }
+    writer.put(b"checkpoint/2/commit", b"1".to_vec()).unwrap();
+}
+
 pub fn corrupt_pending(backend: &SharedBackend) {
     let mut writer = backend.clone();
     for part in ["engine", "sources"] {

@@ -1,6 +1,7 @@
 //! Reject a recovery decision whose checkpointed views disagree with the live
 //! declaration, before the engine is restored or a commit is re-driven.
 
+use crate::runtime::checkpoint::Checkpoint;
 use hotlap::Hotlap;
 use hotlap_connectors::error::ConnectorError;
 
@@ -18,9 +19,16 @@ pub(super) fn validate(hotlap: &Hotlap, decision: &RecoveryDecision) -> Result<(
         RecoveryDecision::Clean | RecoveryDecision::Reject { .. } => None,
     };
     if let Some(checkpoint) = checkpoint {
-        checkpoint
-            .sources
-            .validate_views(&declared, &checkpoint.engine)?;
+        validate_checkpoint(&declared, checkpoint)?;
     }
     Ok(())
+}
+
+pub(super) fn validate_checkpoint(
+    declared: &[SavedView],
+    checkpoint: &Checkpoint,
+) -> Result<(), ConnectorError> {
+    checkpoint
+        .sources
+        .validate_views(declared, &checkpoint.engine)
 }

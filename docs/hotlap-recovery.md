@@ -82,6 +82,9 @@ compara fuentes y vistas contra la misma elección de recovery antes de abrir
 sinks o iniciar lecturas. Para promover un commit pendiente, `SinkFactory` debe
 declarar `may_redrive_commit(options)` y el sink abierto debe confirmar esa
 capacidad; el valor por defecto es `false` y Fluss no declara re-drive durable.
+Si el re-drive falla y se considera replay, el fallback valida identidad de
+fuentes y vistas **antes** de descartar el cuerpo pendiente; un fallback
+incompatible conserva toda la evidencia durable.
 El commit EOF requiere
 además un cierre global sano, nunca se infiere solo de EOF. Así un rechazo deja
 `factory creates`, reads y commits en cero. En SQL, el preflight consulta

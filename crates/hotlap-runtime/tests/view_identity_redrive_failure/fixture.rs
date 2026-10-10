@@ -1,0 +1,123 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures::StreamExt;
+use hotlap_connectors::error::ConnectorError;
+use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
+use hotlap_connectors::source::Source;
+use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, DEFAULT_RETAIN};
+use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
+
+use super::support::{
+    Dataset, ResumableSource, SharedBackend, SpySource, copy_as_pending_commit, filter,
+    seed_registry, sources,
+};
+
+#[derive(Default)]
+pub struct DurableRemote {
+    pub staged: bool,
+    pub committed: bool,
+    fail_next: bool,
+}
+
+pub struct RedriveSink {
+    pub remote: Arc<Mutex<DurableRemote>>,
+    pub writes: AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl Sink for RedriveSink {
+    async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        while changes.next().await.is_some() {}
+        Ok(())
+    }
+
+    fn capabilities(&self) -> SinkCapabilities {
+        SinkCapabilities::Idempotent
+    }
+
+    fn commit_redriable(&self) -> bool {
+        true
+    }
+
+    async fn commit(&self) -> Result<(), ConnectorError> {
+        let mut remote = self.remote.lock().unwrap();
+        if remote.fail_next {
+            remote.fail_next = false;
+            return Err(ConnectorError::Infrastructure(
+                "transient re-drive error".into(),
+            ));
+        }
+        if remote.staged {
+            remote.staged = false;
+            remote.committed = true;
+        }
+        Ok(())
+    }
+
+    async fn abort(&self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
+pub fn redrive_sink() -> (Arc<RedriveSink>, Arc<Mutex<DurableRemote>>) {
+    let remote = Arc::new(Mutex::new(DurableRemote {
+        staged: true,
+        fail_next: true,
+        ..DurableRemote::default()
+    }));
+    (
+        Arc::new(RedriveSink {
+            remote: Arc::clone(&remote),
+            writes: AtomicU32::new(0),
+        }),
+        remote,
+    )
+}
+
+pub fn seeded_registries() -> (SharedBackend, Dataset) {
+    let backend = SharedBackend::default();
+    let dataset = Dataset::new(vec![vec![1], vec![2], vec![1], vec![2], vec![3]]);
+    seed_registry(&backend, vec![("a".into(), filter(1))], dataset.clone(), 3);
+    let pending = SharedBackend::default();
+    seed_registry(
+        &pending,
+        vec![("a".into(), filter(1)), ("b".into(), filter(2))],
+        dataset.clone(),
+        4,
+    );
+    copy_as_pending_commit(&backend, &pending);
+    (backend, dataset)
+}
+
+pub fn pipeline(
+    backend: &SharedBackend,
+    dataset: Dataset,
+    sink: Option<Arc<dyn Sink>>,
+) -> (Pipeline, Arc<SpySource>) {
+    let source: Arc<dyn Source> = Arc::new(ResumableSource::new(dataset));
+    let spy = Arc::new(SpySource::new(source));
+    let as_source: Arc<dyn Source> = spy.clone();
+    let sinks = sink
+        .map(|sink| {
+            vec![SinkSpec {
+                view: "a".into(),
+                sink,
+            }]
+        })
+        .unwrap_or_default();
+    let pipeline = Pipeline {
+        sources: sources(as_source),
+        views: vec![("a".into(), filter(1)), ("b".into(), filter(2))],
+        sinks,
+        checkpoint: Some(CheckpointConfig {
+            interval: Duration::from_secs(3600),
+            backend: Box::new(backend.clone()),
+            retain: DEFAULT_RETAIN,
+        }),
+        retention: None,
+    };
+    (pipeline, spy)
+}
