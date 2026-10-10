@@ -224,6 +224,111 @@ fn replay_safe_prepare_body_identity_mismatch_rejects_before_effects_and_retries
     retry.shutdown().unwrap();
 }
 
+#[test]
+fn replay_safe_prepare_source_name_mismatch_rejects_before_effects_and_retries() {
+    let fixture = SessionFixture::new();
+    let seed_stats = std::sync::Arc::new(Stats::default());
+    let mut seed = fixture.open(
+        &seed_stats,
+        Some(SINK_TARGET.to_owned()),
+        SINK_TARGET.to_owned(),
+    );
+    declared_sql(&mut seed);
+    seed.sql("START;").unwrap();
+    for expected_offset in 1..=7 {
+        fixture.send_source_value(expected_offset);
+        fixture.source_ack(expected_offset);
+    }
+    let seed_rows: BTreeMap<_, _> = (1..=7).map(|key| (key, 1)).collect();
+    fixture.wait_for_remote_bag(&seed_rows);
+    assert_eq!(seed.checkpoint().unwrap(), 1);
+    seed.shutdown().unwrap();
+    let fallback = fixture.read_checkpoint(1);
+    assert_eq!(fallback.sources.entries[0].state.offsets[&0], 7);
+    assert_eq!(
+        fallback.sources.entries[0].physical_identity,
+        support::SOURCE_IDENTITY
+    );
+
+    let original_sources = fixture
+        .backend
+        .get(b"checkpoint/1/sources")
+        .unwrap()
+        .unwrap();
+    let mut pending = decode_sources(&original_sources).unwrap();
+    pending.entries[0].name = "renamed".into();
+    let mut writer = fixture.backend.clone();
+    writer
+        .put(
+            b"checkpoint/2/engine",
+            fixture
+                .backend
+                .get(b"checkpoint/1/engine")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    writer
+        .put(b"checkpoint/2/sources", encode_sources(&pending).unwrap())
+        .unwrap();
+    writer
+        .put(
+            b"checkpoint/2/participants",
+            fixture
+                .backend
+                .get(b"checkpoint/1/participants")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    writer
+        .put(b"checkpoint/2/prepare", b"prepare-v1".to_vec())
+        .unwrap();
+    writer
+        .put(b"checkpoint/reserved", 2_u64.to_be_bytes().to_vec())
+        .unwrap();
+    let evidence_before = fixture.backend.scan(b"").unwrap();
+
+    let retry_stats = std::sync::Arc::new(Stats::default());
+    let mut retry = fixture.open(
+        &retry_stats,
+        Some(SINK_TARGET.to_owned()),
+        SINK_TARGET.to_owned(),
+    );
+    declared_sql(&mut retry);
+    let error = rejected_start(retry.sql("START;"));
+    assert!(error.to_string().contains("was renamed"), "{error}");
+    assert_rejected_without_effects(&retry_stats, 0);
+    assert_eq!(fixture.backend.scan(b"").unwrap(), evidence_before);
+
+    let mut writer = fixture.backend.clone();
+    writer
+        .put(b"checkpoint/2/sources", original_sources)
+        .unwrap();
+    retry
+        .sql("START;")
+        .expect("same-session retry restores fallback");
+    assert_eq!(*retry_stats.resumed.lock().unwrap(), vec![7]);
+    assert_eq!(retry_stats.source_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(support::session_bag(&retry), seed_rows);
+    assert_eq!(*fixture.remote_bag.lock().unwrap(), seed_rows);
+    fixture.send_source_value(8);
+    fixture.source_ack(8);
+    let after_future_row: BTreeMap<_, _> = (1..=8).map(|key| (key, 1)).collect();
+    fixture.wait_for_remote_bag(&after_future_row);
+    assert!(retry_stats.sink_writes.load(Ordering::SeqCst) > 0);
+    let checkpoint = retry.checkpoint().unwrap();
+    assert!(checkpoint > 2);
+    assert_eq!(
+        fixture.read_checkpoint(checkpoint).sources.entries[0]
+            .state
+            .offsets[&0],
+        8
+    );
+    assert_eq!(*fixture.remote_bag.lock().unwrap(), after_future_row);
+    retry.shutdown().unwrap();
+}
+
 fn assert_rejected_without_effects(stats: &Stats, creates: u32) {
     assert_eq!(stats.sink_creates.load(Ordering::SeqCst), creates);
     assert_eq!(stats.sink_writes.load(Ordering::SeqCst), 0);

@@ -19,7 +19,12 @@ impl Checkpointer {
         if let Some(descriptions) = sink_descriptions {
             self.validate_declared_participants(sources, descriptions)?;
         }
-        if let Some(checkpoint) = self.selected_checkpoint(replay_safe, redriable)? {
+        let (checkpoint, pending) =
+            self.selected_checkpoint(replay_safe, redriable, Some(sources))?;
+        if let Some(pending) = pending {
+            pending.sources.validate(sources, &pending.engine)?;
+        }
+        if let Some(checkpoint) = checkpoint {
             checkpoint.sources.validate(sources, &checkpoint.engine)?;
             checkpoint
                 .sources
@@ -41,7 +46,8 @@ impl Checkpointer {
         replay_safe: bool,
         redriable: bool,
     ) -> Result<(), ConnectorError> {
-        if let Some(checkpoint) = self.selected_checkpoint(replay_safe, redriable)? {
+        let (checkpoint, _) = self.selected_checkpoint(replay_safe, redriable, None)?;
+        if let Some(checkpoint) = checkpoint {
             checkpoint
                 .sources
                 .validate_views(declared, &checkpoint.engine)?;
@@ -53,11 +59,12 @@ impl Checkpointer {
         &self,
         replay_safe: bool,
         redriable: bool,
-    ) -> Result<Option<Checkpoint>, ConnectorError> {
+        sources: Option<&Sources>,
+    ) -> Result<(Option<Checkpoint>, Option<Checkpoint>), ConnectorError> {
         let valid = self.newest_valid_with_replay_safety(replay_safe)?;
         let floor = valid.as_ref().map(|checkpoint| checkpoint.id);
         let Some(id) = self.pending_commit(floor)? else {
-            return Ok(valid);
+            return Ok((valid, None));
         };
         match self.pending_phase(id)? {
             PendingPhase::Invalid => {
@@ -75,22 +82,25 @@ impl Checkpointer {
                 // Validate any available body before allowing SQL to open its
                 // writers. Missing/current-corrupt bodies remain discardable;
                 // foreign or identity-inconsistent bodies are fatal.
-                self.read_body_for_recovery(id)?;
-                return Ok(valid);
+                let pending = self.read_body_for_recovery(id)?;
+                return Ok((valid, pending));
             }
-            PendingPhase::Missing => return Ok(valid),
+            PendingPhase::Missing => return Ok((valid, None)),
             PendingPhase::Commit => {}
         }
         let pending = self.read_body_for_recovery(id)?;
+        if let (Some(pending), Some(sources)) = (&pending, sources) {
+            pending.sources.validate(sources, &pending.engine)?;
+        }
         if redriable && pending.is_some() {
-            return Ok(pending);
+            return Ok((pending, None));
         }
         if !replay_safe {
             return Err(ConnectorError::Unsupported(
                 "a transactional sink cannot safely recover an interrupted checkpoint".into(),
             ));
         }
-        Ok(valid)
+        Ok((valid, None))
     }
 
     /// Newest restorable checkpoint under this checkpointer's sink capabilities.
