@@ -9,8 +9,8 @@ mod spy;
 #[path = "common/watermarked_spy.rs"]
 mod watermarked_spy;
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use arrow::array::Int64Array;
 use arrow::datatypes::SchemaRef;
@@ -33,9 +33,14 @@ const SINK: &str = "CREATE SINK out WITH (connector='inmem') AS SELECT * FROM a;
 struct Factory {
     dataset: Dataset,
     spies: Arc<Mutex<Vec<Arc<SpySource>>>>,
+    source_gate: Option<SourceGate>,
 }
 
-struct ReplaySafeFactory;
+type SourceGate = Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>;
+
+struct ReplaySafeFactory {
+    first_change: Option<mpsc::Sender<()>>,
+}
 
 #[async_trait::async_trait]
 impl SinkFactory for ReplaySafeFactory {
@@ -45,7 +50,9 @@ impl SinkFactory for ReplaySafeFactory {
         _options: &std::collections::BTreeMap<String, String>,
         _schema: SchemaRef,
     ) -> Result<Arc<dyn Sink>, SqlError> {
-        Ok(Arc::new(ReplaySafeSink))
+        Ok(Arc::new(ReplaySafeSink {
+            first_change: Mutex::new(self.first_change.clone()),
+        }))
     }
 
     fn may_create_transactional(
@@ -56,7 +63,9 @@ impl SinkFactory for ReplaySafeFactory {
     }
 }
 
-struct ReplaySafeSink;
+struct ReplaySafeSink {
+    first_change: Mutex<Option<mpsc::Sender<()>>>,
+}
 
 #[async_trait::async_trait]
 impl Sink for ReplaySafeSink {
@@ -65,7 +74,11 @@ impl Sink for ReplaySafeSink {
         mut changes: ChangeStream,
     ) -> Result<(), hotlap_connectors::ConnectorError> {
         use futures::StreamExt;
-        while changes.next().await.is_some() {}
+        while changes.next().await.is_some() {
+            if let Some(signal) = self.first_change.lock().unwrap().take() {
+                let _ = signal.send(());
+            }
+        }
         Ok(())
     }
     fn capabilities(&self) -> SinkCapabilities {
@@ -90,17 +103,83 @@ impl SourceFactory for Factory {
             self.dataset.clone().with_retention(0),
         )));
         self.spies.lock().unwrap().push(Arc::new(spy.clone()));
-        Ok(Box::new(WatermarkedSpy(spy)))
+        let source: Box<dyn Source> = Box::new(WatermarkedSpy(spy));
+        match &self.source_gate {
+            Some(gate) => Ok(Box::new(GatedSource {
+                inner: source,
+                gate: Arc::clone(gate),
+            })),
+            None => Ok(source),
+        }
     }
 }
 
-fn config(backend: &SharedBackend, spies: Arc<Mutex<Vec<Arc<SpySource>>>>) -> SessionConfig {
+struct GatedSource {
+    inner: Box<dyn Source>,
+    gate: SourceGate,
+}
+
+impl Source for GatedSource {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+    fn splits(
+        &self,
+    ) -> Result<Vec<hotlap_connectors::source::Split>, hotlap_connectors::ConnectorError> {
+        self.inner.splits()
+    }
+    fn read(
+        &self,
+        split: &hotlap_connectors::source::Split,
+    ) -> Result<hotlap_connectors::source::SourceStream, hotlap_connectors::ConnectorError> {
+        use futures::StreamExt;
+        let source = self.inner.read(split)?;
+        let receiver = self.gate.lock().unwrap().take();
+        match receiver {
+            Some(receiver) => Ok(Box::pin(
+                futures::stream::once(async move {
+                    let _ = receiver.await;
+                    source
+                })
+                .flatten(),
+            )),
+            None => Ok(source),
+        }
+    }
+    fn commit(
+        &self,
+        split: hotlap_connectors::source::SplitId,
+        offset: hotlap_connectors::source::Offset,
+    ) -> Result<(), hotlap_connectors::ConnectorError> {
+        self.inner.commit(split, offset)
+    }
+    fn state(&self) -> hotlap_connectors::source::SourceState {
+        self.inner.state()
+    }
+    fn event_time_column(&self) -> Option<usize> {
+        self.inner.event_time_column()
+    }
+    fn resume(
+        &self,
+        state: &hotlap_connectors::source::SourceState,
+    ) -> Result<Vec<hotlap_connectors::source::Split>, hotlap_connectors::ConnectorError> {
+        self.inner.resume(state)
+    }
+}
+
+fn config(
+    backend: &SharedBackend,
+    spies: Arc<Mutex<Vec<Arc<SpySource>>>>,
+    source_gate: Option<SourceGate>,
+    first_change: Option<mpsc::Sender<()>>,
+) -> SessionConfig {
     SessionConfig::new()
         .with_source_factory(Arc::new(Factory {
             dataset: Dataset::new(vec![vec![1]]).with_retention(0),
             spies,
+            source_gate,
         }))
-        .with_sink_factory(Arc::new(ReplaySafeFactory))
+        .with_sink_factory(Arc::new(ReplaySafeFactory { first_change }))
         .with_checkpoint(
             Duration::from_secs(3600),
             DEFAULT_RETAIN,
@@ -127,15 +206,10 @@ fn rows(session: &Session) -> Vec<Vec<i64>> {
         .collect()
 }
 
-fn wait_for_output(session: &Session) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if rows(session) == vec![vec![1]] {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    panic!("source output did not arrive");
+fn wait_for_output(output: mpsc::Receiver<()>) {
+    output
+        .recv_timeout(Duration::from_secs(5))
+        .expect("sink did not consume the source changelog");
 }
 
 fn add_corrupt_pending(backend: &SharedBackend) {
@@ -159,16 +233,30 @@ fn add_corrupt_pending(backend: &SharedBackend) {
 fn public_start_restores_valid_fallback_output_and_offset() {
     let backend = SharedBackend::default();
     let initial_spies = Arc::new(Mutex::new(Vec::new()));
-    let mut initial = Session::open(config(&backend, initial_spies)).unwrap();
+    let (release_source, source_gate) = tokio::sync::oneshot::channel();
+    let (first_change, output) = mpsc::channel();
+    let mut initial = Session::open(config(
+        &backend,
+        initial_spies,
+        Some(Arc::new(Mutex::new(Some(source_gate)))),
+        Some(first_change),
+    ))
+    .unwrap();
     declare(&mut initial);
     initial.sql("START;").unwrap();
-    wait_for_output(&initial);
+    let before_first_push = initial.snapshot("a").unwrap();
+    assert!(before_first_push.is_empty());
+    assert_eq!(before_first_push.batch.num_columns(), 0);
+    let _ = release_source.send(());
+    wait_for_output(output);
+    assert_eq!(rows(&initial), vec![vec![1]]);
     assert_eq!(initial.checkpoint().unwrap(), 1);
     initial.shutdown().unwrap();
     add_corrupt_pending(&backend);
 
     let restart_spies = Arc::new(Mutex::new(Vec::new()));
-    let mut restarted = Session::open(config(&backend, Arc::clone(&restart_spies))).unwrap();
+    let mut restarted =
+        Session::open(config(&backend, Arc::clone(&restart_spies), None, None)).unwrap();
     declare(&mut restarted);
     restarted
         .sql("START;")
