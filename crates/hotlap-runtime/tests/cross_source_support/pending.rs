@@ -1,4 +1,4 @@
-//! Two-source pipeline and SP8 sink fixtures for cross-source pending recovery.
+//! Two-source pipeline and sink fixtures for cross-source pending recovery.
 //!
 //! Seeding writes a *distinct* pending body: a real checkpoint is taken after
 //! more events than the valid one, so promote and discard resume different

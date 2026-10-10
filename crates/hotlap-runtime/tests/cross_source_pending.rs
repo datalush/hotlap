@@ -1,4 +1,4 @@
-//! Two-source SP8 recovery over a *distinct* pending body.
+//! Two-source recovery over a *distinct* pending body.
 //!
 //! The valid checkpoint holds `k=1` on both sources; the pending one adds `k=2`.
 //! Promote re-drives the sink commit and resumes the later offsets with no

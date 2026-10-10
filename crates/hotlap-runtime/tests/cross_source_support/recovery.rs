@@ -1,4 +1,4 @@
-//! Checkpoint/restart helpers and key oracle for the T6 recovery test.
+//! Checkpoint/restart helpers and key oracle for cross-source recovery tests.
 //!
 //! It takes the caller's source factory and backend so the test reuses the
 //! existing resumable source fixture instead of duplicating one, and folds the
@@ -20,7 +20,7 @@ const CREATE_B: &str = "CREATE SOURCE b WITH (connector='inmem') WATERMARK FOR \
      k AS k - INTERVAL '1 s';";
 const VIEW: &str = "CREATE MATERIALIZED VIEW j AS SELECT a.k FROM a JOIN b ON a.k = b.k;";
 
-/// The order the session issues `CREATE SOURCE`, independent of the factory's
+/// The order the session executes `CREATE SOURCE`, independent of the factory's
 /// declaration order.
 #[derive(Clone, Copy)]
 pub enum Order {

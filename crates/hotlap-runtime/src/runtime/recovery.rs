@@ -4,8 +4,10 @@
 //! per-source offsets), validates it against the declared sources, restores the
 //! engine, reopens each source split at its captured offset and feeds the
 //! resulting streams back in. Because the engine is restored to the checkpoint
-//! before the offsets are replayed, replaying the log from those offsets yields
-//! exactly the state the crashed run had reached.
+//! before the offsets are replayed, replaying the log from those offsets restores
+//! the engine state at that checkpoint. Sink delivery remains subject to the
+//! declared capability: Fluss log appends may duplicate and Hotlap promises no
+//! exactly-once delivery.
 
 mod decision;
 mod load;

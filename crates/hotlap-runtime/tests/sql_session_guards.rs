@@ -66,8 +66,8 @@ fn kv_schema() -> SchemaRef {
     ]))
 }
 
-/// UInt64 is not representable by the kernel (unlike Float64, which Task 1
-/// added), so a view selecting it must be rejected at DDL time.
+/// UInt64 is not representable by the kernel, so a view selecting it must be
+/// rejected at DDL time.
 fn unsupported_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("u", DataType::UInt64, false),

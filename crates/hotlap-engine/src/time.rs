@@ -35,9 +35,9 @@ pub fn settle(frontier: &Frontier, time: u64) -> bool {
     frontier.settle(time)
 }
 
-/// Monotonic event-time watermark computed as `max(event_ts) - lag`.
+/// Monotonic watermark computed as `max(event_ts) - lag`.
 ///
-/// Mirrors the SP1c clock: every observation advances the watermark to at least
+/// Every observation advances the watermark to at least
 /// `max_ts - lag` (clamped at zero) and it never moves backwards.
 #[derive(Debug, Clone, Copy)]
 pub struct Watermark {
