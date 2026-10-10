@@ -163,7 +163,7 @@ fn interrupted_retention_preserves_latest_checkpoint_and_restarts() {
 }
 
 #[test]
-fn interrupted_discard_keeps_phase_markers_until_other_keys_are_removed() {
+fn discard_marker_delete_failure_propagates_after_published_marker_removal() {
     use hotlap::state::StateError;
     use std::io;
 
