@@ -46,6 +46,12 @@ fn corrupt_engine_version(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+fn corrupt_engine_magic(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    out[..4].copy_from_slice(b"OTHR");
+    out
+}
+
 fn storage_key(id: u64, part: &str) -> Vec<u8> {
     format!("checkpoint/{id}/{part}").into_bytes()
 }
@@ -137,6 +143,21 @@ fn an_unknown_engine_frame_version_in_a_valid_tip_is_fatal() {
 }
 
 #[test]
+fn a_foreign_engine_frame_in_a_valid_tip_is_fatal() {
+    let backend = SharedBackend::default();
+    let (valid, _pending) = seed_pair(&backend);
+    put_engine(
+        &backend,
+        valid,
+        corrupt_engine_magic(&engine_bytes(&backend, valid)),
+    );
+
+    let checkpointer = Checkpointer::new(Box::new(backend), DEFAULT_RETAIN);
+    let error = Recovery::load(&checkpointer, &fresh_pipeline().sources).unwrap_err();
+    assert!(matches!(error, ConnectorError::Unsupported(_)));
+}
+
+#[test]
 fn an_unknown_inner_version_in_a_pending_body_is_fatal_before_any_read_or_commit() {
     let backend = SharedBackend::default();
     let (_valid, pending) = seed_pair(&backend);
@@ -175,5 +196,42 @@ fn an_unknown_inner_version_in_a_pending_body_is_fatal_before_any_read_or_commit
             .unwrap()
             .is_none(),
         "an incompatible pending must never be promoted"
+    );
+}
+
+#[test]
+fn a_foreign_engine_frame_in_a_pending_body_is_fatal_before_effects() {
+    let backend = SharedBackend::default();
+    let (_valid, pending) = seed_pair(&backend);
+    put_engine(
+        &backend,
+        pending,
+        corrupt_engine_magic(&engine_bytes(&backend, pending)),
+    );
+    let (pipe, a_reads, b_reads) = recording_pipeline();
+    let (sink, commits) = counting(true);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![sink]);
+    let mut hotlap = engine_with(&pipe);
+    let signal = Mutex::new(None);
+    let metrics = MetricsRegistry::new();
+    let result = futures::executor::block_on(Recovery::start(
+        &mut hotlap,
+        &pipe.sources,
+        &mut checkpointer,
+        &signal,
+        &metrics,
+    ));
+
+    assert!(matches!(result, Err(ConnectorError::Unsupported(_))));
+    assert_eq!(commits.load(Ordering::SeqCst), 0);
+    assert!(read_starts(&a_reads).is_empty());
+    assert!(read_starts(&b_reads).is_empty());
+    assert!(signal.lock().unwrap().is_none());
+    assert!(
+        backend
+            .get(&storage_key(pending, "commit"))
+            .unwrap()
+            .is_some()
     );
 }
