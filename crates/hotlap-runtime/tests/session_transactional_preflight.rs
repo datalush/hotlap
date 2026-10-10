@@ -1,5 +1,13 @@
+#![allow(clippy::duplicate_mod)]
+
+#[allow(dead_code)]
+#[path = "common/backend.rs"]
+mod backend;
 #[path = "common/session_transactional_fixture.rs"]
 mod fixture;
+#[allow(dead_code)]
+#[path = "checkpoint_abort_staged/support.rs"]
+mod staged;
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -10,7 +18,9 @@ use fixture::{
     wait_for_source_read,
 };
 use hotlap::state::StateBackend;
-use hotlap_runtime::{Session, SessionError};
+use hotlap_connectors::sink::Sink;
+use hotlap_runtime::{Session, SessionError, SinkFactory};
+use hotlap_sql::SqlError as FactorySqlError;
 use hotlap_sql::SqlError;
 
 #[test]
@@ -145,6 +155,107 @@ fn invalid_prepare_rejects_session_before_sink_factory_or_source_read() {
         Some(b"unknown-phase".to_vec())
     );
     assert_eq!(backend.get(b"checkpoint/2/commit").unwrap(), None);
+    assert_eq!(backend.get(b"checkpoint/2/valid").unwrap(), None);
+    assert_eq!(backend.get(b"checkpoint/2/engine").unwrap(), body_engine);
+    assert_eq!(backend.get(b"checkpoint/2/sources").unwrap(), body_sources);
+    session.shutdown().unwrap();
+}
+
+struct StagedSinkFactory {
+    remote: Arc<staged::Remote>,
+    creates: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl SinkFactory for StagedSinkFactory {
+    async fn create(
+        &self,
+        _name: &str,
+        _options: &std::collections::BTreeMap<String, String>,
+        _schema: arrow::datatypes::SchemaRef,
+    ) -> Result<Arc<dyn Sink>, FactorySqlError> {
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        Ok(staged::PersistentTxn::new(self.remote.clone(), false, true))
+    }
+
+    fn may_create_transactional(
+        &self,
+        _options: &std::collections::BTreeMap<String, String>,
+    ) -> bool {
+        true
+    }
+}
+
+#[test]
+fn invalid_commit_marker_preserves_real_staged_payload_before_session_factory_effects() {
+    let backend = TestBackend::default();
+    seed(&backend);
+    let remote = Arc::new(staged::Remote::default());
+    let (engine, changes) = staged::engine_with_changes();
+    let staged_writer = staged::PersistentTxn::new(remote.clone(), false, true);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            staged::write_changes(&staged_writer, changes).await;
+            staged_writer.prepare().await.unwrap();
+        });
+    drop(engine);
+    let staged_before = remote.staged();
+    assert_eq!(
+        staged_before,
+        vec![(vec![7], 2), (vec![8], 1), (vec![8], -1)]
+    );
+
+    let mut writer = backend.clone();
+    for part in ["engine", "sources"] {
+        let body = writer
+            .get(format!("checkpoint/1/{part}").as_bytes())
+            .unwrap()
+            .unwrap();
+        writer
+            .put(format!("checkpoint/2/{part}").as_bytes(), body)
+            .unwrap();
+    }
+    writer.delete(b"checkpoint/2/prepare").unwrap();
+    writer.put(b"checkpoint/2/commit", b"0".to_vec()).unwrap();
+    let body_engine = backend.get(b"checkpoint/2/engine").unwrap();
+    let body_sources = backend.get(b"checkpoint/2/sources").unwrap();
+
+    let reads = Arc::new(AtomicU32::new(0));
+    let factory_creates = Arc::new(AtomicU32::new(0));
+    let mut session = Session::open(
+        config(
+            &backend,
+            reads.clone(),
+            Arc::new(AtomicU32::new(0)),
+            true,
+            Arc::new(Mutex::new(Vec::new())),
+            SessionSignals::default(),
+        )
+        .with_sink_factory(Arc::new(StagedSinkFactory {
+            remote: remote.clone(),
+            creates: factory_creates.clone(),
+        })),
+    )
+    .unwrap();
+    declare(&mut session);
+
+    let error = match session.sql("START;") {
+        Ok(_) => panic!("noncanonical commit marker must reject before effects"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SessionError::Sql(SqlError::Unsupported(_))));
+    assert_eq!(factory_creates.load(Ordering::SeqCst), 0);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(remote.commit_calls(), 0);
+    assert_eq!(remote.staged(), staged_before);
+    assert!(remote.committed().is_empty());
+    assert_eq!(
+        backend.get(b"checkpoint/2/commit").unwrap(),
+        Some(b"0".to_vec())
+    );
     assert_eq!(backend.get(b"checkpoint/2/valid").unwrap(), None);
     assert_eq!(backend.get(b"checkpoint/2/engine").unwrap(), body_engine);
     assert_eq!(backend.get(b"checkpoint/2/sources").unwrap(), body_sources);

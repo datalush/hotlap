@@ -11,12 +11,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use hotlap::state::StateBackend;
-use hotlap::{Hotlap, InputId, Plan};
+use hotlap::{InputId, Plan};
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, Checkpointer, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::handle::EngineHandle;
-use hotlap_runtime::runtime::pipeline::{self, Pipeline, SinkSpec};
+use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
@@ -54,39 +54,32 @@ fn sources(reads: Arc<AtomicUsize>) -> Sources {
     .unwrap()
 }
 
-fn setup(reads: Arc<AtomicUsize>) -> (Hotlap, Pipeline) {
+async fn seed_staged_attempt() -> (SharedBackend, Arc<Remote>, Vec<u8>, Vec<u8>) {
+    let backend = SharedBackend::default();
+    let (hotlap, changes) = support::engine_with_changes();
     let pipeline = Pipeline {
-        sources: sources(reads),
+        sources: sources(Arc::new(AtomicUsize::new(0))),
         views: vec![("v".into(), Plan::Source(InputId(0)))],
         sinks: vec![],
         checkpoint: None,
         retention: None,
     };
-    let mut hotlap = support::engine();
-    pipeline::setup(&mut hotlap, &pipeline).unwrap();
-    (hotlap, pipeline)
-}
-
-async fn seed_staged_attempt() -> (SharedBackend, Arc<Remote>, Vec<u8>, Vec<u8>) {
-    let backend = SharedBackend::default();
-    let (hotlap, pipeline) = setup(Arc::new(AtomicUsize::new(0)));
     let mut seed = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     seed.take(&hotlap, &pipeline.sources).await.unwrap();
 
     let remote = Arc::new(Remote::default());
-    let mut interrupted =
-        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
-            SinkSync::sink_only(SharedSink::new(PersistentTxn::failing_prepare(
-                remote.clone(),
-                true,
-                true,
-            ))),
-        ]);
+    let interrupted_sink = PersistentTxn::failing_prepare(remote.clone(), true, true);
+    support::write_changes(&interrupted_sink, changes).await;
+    let mut interrupted = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(interrupted_sink))]);
     assert!(
         interrupted.take(&hotlap, &pipeline.sources).await.is_err(),
         "injected prepare/abort failure leaves a real staged payload"
     );
-    assert_eq!(remote.staged(), vec![7]);
+    assert_eq!(
+        remote.staged(),
+        vec![(vec![7], 2), (vec![8], 1), (vec![8], -1)]
+    );
     assert!(remote.committed().is_empty());
 
     let mut writer = backend.clone();
@@ -171,8 +164,12 @@ fn invalid_and_prepare_phases_preserve_staged_payload_before_pipeline_effects() 
             0,
             "source read must not start"
         );
-        assert_eq!(remote.staged(), vec![7]);
+        assert_eq!(
+            remote.staged(),
+            vec![(vec![7], 2), (vec![8], 1), (vec![8], -1)]
+        );
         assert!(remote.committed().is_empty(), "no new writer may commit");
+        assert_eq!(remote.commit_calls(), 0);
         assert_eq!(backend.get(b"checkpoint/2/valid").unwrap(), None);
         assert_eq!(backend.get(b"checkpoint/2/commit").unwrap(), commit);
         assert_eq!(backend.get(b"checkpoint/2/prepare").unwrap(), prepare);
@@ -200,7 +197,8 @@ fn exact_commit_marker_redrives_and_publishes_staged_payload_once() {
     .unwrap();
 
     assert!(remote.staged().is_empty());
-    assert_eq!(remote.committed(), vec![7]);
+    assert_eq!(remote.committed(), vec![(vec![7], 2)]);
+    assert_eq!(remote.commit_calls(), 1, "recovery must redrive once");
     assert_eq!(
         backend.get(b"checkpoint/2/valid").unwrap(),
         Some(b"1".to_vec())
@@ -209,7 +207,12 @@ fn exact_commit_marker_redrives_and_publishes_staged_payload_once() {
     handle.shutdown().unwrap();
     assert_eq!(
         remote.committed(),
-        vec![7],
+        vec![(vec![7], 2)],
         "EOF must not republish staged data"
+    );
+    assert_eq!(
+        remote.commit_calls(),
+        2,
+        "only recovery and healthy EOF commit ran"
     );
 }

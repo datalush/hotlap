@@ -14,17 +14,22 @@ use hotlap_runtime::runtime::recovery::{Recovery, RecoveryDecision};
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 
 use backend::SharedBackend;
-use support::{FaultBackend, PersistentTxn, Remote, engine, sources};
+use support::{FaultBackend, PersistentTxn, Remote, engine_with_changes, sources, write_changes};
 
-fn sink(remote: Arc<Remote>, fail_abort: bool, redriable: bool) -> SinkSync {
-    SinkSync::sink_only(SharedSink::new(PersistentTxn::new(
-        remote, fail_abort, redriable,
-    )))
+fn coordinated(sink: Arc<PersistentTxn>) -> SinkSync {
+    SinkSync::sink_only(SharedSink::new(sink))
+}
+
+async fn engine_with_written_changes(sink: &PersistentTxn) -> hotlap::Hotlap {
+    let (hotlap, changes) = engine_with_changes();
+    write_changes(sink, changes).await;
+    hotlap
 }
 
 fn recovery(backend: SharedBackend, remote: Arc<Remote>, redriable: bool) -> RecoveryDecision {
-    let checkpointer =
-        Checkpointer::new(Box::new(backend), 3).with_sinks(vec![sink(remote, false, redriable)]);
+    let checkpointer = Checkpointer::new(Box::new(backend), 3).with_sinks(vec![coordinated(
+        PersistentTxn::new(remote, false, redriable),
+    )]);
     Recovery::inspect(&checkpointer, &sources()).unwrap()
 }
 
@@ -33,14 +38,13 @@ async fn capture_storage_failure_aborts_persisted_prepare_before_clearing_marker
     let durable = SharedBackend::default();
     let backend = FaultBackend::new(durable.clone(), false);
     let remote = Arc::new(Remote::default());
-    let mut checkpointer = Checkpointer::new(Box::new(backend), 3).with_sinks(vec![sink(
-        remote.clone(),
-        false,
-        false,
-    )]);
+    let txn = PersistentTxn::new(remote.clone(), false, false);
+    let hotlap = engine_with_written_changes(&txn).await;
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend), 3).with_sinks(vec![coordinated(txn)]);
 
     let error = checkpointer
-        .take(&engine(), &sources())
+        .take(&hotlap, &sources())
         .await
         .expect_err("the injected engine-body write must fail");
 
@@ -52,7 +56,7 @@ async fn capture_storage_failure_aborts_persisted_prepare_before_clearing_marker
     assert!(remote.committed().is_empty());
     assert_eq!(checkpointer.state(), CheckpointState::Failed);
     assert_eq!(durable.get(b"checkpoint/1/prepare").unwrap(), None);
-    assert!(checkpointer.take(&engine(), &sources()).await.is_err());
+    assert!(checkpointer.take(&hotlap, &sources()).await.is_err());
 }
 
 #[tokio::test]
@@ -60,11 +64,13 @@ async fn failed_abort_keeps_prepare_marker_and_rejects_a_fresh_writer() {
     let durable = SharedBackend::default();
     let backend = FaultBackend::new(durable.clone(), false);
     let remote = Arc::new(Remote::default());
+    let txn = PersistentTxn::new(remote.clone(), true, true);
+    let hotlap = engine_with_written_changes(&txn).await;
     let mut checkpointer =
-        Checkpointer::new(Box::new(backend), 3).with_sinks(vec![sink(remote.clone(), true, true)]);
+        Checkpointer::new(Box::new(backend), 3).with_sinks(vec![coordinated(txn)]);
 
     let error = checkpointer
-        .take(&engine(), &sources())
+        .take(&hotlap, &sources())
         .await
         .expect_err("the abort error must be surfaced");
 
@@ -72,13 +78,17 @@ async fn failed_abort_keeps_prepare_marker_and_rejects_a_fresh_writer() {
         matches!(error, ConnectorError::Unsupported(_)),
         "got {error:?}"
     );
-    assert_eq!(remote.staged(), vec![7]);
+    assert_eq!(
+        remote.staged(),
+        vec![(vec![7], 2), (vec![8], 1), (vec![8], -1)]
+    );
     assert!(durable.get(b"checkpoint/1/prepare").unwrap().is_some());
     assert!(matches!(
         recovery(durable, remote.clone(), true),
         RecoveryDecision::Reject { pending: 1, .. }
     ));
     assert!(remote.committed().is_empty());
+    assert_eq!(remote.commit_calls(), 0);
 }
 
 #[tokio::test]
@@ -86,11 +96,13 @@ async fn clear_failure_after_confirmed_abort_never_redrives_aborted_payload() {
     let durable = SharedBackend::default();
     let backend = FaultBackend::new(durable.clone(), true);
     let remote = Arc::new(Remote::default());
+    let txn = PersistentTxn::new(remote.clone(), false, true);
+    let hotlap = engine_with_written_changes(&txn).await;
     let mut checkpointer =
-        Checkpointer::new(Box::new(backend), 3).with_sinks(vec![sink(remote.clone(), false, true)]);
+        Checkpointer::new(Box::new(backend), 3).with_sinks(vec![coordinated(txn)]);
 
     let error = checkpointer
-        .take(&engine(), &sources())
+        .take(&hotlap, &sources())
         .await
         .expect_err("the marker clear error must be surfaced");
 
@@ -112,17 +124,18 @@ async fn prepare_failure_surfaces_abort_error_and_retains_durable_evidence() {
     let durable = SharedBackend::default();
     let first_remote = Arc::new(Remote::default());
     let failed_remote = Arc::new(Remote::default());
-    let first = sink(first_remote.clone(), true, true);
+    let first = PersistentTxn::new(first_remote.clone(), true, true);
+    let hotlap = engine_with_written_changes(&first).await;
     let second = SinkSync::sink_only(SharedSink::new(PersistentTxn::failing_prepare(
         failed_remote.clone(),
         false,
         false,
     )));
-    let mut checkpointer =
-        Checkpointer::new(Box::new(durable.clone()), 3).with_sinks(vec![first, second]);
+    let mut checkpointer = Checkpointer::new(Box::new(durable.clone()), 3)
+        .with_sinks(vec![coordinated(first), second]);
 
     let error = checkpointer
-        .take(&engine(), &sources())
+        .take(&hotlap, &sources())
         .await
         .expect_err("abort failure must override the original prepare error");
 
@@ -130,7 +143,10 @@ async fn prepare_failure_surfaces_abort_error_and_retains_durable_evidence() {
         matches!(error, ConnectorError::Unsupported(_)),
         "got {error:?}"
     );
-    assert_eq!(first_remote.staged(), vec![7]);
+    assert_eq!(
+        first_remote.staged(),
+        vec![(vec![7], 2), (vec![8], 1), (vec![8], -1)]
+    );
     assert!(
         failed_remote.staged().is_empty(),
         "also abort the failing participant"
@@ -147,19 +163,22 @@ async fn stalled_abort_is_bounded_and_keeps_the_prepare_marker() {
     let durable = SharedBackend::default();
     let backend = FaultBackend::new(durable.clone(), false);
     let remote = Arc::new(Remote::default());
-    let sink = SinkSync::sink_only(SharedSink::new(PersistentTxn::stalled_abort(
-        remote.clone(),
-    )));
-    let mut checkpointer = Checkpointer::new(Box::new(backend), 3).with_sinks(vec![sink]);
+    let txn = PersistentTxn::stalled_abort(remote.clone());
+    let hotlap = engine_with_written_changes(&txn).await;
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend), 3).with_sinks(vec![coordinated(txn)]);
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(8),
-        checkpointer.take(&engine(), &sources()),
+        checkpointer.take(&hotlap, &sources()),
     )
     .await
     .expect("abort must not block the checkpoint indefinitely");
 
     assert!(matches!(result, Err(ConnectorError::Infrastructure(_))));
-    assert_eq!(remote.staged(), vec![7]);
+    assert_eq!(
+        remote.staged(),
+        vec![(vec![7], 2), (vec![8], 1), (vec![8], -1)]
+    );
     assert!(durable.get(b"checkpoint/1/prepare").unwrap().is_some());
 }
