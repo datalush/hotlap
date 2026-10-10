@@ -97,4 +97,3 @@ writer dedicado y despierta esperas de buffers. Cancelar un `JoinHandle` async n
 detiene por sí solo una closure bloqueante en ejecución. La reserva del lote de
 entrada persiste hasta que esa closure lo libera. Ningún ACK, timeout, abort o
 cierre de conexión deshace retroactivamente solicitudes ya aplicadas por Fluss.
-

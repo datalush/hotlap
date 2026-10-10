@@ -103,4 +103,3 @@ acción elegida NOT MATCHED usa upsert nativo, no INSERT condicional, y UPDATE p
 predicado sobre snapshot no es CAS. El rechazo posterior por duplicado conserva ACK
 anteriores. Ver [contrato MERGE](merge-contract.md) para semántica verificada de
 acciones/NULL/precedencia, recursos, duplicados y concurrencia de writers.
-
