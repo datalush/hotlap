@@ -94,7 +94,7 @@ pub fn encode_framed<T: Serialize>(value: &T) -> Result<Vec<u8>, EngineError> {
     Ok(out)
 }
 
-/// Decodes a value from a binary frame, rejecting a bad magic, an unknown
+/// Decodes a value from a binary frame, rejecting foreign magic, an unknown
 /// version, a length mismatch or trailing bytes instead of panicking.
 pub fn decode_framed<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, EngineError> {
     let (payload, length) = frame_payload(bytes)?;
@@ -110,7 +110,9 @@ fn frame_payload(bytes: &[u8]) -> Result<(&[u8], u64), EngineError> {
         return Err(corrupt(format!("frame is {} bytes", bytes.len())));
     }
     if bytes[..4] != FRAME_MAGIC {
-        return Err(corrupt("frame magic does not match".into()));
+        return Err(EngineError::Unsupported(
+            "engine frame magic does not match".into(),
+        ));
     }
     let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     if version != FRAME_VERSION {

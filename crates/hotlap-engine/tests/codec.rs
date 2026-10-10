@@ -75,6 +75,17 @@ fn corrupt_frames_are_errors_not_panics() {
 }
 
 #[test]
+fn foreign_frame_magic_is_fatal_unsupported() {
+    let mut bytes = encode_snapshot(&empty_snapshot()).unwrap();
+    bytes[..4].copy_from_slice(b"OTHR");
+    let error = decode_snapshot(&bytes).expect_err("foreign frame magic must be fatal");
+    assert!(
+        matches!(error, hotlap_engine::EngineError::Unsupported(_)),
+        "expected Unsupported, got {error:?}"
+    );
+}
+
+#[test]
 fn generic_values_use_the_same_frame() {
     let value: Vec<u32> = vec![1, 2, 3];
     let bytes = encode_framed(&value).unwrap();
