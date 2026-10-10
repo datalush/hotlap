@@ -21,9 +21,14 @@ use backend::SharedBackend;
 /// A bounded source with no data, enough to declare one identity.
 struct StaticSource {
     schema: SchemaRef,
+    physical_identity: String,
 }
 
 impl Source for StaticSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -51,10 +56,23 @@ fn other_schema() -> SchemaRef {
 }
 
 fn input(id: u32, name: &str, schema: SchemaRef, watermark: Option<Watermark>) -> InputSource {
+    input_on_dataset(id, name, schema, watermark, &format!("cluster-a/{name}"))
+}
+
+fn input_on_dataset(
+    id: u32,
+    name: &str,
+    schema: SchemaRef,
+    watermark: Option<Watermark>,
+    physical_identity: &str,
+) -> InputSource {
     InputSource {
         id: InputId(id),
         name: name.to_string(),
-        source: Arc::new(StaticSource { schema }),
+        source: Arc::new(StaticSource {
+            schema,
+            physical_identity: physical_identity.to_string(),
+        }),
         watermark,
     }
 }
@@ -116,6 +134,22 @@ fn an_incompatible_watermark_is_rejected_before_resume() {
     let checkpointer = Checkpointer::new(Box::new(backend), DEFAULT_RETAIN);
 
     let error = Recovery::load(&checkpointer, &declared(false, false, None)).unwrap_err();
+    assert!(matches!(error, ConnectorError::Unsupported(_)));
+}
+
+#[test]
+fn same_name_schema_and_splits_on_another_physical_dataset_are_rejected() {
+    let saved = declared(false, false, None);
+    let (backend, _) = seed(&saved);
+    let checkpointer = Checkpointer::new(Box::new(backend), DEFAULT_RETAIN);
+    let changed = Sources::new(vec![
+        input_on_dataset(0, "a", schema(), None, "cluster-a/table-a-recreated"),
+        input_on_dataset(1, "b", schema(), None, "cluster-a/b"),
+    ])
+    .unwrap();
+
+    let error = Recovery::load(&checkpointer, &changed).unwrap_err();
+
     assert!(matches!(error, ConnectorError::Unsupported(_)));
 }
 

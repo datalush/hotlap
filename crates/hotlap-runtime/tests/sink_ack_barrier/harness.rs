@@ -23,16 +23,30 @@ use resumable::{Dataset, ResumableSource};
 use tokio::sync::Notify;
 
 /// Durable output: rows only become visible after a committed flush.
-#[derive(Clone, Default)]
-pub struct RemoteStore(Arc<Mutex<usize>>);
+#[derive(Clone)]
+pub struct RemoteStore {
+    count: Arc<Mutex<usize>>,
+    identity: String,
+}
+
+impl Default for RemoteStore {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self {
+            count: Arc::new(Mutex::new(0)),
+            identity: format!("test/sink-ack-barrier/remote/{id}"),
+        }
+    }
+}
 
 impl RemoteStore {
     pub fn total(&self) -> usize {
-        *self.0.lock().unwrap()
+        *self.count.lock().unwrap()
     }
 
     fn flush(&self, rows: usize) {
-        *self.0.lock().unwrap() += rows;
+        *self.count.lock().unwrap() += rows;
     }
 }
 
@@ -65,6 +79,10 @@ impl GatedSink {
 
 #[async_trait::async_trait]
 impl Sink for GatedSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.remote.identity.clone())
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         while let Some(item) = changes.next().await {
             *self.staged.lock().unwrap() += item?.len();
@@ -122,14 +140,13 @@ fn sources(source: ResumableSource) -> Sources {
 
 /// Start an engine over three events with the tapped view feeding `sink`.
 pub fn start(sink: Arc<dyn Sink>) -> (Hotlap, Pipeline, SinkPump) {
-    let dataset = Dataset::new(vec![vec![1], vec![1], vec![2]]).with_retention(0);
+    let dataset = Dataset::new(vec![vec![1], vec![1], vec![2]])
+        .with_retention(0)
+        .with_physical_identity("test/sink-ack-barrier/source");
     let pipeline = Pipeline {
         sources: sources(ResumableSource::new(dataset)),
         views: vec![group_count()],
-        sinks: vec![SinkSpec {
-            view: "c".into(),
-            sink,
-        }],
+        sinks: vec![SinkSpec::named("output", "c", sink)],
         checkpoint: None,
         retention: None,
     };
@@ -142,7 +159,9 @@ pub fn start(sink: Arc<dyn Sink>) -> (Hotlap, Pipeline, SinkPump) {
 /// A fresh engine and sources over the same log, plus an empty sink sharing
 /// `remote`, to model a writer restart.
 pub fn restart(remote: RemoteStore) -> (Hotlap, Pipeline, Arc<GatedSink>) {
-    let dataset = Dataset::new(vec![vec![1], vec![1], vec![2]]).with_retention(0);
+    let dataset = Dataset::new(vec![vec![1], vec![1], vec![2]])
+        .with_retention(0)
+        .with_physical_identity("test/sink-ack-barrier/source");
     let pipeline = Pipeline {
         sources: sources(ResumableSource::new(dataset)),
         views: vec![group_count()],

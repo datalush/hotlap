@@ -22,6 +22,10 @@ struct EventTimeSource {
 }
 
 impl Source for EventTimeSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/source-checkpoint-watermark/orders".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

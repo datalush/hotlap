@@ -47,9 +47,19 @@ impl SharedSink {
         self.inner.capabilities()
     }
 
+    /// Whether the wrapped target applies negative diffs.
+    pub fn accepts_retractions(&self) -> bool {
+        self.inner.accepts_retractions()
+    }
+
     /// Whether the wrapped sink declares its `commit` re-drivable.
     pub fn commit_redriable(&self) -> bool {
         self.inner.commit_redriable()
+    }
+
+    /// Stable identity of the wrapped physical target, if declared.
+    pub fn physical_identity(&self) -> Option<String> {
+        self.inner.physical_identity()
     }
 
     /// Write one batch, serialized against the barrier's control calls.

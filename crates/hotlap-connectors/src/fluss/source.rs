@@ -23,6 +23,7 @@ use super::{fluss_err, parse_path};
 pub struct FlussSource {
     connection: Arc<FlussConnection>,
     table_path: TablePath,
+    physical_identity: String,
     schema: SchemaRef,
     buckets: Vec<i32>,
     event_time_idx: usize,
@@ -40,15 +41,23 @@ impl FlussSource {
             ..Config::default()
         };
         let connection = FlussConnection::new(config).await.map_err(fluss_err)?;
-        Self::open(Arc::new(connection), parse_path(path)?).await
+        Self::open(Arc::new(connection), parse_path(path)?, path, bootstrap).await
     }
 
     async fn open(
         connection: Arc<FlussConnection>,
         table_path: TablePath,
+        canonical_path: &str,
+        cluster_locator: &str,
     ) -> Result<Self, ConnectorError> {
         let table = connection.get_table(&table_path).await.map_err(fluss_err)?;
         let info = table.get_table_info();
+        let physical_identity = format!(
+            "fluss:{}:{}:{}",
+            normalize_cluster_locator(cluster_locator),
+            canonical_table_path(canonical_path),
+            info.get_table_id()
+        );
         if info.has_primary_key() {
             return Err(ConnectorError::Unsupported(
                 "only append-only Fluss log tables are supported".into(),
@@ -80,6 +89,7 @@ impl FlussSource {
         Ok(Self {
             connection,
             table_path,
+            physical_identity,
             schema,
             buckets,
             event_time_idx,
@@ -90,6 +100,10 @@ impl FlussSource {
 }
 
 impl Source for FlussSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -195,5 +209,47 @@ impl Source for FlussSource {
             }
         }
         Ok(splits)
+    }
+}
+
+fn canonical_table_path(path: &str) -> String {
+    path.trim_matches('/')
+        .split('/')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+pub(super) fn normalize_cluster_locator(locator: &str) -> String {
+    let mut endpoints: Vec<_> = locator
+        .split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(|endpoint| {
+            endpoint
+                .rsplit_once('@')
+                .map_or(endpoint, |(_, host)| host)
+                .to_ascii_lowercase()
+        })
+        .collect();
+    endpoints.sort();
+    endpoints.join(",")
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{canonical_table_path, normalize_cluster_locator};
+
+    #[test]
+    fn fluss_locator_excludes_credentials_and_normalizes_endpoints() {
+        assert_eq!(
+            normalize_cluster_locator("user:secret@Broker-B:9092, broker-a:9092"),
+            "broker-a:9092,broker-b:9092"
+        );
+    }
+
+    #[test]
+    fn fluss_table_path_is_canonicalized_without_changing_component_case() {
+        assert_eq!(canonical_table_path("/Sales/Orders/"), "Sales/Orders");
     }
 }

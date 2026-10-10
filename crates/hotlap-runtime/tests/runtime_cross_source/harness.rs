@@ -26,6 +26,7 @@ pub type BatchSender = UnboundedSender<BatchItem>;
 
 /// A source whose batches are injected through one channel per split.
 pub struct ControlledSource {
+    physical_identity: String,
     schema: SchemaRef,
     splits: Vec<Split>,
     receivers: Mutex<Vec<Option<UnboundedReceiver<BatchItem>>>>,
@@ -37,7 +38,11 @@ pub struct ControlledSource {
 
 impl ControlledSource {
     /// Build a source over `splits`; returns it with one sender per split.
-    pub fn new(schema: SchemaRef, splits: Vec<Split>) -> (Arc<Self>, Vec<BatchSender>) {
+    pub fn new(
+        schema: SchemaRef,
+        splits: Vec<Split>,
+        physical_identity: impl Into<String>,
+    ) -> (Arc<Self>, Vec<BatchSender>) {
         let mut senders = Vec::with_capacity(splits.len());
         let mut receivers = Vec::with_capacity(splits.len());
         for _ in &splits {
@@ -46,6 +51,7 @@ impl ControlledSource {
             receivers.push(Some(receiver));
         }
         let source = Arc::new(Self {
+            physical_identity: physical_identity.into(),
             schema,
             splits,
             receivers: Mutex::new(receivers),
@@ -58,8 +64,9 @@ impl ControlledSource {
     }
 
     /// Build a source whose `read` always fails, for open-failure tests.
-    pub fn failing_read(schema: SchemaRef) -> Arc<Self> {
+    pub fn failing_read(schema: SchemaRef, physical_identity: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
+            physical_identity: physical_identity.into(),
             schema,
             splits: vec![Split { id: 0, start: 0 }],
             receivers: Mutex::new(vec![None]),
@@ -87,6 +94,10 @@ impl ControlledSource {
 }
 
 impl Source for ControlledSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

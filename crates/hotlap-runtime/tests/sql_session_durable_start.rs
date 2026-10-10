@@ -40,6 +40,10 @@ struct QuietSource {
 }
 
 impl Source for QuietSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/sql-session-durable-start/source-store".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         session_schema()
     }
@@ -84,6 +88,10 @@ impl SourceFactory for QuietFactory {
 struct SeedSource;
 
 impl Source for SeedSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/sql-session-durable-start/source-store".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
     }

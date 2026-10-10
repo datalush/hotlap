@@ -16,7 +16,7 @@ use hotlap_runtime::runtime::sources::{InputSource, Sources};
 #[path = "common/shutdown.rs"]
 mod common;
 
-use common::{SharedBackend, Signal, keys_with, start};
+use common::{SharedBackend, Signal, start_with_sink_identity};
 
 #[derive(Default)]
 struct Remote {
@@ -46,6 +46,10 @@ impl PrepareStalls {
 
 #[async_trait::async_trait]
 impl Sink for PrepareStalls {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/shutdown-prepare-eof/output".into())
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         while let Some(item) = changes.next().await {
             let batch = item?;
@@ -102,14 +106,15 @@ fn shutdown_does_not_commit_payload_staged_by_cancelled_prepare() {
         written,
         entered,
     });
-    let handle = start(
-        keys_with(&[7], None),
+    let handle = start_with_sink_identity(
+        common::keys_with_identity(&[7], None, "test/shutdown-prepare-eof/source"),
         sink.clone(),
         Some(CheckpointConfig {
             interval: Duration::from_secs(3600),
             backend: Box::new(backend.clone()),
             retain: 3,
         }),
+        "test/shutdown-prepare-eof/output",
     );
     written_rx
         .recv_timeout(Duration::from_secs(10))
@@ -159,14 +164,16 @@ fn assert_shutdown_keeps_prepare_unpublished(
     let sources = Sources::new(vec![InputSource {
         id: InputId(0),
         name: "in".into(),
-        source: keys_with(&[7], None),
+        source: common::keys_with_identity(&[7], None, "test/shutdown-prepare-eof/source"),
         watermark: None,
     }])
     .unwrap();
     let checkpointer = hotlap_runtime::runtime::checkpoint::Checkpointer::new(Box::new(backend), 3)
-        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(
-            PrepareStalls::reopen(remote.clone()),
-        ))]);
+        .with_sinks(vec![SinkSync::sink_only_named(
+            SharedSink::new(PrepareStalls::reopen(remote.clone())),
+            "sink".into(),
+            "c".into(),
+        )]);
     assert!(matches!(
         Recovery::inspect(&checkpointer, &sources).unwrap(),
         RecoveryDecision::Reject { pending: 1, .. }

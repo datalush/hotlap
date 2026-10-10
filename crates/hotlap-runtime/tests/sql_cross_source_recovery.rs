@@ -108,8 +108,15 @@ fn first_run(backend: &SharedBackend) -> Arc<ResumableSessionFactory> {
     // `a` has two matching records, `b` one; the join multiplies, so the bag
     // exposes two rows and the MV snapshot keeps their multiplicities.
     let first = ResumableSessionFactory::new();
-    first.declare("a", Dataset::new(vec![vec![1], vec![1]]));
-    first.declare("b", Dataset::new(vec![vec![1]]));
+    first.declare(
+        "a",
+        Dataset::new(vec![vec![1], vec![1]])
+            .with_physical_identity("test/sql-cross-source-recovery/a"),
+    );
+    first.declare(
+        "b",
+        Dataset::new(vec![vec![1]]).with_physical_identity("test/sql-cross-source-recovery/b"),
+    );
     let mut session = open(&first, backend, Order::Ab);
     session.sql("START;").expect("first start");
     assert_eq!(wait_ints(&mut session, &[1, 1]), vec![1, 1]);
@@ -128,8 +135,18 @@ fn restart_restores_join_and_seeds_offsets() {
     first_run(&backend);
 
     let second = ResumableSessionFactory::new();
-    second.declare("b", Dataset::new(vec![vec![1]]).with_retention(1));
-    second.declare("a", Dataset::new(vec![vec![1], vec![1]]).with_retention(2));
+    second.declare(
+        "b",
+        Dataset::new(vec![vec![1]])
+            .with_retention(1)
+            .with_physical_identity("test/sql-cross-source-recovery/b"),
+    );
+    second.declare(
+        "a",
+        Dataset::new(vec![vec![1], vec![1]])
+            .with_retention(2)
+            .with_physical_identity("test/sql-cross-source-recovery/a"),
+    );
     let mut session = open(&second, &backend, Order::Ba);
     session.sql("START;").expect("recovered start");
     assert_eq!(
@@ -152,10 +169,17 @@ fn restart_continues_from_captured_offset() {
     first_run(&backend);
 
     let third = ResumableSessionFactory::new();
-    third.declare("b", Dataset::new(vec![vec![1]]).with_retention(1));
+    third.declare(
+        "b",
+        Dataset::new(vec![vec![1]])
+            .with_retention(1)
+            .with_physical_identity("test/sql-cross-source-recovery/b"),
+    );
     third.declare(
         "a",
-        Dataset::new(vec![vec![1], vec![1], vec![1]]).with_retention(2),
+        Dataset::new(vec![vec![1], vec![1], vec![1]])
+            .with_retention(2)
+            .with_physical_identity("test/sql-cross-source-recovery/a"),
     );
     let mut session = open(&third, &backend, Order::Ba);
     session

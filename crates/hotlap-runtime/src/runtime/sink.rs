@@ -64,6 +64,7 @@ impl SinkPump {
                     Arc::clone(&close_clean),
                 );
                 SinkEntry {
+                    binding_name: spec.sink.binding_name().map(str::to_owned),
                     view: spec.view.clone(),
                     tx,
                     shared,
@@ -86,7 +87,14 @@ impl SinkPump {
     pub fn coordinated(&self) -> Vec<SinkSync> {
         self.entries
             .iter()
-            .map(|entry| SinkSync::new(entry.tx.clone(), Arc::clone(&entry.shared)))
+            .map(|entry| {
+                SinkSync::new_named(
+                    entry.tx.clone(),
+                    Arc::clone(&entry.shared),
+                    entry.binding_name.clone().unwrap_or_default(),
+                    entry.view.clone(),
+                )
+            })
             .collect()
     }
 

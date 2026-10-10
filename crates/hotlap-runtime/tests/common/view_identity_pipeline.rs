@@ -29,7 +29,9 @@ pub use resumable::{Dataset, ResumableSource};
 pub use spy::SpySource;
 
 pub fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![2]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![2]])
+        .with_retention(0)
+        .with_physical_identity("test/view-identity/log")
 }
 
 pub fn filter(value: i64) -> Plan {
@@ -103,7 +105,7 @@ pub fn seed_two_outputs(backend: &SharedBackend) {
 
 pub fn corrupt_pending(backend: &SharedBackend) {
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let value = writer
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()
@@ -126,6 +128,10 @@ pub struct RecordingSink {
 
 #[async_trait::async_trait]
 impl Sink for RecordingSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/recording-sink-target".into())
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         while changes.next().await.is_some() {}

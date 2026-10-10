@@ -8,6 +8,7 @@
 //! it does not claim a real filesystem atomic transaction.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hotlap_connectors::ConnectorError;
@@ -31,14 +32,23 @@ struct Inner {
 /// The shared logical store every sink instance observes.
 pub struct Store {
     inner: Mutex<Inner>,
+    physical_id: u64,
 }
+
+static NEXT_PHYSICAL_ID: AtomicU64 = AtomicU64::new(1);
 
 impl Store {
     /// An empty store.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner::default()),
+            physical_id: NEXT_PHYSICAL_ID.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    /// Stable identity retained by every sink reopened over this store.
+    pub fn physical_identity(&self) -> String {
+        format!("test/checkpoint-uncertain/store/{}", self.physical_id)
     }
 
     /// Stage `payload` as the next transaction of `view`, returning its id.

@@ -32,6 +32,10 @@ impl Metadata {
 struct MetadataSource(Metadata);
 
 impl Source for MetadataSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/session-source-preflight/metadata-dataset".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.0.declared.read().unwrap().0.clone()
     }

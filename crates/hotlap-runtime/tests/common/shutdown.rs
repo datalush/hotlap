@@ -6,6 +6,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::task::{Context, Poll};
 
@@ -21,6 +22,14 @@ use hotlap_runtime::runtime::checkpoint::CheckpointConfig;
 use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
+
+#[path = "participants.rs"]
+mod participants;
+#[allow(unused_imports)]
+pub use participants::IdentifiedSink;
+
+#[allow(dead_code)]
+static NEXT_TEST_STORE: AtomicU64 = AtomicU64::new(1);
 
 #[path = "backend.rs"]
 mod backend;
@@ -65,6 +74,7 @@ pub fn batch(key: i64) -> SourceBatch {
 pub struct SignalSource {
     batches: Vec<SourceBatch>,
     last: Option<Signal>,
+    identity: String,
 }
 
 struct BatchStream {
@@ -95,6 +105,10 @@ impl Stream for BatchStream {
 }
 
 impl Source for SignalSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.identity.clone())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.batches[0].batch.schema()
     }
@@ -119,9 +133,24 @@ impl Source for SignalSource {
 /// A finite source of one-row batches, one per key.
 ///
 /// `last`, when set, fires as the final batch is yielded.
+#[allow(dead_code)]
 pub fn keys_with(values: &[i64], last: Option<Signal>) -> Arc<dyn Source> {
+    let id = NEXT_TEST_STORE.fetch_add(1, Ordering::Relaxed);
+    keys_with_identity(values, last, format!("test/shutdown/source/{id}"))
+}
+
+/// Build a fresh source object bound to the named physical test store.
+pub fn keys_with_identity(
+    values: &[i64],
+    last: Option<Signal>,
+    identity: impl Into<String>,
+) -> Arc<dyn Source> {
     let batches = values.iter().copied().map(batch).collect();
-    Arc::new(SignalSource { batches, last })
+    Arc::new(SignalSource {
+        batches,
+        last,
+        identity: identity.into(),
+    })
 }
 
 fn group_count() -> Plan {
@@ -133,11 +162,24 @@ fn group_count() -> Plan {
 }
 
 /// Start the engine over `source` tapping one group-count view into `sink`.
+#[allow(dead_code)]
 pub fn start(
     source: Arc<dyn Source>,
     sink: Arc<dyn Sink>,
     checkpoint: Option<CheckpointConfig>,
 ) -> EngineHandle {
+    let id = NEXT_TEST_STORE.fetch_add(1, Ordering::Relaxed);
+    start_with_sink_identity(source, sink, checkpoint, format!("test/shutdown/sink/{id}"))
+}
+
+/// Start using the explicit physical target identity for a durable sink.
+pub fn start_with_sink_identity(
+    source: Arc<dyn Source>,
+    sink: Arc<dyn Sink>,
+    checkpoint: Option<CheckpointConfig>,
+    sink_identity: impl Into<String>,
+) -> EngineHandle {
+    let sink: Arc<dyn Sink> = Arc::new(participants::IdentifiedSink::new(sink_identity, sink));
     EngineHandle::start(Pipeline {
         sources: Sources::new(vec![InputSource {
             id: InputId(0),
@@ -147,10 +189,7 @@ pub fn start(
         }])
         .unwrap(),
         views: vec![("c".into(), group_count())],
-        sinks: vec![SinkSpec {
-            view: "c".into(),
-            sink,
-        }],
+        sinks: vec![SinkSpec::named("sink", "c", sink)],
         checkpoint,
         retention: None,
     })

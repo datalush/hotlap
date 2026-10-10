@@ -3,7 +3,7 @@
 #[path = "common/recovery.rs"]
 mod recovery;
 
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use hotlap::state::StateBackend;
@@ -12,9 +12,11 @@ use hotlap_connectors::sink::{Sink, SinkCapabilities};
 use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, Checkpointer, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline::SinkSpec;
+use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 use recovery::{Dataset, ResumableSource, drain, engine_with, pipeline, rows, take};
 
 struct CommitSink {
+    physical_identity: String,
     fail_commit: bool,
     committed: mpsc::Sender<()>,
     gate: Option<std::sync::Arc<tokio::sync::Notify>>,
@@ -22,6 +24,9 @@ struct CommitSink {
 
 #[async_trait::async_trait]
 impl Sink for CommitSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
     async fn write(
         &self,
         mut changes: hotlap_connectors::ChangeStream,
@@ -61,11 +66,27 @@ fn start(
     fail_commit: bool,
     interval: Duration,
     gate: Option<std::sync::Arc<tokio::sync::Notify>>,
+    sink_identity: &str,
 ) -> (EngineHandle, mpsc::Receiver<()>) {
-    let dataset =
-        Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3], vec![3, 4]]).with_retention(0);
-    let mut seed = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    let dataset = Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3], vec![3, 4]])
+        .with_retention(0)
+        .with_physical_identity("test/checkpoint-error-after-recovery/source");
+    let (seed_committed, _seed_receiver) = mpsc::channel();
+    let seed_sink = Arc::new(CommitSink {
+        physical_identity: sink_identity.to_owned(),
+        fail_commit: false,
+        committed: seed_committed,
+        gate: None,
+    });
+    let mut seed = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+        SinkSync::sink_only_named(
+            SharedSink::new(seed_sink),
+            "commit-output".into(),
+            "c".into(),
+        ),
+    ]);
     let (mut hotlap, seed_pipeline) = engine_with(ResumableSource::new(dataset.clone()));
+    hotlap.tap_view("c").unwrap();
     let mut seed_stream = seed_pipeline.sources.stream().unwrap();
     drain(&mut hotlap, &seed_pipeline.sources, &mut seed_stream, 3);
     assert!(!rows(&hotlap.snapshot("c").unwrap()).is_empty());
@@ -73,10 +94,14 @@ fn start(
 
     let mut writer = backend.clone();
     let sources = writer.get(b"checkpoint/1/sources").unwrap().unwrap();
+    let participants = writer.get(b"checkpoint/1/participants").unwrap().unwrap();
     writer
         .put(b"checkpoint/2/engine", b"not-a-snapshot".to_vec())
         .unwrap();
     writer.put(b"checkpoint/2/sources", sources).unwrap();
+    writer
+        .put(b"checkpoint/2/participants", participants)
+        .unwrap();
     writer.put(b"checkpoint/2/commit", b"1".to_vec()).unwrap();
 
     let config = CheckpointConfig {
@@ -86,14 +111,16 @@ fn start(
     };
     let mut pipeline = pipeline(ResumableSource::new(dataset), Some(config));
     let (committed, received) = mpsc::channel();
-    pipeline.sinks.push(SinkSpec {
-        view: "c".into(),
-        sink: std::sync::Arc::new(CommitSink {
+    pipeline.sinks.push(SinkSpec::named(
+        "commit-output",
+        "c",
+        std::sync::Arc::new(CommitSink {
+            physical_identity: sink_identity.to_owned(),
             fail_commit,
             committed,
             gate,
         }),
-    });
+    ));
     (EngineHandle::start(pipeline).unwrap(), received)
 }
 
@@ -104,6 +131,7 @@ fn fatal_checkpoint_cause_replaces_prior_recovery_warning_on_shutdown() {
         true,
         Duration::from_secs(3600),
         None,
+        "test/checkpoint-error-after-recovery/fatal-commit",
     );
     assert!(
         handle
@@ -140,6 +168,7 @@ fn recovery_warning_alone_does_not_fail_healthy_shutdown() {
         false,
         Duration::from_secs(3600),
         None,
+        "test/checkpoint-error-after-recovery/healthy-commit",
     );
     assert!(
         handle
@@ -158,6 +187,7 @@ fn fatal_periodic_checkpoint_replaces_prior_recovery_warning() {
         true,
         Duration::from_millis(50),
         Some(gate.clone()),
+        "test/checkpoint-error-after-recovery/periodic-commit",
     );
     assert!(
         handle

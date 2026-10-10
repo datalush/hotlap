@@ -102,6 +102,7 @@ impl SqlSession {
         replay_safe: bool,
         redriable: bool,
         sources: &Sources,
+        sink_descriptions: &[crate::runtime::pipeline::SinkDescription],
     ) -> Result<(), SqlError> {
         let Some(config) = self.checkpoint.take() else {
             return Ok(());
@@ -117,7 +118,13 @@ impl SqlSession {
             .collect();
         let checkpointer = Checkpointer::new(config.backend, config.retain);
         let result = checkpointer
-            .validate_sources_and_views(sources, &declared, replay_safe, redriable)
+            .validate_sources_and_views(
+                sources,
+                &declared,
+                replay_safe,
+                redriable,
+                Some(sink_descriptions),
+            )
             .map_err(view_identity_err);
         self.checkpoint = Some(CheckpointConfig {
             interval: config.interval,

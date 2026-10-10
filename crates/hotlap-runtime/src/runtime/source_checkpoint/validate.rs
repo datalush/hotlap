@@ -65,6 +65,17 @@ fn validate_entry(entry: &SavedSource, input: &InputSource) -> Result<(), Connec
     if entry.name != input.name {
         return Err(unsupported(format!("source {:?} was renamed", entry.id)));
     }
+    let physical_identity = input
+        .source
+        .physical_identity()
+        .filter(|identity| !identity.trim().is_empty())
+        .ok_or_else(|| unsupported(format!("source {:?} has no physical identity", entry.id)))?;
+    if entry.physical_identity != physical_identity {
+        return Err(unsupported(format!(
+            "physical dataset for source {:?} does not match",
+            entry.id
+        )));
+    }
     let saved_schema = decode_schema(&entry.schema).map_err(decode_err)?;
     if saved_schema != input.source.schema() {
         return Err(unsupported(format!(

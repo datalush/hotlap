@@ -59,6 +59,15 @@ pub type SourceStream = Pin<Box<dyn Stream<Item = Result<SourceBatch, ConnectorE
 
 /// A source of Arrow batches with resumable offsets and optional event-time.
 pub trait Source: Send + Sync {
+    /// Stable opaque identity of the physical dataset read by this source.
+    ///
+    /// Durable recovery requires a non-empty value. SQL relation names,
+    /// schemas, split ids, and source-instance addresses are not dataset proof.
+    /// Implementations without a stable physical identity return `None` and
+    /// cannot participate in durable checkpoints.
+    fn physical_identity(&self) -> Option<String> {
+        None
+    }
     /// Full Arrow schema of produced batches, including `_event_time` when present.
     fn schema(&self) -> SchemaRef;
     /// Enumerate splits and their start offsets.

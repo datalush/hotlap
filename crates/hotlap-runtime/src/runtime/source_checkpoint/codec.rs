@@ -14,9 +14,9 @@ use super::{SourcesCheckpoint, decode_err, encode_err};
 const MAGIC: [u8; 4] = *b"HLSR";
 /// Layout version of the sources checkpoint container.
 ///
-/// Bumped to 2 when the payload gained the named view registry, so an older
-/// reader rejects the new body instead of decoding a truncated view list.
-const VERSION: u32 = 2;
+/// Bumped to 3 when source entries gained physical dataset identities; older
+/// payloads cannot authorize restoring offsets to a physical source.
+const VERSION: u32 = 3;
 /// Fixed header length: magic (4) plus version (4).
 const HEADER: usize = 8;
 

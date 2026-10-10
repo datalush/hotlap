@@ -70,8 +70,9 @@ fn replay_safe_unrestorable_pending_discards_and_replays_only_after_fallback_val
     let (backend, dataset) = seeded_compatible_registries();
     corrupt_pending_output(&backend);
     let (sink, remote) = ready_redrive_sink();
-    let mut direct = Checkpointer::new(Box::new(backend.clone()), 1)
-        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(sink.clone()))]);
+    let mut direct = Checkpointer::new(Box::new(backend.clone()), 1).with_sinks(vec![
+        SinkSync::sink_only_named(SharedSink::new(sink.clone()), "output".into(), "a".into()),
+    ]);
     assert!(matches!(
         futures::executor::block_on(direct.promote(2)),
         Err(ConnectorError::Corruption(_))

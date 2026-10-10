@@ -25,10 +25,13 @@ use hotlap_engine::MetricsRegistry;
 use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::pipeline::{self, Pipeline};
 use hotlap_runtime::runtime::recovery::Recovery;
+use hotlap_runtime::runtime::source_checkpoint::decode_sources;
 use hotlap_runtime::runtime::sources::{InputStream, Sources};
 
 use backend::SharedBackend;
-use pending::{counting, engine_with, fresh_pipeline, put_sources, seed_pair, sources_bytes};
+use pending::{
+    counting, engine_with, fresh_pipeline, put_sources, seed_pair_with_redriable, sources_bytes,
+};
 
 /// Full recompute of a key-only join; rows are `(k, diff)`.
 fn recompute_keys(left: &[(i64, i64)], right: &[(i64, i64)]) -> Vec<(i64, i64)> {
@@ -88,8 +91,11 @@ fn drain(hotlap: &mut Hotlap, sources: &Sources, stream: &mut InputStream, limit
 
 /// Each fresh source must have resumed at the offset saved in checkpoint `id`.
 fn assert_resumed(backend: &SharedBackend, pipe: &Pipeline, id: u64) {
-    let reader = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    let saved = reader.read(id).unwrap().sources;
+    let encoded = backend
+        .get(format!("checkpoint/{id}/sources").as_bytes())
+        .unwrap()
+        .unwrap();
+    let saved = decode_sources(&encoded).unwrap();
     for entry in &saved.entries {
         let applied = pipe.sources.get(entry.id).unwrap().source.state();
         for (split, offset) in &entry.state.offsets {
@@ -129,7 +135,7 @@ fn start(backend: &SharedBackend, pipe: &Pipeline, redriable: bool) -> Started {
 #[test]
 fn pending_commit_is_promoted_and_both_offsets_resume() {
     let backend = SharedBackend::default();
-    let (_valid, pending) = seed_pair(&backend);
+    let (_valid, pending) = seed_pair_with_redriable(&backend, true);
     let pipe = fresh_pipeline();
 
     let (mut hotlap, mut stream, commits, warning, _) = start(&backend, &pipe, true);
@@ -147,7 +153,7 @@ fn pending_commit_is_promoted_and_both_offsets_resume() {
 #[test]
 fn pending_commit_is_discarded_and_replayed_from_the_valid_one() {
     let backend = SharedBackend::default();
-    let (valid, pending) = seed_pair(&backend);
+    let (valid, pending) = seed_pair_with_redriable(&backend, false);
     let pipe = fresh_pipeline();
 
     let (mut hotlap, mut stream, commits, warning, metrics) = start(&backend, &pipe, false);
@@ -171,7 +177,7 @@ fn pending_commit_is_discarded_and_replayed_from_the_valid_one() {
 #[test]
 fn a_corrupt_pending_body_is_discarded_and_both_sources_replay() {
     let backend = SharedBackend::default();
-    let (valid, pending) = seed_pair(&backend);
+    let (valid, pending) = seed_pair_with_redriable(&backend, true);
     assert!(sources_bytes(&backend, valid).starts_with(b"HLSR"));
     assert!(sources_bytes(&backend, pending).starts_with(b"HLSR"));
     // Keep the `HLSR` header but truncate the framed payload, so the body is

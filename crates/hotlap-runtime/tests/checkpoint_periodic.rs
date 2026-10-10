@@ -59,6 +59,10 @@ fn checkpoint_without_config_is_rejected() {
 struct ReadErrorSource;
 
 impl Source for ReadErrorSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/checkpoint-periodic/read-error-source".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         Arc::new(arrow::datatypes::Schema::empty())
     }

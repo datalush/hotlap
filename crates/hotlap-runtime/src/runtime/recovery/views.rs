@@ -21,6 +21,31 @@ pub(super) fn validate(hotlap: &Hotlap, decision: &RecoveryDecision) -> Result<(
     if let Some(checkpoint) = checkpoint {
         validate_checkpoint(&declared, checkpoint)?;
         validate_engine_for_hotlap(hotlap, checkpoint)?;
+        validate_tap_continuity(hotlap, checkpoint)?;
+    }
+    Ok(())
+}
+
+/// Restore may not overwrite a live sink tap with an untapped saved flag.
+pub(super) fn validate_tap_continuity(
+    hotlap: &Hotlap,
+    checkpoint: &Checkpoint,
+) -> Result<(), ConnectorError> {
+    let live = hotlap
+        .checkpoint()
+        .map_err(|error| ConnectorError::Infrastructure(error.0))?;
+    for view in live.views.iter().filter(|view| view.tapped) {
+        let saved = checkpoint
+            .engine
+            .views
+            .iter()
+            .find(|saved| saved.id == view.id);
+        if !saved.is_some_and(|saved| saved.tapped && saved.plan == view.plan) {
+            return Err(ConnectorError::Unsupported(format!(
+                "checkpoint would remove the active tap from view {:?}",
+                view.id
+            )));
+        }
     }
     Ok(())
 }

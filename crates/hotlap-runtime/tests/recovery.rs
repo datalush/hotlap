@@ -11,6 +11,7 @@ use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, rows
 /// The fixed log used by the differential and boundary tests.
 fn log() -> Dataset {
     Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3], vec![3, 4]])
+        .with_physical_identity("test/recovery/log")
 }
 
 /// A clean run over the whole log, used as the no-crash reference.

@@ -21,10 +21,12 @@ async fn transactional_sink_prepares_then_commits_before_valid() {
     let sink = SharedSink::new(Arc::new(FakeSink::new(
         SinkCapabilities::Transactional,
         log.clone(),
+        "test/sink-barrier/transactional",
     )));
     let backend = MemBackend::default();
-    let mut checkpointer =
-        Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![
+        SinkSync::sink_only_named(sink, "transactional".into(), "standalone".into()),
+    ]);
 
     let id = checkpointer
         .take(&engine(), &sources())
@@ -37,7 +39,17 @@ async fn transactional_sink_prepares_then_commits_before_valid() {
         "commit must follow prepare and precede validity"
     );
 
-    let reader = Checkpointer::new(Box::new(backend), 3);
+    let reader_sink = SharedSink::new(Arc::new(FakeSink::new(
+        SinkCapabilities::Transactional,
+        events(),
+        "test/sink-barrier/transactional",
+    )));
+    let reader =
+        Checkpointer::new(Box::new(backend), 3).with_sinks(vec![SinkSync::sink_only_named(
+            reader_sink,
+            "transactional".into(),
+            "standalone".into(),
+        )]);
     assert_eq!(reader.latest().unwrap(), Some(1));
     assert!(
         reader.read(1).is_ok(),
@@ -51,10 +63,12 @@ async fn idempotent_sink_is_flushed_but_not_prepared() {
     let sink = SharedSink::new(Arc::new(FakeSink::new(
         SinkCapabilities::Idempotent,
         log.clone(),
+        "test/sink-barrier/idempotent",
     )));
     let backend = MemBackend::default();
-    let mut checkpointer =
-        Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![
+        SinkSync::sink_only_named(sink, "idempotent".into(), "standalone".into()),
+    ]);
 
     checkpointer.take(&engine(), &sources()).await.unwrap();
     assert_eq!(
@@ -70,10 +84,12 @@ async fn at_least_once_sink_is_flushed_before_valid() {
     let sink = SharedSink::new(Arc::new(FakeSink::new(
         SinkCapabilities::AtLeastOnce,
         log.clone(),
+        "test/sink-barrier/at-least-once",
     )));
     let backend = MemBackend::default();
-    let mut checkpointer =
-        Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![SinkSync::sink_only(sink)]);
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3).with_sinks(vec![
+        SinkSync::sink_only_named(sink, "at-least-once".into(), "standalone".into()),
+    ]);
 
     checkpointer.take(&engine(), &sources()).await.unwrap();
     assert_eq!(

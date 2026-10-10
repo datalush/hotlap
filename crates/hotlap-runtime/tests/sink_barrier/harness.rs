@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use hotlap::state::{StateBackend, StateEntry, StateError};
-use hotlap::{Hotlap, InputId};
+use hotlap::{Hotlap, InputId, Plan};
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError, Sink, SinkCapabilities};
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
@@ -21,6 +21,7 @@ pub enum Event {
 
 /// Records the 2PC calls it receives; can fail its prepare or commit.
 pub struct FakeSink {
+    physical_identity: String,
     capabilities: SinkCapabilities,
     events: Arc<Mutex<Vec<Event>>>,
     fail_prepare: bool,
@@ -28,8 +29,13 @@ pub struct FakeSink {
 }
 
 impl FakeSink {
-    pub fn new(capabilities: SinkCapabilities, events: Arc<Mutex<Vec<Event>>>) -> Self {
+    pub fn new(
+        capabilities: SinkCapabilities,
+        events: Arc<Mutex<Vec<Event>>>,
+        physical_identity: &str,
+    ) -> Self {
         Self {
+            physical_identity: physical_identity.into(),
             capabilities,
             events,
             fail_prepare: false,
@@ -37,8 +43,9 @@ impl FakeSink {
         }
     }
 
-    pub fn failing_prepare(events: Arc<Mutex<Vec<Event>>>) -> Self {
+    pub fn failing_prepare(events: Arc<Mutex<Vec<Event>>>, physical_identity: &str) -> Self {
         Self {
+            physical_identity: physical_identity.into(),
             capabilities: SinkCapabilities::Transactional,
             events,
             fail_prepare: true,
@@ -46,8 +53,13 @@ impl FakeSink {
         }
     }
 
-    pub fn failing_commit(capabilities: SinkCapabilities, events: Arc<Mutex<Vec<Event>>>) -> Self {
+    pub fn failing_commit(
+        capabilities: SinkCapabilities,
+        events: Arc<Mutex<Vec<Event>>>,
+        physical_identity: &str,
+    ) -> Self {
         Self {
+            physical_identity: physical_identity.into(),
             capabilities,
             events,
             fail_prepare: false,
@@ -62,6 +74,9 @@ impl FakeSink {
 
 #[async_trait::async_trait]
 impl Sink for FakeSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
     async fn write(&self, _changes: ChangeStream) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -152,6 +167,9 @@ impl StateBackend for MemBackend {
 pub struct EmptySource;
 
 impl Source for EmptySource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/sink-barrier/empty-source".into())
+    }
     fn schema(&self) -> SchemaRef {
         Arc::new(Schema::new(Vec::<Field>::new()))
     }
@@ -171,7 +189,13 @@ impl Source for EmptySource {
 
 /// An empty engine for the barrier.
 pub fn engine() -> Hotlap {
-    Hotlap::open_with(Box::new(hotlap_engine::EngineCore::new()))
+    let mut engine = Hotlap::open_with(Box::new(hotlap_engine::EngineCore::new()));
+    engine.register_input("in").unwrap();
+    engine
+        .create_view("standalone", Plan::Source(InputId(0)))
+        .unwrap();
+    engine.tap_view("standalone").unwrap();
+    engine
 }
 
 /// A single empty source set, enough for the barrier.

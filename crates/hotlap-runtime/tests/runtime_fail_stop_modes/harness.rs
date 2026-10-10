@@ -49,6 +49,10 @@ impl ControlledB {
 }
 
 impl Source for ControlledB {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/runtime-fail-stop-modes/controlled-source".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -95,6 +99,10 @@ pub struct ScriptSource {
 }
 
 impl Source for ScriptSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/runtime-fail-stop-modes/script-source".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

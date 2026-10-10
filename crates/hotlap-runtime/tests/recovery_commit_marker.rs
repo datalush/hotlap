@@ -26,15 +26,19 @@ fn commit_marker_is_durable_before_commit_and_removed_after_valid() {
     let commits = Arc::new(AtomicU32::new(0));
     let observed = Arc::new(Mutex::new(false));
     let probe = Arc::new(FakeSink {
+        physical_identity: "test/recovery-commit-marker/output".into(),
         capabilities: SinkCapabilities::Transactional,
         redriable: false,
         commits: Arc::clone(&commits),
         probe: Some((backend.clone(), 1, Arc::clone(&observed))),
     });
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(probe))]);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(SharedSink::new(probe), "output".into(), "c".into()),
+        ]);
 
-    let (engine, pipe) = engine_with(ResumableSource::new(log()));
+    let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
+    engine.tap_view("c").unwrap();
     let id = futures::executor::block_on(checkpointer.take(&engine, &pipe.sources)).unwrap();
 
     assert_eq!(id, 1);
@@ -49,13 +53,20 @@ fn commit_marker_is_durable_before_commit_and_removed_after_valid() {
 
 #[test]
 fn recovery_promotes_an_explicitly_redrivable_interrupted_commit() {
-    let backend = seed_valid_one();
+    let (seed_sink, _) = sink_with(SinkCapabilities::Idempotent, true);
+    let backend = seed_valid_one(vec![SinkSync::sink_only_named(
+        seed_sink,
+        "output".into(),
+        "c".into(),
+    )]);
     seed_pending(&backend, 1, 2);
+    let (sink, commits) = sink_with(SinkCapabilities::Idempotent, true);
     // Idempotent replay alone is not enough: the sink must declare a durable
     // commit it can complete after a restart.
-    let (sink, commits) = sink_with(SinkCapabilities::Idempotent, true);
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(sink)]);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(sink, "output".into(), "c".into()),
+        ]);
 
     let checkpoint = match Recovery::inspect(&checkpointer, &matching()).unwrap() {
         RecoveryDecision::Promote(checkpoint) => checkpoint,
@@ -81,11 +92,18 @@ fn recovery_promotes_an_explicitly_redrivable_interrupted_commit() {
 
 #[test]
 fn an_idempotent_sink_is_not_redrivable_by_default() {
-    let backend = seed_valid_one();
+    let (seed_sink, _) = self::sink(SinkCapabilities::Idempotent);
+    let backend = seed_valid_one(vec![SinkSync::sink_only_named(
+        seed_sink,
+        "output".into(),
+        "c".into(),
+    )]);
     seed_pending(&backend, 1, 2);
-    let (sink, commits) = sink(SinkCapabilities::Idempotent);
-    let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(sink)]);
+    let (sink, commits) = self::sink(SinkCapabilities::Idempotent);
+    let checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(sink, "output".into(), "c".into()),
+        ]);
 
     match Recovery::inspect(&checkpointer, &matching()).unwrap() {
         RecoveryDecision::Discard {
@@ -101,11 +119,18 @@ fn an_idempotent_sink_is_not_redrivable_by_default() {
 
 #[test]
 fn recovery_discards_a_non_redrivable_interrupted_commit() {
-    let backend = seed_valid_one();
+    let (seed_sink, _) = self::sink(SinkCapabilities::AtLeastOnce);
+    let backend = seed_valid_one(vec![SinkSync::sink_only_named(
+        seed_sink,
+        "output".into(),
+        "c".into(),
+    )]);
     seed_pending(&backend, 1, 2);
-    let (sink, commits) = sink(SinkCapabilities::AtLeastOnce);
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(sink)]);
+    let (sink, commits) = self::sink(SinkCapabilities::AtLeastOnce);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(sink, "output".into(), "c".into()),
+        ]);
 
     match Recovery::inspect(&checkpointer, &matching()).unwrap() {
         RecoveryDecision::Discard {
@@ -134,7 +159,7 @@ fn recovery_discards_a_non_redrivable_interrupted_commit() {
 
 #[test]
 fn recovery_without_a_marker_matches_the_newest_valid() {
-    let backend = seed_valid_one();
+    let backend = seed_valid_one(vec![]);
     let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
 
     match Recovery::inspect(&checkpointer, &matching()).unwrap() {

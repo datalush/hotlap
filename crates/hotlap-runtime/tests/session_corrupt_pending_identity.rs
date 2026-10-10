@@ -79,7 +79,7 @@ fn pending_with_extra_view(backend: &SharedBackend) {
     let pending = SharedBackend::default();
     seed(&pending);
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let body = pending
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()
@@ -95,7 +95,7 @@ fn pending_with_extra_view(backend: &SharedBackend) {
 
 fn corrupt_pending(backend: &SharedBackend) {
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let body = writer
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()

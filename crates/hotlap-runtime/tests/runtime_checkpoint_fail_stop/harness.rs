@@ -50,6 +50,10 @@ impl ControlledB {
 }
 
 impl Source for ControlledB {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/runtime-checkpoint-fail-stop/source".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

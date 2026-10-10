@@ -16,12 +16,15 @@ use crate::recovery::{
 
 /// The log shared by the commit-marker tests.
 pub fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]])
+        .with_retention(0)
+        .with_physical_identity("test/recovery-commit-marker/log")
 }
 
 /// A sink that counts commits and, when probing, reports whether the commit
 /// marker was visible (and `valid` absent) while `commit` ran.
 pub struct FakeSink {
+    pub physical_identity: String,
     pub capabilities: SinkCapabilities,
     pub redriable: bool,
     pub commits: Arc<AtomicU32>,
@@ -30,6 +33,9 @@ pub struct FakeSink {
 
 #[async_trait::async_trait]
 impl Sink for FakeSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
     async fn write(&self, _changes: ChangeStream) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -77,6 +83,7 @@ pub fn sink_with(
 ) -> (Arc<SharedSink>, Arc<AtomicU32>) {
     let commits = Arc::new(AtomicU32::new(0));
     let sink = Arc::new(FakeSink {
+        physical_identity: "test/recovery-commit-marker/output".into(),
         capabilities,
         redriable,
         commits: Arc::clone(&commits),
@@ -86,10 +93,12 @@ pub fn sink_with(
 }
 
 /// Persist a valid checkpoint 1 over the shared backend.
-pub fn seed_valid_one() -> SharedBackend {
+pub fn seed_valid_one(sinks: Vec<super::SinkSync>) -> SharedBackend {
     let backend = SharedBackend::default();
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(sinks);
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
+    engine.tap_view("c").unwrap();
     let mut stream = pipe.sources.stream().unwrap();
     drain(&mut engine, &pipe.sources, &mut stream, 3);
     take(&mut checkpointer, &engine, &pipe.sources);
@@ -104,7 +113,7 @@ pub fn seed_valid_one() -> SharedBackend {
 /// durable commit marker, leaving `valid` absent.
 pub fn seed_pending(backend: &SharedBackend, valid: u64, pending: u64) {
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let value = writer
             .get(format!("checkpoint/{valid}/{part}").as_bytes())
             .unwrap()

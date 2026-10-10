@@ -22,9 +22,42 @@ use super::{fluss_err, parse_path};
 pub struct FlussSink {
     writer: FlussWriter,
     schema: SchemaRef,
+    physical_identity: String,
+}
+
+/// Metadata resolved from a Fluss table without opening its writer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlussSinkMetadata {
+    pub physical_identity: String,
+    pub capabilities: SinkCapabilities,
 }
 
 impl FlussSink {
+    /// Resolve table identity and output capabilities without creating a writer.
+    pub async fn describe_target(
+        bootstrap: &str,
+        path: &str,
+    ) -> Result<FlussSinkMetadata, ConnectorError> {
+        let config = Config {
+            bootstrap_servers: bootstrap.to_string(),
+            ..Config::default()
+        };
+        let connection = FlussConnection::new(config).await.map_err(fluss_err)?;
+        let table = connection
+            .get_table(&parse_path(path)?)
+            .await
+            .map_err(fluss_err)?;
+        let info = table.get_table_info();
+        Ok(FlussSinkMetadata {
+            physical_identity: physical_table_identity(bootstrap, path, info.get_table_id()),
+            capabilities: if table.has_primary_key() {
+                SinkCapabilities::Idempotent
+            } else {
+                SinkCapabilities::AtLeastOnce
+            },
+        })
+    }
+
     /// Connect to `bootstrap` and open `path` (`<database>/<table>`).
     ///
     /// A table with a primary key is written through the upsert writer, which
@@ -43,8 +76,10 @@ impl FlussSink {
             .get_table(&parse_path(path)?)
             .await
             .map_err(fluss_err)?;
+        let info = table.get_table_info();
+        let physical_identity = physical_table_identity(bootstrap, path, info.get_table_id());
         let writer = if table.has_primary_key() {
-            let row_type = Arc::new(table.get_table_info().row_type().clone());
+            let row_type = Arc::new(info.row_type().clone());
             let upsert = table.new_upsert().map_err(fluss_err)?;
             FlussWriter::Upsert {
                 writer: upsert.create_writer().map_err(fluss_err)?,
@@ -54,8 +89,29 @@ impl FlussSink {
             let append = table.new_append().map_err(fluss_err)?;
             FlussWriter::Append(append.create_writer().map_err(fluss_err)?)
         };
-        Ok(Self { writer, schema })
+        Ok(Self {
+            writer,
+            schema,
+            physical_identity,
+        })
     }
+}
+
+fn physical_table_identity(
+    bootstrap: &str,
+    path: &str,
+    table_id: impl std::fmt::Display,
+) -> String {
+    format!(
+        "fluss:{}:{}:{}",
+        super::source::normalize_cluster_locator(bootstrap),
+        path.trim_matches('/')
+            .split('/')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join("/"),
+        table_id
+    )
 }
 
 /// Reject any change with a negative diff (append cannot delete).
@@ -75,6 +131,10 @@ pub fn retraction_check(batch: &ZSetBatch) -> Result<(), ConnectorError> {
 
 #[async_trait]
 impl Sink for FlussSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         while let Some(item) = changes.next().await {
             let batch = item?;

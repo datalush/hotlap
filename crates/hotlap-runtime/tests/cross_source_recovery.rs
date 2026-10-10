@@ -51,8 +51,14 @@ fn wait_offsets(factory: &ResumableSessionFactory, a: i64, b: i64) -> bool {
 /// Run `a=[[1],[1]]`, `b=[[1]]`, checkpoint it and return the factory.
 fn first_run(backend: &SharedBackend) -> Arc<ResumableSessionFactory> {
     let factory = ResumableSessionFactory::new();
-    factory.declare("a", Dataset::new(vec![vec![1], vec![1]]));
-    factory.declare("b", Dataset::new(vec![vec![1]]));
+    factory.declare(
+        "a",
+        Dataset::new(vec![vec![1], vec![1]]).with_physical_identity("test/topic/a"),
+    );
+    factory.declare(
+        "b",
+        Dataset::new(vec![vec![1]]).with_physical_identity("test/topic/b"),
+    );
     let mut session = session(factory.clone(), Box::new(backend.clone()), Order::Ab);
     session.sql("START;").expect("first start");
 
@@ -72,10 +78,17 @@ fn restart_resumes_each_source_and_matches_recomputation() {
     // Reversed SQL declaration order and retention that hides the replayed
     // prefix: only a real resume from the checkpoint can read both new lots.
     let second = ResumableSessionFactory::new();
-    second.declare("b", Dataset::new(vec![vec![1], vec![2]]).with_retention(1));
+    second.declare(
+        "b",
+        Dataset::new(vec![vec![1], vec![2]])
+            .with_retention(1)
+            .with_physical_identity("test/topic/b"),
+    );
     second.declare(
         "a",
-        Dataset::new(vec![vec![1], vec![1], vec![2]]).with_retention(2),
+        Dataset::new(vec![vec![1], vec![1], vec![2]])
+            .with_retention(2)
+            .with_physical_identity("test/topic/a"),
     );
     let mut session = session(second.clone(), Box::new(backend.clone()), Order::Ba);
     session.sql("START;").expect("recovered start");

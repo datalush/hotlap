@@ -43,6 +43,21 @@ Result<(), ConnectorError>`, `prepare(&self)`, `commit(&self)`, `abort(&self)` y
 las capacidades declaradas por el sink (`capabilities`, `accepts_retractions`,
 `commit_redriable`). Ver `docs/hotlap-sink.md` y `docs/hotlap-sink-2pc.md`.
 
+Para usar checkpointing durable, `Source::physical_identity()` y
+`Sink::physical_identity()` deben devolver una identidad opaca, no vacía y
+estable del dataset físico leído o del destino físico escrito. No se infiere de
+un nombre SQL, schema, splits, dirección de instancia ni configuración declarada
+por un factory. La implementación Fluss incorpora el ID de tabla de metadatos,
+la ruta canónica y el locator normalizado del clúster (sin credenciales). Si el
+conector no puede probar una identidad, la captura durable se rechaza; el uso no
+durable conserva el comportamiento anterior.
+
+Además, `SinkFactory::describe(binding_name, options, schema, view)` debe resolver
+el target físico y sus metadatos sin abrir writer para un `START` durable. El
+runtime rechaza una descripción ausente/incompatible antes de `create` y verifica
+que el sink creado coincida con ella. Las factories no-durables pueden conservar
+la implementación por defecto que devuelve `None`.
+
 `ConnectorError` (`error.rs`) distingue `Fluss(String)`, `Arrow(String)`,
 `Unsupported(String)` e `Infrastructure(String)`.
 

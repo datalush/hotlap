@@ -5,6 +5,7 @@
 //! `retained_from` boundary models a broker that has dropped older records,
 //! exercising the insufficient-retention error.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, Int64Array};
@@ -21,14 +22,25 @@ use hotlap_connectors::source::{
 pub struct Dataset {
     pub batches: Arc<Vec<Vec<i64>>>,
     pub retained_from: usize,
+    pub physical_identity: String,
 }
+
+static NEXT_DATASET_ID: AtomicU64 = AtomicU64::new(1);
 
 impl Dataset {
     pub fn new(batches: Vec<Vec<i64>>) -> Self {
+        let store_id = NEXT_DATASET_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             batches: Arc::new(batches),
             retained_from: 0,
+            physical_identity: format!("test/resumable-dataset/{store_id}"),
         }
+    }
+
+    /// Reopen the same modeled physical store under a new source object.
+    pub fn with_physical_identity(mut self, identity: impl Into<String>) -> Self {
+        self.physical_identity = identity.into();
+        self
     }
 
     pub fn with_retention(mut self, retained_from: usize) -> Self {
@@ -55,6 +67,10 @@ impl ResumableSource {
 }
 
 impl Source for ResumableSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.dataset.physical_identity.clone())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -128,4 +144,19 @@ impl Source for ResumableSource {
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Dataset;
+
+    #[test]
+    fn cloned_dataset_keeps_store_identity_but_new_store_gets_a_distinct_identity() {
+        let first = Dataset::new(vec![vec![1]]);
+        let reopened = first.clone();
+        let other = Dataset::new(vec![vec![1]]);
+
+        assert_eq!(first.physical_identity, reopened.physical_identity);
+        assert_ne!(first.physical_identity, other.physical_identity);
+    }
 }

@@ -27,7 +27,9 @@ use resumable::{Dataset, ResumableSource};
 use spy::SpySource;
 
 fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![2]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![2]])
+        .with_retention(0)
+        .with_physical_identity("test/view-identity-resume/log")
 }
 
 fn filter(value: i64) -> Plan {

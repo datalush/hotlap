@@ -62,6 +62,10 @@ struct CountingSink {
 
 #[async_trait::async_trait]
 impl Sink for CountingSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/recovery-storage/output".into())
+    }
+
     async fn write(&self, _changes: ChangeStream) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -80,9 +84,16 @@ impl Sink for CountingSink {
     }
 }
 
+fn sink_sync(commits: Arc<AtomicU32>) -> SinkSync {
+    let sink = Arc::new(CountingSink { commits });
+    SinkSync::sink_only_named(SharedSink::new(sink), "recovery-output".into(), "c".into())
+}
+
 /// The fixed log, with retention keeping every record.
 pub fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]])
+        .with_retention(0)
+        .with_physical_identity("test/recovery-storage/log")
 }
 
 /// Sources over `log` wrapped in a resume-counting spy.
@@ -102,8 +113,11 @@ pub fn spy_sources() -> (Sources, Arc<SpySource>) {
 
 /// Persist one valid checkpoint over `backend`.
 pub fn seed_valid(backend: &SharedBackend) -> u64 {
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    let commits = Arc::new(AtomicU32::new(0));
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+        .with_sinks(vec![sink_sync(commits)]);
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
+    engine.tap_view("c").unwrap();
     let mut stream = pipe.sources.stream().unwrap();
     drain(&mut engine, &pipe.sources, &mut stream, 3);
     take(&mut checkpointer, &engine, &pipe.sources)
@@ -117,8 +131,10 @@ pub fn seed_valid(backend: &SharedBackend) -> u64 {
 /// different snapshot and offset. `valid` must already exist.
 pub fn seed_pending(backend: &SharedBackend, valid: u64, pending: u64, events: usize) {
     let scratch = SharedBackend::default();
-    let mut checkpointer = Checkpointer::new(Box::new(scratch.clone()), DEFAULT_RETAIN);
+    let mut checkpointer = Checkpointer::new(Box::new(scratch.clone()), DEFAULT_RETAIN)
+        .with_sinks(vec![sink_sync(Arc::new(AtomicU32::new(0)))]);
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
+    engine.tap_view("c").unwrap();
     let mut stream = pipe.sources.stream().unwrap();
     drain(&mut engine, &pipe.sources, &mut stream, events);
     take(&mut checkpointer, &engine, &pipe.sources);
@@ -133,7 +149,7 @@ pub fn seed_pending(backend: &SharedBackend, valid: u64, pending: u64, events: u
         pending_engine, fallback,
         "the pending fixture must differ from the fallback body"
     );
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let value = scratch
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()
@@ -162,7 +178,7 @@ pub fn start(
     let commits = Arc::new(AtomicU32::new(0));
     let sink = Arc::new(CountingSink { commits });
     let mut checkpointer = Checkpointer::new(backend, DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(sink))]);
+        .with_sinks(vec![sink_sync(sink.commits.clone())]);
     let signal = Mutex::new(None);
     let metrics = MetricsRegistry::new();
     let started = futures::executor::block_on(Recovery::start(

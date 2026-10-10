@@ -1,6 +1,7 @@
 //! Persistent staged-payload fixtures for checkpoint abort tests.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::Int64Array;
@@ -13,9 +14,21 @@ use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
 use hotlap_connectors::{ChangeStream, ConnectorError, Sink, SinkCapabilities};
 use hotlap_runtime::runtime::sources::{InputSource, Sources};
 
-#[derive(Default)]
 pub struct Remote {
+    physical_identity: String,
     state: Mutex<RemoteState>,
+}
+
+static NEXT_REMOTE_ID: AtomicU64 = AtomicU64::new(1);
+
+impl Default for Remote {
+    fn default() -> Self {
+        let id = NEXT_REMOTE_ID.fetch_add(1, Ordering::Relaxed);
+        Self {
+            physical_identity: format!("test/checkpoint-abort-staged/remote/{id}"),
+            state: Mutex::new(RemoteState::default()),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -135,6 +148,9 @@ pub async fn write_changes(sink: &PersistentTxn, changes: Vec<ZSetBatch>) {
 struct EmptySource;
 
 impl Source for EmptySource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/checkpoint-abort-staged/empty-source".into())
+    }
     fn schema(&self) -> arrow::datatypes::SchemaRef {
         Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
     }
@@ -205,6 +221,9 @@ impl StateBackend for FaultBackend {
 
 #[async_trait::async_trait]
 impl Sink for PersistentTxn {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.remote.physical_identity.clone())
+    }
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         while let Some(item) = changes.next().await {
             let change = item?;

@@ -79,6 +79,7 @@ async fn drive(
 
 /// One running sink plus the view it is fed from.
 pub(super) struct SinkEntry {
+    pub(super) binding_name: Option<String>,
     pub(super) view: String,
     pub(super) tx: ChangelogSender,
     pub(super) shared: Arc<SharedSink>,

@@ -28,6 +28,19 @@ pub enum SinkCapabilities {
 /// A sink of change batches with a two-phase-commit shape.
 #[async_trait::async_trait]
 pub trait Sink: Send + Sync {
+    /// Explicit stable binding name for a pipeline sink, when supplied by the caller.
+    fn binding_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Stable opaque identity of the physical output target.
+    ///
+    /// Durable recovery rejects sinks without a non-empty target identity;
+    /// factory declarations or SQL sink names do not prove which resource was
+    /// actually opened.
+    fn physical_identity(&self) -> Option<String> {
+        None
+    }
     /// Consume the changelog until the stream ends, then return.
     async fn write(&self, changes: ChangeStream) -> Result<(), ConnectorError>;
     /// Delivery guarantee this sink offers; defaults to [`SinkCapabilities::AtLeastOnce`].

@@ -31,6 +31,10 @@ struct FailAckSource {
 }
 
 impl Source for FailAckSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/runtime-fail-stop/ack-source".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

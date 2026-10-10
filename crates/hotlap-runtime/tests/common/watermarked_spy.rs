@@ -6,6 +6,10 @@ use hotlap_connectors::source::{Offset, Source, SourceState, SourceStream, Split
 pub struct WatermarkedSpy<S>(pub S);
 
 impl<S: Source> Source for WatermarkedSpy<S> {
+    fn physical_identity(&self) -> Option<String> {
+        self.0.physical_identity()
+    }
+
     fn schema(&self) -> arrow::datatypes::SchemaRef {
         self.0.schema()
     }

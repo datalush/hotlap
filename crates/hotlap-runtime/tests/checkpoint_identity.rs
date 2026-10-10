@@ -16,7 +16,9 @@ use recovery::{Dataset, ResumableSource, SharedBackend, engine_with, rows, take}
 
 /// The fixed log every attempt reads from; retention keeps all records.
 fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3], vec![3, 4]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3], vec![3, 4]])
+        .with_retention(0)
+        .with_physical_identity("test/checkpoint-identity/log")
 }
 
 /// Applied offset of the single source.

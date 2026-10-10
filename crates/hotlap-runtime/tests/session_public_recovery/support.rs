@@ -5,6 +5,7 @@ use arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_connectors::source::{Source, SourceStream};
+use hotlap_runtime::runtime::pipeline::SinkDescription;
 use hotlap_runtime::{SessionConfig, SinkFactory, SourceFactory};
 use hotlap_sql::error::SqlError;
 
@@ -26,6 +27,23 @@ struct ReplaySafeFactory {
 
 #[async_trait::async_trait]
 impl SinkFactory for ReplaySafeFactory {
+    async fn describe(
+        &self,
+        binding_name: &str,
+        _options: &std::collections::BTreeMap<String, String>,
+        _schema: SchemaRef,
+        view: &str,
+    ) -> Result<Option<SinkDescription>, SqlError> {
+        Ok(Some(SinkDescription {
+            binding_name: binding_name.to_owned(),
+            view: view.to_owned(),
+            physical_identity: "test/session-public-recovery/output".into(),
+            capabilities: SinkCapabilities::AtLeastOnce,
+            accepts_retractions: false,
+            commit_redriable: false,
+        }))
+    }
+
     async fn create(
         &self,
         _name: &str,
@@ -51,6 +69,10 @@ struct ReplaySafeSink {
 
 #[async_trait::async_trait]
 impl Sink for ReplaySafeSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/session-public-recovery/output".into())
+    }
+
     async fn write(
         &self,
         mut changes: ChangeStream,
@@ -84,7 +106,9 @@ impl SourceFactory for Factory {
         _options: &std::collections::BTreeMap<String, String>,
     ) -> Result<Box<dyn Source>, SqlError> {
         let source = SpySource::new(Arc::new(ResumableSource::new(
-            Dataset::new(vec![vec![1]]).with_retention(0),
+            Dataset::new(vec![vec![1]])
+                .with_retention(0)
+                .with_physical_identity("test/session-public-recovery/source"),
         )));
         self.spies.lock().unwrap().push(Arc::new(source.clone()));
         let source: Box<dyn Source> = Box::new(WatermarkedSpy(source));
@@ -104,6 +128,10 @@ struct GatedSource {
 }
 
 impl Source for GatedSource {
+    fn physical_identity(&self) -> Option<String> {
+        self.inner.physical_identity()
+    }
+
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }

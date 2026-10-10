@@ -140,6 +140,107 @@ impl Checkpointer {
         self.sinks.replay_safe()
     }
 
+    pub(crate) fn validate_participant_manifest(
+        &self,
+        id: u64,
+        sources: &crate::runtime::sources::Sources,
+    ) -> Result<(), ConnectorError> {
+        let manifest =
+            crate::runtime::checkpoint_body::read_participant_manifest(self.backend.as_ref(), id)?;
+        manifest.matches_sources(sources)?;
+        manifest.matches_sinks(&self.sinks)
+    }
+
+    pub(crate) fn validate_runtime_participants(
+        &self,
+        sources: &crate::runtime::sources::Sources,
+    ) -> Result<(), ConnectorError> {
+        crate::runtime::participants::ParticipantsManifest::capture(sources, &self.sinks)?;
+        for id in self.ids_descending()? {
+            let base = format!("checkpoint/{id}");
+            if self.has_key(&format!("{base}/valid"))?
+                || self.has_key(&format!("{base}/prepare"))?
+                || self.has_key(&format!("{base}/commit"))?
+            {
+                self.validate_participant_manifest(id, sources)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate participant evidence independently of whether checkpoint bodies
+    /// can be decoded or selected as restorable.
+    pub(crate) fn validate_participant_manifests(&self) -> Result<(), ConnectorError> {
+        for id in self.ids_descending()? {
+            let base = format!("checkpoint/{id}");
+            if self.has_key(&format!("{base}/valid"))?
+                || self.has_key(&format!("{base}/prepare"))?
+                || self.has_key(&format!("{base}/commit"))?
+            {
+                crate::runtime::checkpoint_body::read_participant_manifest(
+                    self.backend.as_ref(),
+                    id,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compare every preserved participant set to this checkpointer's sinks.
+    pub(crate) fn validate_sink_participant_manifests(&self) -> Result<(), ConnectorError> {
+        for id in self.ids_descending()? {
+            let base = format!("checkpoint/{id}");
+            if self.has_key(&format!("{base}/valid"))?
+                || self.has_key(&format!("{base}/prepare"))?
+                || self.has_key(&format!("{base}/commit"))?
+            {
+                let manifest = crate::runtime::checkpoint_body::read_participant_manifest(
+                    self.backend.as_ref(),
+                    id,
+                )?;
+                manifest.matches_sinks(&self.sinks)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_declared_participants(
+        &self,
+        sources: &crate::runtime::sources::Sources,
+        descriptions: &[crate::runtime::pipeline::SinkDescription],
+    ) -> Result<(), ConnectorError> {
+        for source in sources.entries() {
+            if source
+                .source
+                .physical_identity()
+                .is_none_or(|identity| identity.trim().is_empty())
+            {
+                return Err(ConnectorError::Unsupported(format!(
+                    "source `{}` has no stable physical dataset identity",
+                    source.name
+                )));
+            }
+        }
+        for description in descriptions {
+            description.validate()?;
+        }
+        for id in self.ids_descending()? {
+            let base = format!("checkpoint/{id}");
+            if self.has_key(&format!("{base}/valid"))?
+                || self.has_key(&format!("{base}/prepare"))?
+                || self.has_key(&format!("{base}/commit"))?
+            {
+                let manifest = crate::runtime::checkpoint_body::read_participant_manifest(
+                    self.backend.as_ref(),
+                    id,
+                )?;
+                manifest.matches_sources(sources)?;
+                manifest.matches_sink_descriptions(descriptions)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Recover the store, for example to move it into a new checkpointer.
     pub fn into_backend(self) -> Box<dyn StateBackend + Send> {
         self.backend

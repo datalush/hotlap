@@ -37,12 +37,26 @@ pub fn diff_column(zset: &ZSetBatch) -> &Int64Array {
 /// Delivery applies the changelog as keyed upserts/retractions: a positive diff
 /// upserts `key -> value`, a negative diff removes the key iff its current value
 /// matches the retracted row. Applying the same changelog twice is idempotent.
-#[derive(Clone, Default)]
-pub struct RemoteStore(Arc<Mutex<BTreeMap<i64, i64>>>);
+#[derive(Clone)]
+pub struct RemoteStore {
+    state: Arc<Mutex<BTreeMap<i64, i64>>>,
+    identity: String,
+}
+
+impl Default for RemoteStore {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self {
+            state: Arc::new(Mutex::new(BTreeMap::new())),
+            identity: format!("test/sink-redrive-recovery/remote/{id}"),
+        }
+    }
+}
 
 impl RemoteStore {
     fn apply(&self, key: i64, value: i64, diff: i64) {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.state.lock().unwrap();
         if diff > 0 {
             map.insert(key, value);
         } else if diff < 0 && map.get(&key) == Some(&value) {
@@ -51,7 +65,7 @@ impl RemoteStore {
     }
 
     pub fn snapshot(&self) -> BTreeMap<i64, i64> {
-        self.0.lock().unwrap().clone()
+        self.state.lock().unwrap().clone()
     }
 }
 
@@ -86,6 +100,9 @@ impl VolatileSink {
 
 #[async_trait::async_trait]
 impl Sink for VolatileSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.remote.identity.clone())
+    }
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         while let Some(item) = changes.next().await {
             let zset = item?;

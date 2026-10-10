@@ -26,7 +26,9 @@ use resumable::{Dataset, ResumableSource};
 
 /// The fixed log every attempt reads from; retention keeps all records.
 fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![2]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![2]])
+        .with_retention(0)
+        .with_physical_identity("test/view-identity/log")
 }
 
 /// A filter plan selecting the rows whose first column equals `value`.

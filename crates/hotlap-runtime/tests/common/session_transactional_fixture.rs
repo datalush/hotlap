@@ -19,6 +19,7 @@ use hotlap::state::StateBackend;
 use hotlap_connectors::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_runtime::runtime::checkpoint::DEFAULT_RETAIN;
+use hotlap_runtime::runtime::pipeline::SinkDescription;
 use hotlap_runtime::{Session, SessionConfig, SinkFactory};
 use hotlap_sql::SqlError;
 use source_fixture::{ProbeDataset, ProbeFactory, SourceProbe};
@@ -42,10 +43,15 @@ pub struct SessionSignals {
 
 struct TransactionalSink {
     first_change: Mutex<Option<mpsc::Sender<()>>>,
+    physical_identity: String,
 }
 
 #[async_trait::async_trait]
 impl Sink for TransactionalSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         use futures::StreamExt;
         while changes.next().await.is_some() {
@@ -57,6 +63,9 @@ impl Sink for TransactionalSink {
     }
     fn capabilities(&self) -> SinkCapabilities {
         SinkCapabilities::Transactional
+    }
+    fn accepts_retractions(&self) -> bool {
+        true
     }
     async fn commit(&self) -> Result<(), ConnectorError> {
         Ok(())
@@ -74,6 +83,23 @@ struct TransactionalFactory {
 
 #[async_trait::async_trait]
 impl SinkFactory for TransactionalFactory {
+    async fn describe(
+        &self,
+        binding_name: &str,
+        _options: &BTreeMap<String, String>,
+        _schema: SchemaRef,
+        view: &str,
+    ) -> Result<Option<SinkDescription>, SqlError> {
+        Ok(Some(SinkDescription {
+            binding_name: binding_name.to_owned(),
+            view: view.to_owned(),
+            physical_identity: format!("test/session-transactional/{binding_name}"),
+            capabilities: SinkCapabilities::Transactional,
+            accepts_retractions: true,
+            commit_redriable: false,
+        }))
+    }
+
     async fn create(
         &self,
         _name: &str,
@@ -83,6 +109,7 @@ impl SinkFactory for TransactionalFactory {
         self.creates.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(TransactionalSink {
             first_change: Mutex::new(self.first_change.clone()),
+            physical_identity: format!("test/session-transactional/{_name}"),
         }))
     }
 
@@ -101,7 +128,9 @@ pub fn config(
 ) -> SessionConfig {
     SessionConfig::new()
         .with_source_factory(Arc::new(ProbeFactory {
-            dataset: ProbeDataset::new(vec![vec![1]]).with_retention(0),
+            dataset: ProbeDataset::new(vec![vec![1]])
+                .with_retention(0)
+                .with_physical_identity("test/session-transactional/source"),
             spies,
             reads,
             source_gate: signals.source_gate,
@@ -147,6 +176,8 @@ pub fn seed(backend: &SharedBackend) {
     session.sql(SOURCE).expect("create source");
     session.sql(VIEW_A).expect("create a");
     session.sql(VIEW_B).expect("create b");
+    session.sql(SINK_A).expect("create sink a");
+    session.sql(SINK_B).expect("create sink b");
     session.sql("START;").expect("start seed");
     let _ = release_source.send(());
     wait_for_output(output);
@@ -157,7 +188,7 @@ pub fn seed(backend: &SharedBackend) {
 
 pub fn corrupt_pending(backend: &SharedBackend) {
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let body = writer
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()

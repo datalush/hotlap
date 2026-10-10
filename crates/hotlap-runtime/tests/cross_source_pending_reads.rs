@@ -28,7 +28,8 @@ use hotlap_runtime::runtime::sources::{InputSource, InputStream, Sources};
 
 use backend::SharedBackend;
 use pending::{
-    counting, engine_with, join_pipeline, log_a, log_b, put_sources, seed_pair, sources_bytes,
+    counting, engine_with, join_pipeline, log_a, log_b, put_sources, seed_pair_with_redriable,
+    sources_bytes,
 };
 use pending_reads::{ReadStartSource, Reads, read_starts};
 
@@ -56,8 +57,7 @@ fn recording_pipeline() -> (Pipeline, Reads, Reads) {
 
 /// The offsets saved for `a` and `b` in checkpoint `id`.
 fn saved_offsets(backend: &SharedBackend, id: u64) -> (i64, i64) {
-    let reader = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    let sources = reader.read(id).unwrap().sources;
+    let sources = decode_sources(&sources_bytes(backend, id)).unwrap();
     let a = sources.entry(InputId(0)).unwrap().state.offsets[&0];
     let b = sources.entry(InputId(1)).unwrap().state.offsets[&0];
     (a, b)
@@ -86,7 +86,7 @@ fn start(backend: &SharedBackend, pipe: &Pipeline, redriable: bool) -> (Arc<Atom
 #[test]
 fn a_promoted_pending_reads_each_source_at_its_saved_offset() {
     let backend = SharedBackend::default();
-    let (_valid, pending) = seed_pair(&backend);
+    let (_valid, pending) = seed_pair_with_redriable(&backend, true);
     let (pipe, a_reads, b_reads) = recording_pipeline();
 
     let (commits, warning) = start(&backend, &pipe, true);
@@ -103,7 +103,7 @@ fn a_promoted_pending_reads_each_source_at_its_saved_offset() {
 #[test]
 fn a_discarded_pending_reads_both_sources_at_the_previous_offsets() {
     let backend = SharedBackend::default();
-    let (valid, _pending) = seed_pair(&backend);
+    let (valid, _pending) = seed_pair_with_redriable(&backend, false);
     let (pipe, a_reads, b_reads) = recording_pipeline();
 
     let (commits, warning) = start(&backend, &pipe, false);
@@ -118,10 +118,12 @@ fn a_discarded_pending_reads_both_sources_at_the_previous_offsets() {
 #[test]
 fn a_saved_offset_past_the_end_fails_recovery() {
     let backend = SharedBackend::default();
-    let (valid, pending) = seed_pair(&backend);
+    let (valid, pending) = seed_pair_with_redriable(&backend, true);
     // Drop the pending so recovery resumes the valid body directly (no promote),
     // then corrupt its saved `a` offset past the end of the dataset.
+    let (sink, _) = counting(true);
     Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+        .with_sinks(vec![sink])
         .discard_commit(pending)
         .unwrap();
     let mut saved = decode_sources(&sources_bytes(&backend, valid)).unwrap();

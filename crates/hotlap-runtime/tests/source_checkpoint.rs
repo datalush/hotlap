@@ -36,8 +36,8 @@ fn input(id: u32, name: &str, source: Arc<ControlledSource>) -> InputSource {
 /// Two sources that both declare split 0 but hold different applied offsets.
 fn two_split_zero_sources() -> (Sources, Arc<ControlledSource>, Arc<ControlledSource>) {
     let s = schema();
-    let (a, _ta) = ControlledSource::new(s.clone(), vec![split(0)]);
-    let (b, _tb) = ControlledSource::new(s, vec![split(0)]);
+    let (a, _ta) = ControlledSource::new_with_identity(s.clone(), vec![split(0)], "dataset-a");
+    let (b, _tb) = ControlledSource::new_with_identity(s, vec![split(0)], "dataset-b");
     a.commit(0, 5).unwrap();
     b.commit(0, 9).unwrap();
     assert_eq!(a.applied().offsets.get(&0), Some(&5));
@@ -76,6 +76,19 @@ fn capture_keeps_the_source_schema_metadata() {
 }
 
 #[test]
+fn capture_keeps_physical_dataset_identity_separate_from_relation_name() {
+    let (source, _) = ControlledSource::new(schema(), vec![split(0)]);
+    source.commit(0, 7).unwrap();
+    let sources = Sources::new(vec![input(0, "orders", source)]).unwrap();
+
+    let checkpoint = SourcesCheckpoint::capture(&sources).unwrap();
+
+    assert_eq!(checkpoint.entries[0].name, "orders");
+    assert_eq!(checkpoint.entries[0].physical_identity, "test-dataset");
+    assert_eq!(checkpoint.entries[0].state.offsets.get(&0), Some(&7));
+}
+
+#[test]
 fn editing_one_entry_leaves_the_other_source_untouched() {
     let (sources, _a, _b) = two_split_zero_sources();
     let mut checkpoint = SourcesCheckpoint::capture(&sources).unwrap();
@@ -101,7 +114,7 @@ fn unknown_version_is_not_supported() {
         views: vec![],
     };
     let mut bytes = encode_sources(&empty).unwrap();
-    bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
     assert!(matches!(
         decode_sources(&bytes),
         Err(ConnectorError::Unsupported(_))
@@ -115,7 +128,7 @@ fn unknown_inner_frame_version_is_not_supported() {
         views: vec![],
     })
     .unwrap();
-    // Keep the valid `HLSR`/version-2 header and overwrite only the inner
+    // Keep the valid `HLSR`/version-3 header and overwrite only the inner
     // engine frame's version, so the envelope is well-formed but incompatible.
     bytes[12..16].copy_from_slice(&9u32.to_le_bytes());
     assert!(matches!(

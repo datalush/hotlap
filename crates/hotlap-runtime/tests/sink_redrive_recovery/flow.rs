@@ -75,7 +75,9 @@ fn next(stream: &mut InputStream) -> SourceEvent {
 }
 
 fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![1], vec![2], vec![3]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![1], vec![2], vec![3]])
+        .with_retention(0)
+        .with_physical_identity("test/sink-redrive-recovery/source")
 }
 
 /// The engine's consolidated view as `key -> count`.
@@ -97,8 +99,10 @@ pub async fn crash_mid_commit(backend: &SharedBackend, remote: &RemoteStore) -> 
     let mut engine = open(&pipeline);
     let (sink, entered, _release) = VolatileSink::new(remote.clone());
     let shared = SharedSink::new(sink.clone());
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(shared.clone())]);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(shared.clone(), "output".into(), "c".into()),
+        ]);
     let mut stream = pipeline.sources.stream().unwrap();
     for _ in 0..3 {
         let event = next(&mut stream);
@@ -133,8 +137,10 @@ pub async fn replay_after_crash(
     let mut engine = open(&pipeline);
     let (sink, _, _) = VolatileSink::new(remote.clone());
     let shared = SharedSink::new(sink.clone());
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(shared.clone())]);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(shared.clone(), "output".into(), "c".into()),
+        ]);
     match Recovery::inspect(&checkpointer, &pipeline.sources).unwrap() {
         RecoveryDecision::Discard {
             pending, fallback, ..

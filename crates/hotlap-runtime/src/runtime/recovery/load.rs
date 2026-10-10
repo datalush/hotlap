@@ -20,6 +20,9 @@ impl Recovery {
         checkpointer: &Checkpointer,
         sources: &Sources,
     ) -> Result<Option<Checkpoint>, ConnectorError> {
+        // Participant manifests are authoritative even when a newer published
+        // body is missing or corrupt and would otherwise be skipped.
+        checkpointer.validate_runtime_participants(sources)?;
         match checkpointer.latest() {
             // A damaged `latest` pointer is current-format corruption: scan the
             // store for a valid checkpoint instead of aborting startup. An
@@ -30,6 +33,7 @@ impl Recovery {
         let Some(checkpoint) = checkpointer.newest_valid()? else {
             return Ok(None);
         };
+        checkpointer.validate_participant_manifest(checkpoint.id, sources)?;
         super::sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
         Ok(Some(checkpoint))
     }

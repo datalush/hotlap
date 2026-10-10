@@ -14,7 +14,11 @@ impl Checkpointer {
         declared: &[SavedView],
         replay_safe: bool,
         redriable: bool,
+        sink_descriptions: Option<&[crate::runtime::pipeline::SinkDescription]>,
     ) -> Result<(), ConnectorError> {
+        if let Some(descriptions) = sink_descriptions {
+            self.validate_declared_participants(sources, descriptions)?;
+        }
         if let Some(checkpoint) = self.selected_checkpoint(replay_safe, redriable)? {
             checkpoint.sources.validate(sources, &checkpoint.engine)?;
             checkpoint
@@ -88,6 +92,7 @@ impl Checkpointer {
     /// Newest restorable checkpoint under this checkpointer's sink capabilities.
     /// Current-format corruption is skipped only when replay is declared safe.
     pub fn newest_valid(&self) -> Result<Option<Checkpoint>, ConnectorError> {
+        self.validate_sink_participant_manifests()?;
         self.newest_valid_with_replay_safety(self.replay_safe())
     }
 
@@ -98,11 +103,12 @@ impl Checkpointer {
         &self,
         replay_safe: bool,
     ) -> Result<Option<Checkpoint>, ConnectorError> {
+        self.validate_participant_manifests()?;
         for id in self.ids_descending()? {
             if !self.has_key(&format!("checkpoint/{id}/valid"))? {
                 continue;
             }
-            match self.read(id) {
+            match self.read_for_selection(id) {
                 Ok(checkpoint) => return Ok(Some(checkpoint)),
                 Err(error @ ConnectorError::Unsupported(_)) => return Err(error),
                 Err(error @ (ConnectorError::Corruption(_) | ConnectorError::Missing(_))) => {

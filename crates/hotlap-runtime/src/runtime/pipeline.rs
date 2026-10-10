@@ -1,10 +1,11 @@
 //! Source -> kernel pipeline: setup, stream merging and batch ingestion.
 
 mod preflight;
+mod sink_spec;
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use hotlap::{Hotlap, HotlapError, Plan};
 
@@ -13,7 +14,6 @@ use crate::runtime::sink::SinkPump;
 use crate::runtime::sources::{SourceEvent, Sources};
 use hotlap_connectors::convert;
 use hotlap_connectors::error::ConnectorError;
-use hotlap_connectors::sink::Sink;
 use hotlap_connectors::source::SplitId;
 
 /// Event-time declaration for one input source.
@@ -23,10 +23,7 @@ pub struct Watermark {
 }
 
 /// A view tapped into a sink's changelog channel.
-pub struct SinkSpec {
-    pub view: String,
-    pub sink: Arc<dyn Sink>,
-}
+pub use sink_spec::{SinkDescription, SinkSpec};
 
 /// Everything needed to run a set of sources into the kernel.
 pub struct Pipeline {

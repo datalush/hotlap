@@ -45,6 +45,10 @@ impl TxnSink {
 
 #[async_trait::async_trait]
 impl Sink for TxnSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(format!("{}/{}", self.store.physical_identity(), self.view))
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         while let Some(item) = changes.next().await {
             collect(&item?, &self.queue);

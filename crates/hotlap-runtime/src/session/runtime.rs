@@ -13,6 +13,7 @@ use super::mv_provider::MvTableProvider;
 use super::{QueryResult, Snapshotter, SqlError, SqlSession, to_engine};
 use crate::runtime::handle::EngineHandle;
 use crate::runtime::pipeline::Pipeline;
+use hotlap_connectors::sink::SinkCapabilities;
 
 impl SqlSession {
     /// Start the engine with the declared source and views.
@@ -101,18 +102,39 @@ impl SqlSession {
         // Refuse unsupported wiring before the factory opens any writer; the
         // created sinks are re-checked by `validate` so a factory cannot lie.
         super::sink_preflight::preflight_sinks(&self.sinks, self.sink_factory.as_ref(), &views)?;
-        // Refuse an incompatible checkpoint before the factory opens a writer.
-        let replay_safe = self
-            .sinks
-            .iter()
-            .all(|sink| !self.sink_factory.may_create_transactional(&sink.options));
-        let redriable = self
-            .sinks
-            .iter()
-            .all(|sink| self.sink_factory.may_redrive_commit(&sink.options));
+        // Durable starts resolve actual target metadata before opening writers.
+        let sink_descriptions = if self.checkpoint.is_some() {
+            Some(self.describe_sinks().await?)
+        } else {
+            None
+        };
+        let (replay_safe, redriable) = match &sink_descriptions {
+            Some(descriptions) => (
+                descriptions
+                    .iter()
+                    .all(|description| description.capabilities != SinkCapabilities::Transactional),
+                descriptions
+                    .iter()
+                    .all(|description| description.commit_redriable),
+            ),
+            None => (
+                self.sinks
+                    .iter()
+                    .all(|sink| !self.sink_factory.may_create_transactional(&sink.options)),
+                self.sinks
+                    .iter()
+                    .all(|sink| self.sink_factory.may_redrive_commit(&sink.options)),
+            ),
+        };
         let sources = self.build_sources(bindings)?;
-        self.validate_recovery_views(&views, replay_safe, redriable, &sources)?;
-        let sinks = self.build_sinks().await?;
+        self.validate_recovery_views(
+            &views,
+            replay_safe,
+            redriable,
+            &sources,
+            sink_descriptions.as_deref().unwrap_or(&[]),
+        )?;
+        let sinks = self.build_sinks(sink_descriptions.as_deref()).await?;
         self.validate_recovery_declarations(&sinks)?;
         let mut pipeline = Pipeline {
             sources,

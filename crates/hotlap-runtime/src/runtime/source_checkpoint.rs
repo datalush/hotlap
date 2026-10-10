@@ -24,6 +24,8 @@ pub struct SavedSource {
     pub id: InputId,
     /// Canonical relation name declared for this source.
     pub name: String,
+    /// Opaque identity of the physical dataset, independent of its SQL name.
+    pub physical_identity: String,
     /// Arrow IPC schema bytes, used to reject an incompatible declaration.
     pub schema: Vec<u8>,
     /// Declared watermark lag, if the source has event-time.
@@ -85,6 +87,16 @@ impl SourcesCheckpoint {
             entries.push(SavedSource {
                 id: input.id,
                 name: input.name.clone(),
+                physical_identity: input
+                    .source
+                    .physical_identity()
+                    .filter(|identity| !identity.trim().is_empty())
+                    .ok_or_else(|| {
+                        ConnectorError::Unsupported(format!(
+                            "source `{}` has no stable physical dataset identity",
+                            input.name
+                        ))
+                    })?,
                 schema,
                 watermark_lag: input.watermark.map(|watermark| watermark.lag),
                 event_time_column: input.source.event_time_column(),

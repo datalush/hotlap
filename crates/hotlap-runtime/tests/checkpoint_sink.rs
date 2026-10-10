@@ -37,6 +37,10 @@ struct JournalSink {
 
 #[async_trait::async_trait]
 impl Sink for JournalSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/checkpoint-sink/journal-target".into())
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         while let Some(item) = changes.next().await {
             item?;
@@ -110,6 +114,10 @@ impl StateBackend for JournalBackend {
 struct EmptySource;
 
 impl Source for EmptySource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/checkpoint-sink/empty-source".into())
+    }
+
     fn schema(&self) -> Arc<Schema> {
         Arc::new(Schema::empty())
     }
@@ -160,10 +168,7 @@ async fn checkpoint_drains_queued_sink_deltas_before_valid() {
     let sink = Arc::new(JournalSink {
         journal: journal.clone(),
     });
-    let pump = SinkPump::start(&[SinkSpec {
-        view: "c".into(),
-        sink,
-    }]);
+    let pump = SinkPump::start(&[SinkSpec::named("journal-output", "c", sink)]);
     let hotlap = engine_with_pending_delta(&pump).await;
 
     let backend = JournalBackend {

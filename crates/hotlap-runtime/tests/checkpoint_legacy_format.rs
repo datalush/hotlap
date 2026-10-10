@@ -15,7 +15,9 @@ use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, rows
 
 /// The fixed log, with retention that keeps every record.
 fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3], vec![3, 4]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3], vec![3, 4]])
+        .with_retention(0)
+        .with_physical_identity("test/checkpoint-legacy-format/log")
 }
 
 /// Persist one valid checkpoint over `backend` and return its id.
@@ -34,7 +36,7 @@ fn seed_valid(backend: &SharedBackend) -> u64 {
 /// Copy checkpoint `valid` under `pending` plus a commit marker, no `valid`.
 fn seed_pending(backend: &SharedBackend, valid: u64, pending: u64) {
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let value = writer
             .get(format!("checkpoint/{valid}/{part}").as_bytes())
             .unwrap()
@@ -58,7 +60,7 @@ fn an_old_snapshot_version_is_fatal_not_a_fallback() {
     let backend = SharedBackend::default();
     seed_valid(&backend);
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let value = writer
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()

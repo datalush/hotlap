@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use futures::{StreamExt, stream};
 use hotlap_connectors::ConnectorError;
-use hotlap_connectors::sink::{ChangeStream, Sink};
+use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_connectors::source::{Source, SourceState, SourceStream, Split};
+use hotlap_runtime::runtime::pipeline::SinkDescription;
 use hotlap_runtime::{SinkFactory, SourceFactory};
 use hotlap_sql::SqlError;
 
@@ -26,6 +27,10 @@ struct CountedSource {
 }
 
 impl Source for CountedSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/sql-session-rejected-start/source-store".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         session_schema()
     }
@@ -69,10 +74,15 @@ impl SourceFactory for CountedFactory {
 struct ToggleSink {
     accepts: Arc<AtomicBool>,
     writes: Arc<AtomicU32>,
+    physical_identity: String,
 }
 
 #[async_trait::async_trait]
 impl Sink for ToggleSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         while changes.next().await.is_some() {}
@@ -98,6 +108,23 @@ pub struct ToggleFactory {
 
 #[async_trait::async_trait]
 impl SinkFactory for ToggleFactory {
+    async fn describe(
+        &self,
+        binding_name: &str,
+        _options: &BTreeMap<String, String>,
+        _schema: SchemaRef,
+        view: &str,
+    ) -> Result<Option<SinkDescription>, SqlError> {
+        Ok(Some(SinkDescription {
+            binding_name: binding_name.to_owned(),
+            view: view.to_owned(),
+            physical_identity: "test/sql-session-rejected-start/output-store".into(),
+            capabilities: SinkCapabilities::AtLeastOnce,
+            accepts_retractions: self.accepts.load(Ordering::SeqCst),
+            commit_redriable: false,
+        }))
+    }
+
     async fn create(
         &self,
         _name: &str,
@@ -108,6 +135,7 @@ impl SinkFactory for ToggleFactory {
         Ok(Arc::new(ToggleSink {
             accepts: Arc::clone(&self.accepts),
             writes: Arc::clone(&self.writes),
+            physical_identity: "test/sql-session-rejected-start/output-store".into(),
         }))
     }
 

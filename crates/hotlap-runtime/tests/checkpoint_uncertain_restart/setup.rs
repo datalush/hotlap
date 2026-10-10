@@ -44,7 +44,9 @@ pub struct Restarted {
 }
 
 fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]])
+        .with_retention(0)
+        .with_physical_identity("test/checkpoint-uncertain-restart/log")
 }
 
 fn step(
@@ -74,8 +76,8 @@ pub fn interrupt(fail: Fail) -> Fixture {
     let b = SharedSink::new(Arc::new(TxnSink::new(COUNT, store.clone())));
     let mut checkpointer =
         Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
-            SinkSync::sink_only(a.clone()),
-            SinkSync::sink_only(b.clone()),
+            SinkSync::sink_only_named(a.clone(), "rows".into(), ROWS.into()),
+            SinkSync::sink_only_named(b.clone(), "count".into(), COUNT.into()),
         ]);
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
     let mut stream = pipe.sources.stream().unwrap();
@@ -114,7 +116,10 @@ pub fn restart(fixture: &Fixture, redriable: bool) -> Restarted {
     let a = SharedSink::new(Arc::new(build(ROWS)));
     let b = SharedSink::new(Arc::new(build(COUNT)));
     let mut checkpointer = Checkpointer::new(Box::new(fixture.backend.clone()), DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(a), SinkSync::sink_only(b)]);
+        .with_sinks(vec![
+            SinkSync::sink_only_named(a, "rows".into(), ROWS.into()),
+            SinkSync::sink_only_named(b, "count".into(), COUNT.into()),
+        ]);
     let inner: Arc<dyn Source> = Arc::new(ResumableSource::new(log()));
     let spy = Arc::new(SpySource::new(inner));
     let (mut hotlap, pipe): (Hotlap, Pipeline) = engine_for(sources_of(spy.clone()));

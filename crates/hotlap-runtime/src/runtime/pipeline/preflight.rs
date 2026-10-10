@@ -35,10 +35,26 @@ impl Pipeline {
         let checkpointer = checkpointer.with_sinks(
             self.sinks
                 .iter()
-                .map(|spec| SinkSync::sink_only(SharedSink::new(Arc::clone(&spec.sink))))
+                .map(|spec| {
+                    SinkSync::sink_only_named(
+                        SharedSink::new(Arc::clone(&spec.sink)),
+                        spec.sink.binding_name().unwrap_or_default().to_owned(),
+                        spec.view.clone(),
+                    )
+                })
                 .collect(),
         );
-        let result = checkpointer.validate_views(&declared);
+        let result = checkpointer
+            .validate_runtime_participants(&self.sources)
+            .and_then(|()| {
+                checkpointer.validate_sources_and_views(
+                    &self.sources,
+                    &declared,
+                    checkpointer.replay_safe(),
+                    checkpointer.redriable(),
+                    None,
+                )
+            });
         self.checkpoint = Some(CheckpointConfig {
             interval: config.interval,
             retain: config.retain,

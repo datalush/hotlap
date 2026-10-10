@@ -25,12 +25,17 @@ use backend::SharedBackend;
 use source_fixture::{GatedSource, schema};
 
 struct FailingSink {
+    physical_identity: String,
     aborts: std::sync::mpsc::Sender<()>,
     writes: AtomicU32,
 }
 
 #[async_trait::async_trait]
 impl Sink for FailingSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         while changes.next().await.is_some() {}
@@ -71,10 +76,7 @@ fn pipeline(source: Arc<GatedSource>, sink: Arc<FailingSink>) -> Pipeline {
         }])
         .unwrap(),
         views: vec![("v".into(), plan)],
-        sinks: vec![SinkSpec {
-            view: "v".into(),
-            sink,
-        }],
+        sinks: vec![SinkSpec::named("failure-sink", "v", sink)],
         checkpoint: Some(CheckpointConfig {
             interval: Duration::from_secs(3600),
             backend: Box::new(SharedBackend::default()),
@@ -120,9 +122,11 @@ fn assert_no_late_ack(commits: &std::sync::mpsc::Receiver<(i32, i64)>) {
 
 #[test]
 fn failed_flush_stops_later_filtered_source_ack_and_view_build() {
-    let (source, sender, commits) = GatedSource::new(schema());
+    let (source, sender, commits) =
+        GatedSource::new(schema(), "test/checkpoint-drain-failstop/source");
     let (aborts_tx, aborts_rx) = std::sync::mpsc::channel();
     let sink = Arc::new(FailingSink {
+        physical_identity: "test/checkpoint-drain-failstop/sink".into(),
         aborts: aborts_tx,
         writes: AtomicU32::new(0),
     });

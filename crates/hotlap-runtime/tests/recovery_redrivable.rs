@@ -20,6 +20,7 @@ use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, rows
 
 /// A sink that overrides the default re-drivability declaration.
 struct DeclaringSink {
+    physical_identity: String,
     capabilities: SinkCapabilities,
     redriable: bool,
     commits: Arc<AtomicU32>,
@@ -27,6 +28,10 @@ struct DeclaringSink {
 
 #[async_trait::async_trait]
 impl Sink for DeclaringSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
+
     async fn write(&self, _changes: ChangeStream) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -50,13 +55,20 @@ impl Sink for DeclaringSink {
 }
 
 fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]])
+        .with_retention(0)
+        .with_physical_identity("test/recovery-redrivable/log")
 }
 
 /// A shared declaring sink plus its commit counter.
-fn declaring(capabilities: SinkCapabilities, redriable: bool) -> (Arc<SharedSink>, Arc<AtomicU32>) {
+fn declaring(
+    capabilities: SinkCapabilities,
+    redriable: bool,
+    physical_identity: &str,
+) -> (Arc<SharedSink>, Arc<AtomicU32>) {
     let commits = Arc::new(AtomicU32::new(0));
     let sink = Arc::new(DeclaringSink {
+        physical_identity: physical_identity.to_owned(),
         capabilities,
         redriable,
         commits: Arc::clone(&commits),
@@ -65,10 +77,19 @@ fn declaring(capabilities: SinkCapabilities, redriable: bool) -> (Arc<SharedSink
 }
 
 /// Persist a valid checkpoint 1 over the shared backend.
-fn seed_valid_one() -> SharedBackend {
+fn seed_valid_one(
+    capabilities: SinkCapabilities,
+    redriable: bool,
+    physical_identity: &str,
+) -> SharedBackend {
     let backend = SharedBackend::default();
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    let (sink, _) = declaring(capabilities, redriable, physical_identity);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(sink, "output".into(), "c".into()),
+        ]);
     let (mut engine, pipe) = engine_with(ResumableSource::new(log()));
+    engine.tap_view("c").unwrap();
     let mut stream = pipe.sources.stream().unwrap();
     drain(&mut engine, &pipe.sources, &mut stream, 3);
     take(&mut checkpointer, &engine, &pipe.sources);
@@ -79,7 +100,7 @@ fn seed_valid_one() -> SharedBackend {
 /// durable commit marker, leaving `valid` absent.
 fn seed_pending(backend: &SharedBackend, valid: u64, pending: u64) {
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let value = writer
             .get(format!("checkpoint/{valid}/{part}").as_bytes())
             .unwrap()
@@ -98,11 +119,14 @@ fn seed_pending(backend: &SharedBackend, valid: u64, pending: u64) {
 
 #[test]
 fn a_sink_can_declare_commit_non_redrivable_despite_its_capability() {
-    let backend = seed_valid_one();
+    let target = "test/recovery-redrivable/non-redrivable";
+    let backend = seed_valid_one(SinkCapabilities::Idempotent, false, target);
     seed_pending(&backend, 1, 2);
-    let (sink, commits) = declaring(SinkCapabilities::Idempotent, false);
-    let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(sink)]);
+    let (sink, commits) = declaring(SinkCapabilities::Idempotent, false, target);
+    let checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(sink, "output".into(), "c".into()),
+        ]);
 
     match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
         RecoveryDecision::Discard {
@@ -118,11 +142,14 @@ fn a_sink_can_declare_commit_non_redrivable_despite_its_capability() {
 
 #[test]
 fn a_sink_can_declare_commit_redrivable_despite_at_least_once() {
-    let backend = seed_valid_one();
+    let target = "test/recovery-redrivable/redrivable";
+    let backend = seed_valid_one(SinkCapabilities::AtLeastOnce, true, target);
     seed_pending(&backend, 1, 2);
-    let (sink, commits) = declaring(SinkCapabilities::AtLeastOnce, true);
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(sink)]);
+    let (sink, commits) = declaring(SinkCapabilities::AtLeastOnce, true, target);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(sink, "output".into(), "c".into()),
+        ]);
 
     match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
         RecoveryDecision::Promote(checkpoint) => assert_eq!(checkpoint.id, 2),
@@ -138,11 +165,14 @@ fn a_sink_can_declare_commit_redrivable_despite_at_least_once() {
 
 #[test]
 fn discarding_emits_a_warning_signal_and_metric() {
-    let backend = seed_valid_one();
+    let target = "test/recovery-redrivable/discard";
+    let backend = seed_valid_one(SinkCapabilities::AtLeastOnce, false, target);
     seed_pending(&backend, 1, 2);
-    let (sink, _) = declaring(SinkCapabilities::AtLeastOnce, false);
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(sink)]);
+    let (sink, _) = declaring(SinkCapabilities::AtLeastOnce, false, target);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(sink, "output".into(), "c".into()),
+        ]);
     let (mut hotlap, pipe) = engine_with(ResumableSource::new(log()));
     let signal = Mutex::new(None);
     let metrics = MetricsRegistry::new();

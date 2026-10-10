@@ -32,6 +32,8 @@ pub type ChangelogSender = mpsc::Sender<SinkMessage>;
 pub struct SinkSync {
     sender: Option<ChangelogSender>,
     sink: Arc<SharedSink>,
+    binding_name: Option<String>,
+    view: Option<String>,
 }
 
 impl SinkSync {
@@ -40,12 +42,54 @@ impl SinkSync {
         Self {
             sender: Some(sender),
             sink,
+            binding_name: None,
+            view: None,
+        }
+    }
+
+    /// Coordinate a sink using the same explicit name and view binding.
+    pub fn new_bound(sender: ChangelogSender, sink: Arc<SharedSink>, binding: String) -> Self {
+        Self::new_named(sender, sink, binding.clone(), binding)
+    }
+
+    /// Coordinate a sink with explicit binding name and view.
+    pub fn new_named(
+        sender: ChangelogSender,
+        sink: Arc<SharedSink>,
+        binding_name: String,
+        view: String,
+    ) -> Self {
+        Self {
+            sender: Some(sender),
+            sink,
+            binding_name: Some(binding_name),
+            view: Some(view),
         }
     }
 
     /// Coordinate `sink` without a channel to drain.
     pub fn sink_only(sink: Arc<SharedSink>) -> Self {
-        Self { sender: None, sink }
+        Self {
+            sender: None,
+            sink,
+            binding_name: None,
+            view: None,
+        }
+    }
+
+    /// Coordinate an embedded sink with an explicit stable binding name.
+    pub fn sink_only_bound(sink: Arc<SharedSink>, binding: String) -> Self {
+        Self::sink_only_named(sink, binding.clone(), binding)
+    }
+
+    /// Coordinate an embedded sink with explicit binding name and view.
+    pub fn sink_only_named(sink: Arc<SharedSink>, binding_name: String, view: String) -> Self {
+        Self {
+            sender: None,
+            sink,
+            binding_name: Some(binding_name),
+            view: Some(view),
+        }
     }
 
     /// The shared sink the barrier prepares and commits.
@@ -56,5 +100,13 @@ impl SinkSync {
     /// The channel to drain, when the sink is fed through one.
     pub(crate) fn sender(&self) -> Option<&ChangelogSender> {
         self.sender.as_ref()
+    }
+
+    pub(crate) fn binding_name(&self) -> Option<&str> {
+        self.binding_name.as_deref()
+    }
+
+    pub(crate) fn view(&self) -> Option<&str> {
+        self.view.as_deref()
     }
 }

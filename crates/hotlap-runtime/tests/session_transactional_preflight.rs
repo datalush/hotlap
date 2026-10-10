@@ -64,14 +64,14 @@ fn transactional_pending_retry_restores_and_publishes_a_new_checkpoint() {
     let probes = spies.lock().unwrap();
     assert_eq!(probes[0].resumed(), 1);
     assert_eq!(probes[0].offset(), Some(1));
-    assert_eq!(session.checkpoint().unwrap(), 2);
+    assert_eq!(session.checkpoint().unwrap(), 3);
     assert_eq!(
-        backend.get(b"checkpoint/2/valid").unwrap(),
+        backend.get(b"checkpoint/3/valid").unwrap(),
         Some(b"1".to_vec())
     );
     assert_eq!(
         backend.get(b"checkpoint/reserved").unwrap(),
-        Some(2_u64.to_le_bytes().to_vec())
+        Some(3_u64.to_le_bytes().to_vec())
     );
     drop(probes);
     session.shutdown().expect("shutdown retry");
@@ -146,7 +146,7 @@ fn invalid_prepare_rejects_session_before_sink_factory_or_source_read() {
     let backend = TestBackend::default();
     seed(&backend);
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let body = writer
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()
@@ -247,7 +247,7 @@ fn invalid_commit_marker_preserves_real_staged_payload_before_session_factory_ef
     );
 
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let body = writer
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()

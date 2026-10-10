@@ -103,6 +103,10 @@ impl SourceFactory for CrossSourceFactory {
 struct SharedSource(Arc<SqlSource>);
 
 impl Source for SharedSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/sql-source-dataset".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.0.schema()
     }

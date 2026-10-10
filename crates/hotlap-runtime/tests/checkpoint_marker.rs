@@ -24,7 +24,9 @@ use fault::FaultBackend;
 use support::{Dataset, ResumableSource, SharedBackend, engine_for, sources_of};
 
 fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]])
+        .with_retention(0)
+        .with_physical_identity("test/checkpoint-marker/log")
 }
 
 fn prepared(source: ResumableSource) -> (Hotlap, Pipeline) {

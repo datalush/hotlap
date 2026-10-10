@@ -5,8 +5,9 @@ use hotlap::Hotlap;
 use crate::runtime::checkpoint::{CheckpointState, Checkpointer};
 use crate::runtime::checkpoint_body::{
     checkpoint_prefix, clear_commit, clear_prepare_intent, id_exhausted, mark_commit_intent,
-    mark_prepare_intent, publish_valid, reserve, state_err, write_body,
+    mark_prepare_intent, publish_valid, reserve, state_err, write_body, write_participant_manifest,
 };
+use crate::runtime::participants::ParticipantsManifest;
 use crate::runtime::retention::prune;
 use crate::runtime::sink_barrier::Prepared;
 use crate::runtime::sources::Sources;
@@ -27,6 +28,13 @@ impl Checkpointer {
         sources: &Sources,
     ) -> Result<u64, ConnectorError> {
         self.block_if_failed()?;
+        let manifest = ParticipantsManifest::capture(sources, &self.sinks)?;
+        let snapshot = engine
+            .checkpoint()
+            .map_err(crate::runtime::checkpoint_body::hotlap_err)?;
+        let views =
+            crate::runtime::source_checkpoint::SavedView::from_registry(&engine.view_registry());
+        manifest.validate_tapped_views(&views, &snapshot)?;
         // Resolve the starting id and advance the in-memory sequence before the
         // durable reservation: an ambiguous reservation that persists then
         // reports failure must not let this checkpointer retry the same id.
@@ -35,6 +43,7 @@ impl Checkpointer {
         let next = id.checked_add(1).ok_or_else(id_exhausted)?;
         self.next_id = next;
         reserve(self.backend.as_mut(), id)?;
+        write_participant_manifest(self.backend.as_mut(), id, &manifest)?;
 
         if let Err(error) = self.sinks.drain(&self.cancel).await {
             // The engine and source offsets may already have advanced, and a
@@ -73,6 +82,10 @@ impl Checkpointer {
                 return Err(failure.error);
             }
         };
+
+        if let Err(error) = manifest.matches_sinks(&self.sinks) {
+            return self.capture_failed(id, prepared, error).await;
+        }
 
         if let Err(error) = write_body(self.backend.as_mut(), id, engine, sources).await {
             return self.capture_failed(id, prepared, error).await;
@@ -135,10 +148,15 @@ impl Checkpointer {
     /// `commit` (idempotent, only valid when every sink is re-drivable), publish
     /// `valid`, prune and clear the marker.
     pub async fn promote(&mut self, id: u64) -> Result<(), ConnectorError> {
+        let manifest =
+            crate::runtime::checkpoint_body::read_participant_manifest(self.backend.as_ref(), id)?;
+        manifest.matches_sinks(&self.sinks)?;
         let checkpoint = self
             .read_body(id)?
             .ok_or_else(|| crate::runtime::checkpoint_body::invalid(id))?;
         crate::runtime::checkpoint_body::validate_engine_snapshot(&checkpoint.engine)?;
+        manifest.matches_saved_sources(&checkpoint.sources.entries)?;
+        manifest.validate_tapped_views(&checkpoint.sources.views, &checkpoint.engine)?;
         self.sinks.redrive_commit().await?;
         publish_valid(self.backend.as_mut(), id)?;
         prune(self.backend.as_mut(), self.retain).map_err(state_err)?;
@@ -149,7 +167,14 @@ impl Checkpointer {
     /// Delete an interrupted checkpoint that recovery cannot promote.
     pub fn discard_commit(&mut self, id: u64) -> Result<(), ConnectorError> {
         let prefix = format!("{}/", checkpoint_prefix(id));
-        for key in self.backend.list(prefix.as_bytes()).map_err(state_err)? {
+        let keys = self.backend.list(prefix.as_bytes()).map_err(state_err)?;
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let manifest =
+            crate::runtime::checkpoint_body::read_participant_manifest(self.backend.as_ref(), id)?;
+        manifest.matches_sinks(&self.sinks)?;
+        for key in keys {
             self.backend.delete(&key).map_err(state_err)?;
         }
         Ok(())
@@ -169,6 +194,7 @@ impl Checkpointer {
         &mut self,
         replay_safe: bool,
     ) -> Result<(), ConnectorError> {
+        self.validate_sink_participant_manifests()?;
         for id in self.ids_descending()? {
             let base = checkpoint_prefix(id);
             if self.has_key(&format!("{base}/valid"))?

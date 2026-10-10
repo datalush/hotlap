@@ -81,8 +81,8 @@ fn wait_for(done: impl Fn() -> bool) -> bool {
 
 #[test]
 fn split_zero_of_each_source_commits_independently() {
-    let (a, a_tx) = ControlledSource::new(schema(), vec![split(0)]);
-    let (b, b_tx) = ControlledSource::new(schema(), vec![split(0)]);
+    let (a, a_tx) = ControlledSource::new(schema(), vec![split(0)], "test/runtime-cross-source/a");
+    let (b, b_tx) = ControlledSource::new(schema(), vec![split(0)], "test/runtime-cross-source/b");
     let handle = EngineHandle::start(pipeline(
         sources(a.clone(), b.clone()),
         SharedBackend::default(),
@@ -114,8 +114,8 @@ fn split_zero_of_each_source_commits_independently() {
 #[test]
 fn a_pending_source_does_not_block_ingest_or_checkpoint() {
     bounded(Duration::from_secs(10), || {
-        let (a, a_tx) = ControlledSource::new(schema(), vec![split(0)]);
-        let (b, _b_tx) = ControlledSource::new(schema(), vec![split(0)]);
+        let (a, a_tx) = ControlledSource::new(schema(), vec![split(0)], "test/runtime-failure/a");
+        let (b, _b_tx) = ControlledSource::new(schema(), vec![split(0)], "test/runtime-failure/b");
         let handle = EngineHandle::start(pipeline(
             sources(a.clone(), b.clone()),
             SharedBackend::default(),
@@ -139,7 +139,7 @@ fn a_pending_source_does_not_block_ingest_or_checkpoint() {
 
 #[test]
 fn a_source_that_cannot_open_aborts_startup() {
-    let bad = ControlledSource::failing_read(schema());
+    let bad = ControlledSource::failing_read(schema(), "test/runtime-failure/bad-read");
     let pipeline = Pipeline {
         sources: Sources::new(vec![InputSource {
             id: InputId(0),
@@ -158,8 +158,8 @@ fn a_source_that_cannot_open_aborts_startup() {
 
 #[test]
 fn checkpoint_after_a_normal_end_still_works() {
-    let (a, a_tx) = ControlledSource::new(schema(), vec![split(0)]);
-    let (b, b_tx) = ControlledSource::new(schema(), vec![split(0)]);
+    let (a, a_tx) = ControlledSource::new(schema(), vec![split(0)], "test/runtime-checkpoint/a");
+    let (b, b_tx) = ControlledSource::new(schema(), vec![split(0)], "test/runtime-checkpoint/b");
     let backend = SharedBackend::default();
     let handle =
         EngineHandle::start(pipeline(sources(a.clone(), b.clone()), backend.clone())).unwrap();

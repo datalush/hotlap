@@ -18,7 +18,9 @@ mod resumable;
 use resumable::{Dataset, ResumableSource};
 
 fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![2]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![2]])
+        .with_retention(0)
+        .with_physical_identity("test/view-identity-lifecycle/log")
 }
 
 /// A resumable source that counts reads and advertises column 0 as event time.
@@ -28,6 +30,10 @@ struct CountingSource {
 }
 
 impl Source for CountingSource {
+    fn physical_identity(&self) -> Option<String> {
+        self.inner.physical_identity()
+    }
+
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }

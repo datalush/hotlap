@@ -8,6 +8,7 @@ use tokio::sync::mpsc::{self as tokio_mpsc, UnboundedReceiver, UnboundedSender};
 pub type BatchSender = UnboundedSender<Result<SourceBatch, ConnectorError>>;
 
 pub struct GatedSource {
+    physical_identity: String,
     schema: SchemaRef,
     receiver: Mutex<Option<UnboundedReceiver<Result<SourceBatch, ConnectorError>>>>,
     commits: Arc<Mutex<Vec<(i32, Offset)>>>,
@@ -15,11 +16,15 @@ pub struct GatedSource {
 }
 
 impl GatedSource {
-    pub fn new(schema: SchemaRef) -> (Arc<Self>, BatchSender, mpsc::Receiver<(i32, Offset)>) {
+    pub fn new(
+        schema: SchemaRef,
+        physical_identity: impl Into<String>,
+    ) -> (Arc<Self>, BatchSender, mpsc::Receiver<(i32, Offset)>) {
         let (sender, receiver) = tokio_mpsc::unbounded_channel();
         let (commit_signal, commit_receiver) = mpsc::channel();
         (
             Arc::new(Self {
+                physical_identity: physical_identity.into(),
                 schema,
                 receiver: Mutex::new(Some(receiver)),
                 commits: Arc::new(Mutex::new(Vec::new())),
@@ -36,6 +41,10 @@ impl GatedSource {
 }
 
 impl Source for GatedSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

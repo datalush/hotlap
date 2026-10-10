@@ -55,12 +55,16 @@ impl Recovery {
     ) -> Result<RecoveryDecision, ConnectorError> {
         let mut fallback = Self::load(checkpointer, sources)?;
         if let Some(pending) = pending_commit(checkpointer, fallback.as_ref().map(|c| c.id))? {
+            checkpointer.validate_participant_manifest(pending, sources)?;
+            let pending_body = checkpointer.read_body_for_recovery(pending)?;
+            if let Some(checkpoint) = &pending_body {
+                sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
+            }
             if let Some(decision) = prepare_decision(checkpointer, pending, &mut fallback)? {
                 return Ok(decision);
             }
-            let reason = match checkpointer.read_body_for_recovery(pending)? {
+            let reason = match pending_body {
                 Some(checkpoint) => {
-                    sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
                     if checkpointer.redriable() {
                         return Ok(RecoveryDecision::Promote(checkpoint));
                     }

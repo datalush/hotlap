@@ -21,6 +21,7 @@ use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, Checkpointer, DEFAUL
 use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::pipeline;
 use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
+use hotlap_runtime::runtime::recovery::Recovery;
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 
 use support::{
@@ -67,6 +68,89 @@ fn an_incompatible_registry_fails_before_the_pump_starts() {
     );
     assert_eq!(spy.resumed(), 0, "no source may be reopened");
     assert_eq!(spy.offset(), None, "no source may be reopened");
+}
+
+#[test]
+fn adding_sink_to_previously_untapped_checkpoint_is_rejected_without_effects() {
+    let backend = SharedBackend::default();
+    seed_output(&backend);
+    let sink = Arc::new(RecordingSink::default());
+    let source: Arc<dyn Source> = Arc::new(ResumableSource::new(log()));
+    let spy = Arc::new(SpySource::new(source));
+    let pipeline = Pipeline {
+        sources: sources(spy.clone()),
+        views: vec![("a".into(), filter(1))],
+        sinks: vec![SinkSpec::named("new-output", "a", sink.clone())],
+        checkpoint: Some(CheckpointConfig {
+            interval: Duration::from_secs(3600),
+            backend: Box::new(backend),
+            retain: 1,
+        }),
+        retention: None,
+    };
+
+    let result = EngineHandle::start(pipeline);
+
+    assert!(matches!(result, Err(ConnectorError::Unsupported(_))));
+    assert_eq!(sink.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(sink.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(spy.resumed(), 0);
+}
+
+#[test]
+fn pending_prepare_without_a_valid_manifest_is_fatal_and_preserves_evidence() {
+    for corrupt in [false, true] {
+        let backend = SharedBackend::default();
+        seed_output(&backend);
+        let mut writer = backend.clone();
+        writer
+            .put(b"checkpoint/2/prepare", b"prepare-v1".to_vec())
+            .unwrap();
+        if corrupt {
+            writer
+                .put(b"checkpoint/2/participants", b"broken-manifest".to_vec())
+                .unwrap();
+        }
+        let sources = sources(Arc::new(ResumableSource::new(log())));
+        let checkpointer = Checkpointer::new(Box::new(backend.clone()), 1);
+
+        let result = Recovery::inspect(&checkpointer, &sources);
+
+        assert!(matches!(result, Err(ConnectorError::Unsupported(_))));
+        assert_eq!(
+            backend.get(b"checkpoint/2/prepare").unwrap(),
+            Some(b"prepare-v1".to_vec())
+        );
+        assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
+        assert!(backend.get(b"checkpoint/2/valid").unwrap().is_none());
+    }
+}
+
+#[test]
+fn removed_sink_cannot_promote_a_pending_commit_or_discard_its_evidence() {
+    let backend = SharedBackend::default();
+    let remote = seed_transactional_checkpoints(&backend);
+    let body = backend.get(b"checkpoint/2/engine").unwrap().unwrap();
+    let sources = sources(Arc::new(ResumableSource::new(log())));
+    let mut writer = backend.clone();
+    writer.delete(b"checkpoint/2/valid").unwrap();
+    writer.put(b"checkpoint/2/commit", b"1".to_vec()).unwrap();
+    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 1);
+
+    let result = futures::executor::block_on(checkpointer.promote(2));
+
+    assert!(matches!(result, Err(ConnectorError::Unsupported(_))));
+    assert_eq!(remote.lock().unwrap().committed, vec![(1, 1), (2, 1)]);
+    assert_eq!(backend.get(b"checkpoint/2/engine").unwrap(), Some(body));
+    assert_eq!(
+        backend.get(b"checkpoint/2/commit").unwrap(),
+        Some(b"1".to_vec())
+    );
+    assert!(backend.get(b"checkpoint/2/valid").unwrap().is_none());
+    assert!(matches!(
+        Recovery::inspect(&checkpointer, &sources),
+        Err(ConnectorError::Unsupported(_))
+    ));
 }
 
 #[test]
@@ -178,7 +262,10 @@ fn corrupt_latest_valid_internal_ipc_falls_back_to_restorable_predecessor() {
 fn transactional_start_rejects_corrupt_latest_ipc_without_replay_or_effects() {
     let backend = SharedBackend::default();
     let remote = seed_transactional_checkpoints(&backend);
-    let checkpointer = Checkpointer::new(Box::new(backend.clone()), 1);
+    let reader_sink = Arc::new(DurableTxnSink::new(Arc::clone(&remote)));
+    let checkpointer = Checkpointer::new(Box::new(backend.clone()), 1).with_sinks(vec![
+        SinkSync::sink_only_bound(SharedSink::new(reader_sink), "a".into()),
+    ]);
     let first = checkpointer.read(1).unwrap();
     let second = checkpointer.read(2).unwrap();
     assert_ne!(first.engine, second.engine);
@@ -208,10 +295,7 @@ fn transactional_start_rejects_corrupt_latest_ipc_without_replay_or_effects() {
     let pipeline = Pipeline {
         sources: sources(spy.clone()),
         views: vec![("a".into(), Plan::Source(InputId(0)))],
-        sinks: vec![SinkSpec {
-            view: "a".into(),
-            sink: restarted_sink.clone(),
-        }],
+        sinks: vec![SinkSpec::named("a", "a", restarted_sink.clone())],
         checkpoint: Some(CheckpointConfig {
             interval: Duration::from_secs(3600),
             backend: Box::new(backend.clone()),
@@ -315,6 +399,10 @@ impl DurableTxnSink {
 
 #[async_trait::async_trait]
 impl Sink for DurableTxnSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/durable-rows-store".into())
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         while let Some(change) = changes.next().await {
@@ -367,7 +455,7 @@ fn seed_transactional_checkpoints(backend: &SharedBackend) -> Arc<Mutex<DurableR
     let sink = Arc::new(DurableTxnSink::new(Arc::clone(&remote)));
     let shared_sink = SharedSink::new(sink.clone());
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), 3)
-        .with_sinks(vec![SinkSync::sink_only(shared_sink)]);
+        .with_sinks(vec![SinkSync::sink_only_bound(shared_sink, "a".into())]);
     for expected_id in 1..=2 {
         let event = futures::executor::block_on(stream.next()).unwrap().unwrap();
         pipeline::ingest_event(&mut hotlap, &pipe.sources, &event).unwrap();

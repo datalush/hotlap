@@ -55,17 +55,28 @@ leer (`records < offset` ya aplicados, `records >= offset` a replayar). Como los
 checkpoints se toman **entre polls** del source, reabrir en `offset` **ni pierde
 ni duplica** en la frontera.
 
-**Identidad por fuente.** El checkpoint es multifuente (ver `hotlap-durability.md`)
-y la recuperación reanuda **cada** fuente desde su propio offset aplicado: dos fuentes
-que usan `SplitId` 0 mantienen mapas de estado separados y no colapsan sus
-offsets. Un schema, lag o columna event-time incompatible se rechaza **antes** de
+**Identidad física por fuente y sink.** El checkpoint es multifuente (ver
+`hotlap-durability.md`) y la recuperación reanuda **cada** fuente desde su propio
+offset aplicado: dos fuentes que usan `SplitId` 0 mantienen mapas separados. Cada
+fuente persistida también lleva su identidad física, distinta del nombre SQL,
+schema y splits; un dataset reemplazado se rechaza antes de `Source::resume`. Un
+schema, lag o columna event-time incompatible también se rechaza **antes** de
 restaurar o consumir.
+
+Cada sink durable queda enlazado por `(binding_name, view)` a su destino físico y
+metadatos de entrega (capability, retracts y `commit_redriable`). Añadir, quitar,
+renombrar o retargetear un sink —o cambiar esos metadatos— no equivale al set
+capturado: recovery lo rechaza antes de abrir fuentes/writers, preparar, confirmar
+o borrar evidencia. El manifiesto `HLPM` separado se escribe antes de `prepare`;
+si falta, está corrupto o no concuerda con el cuerpo, es fatal y no autoriza
+fallback silencioso. Un pipeline durable requiere identidades explícitas y los
+sinks usan `SinkSpec::named` / `SinkSync::sink_only_named`.
 
 **Identidad de vistas.** El snapshot del motor guarda los planes por *handle*
 numérico, pero **no** el nombre declarado. Para que un restart no reasigne un
 handle a otra vista con el mismo schema (p. ej. el orden de `CREATE MATERIALIZED
 VIEW` invertido, o el mismo nombre con otro plan), el checkpoint persiste un
-registro `nombre↔handle↔plan` (contenedor `HLSR` versión 2, sin lector legacy).
+registro `nombre↔handle↔plan` (contenedor `HLSR` versión 3, sin lector legacy).
 Al recuperar se exige que el **namespace completo** coincida: registro,
 snapshot del motor y declaración deben nombrar exactamente las mismas vistas, con
 el mismo número, nombres, handles y planes (nada de "restaurar pero no
@@ -79,9 +90,13 @@ su cuenta (no confía en el caller). La sesión SQL valida el mismo registro con
 las vistas compiladas **antes** de que el `SinkFactory` abra un writer, y el
 `Pipeline` público lo valida **antes** de arrancar el pump; la sesión también
 compara fuentes y vistas contra la misma elección de recovery antes de abrir
-sinks o iniciar lecturas. Para promover un commit pendiente, `SinkFactory` debe
-declarar `may_redrive_commit(options)` y el sink abierto debe confirmar esa
-capacidad; el valor por defecto es `false` y Fluss no declara re-drive durable.
+sinks o iniciar lecturas. Para un `START` durable,
+`SinkFactory::describe(binding_name, options, schema, view)` debe resolver el
+destino y sus metadatos sin crear writer. `None` rechaza antes de `create`; tras
+crear, el runtime vuelve a verificar identidad y metadatos del sink abierto. Para
+promover un commit pendiente, el factory debe declarar
+`may_redrive_commit(options)` y el sink abierto debe confirmar esa capacidad; el
+valor por defecto es `false` y Fluss no declara re-drive durable.
 Si el re-drive falla y se considera replay, el fallback valida identidad de
 fuentes y vistas **antes** de descartar el cuerpo pendiente; un fallback
 incompatible conserva toda la evidencia durable.

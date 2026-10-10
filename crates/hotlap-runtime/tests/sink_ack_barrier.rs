@@ -42,8 +42,9 @@ async fn a_checkpoint_waits_for_the_writer_ack() {
         // Restart: a fresh empty writer against the same output store; the
         // checkpoint still restores its offsets and the output is not lost.
         let (_, pipeline, fresh) = restart(remote.clone());
-        let reader = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-            .with_sinks(vec![SinkSync::sink_only(SharedSink::new(fresh))]);
+        let reader = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(SharedSink::new(fresh), "output".into(), "c".into()),
+        ]);
         match Recovery::inspect(&reader, &pipeline.sources).unwrap() {
             RecoveryDecision::Resume(checkpoint) => assert_eq!(checkpoint.id, id),
             other => panic!("a fresh writer must resume the valid checkpoint: {other:?}"),

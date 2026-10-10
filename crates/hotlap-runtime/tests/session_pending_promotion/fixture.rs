@@ -69,6 +69,10 @@ impl Progress {
 struct FixtureSource(Progress);
 
 impl Source for FixtureSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/session-pending-promotion/source".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),

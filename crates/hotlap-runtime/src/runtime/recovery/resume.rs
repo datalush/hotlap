@@ -32,6 +32,7 @@ impl Recovery {
         checkpoint
             .sources
             .validate_views(&declared, &checkpoint.engine)?;
+        super::views::validate_tap_continuity(hotlap, checkpoint)?;
         sources::validate(sources, &checkpoint.sources, &checkpoint.engine)?;
         restore(hotlap, &checkpoint.engine)?;
         let splits = sources::resume(sources, &checkpoint.sources)?;

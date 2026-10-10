@@ -21,7 +21,7 @@ use hotlap_runtime::runtime::checkpoint::{CheckpointState, Checkpointer, DEFAULT
 
 use backend::SharedBackend;
 use fault::FaultBackend;
-use harness::{Event, healthy_engine, poisoned_engine, sink, sources};
+use harness::{Event, changing_sources, healthy_engine, sink, sources};
 
 #[tokio::test]
 async fn a_commit_failure_is_commit_uncertain_and_does_not_abort() {
@@ -60,12 +60,12 @@ async fn a_precommit_capture_abort_is_failed() {
         .with_sinks(vec![sink(&events, false)]);
 
     let error = checkpointer
-        .take(&poisoned_engine(), &sources())
+        .take(&healthy_engine(), &changing_sources())
         .await
         .expect_err("a poisoned engine must fail the capture");
 
     assert!(
-        matches!(error, ConnectorError::Infrastructure(_)),
+        matches!(error, ConnectorError::Unsupported(_)),
         "got {error:?}"
     );
     assert_eq!(checkpointer.state(), CheckpointState::Failed);
@@ -94,7 +94,7 @@ async fn a_clear_failure_after_confirmed_abort_keeps_evidence() {
         Checkpointer::new(Box::new(faulty), DEFAULT_RETAIN).with_sinks(vec![sink(&events, false)]);
 
     let error = checkpointer
-        .take(&poisoned_engine(), &sources())
+        .take(&healthy_engine(), &changing_sources())
         .await
         .expect_err("a failed clear must surface");
 

@@ -23,6 +23,10 @@ como un `SourcesCheckpoint` multifuente en un contenedor `HLSR`
   longitud del payload (8, little-endian), seguida de payload `bincode`.
 - Contenedor fuentes: magic `HLSR` (4) + versión de layout (4) + frame del motor
   con payload `SourcesCheckpoint`.
+- Manifiesto independiente de participantes: magic `HLPM` (4) + versión (4) +
+  frame con identidades físicas, binding explícito y vista por sink, capabilities,
+  retracts y política de re-drive. Se persiste antes de `prepare`, no dentro del
+  cuerpo posterior.
 - La decodificación **rechaza** magic incorrecto, versión desconocida, longitud que no
   coincide, bytes sobrantes o payloads por encima del límite (`MAX_FRAME_BYTES`),
   devolviendo error en vez de `panic`.
@@ -30,9 +34,9 @@ como un `SourcesCheckpoint` multifuente en un contenedor `HLSR`
   son guardas adicionales contra layouts incompatibles.
 
 **Un único formato multifuente.** El mismo contenedor sirve para una o varias
-fuentes: cada entrada guarda ID, nombre canónico, esquema Arrow IPC, retraso del
-watermark, columna de tiempo de evento y `SourceState` (offsets por split).
-El contenedor **versión 2** guarda el registro de vistas (`nombre↔handle↔plan`)
+fuentes: cada entrada guarda ID, nombre canónico, identidad física, esquema Arrow
+IPC, retraso del watermark, columna de tiempo de evento y `SourceState` (offsets
+por split). El contenedor **versión 3** guarda el registro de vistas (`nombre↔handle↔plan`)
 para asociar cada nombre con handle y plan, no solo con esquema. No hay lectores
 de formatos anteriores ni migraciones: checkpoint monofuente previo o versión
 incompatible produce `Unsupported` (ver `hotlap-cross-source-joins.md`). La corrupción del formato actual se tolera: la recuperación cae al predecesor
@@ -41,20 +45,31 @@ exactamente** (nombre, handle o plan
 desajustado, o handles duplicados) o un schema que no valida contra las fuentes
 declaradas es fatal.
 
+La captura durable rechaza fuentes/sinks sin identidad física y la recuperación
+compara el set exacto de participantes con el manifiesto. El nombre SQL, schema,
+splits, credenciales o configuración declarada no sustituyen la identidad del
+dataset/target real. Una entrada HLSR sin identidad, un manifiesto HLPM ausente,
+corrupto o incompatible, o un cambio de binding, vista, target o capacidad se
+rechaza; no hay conversión automática de checkpoints HLSR antiguos. Las factories
+SQL deben resolver el destino con `SinkFactory::describe(...)` antes de `create`;
+una factory sin descripción metadata-only no puede iniciar `START` durable.
+
 **Estructura en disco** (namespace bajo `checkpoint/`):
 
 | Clave | Contenido |
 | --- | --- |
 | `checkpoint/<id>/engine` | snapshot del motor (frame binario) |
 | `checkpoint/<id>/sources` | `SourcesCheckpoint` multifuente (contenedor `HLSR`) |
+| `checkpoint/<id>/participants` | Manifiesto independiente `HLPM` de fuentes/sinks originales |
 | `checkpoint/<id>/prepare` | marcador `prepare-v1`: intención durable escrita antes de invocar `Sink::prepare` |
 | `checkpoint/<id>/commit` | marcador `1`: intención durable escrita antes de invocar `Sink::commit` |
 | `checkpoint/<id>/valid` | marcador `1`: el checkpoint está completo |
 | `checkpoint/latest` | id (8 bytes LE) del checkpoint nuevo más reciente |
 | `checkpoint/reserved` | id (8 bytes LE) más alto reservado nunca reutilizable |
 
-**Publicación coherente.** El orden es reserva → drain → marcador durable
-`prepare` → llamadas externas `prepare` → cuerpo (`engine` + `sources`) →
+**Publicación coherente.** El orden es reserva → manifiesto de participantes →
+drain → marcador durable `prepare` → llamadas externas `prepare` → cuerpo
+(`engine` + `sources`) →
 marcador durable `commit` → llamadas `commit` → marcador `valid` → `latest`.
 El marcador `prepare` existe antes de cualquier efecto externo de prepare; ante
 fallo pre-commit solo se elimina después de que todos los `abort` confirmen éxito.

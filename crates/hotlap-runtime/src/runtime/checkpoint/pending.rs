@@ -60,18 +60,25 @@ impl Checkpointer {
         &self,
         id: u64,
     ) -> Result<Option<Checkpoint>, ConnectorError> {
+        let manifest =
+            crate::runtime::checkpoint_body::read_participant_manifest(self.backend.as_ref(), id)?;
         let body = self.read_body(id).and_then(|body| match body {
             Some(checkpoint) => {
                 validate_engine_snapshot(&checkpoint.engine).map(|()| Some(checkpoint))
             }
             None => Ok(None),
         });
-        match body {
-            Ok(body) => Ok(body),
-            Err(error @ ConnectorError::Unsupported(_)) => Err(error),
-            Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => Ok(None),
-            Err(error) => Err(error),
+        let body = match body {
+            Ok(body) => body,
+            Err(error @ ConnectorError::Unsupported(_)) => return Err(error),
+            Err(ConnectorError::Corruption(_) | ConnectorError::Missing(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if let Some(checkpoint) = &body {
+            manifest.matches_saved_sources(&checkpoint.sources.entries)?;
+            manifest.validate_tapped_views(&checkpoint.sources.views, &checkpoint.engine)?;
         }
+        Ok(body)
     }
 
     /// Whether `key` is present in the store.
@@ -81,9 +88,28 @@ impl Checkpointer {
 
     /// Read and decode the checkpoint `id`, rejecting an incomplete one.
     pub fn read(&self, id: u64) -> Result<Checkpoint, ConnectorError> {
+        self.read_with_sink_validation(id, true)
+    }
+
+    /// Decode for internal selection after the caller validated participants by
+    /// their metadata-only descriptions instead of open sink instances.
+    pub(crate) fn read_for_selection(&self, id: u64) -> Result<Checkpoint, ConnectorError> {
+        self.read_with_sink_validation(id, false)
+    }
+
+    fn read_with_sink_validation(
+        &self,
+        id: u64,
+        validate_sinks: bool,
+    ) -> Result<Checkpoint, ConnectorError> {
         let base = checkpoint_prefix(id);
         if self.get(&format!("{base}/valid"))?.is_none() {
             return Err(invalid(id));
+        }
+        let manifest =
+            crate::runtime::checkpoint_body::read_participant_manifest(self.backend.as_ref(), id)?;
+        if validate_sinks {
+            manifest.matches_sinks(&self.sinks)?;
         }
         let engine = self
             .get(&format!("{base}/engine"))?
@@ -94,6 +120,8 @@ impl Checkpointer {
             .get(&format!("{base}/sources"))?
             .ok_or_else(|| invalid(id))?;
         let sources = decode_sources(&sources)?;
+        manifest.matches_saved_sources(&sources.entries)?;
+        manifest.validate_tapped_views(&sources.views, &engine)?;
         Ok(Checkpoint {
             id,
             engine,

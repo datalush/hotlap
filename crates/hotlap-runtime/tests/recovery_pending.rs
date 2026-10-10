@@ -13,19 +13,24 @@ use hotlap_connectors::sink::SinkCapabilities;
 use hotlap_engine::MetricsRegistry;
 use hotlap_runtime::runtime::checkpoint::{Checkpointer, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::recovery::{Recovery, RecoveryDecision};
-use hotlap_runtime::runtime::sink::SinkSync;
 
 use harness::{capability, delete_checkpoint, fallback_id, log, seed_pending, seed_valid_one};
 use recovery::{ResumableSource, engine_with, rows, sources};
 
 #[test]
 fn a_transactional_pending_is_rejected_not_replayed() {
-    let backend = seed_valid_one();
+    let backend = seed_valid_one(vec![capability(
+        SinkCapabilities::Transactional,
+        "test/recovery-pending/sink/transactional",
+        "transactional-output",
+    )]);
     seed_pending(&backend, 1, 2);
     let checkpointer =
-        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
-            SinkSync::sink_only(capability(SinkCapabilities::Transactional)),
-        ]);
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![capability(
+            SinkCapabilities::Transactional,
+            "test/recovery-pending/sink/transactional",
+            "transactional-output",
+        )]);
 
     // A transactional sink is not re-drivable by default, and replaying could
     // duplicate a commit it already confirmed, so recovery must refuse instead.
@@ -40,7 +45,11 @@ fn a_transactional_pending_is_rejected_not_replayed() {
 
 #[test]
 fn corrupt_pending_body_falls_back_to_a_valid_predecessor() {
-    let backend = seed_valid_one();
+    let backend = seed_valid_one(vec![capability(
+        SinkCapabilities::AtLeastOnce,
+        "test/recovery-pending/sink/at-least-once-fallback",
+        "fallback-output",
+    )]);
     seed_pending(&backend, 1, 2);
     let mut writer = backend.clone();
     writer
@@ -49,9 +58,11 @@ fn corrupt_pending_body_falls_back_to_a_valid_predecessor() {
 
     let (mut hotlap, pipe) = engine_with(ResumableSource::new(log()));
     let mut checkpointer =
-        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
-            SinkSync::sink_only(capability(SinkCapabilities::AtLeastOnce)),
-        ]);
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![capability(
+            SinkCapabilities::AtLeastOnce,
+            "test/recovery-pending/sink/at-least-once-fallback",
+            "fallback-output",
+        )]);
     let signal = Mutex::new(None);
     let metrics = MetricsRegistry::new();
 
@@ -77,33 +88,42 @@ fn corrupt_pending_body_falls_back_to_a_valid_predecessor() {
 }
 
 #[test]
-fn a_commit_marker_over_an_incomplete_body_is_discarded() {
-    let backend = seed_valid_one();
+fn a_commit_marker_without_a_participant_manifest_is_fatal_and_preserved() {
+    let backend = seed_valid_one(vec![capability(
+        SinkCapabilities::Idempotent,
+        "test/recovery-pending/sink/idempotent",
+        "idempotent-output",
+    )]);
     let mut writer = backend.clone();
     let engine = writer.get(b"checkpoint/1/engine").unwrap().unwrap();
     writer.put(b"checkpoint/2/engine", engine).unwrap();
     writer.put(b"checkpoint/2/commit", b"1".to_vec()).unwrap();
 
     let checkpointer =
-        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
-            SinkSync::sink_only(capability(SinkCapabilities::Idempotent)),
-        ]);
-    match Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log()))).unwrap() {
-        RecoveryDecision::Discard {
-            pending, fallback, ..
-        } => {
-            assert_eq!(pending, 2);
-            assert_eq!(fallback.expect("fallback").id, 1);
-        }
-        other => panic!("expected Discard, got {other:?}"),
-    }
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![capability(
+            SinkCapabilities::Idempotent,
+            "test/recovery-pending/sink/idempotent",
+            "idempotent-output",
+        )]);
+    let error = Recovery::inspect(&checkpointer, &sources(ResumableSource::new(log())))
+        .expect_err("missing participant identity must fail closed");
+    assert!(
+        error.to_string().contains("no participant manifest"),
+        "{error}"
+    );
+    assert!(writer.get(b"checkpoint/2/engine").unwrap().is_some());
+    assert_eq!(
+        writer.get(b"checkpoint/2/commit").unwrap(),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(writer.get(b"checkpoint/2/valid").unwrap(), None);
 }
 
 #[test]
 fn a_body_without_a_marker_is_not_a_pending_commit() {
-    let backend = seed_valid_one();
+    let backend = seed_valid_one(vec![]);
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let value = writer
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()
@@ -122,7 +142,7 @@ fn a_body_without_a_marker_is_not_a_pending_commit() {
 
 #[test]
 fn both_valid_and_commit_resumes_and_sweeps_the_marker() {
-    let backend = seed_valid_one();
+    let backend = seed_valid_one(vec![]);
     let mut writer = backend.clone();
     writer.put(b"checkpoint/1/commit", b"1".to_vec()).unwrap();
 
@@ -154,7 +174,7 @@ fn both_valid_and_commit_resumes_and_sweeps_the_marker() {
 
 #[test]
 fn discard_commit_is_idempotent() {
-    let backend = seed_valid_one();
+    let backend = seed_valid_one(vec![]);
     seed_pending(&backend, 1, 2);
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
 
@@ -166,15 +186,21 @@ fn discard_commit_is_idempotent() {
 
 #[test]
 fn discarding_without_a_fallback_starts_clean() {
-    let backend = seed_valid_one();
+    let backend = seed_valid_one(vec![capability(
+        SinkCapabilities::AtLeastOnce,
+        "test/recovery-pending/sink/clean-start",
+        "clean-output",
+    )]);
     seed_pending(&backend, 1, 2);
     delete_checkpoint(&backend, 1);
 
     let (mut hotlap, pipe) = engine_with(ResumableSource::new(log()));
     let mut checkpointer =
-        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
-            SinkSync::sink_only(capability(SinkCapabilities::AtLeastOnce)),
-        ]);
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![capability(
+            SinkCapabilities::AtLeastOnce,
+            "test/recovery-pending/sink/clean-start",
+            "clean-output",
+        )]);
     let signal = Mutex::new(None);
     let metrics = MetricsRegistry::new();
 

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use hotlap::state::StateBackend;
-use hotlap::{Hotlap, InputId};
+use hotlap::{Hotlap, InputId, Plan};
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_connectors::source::{Source, SourceBatch, SourceState, SourceStream, Split};
@@ -27,6 +27,10 @@ struct StaticSource {
 }
 
 impl Source for StaticSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/recovery-pending-source/physical".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -52,6 +56,10 @@ struct CountingSink {
 
 #[async_trait::async_trait]
 impl Sink for CountingSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/recovery-pending-source/output".into())
+    }
+
     async fn write(&self, _changes: ChangeStream) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -88,13 +96,22 @@ fn engine() -> Hotlap {
     let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
     hotlap.register_input_with_id("a", InputId(0)).unwrap();
     hotlap.register_input_with_id("b", InputId(1)).unwrap();
+    hotlap.create_view("out", Plan::Source(InputId(0))).unwrap();
+    hotlap.tap_view("out").unwrap();
     hotlap
 }
 
 /// Persist a valid checkpoint and return its id.
 fn seed(backend: &SharedBackend, sources: &Sources) -> u64 {
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    futures::executor::block_on(checkpointer.take(&engine(), sources)).unwrap()
+    let sink = Arc::new(CountingSink {
+        commits: Arc::new(AtomicU32::new(0)),
+    });
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(SharedSink::new(sink), "output".into(), "out".into()),
+        ]);
+    let engine = engine();
+    futures::executor::block_on(checkpointer.take(&engine, sources)).unwrap()
 }
 
 /// Copy the valid body to `pending`, rename one source and mark the commit.
@@ -138,8 +155,10 @@ fn counting(backend: &SharedBackend) -> (Checkpointer, Arc<AtomicU32>) {
     let sink = Arc::new(CountingSink {
         commits: Arc::clone(&commits),
     });
-    let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(sink))]);
+    let checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(SharedSink::new(sink), "output".into(), "out".into()),
+        ]);
     (checkpointer, commits)
 }
 

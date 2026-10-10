@@ -12,7 +12,9 @@ use recovery::{Dataset, ResumableSource, SharedBackend, drain, engine_with, rows
 
 /// A log with retention keeping every record.
 fn log() -> Dataset {
-    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![1, 2], vec![2], vec![3]])
+        .with_retention(0)
+        .with_physical_identity("test/checkpoint-recovery-selection/log")
 }
 
 #[test]

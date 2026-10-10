@@ -54,6 +54,38 @@ impl SinkBarrier {
         Self { sinks }
     }
 
+    pub(crate) fn participants(
+        &self,
+    ) -> Result<Vec<crate::runtime::participants::SavedSink>, ConnectorError> {
+        self.sinks
+            .iter()
+            .map(|sync| {
+                let sink = sync.sink();
+                let binding_name = sync
+                    .binding_name()
+                    .filter(|binding| !binding.trim().is_empty())
+                    .ok_or_else(|| {
+                        ConnectorError::Unsupported("sink binding name is absent".into())
+                    })?;
+                let view = sync
+                    .view()
+                    .filter(|view| !view.trim().is_empty())
+                    .ok_or_else(|| {
+                        ConnectorError::Unsupported("sink view binding is absent".into())
+                    })?;
+                let target = crate::runtime::participants::sink_identity(sink.as_ref())?;
+                Ok(crate::runtime::participants::SavedSink {
+                    binding_name: binding_name.to_string(),
+                    view: view.to_string(),
+                    target,
+                    capabilities: format!("{:?}", sink.capabilities()),
+                    accepts_retractions: sink.accepts_retractions(),
+                    redriable: sink.commit_redriable(),
+                })
+            })
+            .collect()
+    }
+
     /// Drain every channel so all queued deltas have reached their sink.
     ///
     /// A `Flush` is sent behind the queued batches and awaited; the sink task

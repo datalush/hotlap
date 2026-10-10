@@ -9,11 +9,26 @@ use hotlap_connectors::sink::Sink;
 use hotlap_sql::error::SqlError;
 
 use super::SqlSession;
+use crate::runtime::pipeline::SinkDescription;
 use crate::runtime::pipeline::SinkSpec;
 
 /// Builds engine sinks from `CREATE SINK` options and the target view schema.
 #[async_trait::async_trait]
 pub trait SinkFactory: Send + Sync {
+    /// Resolve the real target and delivery metadata without creating a writer.
+    ///
+    /// Durable sessions reject factories that do not provide this proof before
+    /// calling [`Self::create`]. Non-durable sessions do not require it.
+    async fn describe(
+        &self,
+        _binding_name: &str,
+        _options: &BTreeMap<String, String>,
+        _schema: SchemaRef,
+        _view: &str,
+    ) -> Result<Option<SinkDescription>, SqlError> {
+        Ok(None)
+    }
+
     /// Create the sink named `name`, writing rows shaped by `schema`.
     async fn create(
         &self,
@@ -53,6 +68,29 @@ pub struct FlussSinkFactory;
 
 #[async_trait::async_trait]
 impl SinkFactory for FlussSinkFactory {
+    async fn describe(
+        &self,
+        binding_name: &str,
+        options: &BTreeMap<String, String>,
+        _schema: SchemaRef,
+        view: &str,
+    ) -> Result<Option<SinkDescription>, SqlError> {
+        require_connector(options)?;
+        let bootstrap = required(options, "bootstrap")?;
+        let table = required(options, "table")?;
+        let metadata = FlussSink::describe_target(bootstrap, table)
+            .await
+            .map_err(|error| SqlError::Engine(error.to_string()))?;
+        Ok(Some(SinkDescription {
+            binding_name: binding_name.to_owned(),
+            view: view.to_owned(),
+            physical_identity: metadata.physical_identity,
+            capabilities: metadata.capabilities,
+            accepts_retractions: false,
+            commit_redriable: false,
+        }))
+    }
+
     async fn create(
         &self,
         _name: &str,
@@ -81,9 +119,44 @@ impl SinkFactory for FlussSinkFactory {
 
 impl SqlSession {
     /// Open every declared sink via the factory, resolving its view schema.
-    pub(super) async fn build_sinks(&self) -> Result<Vec<SinkSpec>, SqlError> {
-        let mut sinks = Vec::with_capacity(self.sinks.len());
+    pub(super) async fn describe_sinks(&self) -> Result<Vec<SinkDescription>, SqlError> {
+        let mut descriptions = Vec::with_capacity(self.sinks.len());
         for def in &self.sinks {
+            let schema = self
+                .mv_schemas
+                .get(&def.view)
+                .cloned()
+                .ok_or_else(|| SqlError::Catalog(format!("unknown view: {}", def.view)))?;
+            let description = self
+                .sink_factory
+                .describe(&def.name, &def.options, schema, &def.view)
+                .await?
+                .ok_or_else(|| {
+                    SqlError::Unsupported(format!(
+                        "sink factory cannot resolve durable target metadata for `{}`",
+                        def.name
+                    ))
+                })?;
+            description.validate().map_err(to_sql_error)?;
+            if description.binding_name != def.name || description.view != def.view {
+                return Err(SqlError::Unsupported(format!(
+                    "sink factory metadata binding for `{}` does not match its declaration",
+                    def.name
+                )));
+            }
+            descriptions.push(description);
+        }
+        Ok(descriptions)
+    }
+
+    /// Open every declared sink via the factory, verifying each created target
+    /// against the metadata-only description captured before creation.
+    pub(super) async fn build_sinks(
+        &self,
+        descriptions: Option<&[SinkDescription]>,
+    ) -> Result<Vec<SinkSpec>, SqlError> {
+        let mut sinks = Vec::with_capacity(self.sinks.len());
+        for (index, def) in self.sinks.iter().enumerate() {
             let schema = self
                 .mv_schemas
                 .get(&def.view)
@@ -93,10 +166,15 @@ impl SqlSession {
                 .sink_factory
                 .create(&def.name, &def.options, schema)
                 .await?;
-            sinks.push(SinkSpec {
-                view: def.view.clone(),
-                sink,
-            });
+            let spec = SinkSpec::named(&def.name, &def.view, sink);
+            if let Some(descriptions) = descriptions {
+                let actual = spec.description().map_err(to_sql_error)?;
+                let expected = descriptions.get(index).ok_or_else(|| {
+                    SqlError::Unsupported("sink factory description count changed".into())
+                })?;
+                verify_sink_description(&def.name, expected, &actual)?;
+            }
+            sinks.push(spec);
         }
         Ok(sinks)
     }
@@ -146,4 +224,90 @@ fn required<'a>(options: &'a BTreeMap<String, String>, key: &str) -> Result<&'a 
         .get(key)
         .map(String::as_str)
         .ok_or_else(|| SqlError::Unsupported(format!("CREATE SINK requires `{key}`")))
+}
+
+fn to_sql_error(error: hotlap_connectors::error::ConnectorError) -> SqlError {
+    match error {
+        hotlap_connectors::error::ConnectorError::Unsupported(message) => {
+            SqlError::Unsupported(message)
+        }
+        other => SqlError::Engine(other.to_string()),
+    }
+}
+
+fn verify_sink_description(
+    name: &str,
+    expected: &SinkDescription,
+    actual: &SinkDescription,
+) -> Result<(), SqlError> {
+    if expected != actual {
+        return Err(SqlError::Unsupported(format!(
+            "created sink `{name}` differs from its preflight target metadata"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FactoryWithoutDescription;
+
+    #[async_trait::async_trait]
+    impl SinkFactory for FactoryWithoutDescription {
+        async fn create(
+            &self,
+            _name: &str,
+            _options: &BTreeMap<String, String>,
+            _schema: SchemaRef,
+        ) -> Result<Arc<dyn Sink>, SqlError> {
+            unreachable!("a metadata-only factory must not create a sink")
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_without_metadata_description_is_explicitly_unavailable() {
+        let description = FactoryWithoutDescription
+            .describe(
+                "sink_binding",
+                &BTreeMap::new(),
+                Arc::new(arrow::datatypes::Schema::empty()),
+                "view_binding",
+            )
+            .await
+            .unwrap();
+
+        assert!(description.is_none());
+    }
+
+    #[test]
+    fn sink_description_verification_rejects_binding_view_and_target_changes() {
+        let expected = SinkDescription {
+            binding_name: "sink_a".into(),
+            view: "view_a".into(),
+            physical_identity: "fluss:cluster:db/table:table-7".into(),
+            capabilities: hotlap_connectors::sink::SinkCapabilities::Idempotent,
+            accepts_retractions: false,
+            commit_redriable: false,
+        };
+
+        for actual in [
+            SinkDescription {
+                binding_name: "renamed".into(),
+                ..expected.clone()
+            },
+            SinkDescription {
+                view: "view_b".into(),
+                ..expected.clone()
+            },
+            SinkDescription {
+                physical_identity: "fluss:cluster:db/other:table-8".into(),
+                ..expected.clone()
+            },
+        ] {
+            assert!(verify_sink_description("sink_a", &expected, &actual).is_err());
+        }
+        assert!(verify_sink_description("sink_a", &expected, &expected).is_ok());
+    }
 }

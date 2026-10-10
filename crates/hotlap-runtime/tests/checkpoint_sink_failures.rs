@@ -26,6 +26,10 @@ struct FailingSink(Arc<AtomicBool>);
 
 #[async_trait::async_trait]
 impl Sink for FailingSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/checkpoint-sink-failures/output".into())
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         while changes.next().await.is_some() {}
         Err(ConnectorError::Infrastructure("write failed".into()))
@@ -48,6 +52,10 @@ impl Sink for FailingSink {
 struct EmptySource;
 
 impl Source for EmptySource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/checkpoint-sink-failures/source".into())
+    }
+
     fn schema(&self) -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
     }
@@ -98,10 +106,11 @@ async fn engine_with_delta(pump: &SinkPump) -> Hotlap {
 #[tokio::test]
 async fn writer_rollback_on_failed_drain_marks_checkpointer_failed() {
     let aborted = Arc::new(AtomicBool::new(false));
-    let pump = SinkPump::start(&[SinkSpec {
-        view: "c".into(),
-        sink: Arc::new(FailingSink(Arc::clone(&aborted))),
-    }]);
+    let pump = SinkPump::start(&[SinkSpec::named(
+        "output",
+        "c",
+        Arc::new(FailingSink(Arc::clone(&aborted))),
+    )]);
     let hotlap = engine_with_delta(&pump).await;
     let mut checkpointer =
         Checkpointer::new(Box::new(SharedBackend::default()), 3).with_sinks(pump.coordinated());

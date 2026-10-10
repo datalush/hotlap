@@ -37,6 +37,10 @@ impl ReadStartSource {
 }
 
 impl Source for ReadStartSource {
+    fn physical_identity(&self) -> Option<String> {
+        self.inner.physical_identity()
+    }
+
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }

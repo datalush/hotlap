@@ -4,6 +4,7 @@ use hotlap::Hotlap;
 use hotlap::state::{StateBackend, StateError};
 use hotlap_engine::{EngineCore, EngineError, EngineSnapshot, decode_snapshot, encode_snapshot};
 
+use crate::runtime::participants::{self, ParticipantsManifest};
 use crate::runtime::source_checkpoint::{
     SavedView, SourcesCheckpoint, decode_sources, encode_sources,
 };
@@ -29,6 +30,38 @@ pub(crate) fn checkpoint_prefix(id: u64) -> String {
     format!("checkpoint/{id}")
 }
 
+pub(crate) fn write_participant_manifest(
+    backend: &mut (dyn StateBackend + Send),
+    id: u64,
+    manifest: &ParticipantsManifest,
+) -> Result<(), ConnectorError> {
+    let bytes = participants::encode(manifest)?;
+    backend
+        .put(
+            format!("{}/participants", checkpoint_prefix(id)).as_bytes(),
+            bytes,
+        )
+        .map_err(state_err)
+}
+
+pub(crate) fn read_participant_manifest(
+    backend: &dyn StateBackend,
+    id: u64,
+) -> Result<ParticipantsManifest, ConnectorError> {
+    let bytes = backend
+        .get(format!("{}/participants", checkpoint_prefix(id)).as_bytes())
+        .map_err(state_err)?
+        .ok_or_else(|| {
+            ConnectorError::Unsupported(format!("checkpoint {id} has no participant manifest"))
+        })?;
+    participants::decode(&bytes).map_err(|error| match error {
+        ConnectorError::Corruption(message) | ConnectorError::Missing(message) => {
+            ConnectorError::Unsupported(format!("participant manifest is corrupt: {message}"))
+        }
+        error => error,
+    })
+}
+
 /// Encode the engine snapshot and source offsets under `checkpoint/<id>/`.
 ///
 /// The engine snapshot and source offsets are written before the commit marker.
@@ -42,6 +75,9 @@ pub(crate) async fn write_body(
     let engine_bytes = encode_snapshot(&snapshot).map_err(encode_err)?;
     let views = SavedView::from_registry(&engine.view_registry());
     let sources_checkpoint = SourcesCheckpoint::capture_with_views(sources, &views)?;
+    let manifest = read_participant_manifest(backend, id)?;
+    manifest.matches_saved_sources(&sources_checkpoint.entries)?;
+    manifest.validate_tapped_views(&views, &snapshot)?;
     let source_bytes = encode_sources(&sources_checkpoint)?;
     let base = checkpoint_prefix(id);
     backend

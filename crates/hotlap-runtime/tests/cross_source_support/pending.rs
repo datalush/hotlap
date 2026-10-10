@@ -27,12 +27,16 @@ use crate::resumable::{Dataset, ResumableSource};
 
 /// Log for source `a`: `k = 1, 1, 2`.
 pub fn log_a() -> Dataset {
-    Dataset::new(vec![vec![1], vec![1], vec![2]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![1], vec![2]])
+        .with_retention(0)
+        .with_physical_identity("test/cross-source-pending/a")
 }
 
 /// Log for source `b`: `k = 1, 2`.
 pub fn log_b() -> Dataset {
-    Dataset::new(vec![vec![1], vec![2]]).with_retention(0)
+    Dataset::new(vec![vec![1], vec![2]])
+        .with_retention(0)
+        .with_physical_identity("test/cross-source-pending/b")
 }
 
 /// Inputs `a` (id 0) and `b` (id 1), each resumable and independent.
@@ -82,6 +86,7 @@ pub fn fresh_pipeline() -> Pipeline {
 pub fn engine_with(pipeline: &Pipeline) -> Hotlap {
     let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
     pipeline::setup(&mut hotlap, pipeline).unwrap();
+    hotlap.tap_view("j").unwrap();
     hotlap
 }
 
@@ -128,10 +133,17 @@ fn mark_pending(backend: &SharedBackend, valid: u64, pending: u64) {
 
 /// Take a valid checkpoint after `k=1,1`/`1`, then a distinct pending body after
 /// `k=2` on both sources. Returns `(valid, pending)` ids.
+#[allow(dead_code)] // Shared by integration-test targets with different fixture needs.
 pub fn seed_pair(backend: &SharedBackend) -> (u64, u64) {
+    seed_pair_with_redriable(backend, false)
+}
+
+pub fn seed_pair_with_redriable(backend: &SharedBackend, redriable: bool) -> (u64, u64) {
     let pipe = fresh_pipeline();
     let mut engine = engine_with(&pipe);
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    let (sink, _) = counting(redriable);
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![sink]);
     let sources = &pipe.sources;
     push(&mut engine, sources, InputId(0), 1);
     push(&mut engine, sources, InputId(0), 1);
@@ -158,6 +170,7 @@ pub fn put_sources(backend: &SharedBackend, id: u64, bytes: Vec<u8>) {
 
 /// A sink that counts commits and declares whether they may be re-driven.
 struct CountingSink {
+    physical_identity: String,
     capabilities: SinkCapabilities,
     redriable: bool,
     commits: Arc<AtomicU32>,
@@ -165,6 +178,9 @@ struct CountingSink {
 
 #[async_trait::async_trait]
 impl Sink for CountingSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some(self.physical_identity.clone())
+    }
     async fn write(&self, _changes: ChangeStream) -> Result<(), ConnectorError> {
         Ok(())
     }
@@ -191,9 +207,13 @@ impl Sink for CountingSink {
 pub fn counting(redriable: bool) -> (SinkSync, Arc<AtomicU32>) {
     let commits = Arc::new(AtomicU32::new(0));
     let sink = Arc::new(CountingSink {
+        physical_identity: "test/cross-source-pending/output".into(),
         capabilities: SinkCapabilities::Idempotent,
         redriable,
         commits: Arc::clone(&commits),
     });
-    (SinkSync::sink_only(SharedSink::new(sink)), commits)
+    (
+        SinkSync::sink_only_named(SharedSink::new(sink), "output".into(), "j".into()),
+        commits,
+    )
 }

@@ -5,6 +5,7 @@
 //! parks at one specific SPI call. The state after cancellation is asserted
 //! precisely, and every hang test is bounded by an independent OS watchdog.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use hotlap::InputId;
@@ -19,8 +20,9 @@ mod harness;
 mod support;
 
 use harness::{
-    GatedPrepareSink, ParkedWriteSink, SharedBackend, Signal, StagedSink, StagedStore,
-    WatchedBackend, fill_queue, keys_with, start,
+    GatedPrepareSink, IdentifiedSink, ParkedWriteSink, SharedBackend, Signal, StagedSink,
+    StagedStore, WatchedBackend, fill_queue, keys_with, keys_with_identity, start,
+    start_with_sink_identity,
 };
 use support::{
     assert_cancelled, assert_evidence, assert_prepare_uncertain, commit_uncertain, config,
@@ -116,10 +118,11 @@ fn a_staged_transactional_commit_cancel_is_rejected_on_restart() {
     let (sink, _release) = StagedSink::new(store.clone(), entered, written);
     let backend = SharedBackend::default();
     let watched = WatchedBackend::watch(backend.clone(), None, None);
-    let handle = start(
-        keys_with(&[7, 8], None),
+    let handle = start_with_sink_identity(
+        keys_with_identity(&[7, 8], None, "test/shutdown/staged-source"),
         sink.clone(),
         Some(config(watched)),
+        "test/shutdown/staged-sink",
     );
     for _ in 0..2 {
         written_rx
@@ -154,13 +157,21 @@ fn a_staged_transactional_commit_cancel_is_rejected_on_restart() {
     let sources = Sources::new(vec![InputSource {
         id: InputId(0),
         name: "in".into(),
-        source: keys_with(&[7, 8], None),
+        source: keys_with_identity(&[7, 8], None, "test/shutdown/staged-source"),
         watermark: None,
     }])
     .unwrap();
     let restarted_sink = StagedSink::reopen(store.clone());
-    let restarted = Checkpointer::new(Box::new(backend), 3)
-        .with_sinks(vec![SinkSync::sink_only(SharedSink::new(restarted_sink))]);
+    let restarted_sink = Arc::new(IdentifiedSink::new(
+        "test/shutdown/staged-sink",
+        restarted_sink,
+    ));
+    let restarted =
+        Checkpointer::new(Box::new(backend), 3).with_sinks(vec![SinkSync::sink_only_named(
+            SharedSink::new(restarted_sink),
+            "sink".into(),
+            "c".into(),
+        )]);
     let decision = Recovery::inspect(&restarted, &sources).expect("inspect");
     assert!(
         matches!(decision, RecoveryDecision::Reject { .. }),

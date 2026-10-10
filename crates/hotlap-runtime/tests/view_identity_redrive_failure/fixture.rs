@@ -16,6 +16,7 @@ use hotlap_runtime::runtime::checkpoint::Checkpointer;
 use hotlap_runtime::runtime::checkpoint::{CheckpointConfig, DEFAULT_RETAIN};
 use hotlap_runtime::runtime::pipeline;
 use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
+use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 
 use super::support::{Dataset, ResumableSource, SharedBackend, SpySource, filter, sources};
 
@@ -33,6 +34,10 @@ pub struct RedriveSink {
 
 #[async_trait::async_trait]
 impl Sink for RedriveSink {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/view-identity-redrive/output".into())
+    }
+
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         let mut staged = Vec::new();
@@ -136,12 +141,8 @@ pub fn seeded_compatible_registries() -> (SharedBackend, Dataset) {
     seed_registry(&backend, views.clone(), dataset.clone(), 3);
     let pending = SharedBackend::default();
     seed_registry(&pending, views, dataset.clone(), 4);
-    let fallback = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
-        .read(1)
-        .unwrap();
-    let interrupted = Checkpointer::new(Box::new(pending.clone()), DEFAULT_RETAIN)
-        .read(1)
-        .unwrap();
+    let fallback = read_checkpoint(&backend);
+    let interrupted = read_checkpoint(&pending);
     assert_ne!(fallback.engine, interrupted.engine);
     assert_eq!(
         fallback.sources.entries[0]
@@ -165,6 +166,18 @@ pub fn seeded_compatible_registries() -> (SharedBackend, Dataset) {
     (backend, dataset)
 }
 
+fn read_checkpoint(backend: &SharedBackend) -> hotlap_runtime::runtime::checkpoint::Checkpoint {
+    let sink = RedriveSink {
+        remote: Arc::new(Mutex::new(DurableRemote::default())),
+        writes: AtomicU32::new(0),
+    };
+    let checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(SharedSink::new(Arc::new(sink)), "output".into(), "a".into()),
+        ]);
+    checkpointer.read(1).unwrap()
+}
+
 fn seed_registry(
     backend: &SharedBackend,
     views: Vec<(String, Plan)>,
@@ -174,7 +187,14 @@ fn seed_registry(
     let pipe = Pipeline {
         sources: sources(Arc::new(ResumableSource::new(dataset))),
         views,
-        sinks: vec![],
+        sinks: vec![SinkSpec::named(
+            "output",
+            "a",
+            Arc::new(RedriveSink {
+                remote: Arc::new(Mutex::new(DurableRemote::default())),
+                writes: AtomicU32::new(0),
+            }),
+        )],
         checkpoint: None,
         retention: None,
     };
@@ -195,13 +215,17 @@ fn seed_registry(
             .unwrap();
         pushed += 1;
     }
-    let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
+    let sink = pipe.sinks[0].sink.clone();
+    let mut checkpointer =
+        Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN).with_sinks(vec![
+            SinkSync::sink_only_named(SharedSink::new(sink), "output".into(), "a".into()),
+        ]);
     futures::executor::block_on(checkpointer.take(&hotlap, &pipe.sources)).unwrap();
 }
 
 fn copy_as_pending_commit(valid: &SharedBackend, pending: &SharedBackend) {
     let mut writer = valid.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let body = pending
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()
@@ -230,14 +254,13 @@ pub fn pipeline_retaining(
     let source: Arc<dyn Source> = Arc::new(ResumableSource::new(dataset));
     let spy = Arc::new(SpySource::new(source));
     let as_source: Arc<dyn Source> = spy.clone();
-    let sinks = sink
-        .map(|sink| {
-            vec![SinkSpec {
-                view: "a".into(),
-                sink,
-            }]
+    let sink = sink.unwrap_or_else(|| {
+        Arc::new(RedriveSink {
+            remote: Arc::new(Mutex::new(DurableRemote::default())),
+            writes: AtomicU32::new(0),
         })
-        .unwrap_or_default();
+    });
+    let sinks = vec![SinkSpec::named("output", "a", sink)];
     let pipeline = Pipeline {
         sources: sources(as_source),
         views: vec![("a".into(), filter(1)), ("b".into(), filter(2))],

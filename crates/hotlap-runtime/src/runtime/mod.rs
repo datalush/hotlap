@@ -6,6 +6,7 @@ mod checkpoint_body;
 pub mod command;
 pub mod engine;
 pub mod handle;
+mod participants;
 pub mod pipeline;
 pub mod recovery;
 pub(crate) mod retention;

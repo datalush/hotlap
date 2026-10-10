@@ -69,6 +69,9 @@ struct GatedSource {
 }
 
 impl Source for GatedSource {
+    fn physical_identity(&self) -> Option<String> {
+        self.inner.physical_identity()
+    }
     fn schema(&self) -> arrow::datatypes::SchemaRef {
         self.inner.schema()
     }
@@ -119,6 +122,9 @@ struct ReadCounter<S> {
 }
 
 impl<S: Source> Source for ReadCounter<S> {
+    fn physical_identity(&self) -> Option<String> {
+        self.inner.physical_identity()
+    }
     fn schema(&self) -> arrow::datatypes::SchemaRef {
         self.inner.schema()
     }

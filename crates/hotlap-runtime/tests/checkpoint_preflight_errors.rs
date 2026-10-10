@@ -23,7 +23,9 @@ use fault::FaultBackend;
 use resumable::{Dataset, ResumableSource};
 
 fn log() -> Dataset {
-    Dataset::new(vec![vec![1]]).with_retention(0)
+    Dataset::new(vec![vec![1]])
+        .with_retention(0)
+        .with_physical_identity("test/checkpoint-preflight-errors/log")
 }
 
 fn filter() -> Plan {
@@ -77,7 +79,7 @@ fn storage_and_unsupported_errors_remain_fatal_in_pipeline_preflight() {
     ));
 
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let value = writer
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()

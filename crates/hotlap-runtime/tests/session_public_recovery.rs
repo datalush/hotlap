@@ -44,7 +44,7 @@ fn rows(session: &Session) -> Vec<Vec<i64>> {
 
 fn add_corrupt_pending(backend: &SharedBackend) {
     let mut writer = backend.clone();
-    for part in ["engine", "sources"] {
+    for part in ["engine", "sources", "participants"] {
         let body = writer
             .get(format!("checkpoint/1/{part}").as_bytes())
             .unwrap()

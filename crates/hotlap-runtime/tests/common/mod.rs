@@ -66,6 +66,10 @@ struct ScriptSource {
 }
 
 impl Source for ScriptSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/script-source-dataset".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

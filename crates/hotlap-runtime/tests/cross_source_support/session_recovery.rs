@@ -73,6 +73,10 @@ impl SourceFactory for ResumableSessionFactory {
 struct SessionSource(Arc<ResumableSource>);
 
 impl Source for SessionSource {
+    fn physical_identity(&self) -> Option<String> {
+        self.0.physical_identity()
+    }
+
     fn schema(&self) -> SchemaRef {
         self.0.schema()
     }

@@ -60,6 +60,10 @@ struct FakeSource {
 }
 
 impl Source for FakeSource {
+    fn physical_identity(&self) -> Option<String> {
+        Some("test/session-fake-dataset".into())
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
