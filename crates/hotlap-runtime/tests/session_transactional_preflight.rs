@@ -92,3 +92,61 @@ fn an_actual_transactional_sink_cannot_contradict_preflight() {
     assert_eq!(creates.load(Ordering::SeqCst), 2);
     assert_eq!(reads.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn invalid_prepare_rejects_session_before_sink_factory_or_source_read() {
+    let backend = TestBackend::default();
+    seed(&backend);
+    let mut writer = backend.clone();
+    for part in ["engine", "sources"] {
+        let body = writer
+            .get(format!("checkpoint/1/{part}").as_bytes())
+            .unwrap()
+            .unwrap();
+        writer
+            .put(format!("checkpoint/2/{part}").as_bytes(), body)
+            .unwrap();
+    }
+    writer
+        .put(b"checkpoint/2/prepare", b"unknown-phase".to_vec())
+        .unwrap();
+    let body_engine = backend.get(b"checkpoint/2/engine").unwrap();
+    let body_sources = backend.get(b"checkpoint/2/sources").unwrap();
+    let reads = Arc::new(AtomicU32::new(0));
+    let creates = Arc::new(AtomicU32::new(0));
+    let mut session = Session::open(config(
+        &backend,
+        reads.clone(),
+        creates.clone(),
+        true,
+        Arc::new(Mutex::new(Vec::new())),
+        SessionSignals::default(),
+    ))
+    .unwrap();
+    declare(&mut session);
+
+    let error = match session.sql("START;") {
+        Ok(_) => panic!("an unknown durable phase must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SessionError::Sql(SqlError::Unsupported(_))));
+    assert_eq!(
+        creates.load(Ordering::SeqCst),
+        0,
+        "sink factories must not run"
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "source reads must not start"
+    );
+    assert_eq!(
+        backend.get(b"checkpoint/2/prepare").unwrap(),
+        Some(b"unknown-phase".to_vec())
+    );
+    assert_eq!(backend.get(b"checkpoint/2/commit").unwrap(), None);
+    assert_eq!(backend.get(b"checkpoint/2/valid").unwrap(), None);
+    assert_eq!(backend.get(b"checkpoint/2/engine").unwrap(), body_engine);
+    assert_eq!(backend.get(b"checkpoint/2/sources").unwrap(), body_sources);
+    session.shutdown().unwrap();
+}
