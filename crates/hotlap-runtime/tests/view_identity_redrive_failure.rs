@@ -26,8 +26,8 @@ fn incompatible_fallback_keeps_pending_marker_after_redrive_error() {
     assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
     assert!(backend.get(b"checkpoint/2/commit").unwrap().is_some());
     assert!(backend.get(b"checkpoint/2/engine").unwrap().is_some());
-    assert!(remote.lock().unwrap().staged);
-    assert!(!remote.lock().unwrap().committed);
+    assert_eq!(remote.lock().unwrap().staged, vec![(1, 1)]);
+    assert!(remote.lock().unwrap().committed.is_empty());
     assert_eq!(sink.writes.load(Ordering::SeqCst), 0);
     assert_eq!(spy.resumed(), 0);
 }

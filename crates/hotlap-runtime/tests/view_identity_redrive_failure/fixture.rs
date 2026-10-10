@@ -2,9 +2,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use hotlap::state::StateBackend;
-use hotlap::{Hotlap, Plan};
+use hotlap::{Hotlap, Plan, ZSetBatch};
 use hotlap_connectors::error::ConnectorError;
 use hotlap_connectors::sink::{ChangeStream, Sink, SinkCapabilities};
 use hotlap_connectors::source::Source;
@@ -18,8 +21,8 @@ use super::support::{Dataset, ResumableSource, SharedBackend, SpySource, filter,
 
 #[derive(Default)]
 pub struct DurableRemote {
-    pub staged: bool,
-    pub committed: bool,
+    pub staged: Vec<(i64, i64)>,
+    pub committed: Vec<(i64, i64)>,
     fail_next: bool,
 }
 
@@ -32,7 +35,23 @@ pub struct RedriveSink {
 impl Sink for RedriveSink {
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         self.writes.fetch_add(1, Ordering::SeqCst);
-        while changes.next().await.is_some() {}
+        let mut staged = Vec::new();
+        while let Some(change) = changes.next().await {
+            let change = change?;
+            let keys = change
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test sink receives Int64 keys");
+            let diffs = change
+                .diff
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("test sink receives Int64 diffs");
+            staged.extend((0..keys.len()).map(|index| (keys.value(index), diffs.value(index))));
+        }
+        self.remote.lock().unwrap().staged.extend(staged);
         Ok(())
     }
 
@@ -52,10 +71,8 @@ impl Sink for RedriveSink {
                 "transient re-drive error".into(),
             ));
         }
-        if remote.staged {
-            remote.staged = false;
-            remote.committed = true;
-        }
+        let staged = std::mem::take(&mut remote.staged);
+        remote.committed.extend(staged);
         Ok(())
     }
 
@@ -66,10 +83,20 @@ impl Sink for RedriveSink {
 
 pub fn redrive_sink() -> (Arc<RedriveSink>, Arc<Mutex<DurableRemote>>) {
     let remote = Arc::new(Mutex::new(DurableRemote {
-        staged: true,
         fail_next: true,
         ..DurableRemote::default()
     }));
+    let initial_process_sink = RedriveSink {
+        remote: Arc::clone(&remote),
+        writes: AtomicU32::new(0),
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+    let change = ZSetBatch::new(batch, Arc::new(Int64Array::from(vec![1]))).unwrap();
+    futures::executor::block_on(
+        initial_process_sink.write(Box::pin(futures::stream::iter([Ok(change)]))),
+    )
+    .unwrap();
     (
         Arc::new(RedriveSink {
             remote: Arc::clone(&remote),
