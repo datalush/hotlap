@@ -174,6 +174,14 @@ impl Checkpointer {
         let manifest =
             crate::runtime::checkpoint_body::read_participant_manifest(self.backend.as_ref(), id)?;
         manifest.matches_sinks(&self.sinks)?;
+        let mut keys = keys;
+        keys.sort_by_key(|key| {
+            if key.ends_with(b"/valid") || key.ends_with(b"/prepare") || key.ends_with(b"/commit") {
+                0
+            } else {
+                1
+            }
+        });
         for key in keys {
             self.backend.delete(&key).map_err(state_err)?;
         }

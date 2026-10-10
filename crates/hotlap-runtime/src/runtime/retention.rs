@@ -42,7 +42,17 @@ pub(crate) fn checkpoint_ids(backend: &dyn StateBackend) -> Result<Vec<u64>, Sta
 /// Delete every key belonging to checkpoint `id`.
 fn remove(backend: &mut (dyn StateBackend + Send), id: u64) -> Result<(), StateError> {
     let prefix = format!("checkpoint/{id}/");
-    for key in backend.list(prefix.as_bytes())? {
+    let mut keys = backend.list(prefix.as_bytes())?;
+    // Clear phase markers before deleting participant metadata or body bytes.
+    // An interrupted prune must not leave a marked attempt without evidence.
+    keys.sort_by_key(|key| {
+        if key.ends_with(b"/valid") || key.ends_with(b"/prepare") || key.ends_with(b"/commit") {
+            0
+        } else {
+            1
+        }
+    });
+    for key in keys {
         backend.delete(&key)?;
     }
     Ok(())
