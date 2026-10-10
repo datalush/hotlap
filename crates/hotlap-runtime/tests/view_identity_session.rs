@@ -19,9 +19,13 @@ use hotlap_sql::SqlError;
 
 const SOURCE: &str = "CREATE SOURCE src WITH (connector='inmem') WATERMARK FOR \
      _event_time AS _event_time - INTERVAL '1 s';";
+const RENAMED_SOURCE: &str = "CREATE SOURCE renamed WITH (connector='inmem') WATERMARK FOR \
+     _event_time AS _event_time - INTERVAL '1 s';";
 const VIEW_A: &str = "CREATE MATERIALIZED VIEW a AS SELECT k FROM src WHERE k = 1;";
+const VIEW_A_RENAMED: &str = "CREATE MATERIALIZED VIEW a AS SELECT k FROM renamed WHERE k = 1;";
 const VIEW_A_CHANGED: &str = "CREATE MATERIALIZED VIEW a AS SELECT k FROM src WHERE k = 7;";
 const VIEW_B: &str = "CREATE MATERIALIZED VIEW b AS SELECT k FROM src WHERE k = 2;";
+const VIEW_B_RENAMED: &str = "CREATE MATERIALIZED VIEW b AS SELECT k FROM renamed WHERE k = 2;";
 const VIEW_C: &str = "CREATE MATERIALIZED VIEW c AS SELECT k FROM src WHERE k = 1;";
 const SINK_A: &str = "CREATE SINK outa WITH (connector='inmem') AS SELECT * FROM a;";
 const SINK_B: &str = "CREATE SINK outb WITH (connector='inmem') AS SELECT * FROM b;";
@@ -96,6 +100,27 @@ fn a_reordered_view_declaration_is_rejected_before_any_effect() {
     );
     assert_eq!(creates, 0, "no sink writer may open");
     assert_eq!(reads, 0, "no source may open");
+}
+
+#[test]
+fn a_renamed_source_is_rejected_before_opening_sink_factories() {
+    let backend = SharedBackend::default();
+    seed(&backend);
+    let (config, reads, creates) = config(&backend);
+    let mut session = Session::open(config).expect("open session");
+    session.sql(RENAMED_SOURCE).expect("create renamed source");
+    session.sql(VIEW_A_RENAMED).expect("create view");
+    session.sql(VIEW_B_RENAMED).expect("create second view");
+    session.sql(SINK_A).expect("create sink a");
+    session.sql(SINK_B).expect("create sink b");
+
+    let error = match session.sql("START;") {
+        Ok(_) => panic!("source identity must match"),
+        Err(error) => error,
+    };
+    assert_eq!(creates.load(Ordering::SeqCst), 0, "no sink writer may open");
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "no source may start");
+    assert!(matches!(error, SessionError::Sql(SqlError::Unsupported(_))));
 }
 
 #[test]

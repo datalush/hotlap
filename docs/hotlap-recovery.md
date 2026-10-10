@@ -77,7 +77,9 @@ desajuste es `Unsupported` **antes** de restaurar el motor, re-conducir un commi
 o abrir cualquier writer, y `Recovery::resume` vuelve a validar la identidad por
 su cuenta (no confía en el caller). La sesión SQL valida el mismo registro contra
 las vistas compiladas **antes** de que el `SinkFactory` abra un writer, y el
-`Pipeline` público lo valida **antes** de arrancar el pump; el commit EOF requiere
+`Pipeline` público lo valida **antes** de arrancar el pump; la sesión también
+compara las fuentes declaradas con el último checkpoint válido antes de abrir
+sinks o iniciar lecturas. El commit EOF requiere
 además un cierre global sano, nunca se infiere solo de EOF. Así un rechazo deja
 `factory creates`, reads y commits en cero. En SQL, el preflight consulta
 `SinkFactory::accepts_retractions(options)` antes de abrir writers y revalida la

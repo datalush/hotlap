@@ -106,10 +106,10 @@ impl SqlSession {
             .sinks
             .iter()
             .all(|sink| !self.sink_factory.may_create_transactional(&sink.options));
-        self.validate_recovery_views(&views, replay_safe)?;
+        let sources = self.build_sources(bindings)?;
+        self.validate_recovery_views(&views, replay_safe, &sources)?;
         let sinks = self.build_sinks().await?;
         self.validate_recovery_declarations(&sinks)?;
-        let sources = self.build_sources(bindings)?;
         let mut pipeline = Pipeline {
             sources,
             views,

@@ -2,9 +2,24 @@
 
 use crate::runtime::checkpoint::{Checkpoint, Checkpointer};
 use crate::runtime::source_checkpoint::SavedView;
+use crate::runtime::sources::Sources;
 use hotlap_connectors::error::ConnectorError;
 
 impl Checkpointer {
+    /// Validate the newest durable source and view identities before factories
+    /// with external effects are opened.
+    pub(crate) fn validate_sources_and_views(
+        &self,
+        sources: &Sources,
+        declared: &[SavedView],
+        replay_safe: bool,
+    ) -> Result<(), ConnectorError> {
+        if let Some(checkpoint) = self.newest_valid()? {
+            checkpoint.sources.validate(sources, &checkpoint.engine)?;
+        }
+        self.validate_views_with_replay_safety(declared, replay_safe)
+    }
+
     /// Every candidate checkpoint's named views must match `declared`.
     pub fn validate_views(&self, declared: &[SavedView]) -> Result<(), ConnectorError> {
         self.validate_views_with_replay_safety(declared, self.replay_safe())
