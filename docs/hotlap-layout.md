@@ -1,29 +1,24 @@
-# Hotlap: native Rust project layout
+# Estructura del proyecto Rust nativo Hotlap
 
-Hotlap is the project/engine identity. It ships its own Arrow-native incremental
-engine (`hotlap-engine`) behind the `hotlap-core` contract, with `hotlap` as the
-public facade; `hotlap-sql` and `hotlap-connectors` are the SQL-plan and runtime
-boundaries. DataFusion remains the SQL/planning/operator/runtime foundation for
-the Fluss provider integration in `fluss-datafusion`, and `fluss-rs` is the
-native protocol/client implementation. The earlier `differential-dataflow` spike
-has been removed. Component names and public API versions remained stable across
-the Rust-only migration.
+Hotlap identifica el proyecto y el motor. Incluye su propio motor incremental
+columnar (`hotlap-engine`) tras el contrato `hotlap-core`, con `hotlap` como
+fachada pública; `hotlap-sql` y `hotlap-connectors` delimitan plan SQL/runtime.
+DataFusion sigue siendo la base SQL/planificación/operadores/runtime de la
+integración provider Fluss en `fluss-datafusion`; `fluss-rs` implementa cliente y
+protocolo nativos. Los nombres de componentes y versiones API pública se
+mantuvieron en la migración a Rust.
 
-> **Superseded (2026-10-06):** Hotlap is now an explicit **engine** layer built on
-> DataFusion. Its incremental core is the Arrow-native `hotlap-engine` kernel
-> behind an `IncrementalCore` boundary; the earlier
-> `differential-dataflow` spike was replaced. The Fluss provider lives in
-> `fluss-datafusion`. See
-> [incremental core decision and boundary](hotlap-incremental-core.md).
+> El runtime Hotlap y la integración provider DataFusion nativa son capas distintas;
+> aceptar providers no certifica comportamiento del runtime Hotlap.
 
-## Current tree
+## Árbol actual
 
 ```text
 hotlap/
   Cargo.toml / Cargo.lock
   crates/hotlap/            # public facade over IncrementalCore
   crates/hotlap-core/       # engine contract (Plan, IncrementalCore, ZSetBatch)
-  crates/hotlap-engine/     # Arrow-native incremental engine kernel
+  crates/hotlap-engine/     # Columnar incremental engine kernel
   crates/hotlap-sql/        # SQL to Plan boundary
   crates/hotlap-connectors/ # runtime/connector integration
   crates/fluss-datafusion/  # DataFusion Fluss provider integration
@@ -33,61 +28,63 @@ hotlap/
   LICENSE / NOTICE
 ```
 
-The Java/reference tree, Python/C++/Elixir bindings, imported website and binding-
-specific build/release tooling have been removed. Git history retains their
-import provenance. Original notices/licenses for retained code are preserved.
-Local Java ignored files are archived outside the repository rather than erased.
+Se retiraron árbol Java/referencia, bindings Python/C++/Elixir, sitio importado y
+herramientas build/release propias de bindings. Git conserva su proveniencia de
+importación. Se preservan avisos/licencias originales del código retenido. Los
+archivos Java locales ignorados se archivaron fuera del repo, no se borraron.
 
-The Rust client includes `proto/FlussApi.proto` and checked-in generated Rust;
-normal builds have no Java dependency. Regeneration uses the vendored schema,
-not an external monorepo fallback. The short STS fixture is now Rust and reuses
-AWS CLI signing against the existing RustFS, preserving its 900s/policy contract.
-There are no Python sources required by Hotlap. Shell build/protocol utilities
-and external Docker/AWS CLI/lab credentials remain tooling/runtime dependencies.
+El cliente Rust incluye `proto/FlussApi.proto` y código Rust generado versionado;
+build normal no requiere Java. Regeneración usa esquema vendorizado, no fallback
+a monorepo externo. Fixture STS corto ahora es Rust y reutiliza firma AWS CLI
+contra RustFS existente, conservando contrato de 900 s/política. Hotlap no requiere
+fuentes Python. Utilidades shell build/protocolo y credenciales externas Docker/
+AWS CLI/lab siguen como dependencias de herramientas/runtime.
 
-## Paths and identity
+## Rutas e identidad
 
-The project directory moves from `fluss-connectors` to sibling `hotlap`; sibling
-`../lab/.env` paths remain valid. Historical evidence documents retain the original
-paths/SHA/artifact names as history, not current installation instructions.
-The Kata project is renamed in place, preserving its issue IDs/history.
-Git linked worktrees are repaired after the main-directory move. The configured
-Git remote is preserved; this operation does not rename a GitHub repository.
+El directorio del proyecto pasa de `fluss-connectors` al hermano `hotlap`; rutas
+hermanas `../lab/.env` siguen válidas. Documentos de evidencia histórica conservan
+rutas/SHA/nombres de artefactos originales como historia, no instrucciones de
+instalación actuales. Se preserva el historial del proyecto.
+Worktrees Git enlazados se repararon tras mover directorio principal. Se conserva
+remote Git configurado; esta operación no cambia nombre del repositorio GitHub.
 
-All paths used for current commands should be relative to the Hotlap root or use
-the new directory. There is no compatibility symlink/fallback at the old path.
-Native functional checks use DEBUG/eight jobs; profiles use RELEASE/eight jobs.
+Rutas de comandos actuales deben ser relativas a raíz Hotlap o usar directorio nuevo.
+No hay symlink/fallback de compatibilidad en ruta anterior. Pruebas funcionales
+nativas usan DEBUG/ocho jobs; perfiles, RELEASE/ocho jobs.
 
-## Migration verification
+## Verificación de migración
 
-From `/home/midnattsol/code/datalush/fluss/hotlap`, after removing the imported
-trees and repairing linked worktrees:
+Desde `/home/midnattsol/code/datalush/fluss/hotlap`, tras retirar árboles importados
+y reparar worktrees enlazados:
 
-- Root workspace: 29 core and 3 planner tests pass; opt-in integrations compile.
-- Client: 836 tests pass, 2 ignored, both serially and on the final default-parallel
-  rerun. The first parallel run observed a metrics-counter test failure (2 vs 1);
-  serial/default reruns pass without changing client source. This observation is
-  retained rather than claiming every run passed or a proven cause.
-- Root/client four-member workspace all-target clippy with warnings denied,
-  formatting and diff checks pass. The Rust `gen` crate compiles with its
-  vendored schema and no Java path/fallback.
-- Native-sni SQL: eight write/DML/streaming cases pass (44.16s), including the
-  separately built native query example against log and KV from the new path.
-- The new Rust STS endpoint passes the real RustFS **preflight** (15.84s): actual
-  server 900-second credentials are issued and the first remote scan succeeds.
-  This does not claim a repeated 900-second expiry/renewal run; the historical
-  full-expiry evidence remains separately scoped.
-- Locked resolved graphs remain 453 root / 431 client packages, with unchanged
-  DataFusion55.1/Arrow59 and no active non-Rust binding dependencies.
-- Existing linked worktrees retain their HEADs and resolve the new common Git
-  directory. Kata remains project ID26 with its original issue history, default
-  binding `hotlap`, and the obsolete local directory alias removed.
+- Workspace raíz: pasaron 29 pruebas core y 3 planner; integraciones opt-in compilan.
+- Cliente: pasaron 836 pruebas, 2 ignoradas, tanto seriales como en última ejecución
+  paralela predeterminada.
+  La primera ejecución paralela observó fallo en contador de métricas (2 vs 1);
+  reruns serial/paralelo predeterminado pasaron sin cambiar fuente cliente. Se
+  conserva esta observación, sin afirmar que todas las corridas pasaron ni atribuir
+  causa demostrada.
+- Clippy all-target con warnings denegados del workspace raíz/cliente de cuatro
+  miembros, formato y diff checks pasaron. Crate Rust `gen` compila con esquema
+  vendorizado sin ruta/fallback Java.
+- SQL native-sni: ocho casos escritura/DML/streaming pasaron (44,16s), incluido
+  ejemplo query nativo compilado aparte contra log/KV desde ruta nueva.
+- Endpoint STS Rust nuevo pasó **preflight** RustFS real (15,84s): servidor emitió
+  credenciales de 900 s y primer scan remoto tuvo éxito. No afirma repetir prueba
+  de expiración/renovación 900 s; evidencia histórica de expiración completa tiene
+  alcance separado.
+- Grafos locked resueltos siguen en 453 paquetes raíz / 431 cliente, DataFusion
+  55.1/Arrow59 sin cambios y sin dependencias activas bindings no-Rust.
+- Worktrees enlazados conservan sus HEAD y resuelven directorio Git común nuevo.
+  El proyecto conserva su historial y binding predeterminado `hotlap`; se retiró el
+  alias local obsoleto del directorio.
 
-Removed source/ignored local artifacts are preserved under
-`/tmp/opencode/hotlap-retired-source`, including the entire Java tree, bindings,
-website/tooling and old project virtualenv/wheels/caches. This archive is not a
-build fallback or deliverable. External `../lab` installations were untouched.
+Las fuentes/artefactos locales ignorados retirados se conservan en
+`/tmp/opencode/hotlap-retired-source`, incluido árbol Java, bindings, sitio,
+herramientas y virtualenv/wheels/caches antiguos. El archivo no es fallback de build
+ni entregable. Instalaciones externas `../lab` no se modificaron.
 
-The directory rename is a local filesystem operation. Git versions the
-Rust-only source, branding and metadata
-changes, while GitHub remote repository naming is a separate operation.
+El cambio de nombre del directorio es una operación local del filesystem. Git
+versiona fuentes Rust, marca y metadatos; el nombre del repositorio GitHub es otra
+operación.
