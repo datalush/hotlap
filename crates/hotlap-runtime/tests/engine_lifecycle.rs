@@ -96,7 +96,10 @@ fn source_error_is_surfaced() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(raised, "engine did not surface the source error");
-    handle.shutdown().unwrap();
+    let error = handle
+        .shutdown()
+        .expect_err("source error must survive shutdown");
+    assert!(error.to_string().contains("boom"), "got {error}");
 }
 
 #[test]

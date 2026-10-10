@@ -118,5 +118,8 @@ fn failure_disables_periodic_checkpoints() {
         None,
         "no checkpoint may publish after a failure"
     );
-    handle.shutdown().unwrap();
+    let error = handle
+        .shutdown()
+        .expect_err("source failure must survive shutdown");
+    assert!(error.to_string().contains("read boom"), "got {error}");
 }

@@ -101,7 +101,10 @@ fn assert_stopped(b: Arc<ControlledB>, b_tx: Vec<harness::BatchSender>, handle: 
         },
     );
     assert!(build.is_err(), "view builds must stay rejected");
-    handle.shutdown().unwrap();
+    let error = handle
+        .shutdown()
+        .expect_err("checkpoint failure must survive shutdown");
+    assert!(error.to_string().contains("checkpoint"), "got {error}");
 }
 
 #[test]

@@ -144,7 +144,38 @@ impl EngineHandle {
         let joined = self.stop();
         let closed = self.take_close_error();
         let cancelled = self.take_cancel_error();
-        joined.and(closed).and(cancelled)
+        joined.and(closed).and(cancelled)?;
+        if !self
+            .shared
+            .close_clean
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Some(error) = self
+                .shared
+                .last_error
+                .lock()
+                .map_err(|_| ConnectorError::Infrastructure("runtime error state poisoned".into()))?
+                .as_ref()
+            {
+                return Err(ConnectorError::Infrastructure(format!(
+                    "runtime failure: {error}"
+                )));
+            }
+            if let Some(error) = self
+                .shared
+                .checkpoint_error
+                .lock()
+                .map_err(|_| {
+                    ConnectorError::Infrastructure("checkpoint error state poisoned".into())
+                })?
+                .as_ref()
+            {
+                return Err(ConnectorError::Infrastructure(format!(
+                    "checkpoint failure: {error}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Ask the engine to stop and join its thread, if still running.

@@ -126,7 +126,10 @@ fn assert_stops(pipeline: Pipeline, b: Arc<ControlledB>, b_tx: Vec<BatchSender>)
         "B must not continue after fail-stop"
     );
     assert!(handle.checkpoint().is_err(), "checkpoint must be rejected");
-    handle.shutdown().unwrap();
+    let error = handle
+        .shutdown()
+        .expect_err("runtime failure must survive shutdown");
+    assert!(error.to_string().contains("runtime failure"), "got {error}");
 }
 
 #[test]

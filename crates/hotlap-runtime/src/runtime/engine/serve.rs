@@ -120,6 +120,7 @@ async fn handle(
         &mut engine.checkpointer,
         failed,
         &shared.close_clean,
+        &shared.checkpoint_error,
     )
     .await
 }

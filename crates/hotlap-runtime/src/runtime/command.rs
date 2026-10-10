@@ -50,6 +50,7 @@ pub(crate) async fn handle(
     checkpointer: &mut Option<Checkpointer>,
     failed: &mut bool,
     close_clean: &AtomicBool,
+    checkpoint_error: &Mutex<Option<String>>,
 ) -> bool {
     match cmd {
         Some(Command::Snapshot { view, reply }) => {
@@ -70,6 +71,11 @@ pub(crate) async fn handle(
             }
             if result.is_err() && checkpointer.as_ref().is_some_and(inconsistent) {
                 *failed = true;
+                if let Err(error) = &result {
+                    if let Ok(mut slot) = checkpoint_error.lock() {
+                        slot.get_or_insert_with(|| error.to_string());
+                    }
+                }
             }
             let _ = reply.send(result);
             false

@@ -161,7 +161,15 @@ fn ack_failure_stops_the_runtime_and_rejects_later_checkpoints() {
     assert!(build.unwrap_err().to_string().contains("runtime failure"));
 
     assert!(b.applied().offsets.is_empty());
-    handle.shutdown().unwrap();
+    let shutdown_error = handle
+        .shutdown()
+        .expect_err("source failure must survive shutdown");
+    assert!(
+        shutdown_error
+            .to_string()
+            .contains("ack failed for split 0"),
+        "shutdown should preserve the original source failure: {shutdown_error}"
+    );
 }
 
 #[test]

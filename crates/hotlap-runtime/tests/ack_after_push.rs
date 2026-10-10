@@ -174,5 +174,8 @@ fn a_failed_push_never_advances_the_offset() {
         ledger.applied().is_empty(),
         "a failed push must not be acked; state() must stay behind applied"
     );
-    handle.shutdown().unwrap();
+    let error = handle
+        .shutdown()
+        .expect_err("push failure must survive shutdown");
+    assert!(error.to_string().contains("runtime failure"), "got {error}");
 }

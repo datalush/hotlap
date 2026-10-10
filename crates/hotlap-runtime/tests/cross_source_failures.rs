@@ -135,6 +135,9 @@ fn read_error_stops_the_session_and_keeps_only_acked_rows() {
         );
         let select = session.sql("SELECT k, lv, rv FROM j").expect("select");
         assert_eq!(query_rows(select), vec![vec![1, 10, 20]]);
-        session.shutdown().expect("shutdown");
+        let error = session
+            .shutdown()
+            .expect_err("session shutdown must report source failure");
+        assert!(error.to_string().contains("read boom"), "got {error}");
     });
 }
