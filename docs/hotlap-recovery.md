@@ -78,8 +78,11 @@ o abrir cualquier writer, y `Recovery::resume` vuelve a validar la identidad por
 su cuenta (no confía en el caller). La sesión SQL valida el mismo registro contra
 las vistas compiladas **antes** de que el `SinkFactory` abra un writer, y el
 `Pipeline` público lo valida **antes** de arrancar el pump; la sesión también
-compara las fuentes declaradas con el último checkpoint válido antes de abrir
-sinks o iniciar lecturas. El commit EOF requiere
+compara fuentes y vistas contra la misma elección de recovery antes de abrir
+sinks o iniciar lecturas. Para promover un commit pendiente, `SinkFactory` debe
+declarar `may_redrive_commit(options)` y el sink abierto debe confirmar esa
+capacidad; el valor por defecto es `false` y Fluss no declara re-drive durable.
+El commit EOF requiere
 además un cierre global sano, nunca se infiere solo de EOF. Así un rechazo deja
 `factory creates`, reads y commits en cero. En SQL, el preflight consulta
 `SinkFactory::accepts_retractions(options)` antes de abrir writers y revalida la

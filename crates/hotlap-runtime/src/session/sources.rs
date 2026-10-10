@@ -100,6 +100,7 @@ impl SqlSession {
         &mut self,
         views: &[(String, Plan)],
         replay_safe: bool,
+        redriable: bool,
         sources: &Sources,
     ) -> Result<(), SqlError> {
         let Some(config) = self.checkpoint.take() else {
@@ -116,7 +117,7 @@ impl SqlSession {
             .collect();
         let checkpointer = Checkpointer::new(config.backend, config.retain);
         let result = checkpointer
-            .validate_sources_and_views(sources, &declared, replay_safe)
+            .validate_sources_and_views(sources, &declared, replay_safe, redriable)
             .map_err(view_identity_err);
         self.checkpoint = Some(CheckpointConfig {
             interval: config.interval,

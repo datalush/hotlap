@@ -39,6 +39,12 @@ pub trait SinkFactory: Send + Sync {
     fn may_create_transactional(&self, _options: &BTreeMap<String, String>) -> bool {
         true
     }
+
+    /// Whether a sink created for `options` can durably re-drive an interrupted
+    /// commit after process restart. Unknown factories default to `false`.
+    fn may_redrive_commit(&self, _options: &BTreeMap<String, String>) -> bool {
+        false
+    }
 }
 
 /// Builds a [`FlussSink`] from the DDL options (`bootstrap`, `table`).
@@ -109,6 +115,14 @@ impl SqlSession {
             {
                 return Err(SqlError::Unsupported(format!(
                     "sink factory declared `{}` non-transactional but created a transactional sink",
+                    definition.name
+                )));
+            }
+            if self.sink_factory.may_redrive_commit(&definition.options)
+                && !sink.sink.commit_redriable()
+            {
+                return Err(SqlError::Unsupported(format!(
+                    "sink factory declared `{}` re-drivable but created a non-re-drivable sink",
                     definition.name
                 )));
             }

@@ -13,47 +13,66 @@ impl Checkpointer {
         sources: &Sources,
         declared: &[SavedView],
         replay_safe: bool,
+        redriable: bool,
     ) -> Result<(), ConnectorError> {
-        if let Some(checkpoint) = self.newest_valid()? {
+        if let Some(checkpoint) = self.selected_checkpoint(replay_safe, redriable)? {
             checkpoint.sources.validate(sources, &checkpoint.engine)?;
-        }
-        self.validate_views_with_replay_safety(declared, replay_safe)
-    }
-
-    /// Every candidate checkpoint's named views must match `declared`.
-    pub fn validate_views(&self, declared: &[SavedView]) -> Result<(), ConnectorError> {
-        self.validate_views_with_replay_safety(declared, self.replay_safe())
-    }
-
-    /// Validate names using the recovery-safety declaration available before
-    /// session sink factories are opened.
-    pub(crate) fn validate_views_with_replay_safety(
-        &self,
-        declared: &[SavedView],
-        replay_safe: bool,
-    ) -> Result<(), ConnectorError> {
-        let valid = self.newest_valid()?;
-        if let Some(checkpoint) = &valid {
-            checkpoint
-                .sources
-                .validate_views(declared, &checkpoint.engine)?;
-        }
-        let floor = valid.as_ref().map(|checkpoint| checkpoint.id);
-        if let Some(id) = self.pending_commit(floor)? {
-            let Some(checkpoint) = self.read_body_for_recovery(id)? else {
-                if !replay_safe {
-                    return Err(ConnectorError::Unsupported(
-                        "a transactional sink cannot safely recover a corrupt pending checkpoint"
-                            .into(),
-                    ));
-                }
-                return Ok(());
-            };
             checkpoint
                 .sources
                 .validate_views(declared, &checkpoint.engine)?;
         }
         Ok(())
+    }
+
+    /// Every candidate checkpoint's named views must match `declared`.
+    pub fn validate_views(&self, declared: &[SavedView]) -> Result<(), ConnectorError> {
+        self.validate_views_with_capabilities(declared, self.replay_safe(), self.redriable())
+    }
+
+    /// Validate names using the recovery-safety declaration available before
+    /// session sink factories are opened.
+    pub(crate) fn validate_views_with_capabilities(
+        &self,
+        declared: &[SavedView],
+        replay_safe: bool,
+        redriable: bool,
+    ) -> Result<(), ConnectorError> {
+        if let Some(checkpoint) = self.selected_checkpoint(replay_safe, redriable)? {
+            checkpoint
+                .sources
+                .validate_views(declared, &checkpoint.engine)?;
+        }
+        Ok(())
+    }
+
+    fn selected_checkpoint(
+        &self,
+        replay_safe: bool,
+        redriable: bool,
+    ) -> Result<Option<Checkpoint>, ConnectorError> {
+        let valid = self.newest_valid()?;
+        let floor = valid.as_ref().map(|checkpoint| checkpoint.id);
+        let Some(id) = self.pending_commit(floor)? else {
+            return Ok(valid);
+        };
+        if self.prepare_pending(id)? {
+            if !replay_safe {
+                return Err(ConnectorError::Unsupported(
+                    "an interrupted prepare cannot be recovered with transactional sinks".into(),
+                ));
+            }
+            return Ok(valid);
+        }
+        let pending = self.read_body_for_recovery(id)?;
+        if redriable && pending.is_some() {
+            return Ok(pending);
+        }
+        if !replay_safe {
+            return Err(ConnectorError::Unsupported(
+                "a transactional sink cannot safely recover an interrupted checkpoint".into(),
+            ));
+        }
+        Ok(valid)
     }
 
     /// Newest checkpoint with a valid marker that decodes, or `None`.

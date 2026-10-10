@@ -61,6 +61,38 @@ fn seed(backend: &SharedBackend) {
     session.shutdown().unwrap();
 }
 
+fn seed_single_view(backend: &SharedBackend) {
+    let mut session = Session::open(config(
+        backend,
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    ))
+    .unwrap();
+    session.sql(SOURCE).unwrap();
+    session.sql(VIEW_A).unwrap();
+    session.sql("START;").unwrap();
+    session.checkpoint().unwrap();
+    session.shutdown().unwrap();
+}
+
+fn pending_with_extra_view(backend: &SharedBackend) {
+    let pending = SharedBackend::default();
+    seed(&pending);
+    let mut writer = backend.clone();
+    for part in ["engine", "sources"] {
+        let body = pending
+            .get(format!("checkpoint/1/{part}").as_bytes())
+            .unwrap()
+            .unwrap();
+        writer
+            .put(format!("checkpoint/2/{part}").as_bytes(), body)
+            .unwrap();
+    }
+    writer
+        .put(b"checkpoint/2/prepare", b"prepare-v1".to_vec())
+        .unwrap();
+}
+
 fn corrupt_pending(backend: &SharedBackend) {
     let mut writer = backend.clone();
     for part in ["engine", "sources"] {
@@ -99,5 +131,24 @@ fn changed_valid_fallback_is_rejected_before_any_factory_effect() {
     assert!(matches!(error, SessionError::Sql(SqlError::Unsupported(_))));
     assert_eq!(creates.load(Ordering::SeqCst), 0);
     assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
+}
+
+#[test]
+fn discarded_prepare_registry_does_not_override_the_fallback() {
+    let backend = SharedBackend::default();
+    seed_single_view(&backend);
+    pending_with_extra_view(&backend);
+    let mut session = Session::open(config(
+        &backend,
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(AtomicU32::new(0)),
+    ))
+    .unwrap();
+    session.sql(SOURCE).unwrap();
+    session.sql(VIEW_A).unwrap();
+
+    assert!(session.sql("START;").is_ok());
+    session.shutdown().unwrap();
     assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
 }
