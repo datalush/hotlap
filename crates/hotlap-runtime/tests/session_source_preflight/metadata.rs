@@ -48,7 +48,6 @@ impl Source for MetadataSource {
     fn state(&self) -> SourceState {
         SourceState {
             offsets: std::collections::BTreeMap::from([(0, 1)]),
-            ..SourceState::default()
         }
     }
 

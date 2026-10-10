@@ -12,7 +12,8 @@ use hotlap::state::StateBackend;
 use hotlap_connectors::error::ConnectorError;
 use hotlap_runtime::runtime::handle::EngineHandle;
 
-use fixture::{pipeline, redrive_sink, rows, seeded_compatible_registries, seeded_registries};
+use fixture::{pipeline, redrive_sink, seeded_compatible_registries, seeded_registries};
+use support::rows;
 
 #[test]
 fn incompatible_fallback_keeps_pending_marker_after_redrive_error() {

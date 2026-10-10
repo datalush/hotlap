@@ -16,10 +16,6 @@ use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
 
 use super::support::{Dataset, ResumableSource, SharedBackend, SpySource, filter, sources};
 
-#[path = "../common/recovery/ops.rs"]
-mod ops;
-pub use ops::rows;
-
 #[derive(Default)]
 pub struct DurableRemote {
     pub staged: bool,
@@ -125,9 +121,22 @@ fn seed_registry(
     let mut hotlap = Hotlap::open_with(Box::new(EngineCore::new()));
     pipeline::setup(&mut hotlap, &pipe).unwrap();
     let mut stream = pipe.sources.stream().unwrap();
-    ops::drain(&mut hotlap, &pipe.sources, &mut stream, consumed);
+    let mut pushed = 0;
+    while pushed < consumed {
+        let event = futures::executor::block_on(stream.next())
+            .expect("seed stream has enough rows")
+            .expect("seed source has no errors");
+        pipeline::ingest_event(&mut hotlap, &pipe.sources, &event).unwrap();
+        pipe.sources
+            .get(event.input)
+            .unwrap()
+            .source
+            .commit(event.batch.split, event.batch.next_offset)
+            .unwrap();
+        pushed += 1;
+    }
     let mut checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
-    ops::take(&mut checkpointer, &hotlap, &pipe.sources);
+    futures::executor::block_on(checkpointer.take(&hotlap, &pipe.sources)).unwrap();
 }
 
 fn copy_as_pending_commit(valid: &SharedBackend, pending: &SharedBackend) {
