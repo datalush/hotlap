@@ -7,7 +7,9 @@ mod source_fixture;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use arrow::array::Int64Array;
@@ -30,13 +32,27 @@ pub const VIEW_B: &str = "CREATE MATERIALIZED VIEW b AS SELECT k FROM src WHERE 
 pub const SINK_A: &str = "CREATE SINK outa WITH (connector='inmem') AS SELECT * FROM a;";
 pub const SINK_B: &str = "CREATE SINK outb WITH (connector='inmem') AS SELECT * FROM b;";
 
-struct TransactionalSink;
+#[derive(Default)]
+pub struct SessionSignals {
+    pub source_gate: Option<Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>>,
+    pub first_change: Option<mpsc::Sender<()>>,
+    pub source_ack: Option<mpsc::Sender<()>>,
+    pub source_read_ack: Option<mpsc::Sender<()>>,
+}
+
+struct TransactionalSink {
+    first_change: Mutex<Option<mpsc::Sender<()>>>,
+}
 
 #[async_trait::async_trait]
 impl Sink for TransactionalSink {
     async fn write(&self, mut changes: ChangeStream) -> Result<(), ConnectorError> {
         use futures::StreamExt;
-        while changes.next().await.is_some() {}
+        while changes.next().await.is_some() {
+            if let Some(signal) = self.first_change.lock().unwrap().take() {
+                let _ = signal.send(());
+            }
+        }
         Ok(())
     }
     fn capabilities(&self) -> SinkCapabilities {
@@ -53,6 +69,7 @@ impl Sink for TransactionalSink {
 struct TransactionalFactory {
     creates: Arc<AtomicU32>,
     may_create_transactional: bool,
+    first_change: Option<mpsc::Sender<()>>,
 }
 
 #[async_trait::async_trait]
@@ -64,7 +81,9 @@ impl SinkFactory for TransactionalFactory {
         _schema: SchemaRef,
     ) -> Result<Arc<dyn Sink>, SqlError> {
         self.creates.fetch_add(1, Ordering::SeqCst);
-        Ok(Arc::new(TransactionalSink))
+        Ok(Arc::new(TransactionalSink {
+            first_change: Mutex::new(self.first_change.clone()),
+        }))
     }
 
     fn may_create_transactional(&self, _options: &BTreeMap<String, String>) -> bool {
@@ -78,16 +97,21 @@ pub fn config(
     creates: Arc<AtomicU32>,
     may_create_transactional: bool,
     spies: Arc<std::sync::Mutex<Vec<Arc<SourceProbe>>>>,
+    signals: SessionSignals,
 ) -> SessionConfig {
     SessionConfig::new()
         .with_source_factory(Arc::new(ProbeFactory {
             dataset: ProbeDataset::new(vec![vec![1]]).with_retention(0),
             spies,
             reads,
+            source_gate: signals.source_gate,
+            source_ack: signals.source_ack,
+            source_read_ack: signals.source_read_ack,
         }))
         .with_sink_factory(Arc::new(TransactionalFactory {
             creates,
             may_create_transactional,
+            first_change: signals.first_change,
         }))
         .with_checkpoint(
             Duration::from_secs(3600),
@@ -105,19 +129,28 @@ pub fn declare(session: &mut Session) {
 }
 
 pub fn seed(backend: &SharedBackend) {
+    let (release_source, source_gate) = tokio::sync::oneshot::channel();
+    let (source_ack, output) = mpsc::channel();
     let mut session = Session::open(config(
         backend,
         Arc::new(AtomicU32::new(0)),
         Arc::new(AtomicU32::new(0)),
         true,
         Arc::new(std::sync::Mutex::new(Vec::new())),
+        SessionSignals {
+            source_gate: Some(Arc::new(Mutex::new(Some(source_gate)))),
+            source_ack: Some(source_ack),
+            ..SessionSignals::default()
+        },
     ))
     .expect("open seed session");
     session.sql(SOURCE).expect("create source");
     session.sql(VIEW_A).expect("create a");
     session.sql(VIEW_B).expect("create b");
     session.sql("START;").expect("start seed");
-    wait_for_output(&session);
+    let _ = release_source.send(());
+    wait_for_output(output);
+    assert_eq!(rows(&session), vec![vec![1]]);
     assert_eq!(session.checkpoint().unwrap(), 1);
     session.shutdown().expect("shutdown seed");
 }
@@ -161,13 +194,14 @@ pub fn rows(session: &Session) -> Vec<Vec<i64>> {
         .collect()
 }
 
-pub fn wait_for_output(session: &Session) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if rows(session) == vec![vec![1]] {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    panic!("seed output did not arrive");
+pub fn wait_for_output(output: mpsc::Receiver<()>) {
+    output
+        .recv_timeout(Duration::from_secs(5))
+        .expect("source did not acknowledge an applied batch");
+}
+
+pub fn wait_for_source_read(output: mpsc::Receiver<()>) {
+    output
+        .recv_timeout(Duration::from_secs(5))
+        .expect("source read did not start after recovery");
 }
