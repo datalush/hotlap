@@ -76,6 +76,7 @@ fn ancestors_including_root(path: &Path) -> Vec<PathBuf> {
 struct RecordingFs {
     synced: RefCell<Vec<PathBuf>>,
     fail_sync: Option<(PathBuf, io::ErrorKind)>,
+    fail_probe: Option<(PathBuf, io::ErrorKind)>,
 }
 
 impl RecordingFs {
@@ -83,6 +84,7 @@ impl RecordingFs {
         Self {
             synced: RefCell::new(Vec::new()),
             fail_sync: Some((path, io::ErrorKind::PermissionDenied)),
+            fail_probe: None,
         }
     }
 
@@ -90,13 +92,38 @@ impl RecordingFs {
         Self {
             synced: RefCell::new(Vec::new()),
             fail_sync: Some((path, kind)),
+            fail_probe: None,
+        }
+    }
+
+    fn failing_probe_on(path: PathBuf, kind: io::ErrorKind) -> Self {
+        Self {
+            synced: RefCell::new(Vec::new()),
+            fail_sync: None,
+            fail_probe: Some((path, kind)),
         }
     }
 }
 
 impl FsOps for RecordingFs {
     fn exists(&self, path: &Path) -> bool {
+        if self
+            .fail_probe
+            .as_ref()
+            .is_some_and(|(failed_path, _)| failed_path == path)
+        {
+            return false;
+        }
         RealFs.exists(path)
+    }
+
+    fn dir_exists(&self, path: &Path) -> io::Result<bool> {
+        if let Some((failed_path, kind)) = &self.fail_probe
+            && failed_path == path
+        {
+            return Err(io::Error::from(*kind));
+        }
+        RealFs.dir_exists(path)
     }
 
     fn create_dir(&self, dir: &Path) -> io::Result<()> {
@@ -329,6 +356,24 @@ fn delete_retry_syncs_absent_file_parent_chain_before_idempotent_success() {
 }
 
 #[test]
+fn delete_propagates_directory_probe_failure_after_unlink() {
+    let scratch = Scratch::new("delete-probe-fail");
+    let dir = scratch.path().join("a");
+    fs::create_dir(&dir).unwrap();
+    let file = dir.join("k");
+    fs::write(&file, b"v").unwrap();
+    let ops = RecordingFs::failing_probe_on(dir.clone(), io::ErrorKind::PermissionDenied);
+
+    assert_eq!(
+        remove_file_pruning(&ops, &file, scratch.path())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(!file.exists());
+}
+
+#[test]
 fn delete_retry_repairs_pruned_directories_from_nearest_existing_ancestor() {
     let scratch = Scratch::new("delete-pruned-retry");
     let inner = scratch.path().join("a").join("b");
@@ -348,4 +393,59 @@ fn delete_retry_repairs_pruned_directories_from_nearest_existing_ancestor() {
     let retry = RecordingFs::default();
     assert!(!remove_file_pruning(&retry, &file, scratch.path()).unwrap());
     assert_eq!(&*retry.synced.borrow(), &[scratch.path().to_path_buf()]);
+}
+
+#[test]
+fn delete_retry_syncs_nearest_surviving_ancestor_after_partial_prune() {
+    let scratch = Scratch::new("delete-partial-retry");
+    let inner = scratch.path().join("a").join("b");
+    fs::create_dir_all(&inner).unwrap();
+    let file = inner.join("k");
+    fs::write(&file, b"v").unwrap();
+
+    let nearest = scratch.path().join("a");
+    let first = RecordingFs::failing_on(nearest.clone());
+    assert_eq!(
+        remove_file_pruning(&first, &file, scratch.path())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(!inner.exists());
+    assert!(nearest.is_dir());
+    assert!(scratch.path().is_dir());
+
+    let second = RecordingFs::failing_on_kind(nearest.clone(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        remove_file_pruning(&second, &file, scratch.path())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(&*second.synced.borrow(), std::slice::from_ref(&nearest));
+
+    let third = RecordingFs::default();
+    assert!(!remove_file_pruning(&third, &file, scratch.path()).unwrap());
+    assert_eq!(
+        &*third.synced.borrow(),
+        &[nearest, scratch.path().to_path_buf()]
+    );
+}
+
+#[test]
+fn delete_with_empty_relative_root_syncs_current_directory_boundary() {
+    let scratch = Scratch::new_relative("delete-dot-root");
+    let inner = scratch.path().join("a");
+    fs::create_dir(&inner).unwrap();
+    let file = inner.join("k");
+    fs::write(&file, b"v").unwrap();
+    let ops = RecordingFs::default();
+
+    assert!(remove_file_pruning(&ops, &file, Path::new("")).unwrap());
+
+    assert!(!scratch.path().exists());
+    assert_eq!(
+        &*ops.synced.borrow(),
+        &[inner, scratch.path().to_path_buf(), PathBuf::from("."),]
+    );
 }

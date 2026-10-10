@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 /// can observe the order of syncs and force failures against a real tree.
 pub(super) trait FsOps {
     fn exists(&self, path: &Path) -> bool;
+    fn dir_exists(&self, path: &Path) -> io::Result<bool>;
     fn create_dir(&self, dir: &Path) -> io::Result<()>;
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
     fn remove_file(&self, file: &Path) -> io::Result<()>;
@@ -22,6 +23,15 @@ pub(super) struct RealFs;
 impl FsOps for RealFs {
     fn exists(&self, path: &Path) -> bool {
         path.exists()
+    }
+
+    fn dir_exists(&self, path: &Path) -> io::Result<bool> {
+        match fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => Ok(true),
+            Ok(_) => Err(io::Error::from(io::ErrorKind::NotADirectory)),
+            Err(error) if is_absent(error.kind()) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn create_dir(&self, dir: &Path) -> io::Result<()> {
@@ -118,11 +128,22 @@ pub(super) fn remove_file_pruning(ops: &impl FsOps, file: &Path, root: &Path) ->
     };
     // Even an absent file can mean an earlier attempt unlinked it but failed
     // syncing its parent. Retry all surviving directory links to the root.
+    // An empty backend root denotes the current directory, never its parent.
+    let boundary = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
     let mut modified = file.parent();
     while let Some(path) = modified {
-        if ops.exists(path) {
+        let path = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        if ops.dir_exists(path)? {
             ops.sync_dir(path)?;
-            if removed && path != root {
+            if removed && path != boundary {
                 match ops.remove_dir(path) {
                     Ok(()) => modified = path.parent(),
                     // A non-empty dir keeps its ancestors non-empty too.
@@ -136,7 +157,7 @@ pub(super) fn remove_file_pruning(ops: &impl FsOps, file: &Path, root: &Path) ->
                 continue;
             }
         }
-        if path == root {
+        if path == boundary {
             break;
         }
         modified = path.parent();

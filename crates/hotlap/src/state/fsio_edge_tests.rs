@@ -26,6 +26,14 @@ impl FsOps for FakeFs {
         self.present.iter().any(|present| present == _path)
     }
 
+    fn dir_exists(&self, path: &Path) -> io::Result<bool> {
+        if self.exists(path) {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn create_dir(&self, dir: &Path) -> io::Result<()> {
         self.created.borrow_mut().push(dir.to_path_buf());
         Ok(())
