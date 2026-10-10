@@ -8,6 +8,9 @@ use hotlap_connectors::fluss::sink::FlussSink;
 use hotlap_connectors::sink::Sink;
 use hotlap_sql::error::SqlError;
 
+use super::SqlSession;
+use crate::runtime::pipeline::SinkSpec;
+
 /// Builds engine sinks from `CREATE SINK` options and the target view schema.
 #[async_trait::async_trait]
 pub trait SinkFactory: Send + Sync {
@@ -67,6 +70,50 @@ impl SinkFactory for FlussSinkFactory {
 
     fn may_create_transactional(&self, _options: &BTreeMap<String, String>) -> bool {
         false
+    }
+}
+
+impl SqlSession {
+    /// Open every declared sink via the factory, resolving its view schema.
+    pub(super) async fn build_sinks(&self) -> Result<Vec<SinkSpec>, SqlError> {
+        let mut sinks = Vec::with_capacity(self.sinks.len());
+        for def in &self.sinks {
+            let schema = self
+                .mv_schemas
+                .get(&def.view)
+                .cloned()
+                .ok_or_else(|| SqlError::Catalog(format!("unknown view: {}", def.view)))?;
+            let sink = self
+                .sink_factory
+                .create(&def.name, &def.options, schema)
+                .await?;
+            sinks.push(SinkSpec {
+                view: def.view.clone(),
+                sink,
+            });
+        }
+        Ok(sinks)
+    }
+
+    /// Ensure the opened sink did not contradict its preflight declaration.
+    pub(super) fn validate_recovery_declarations(
+        &self,
+        sinks: &[SinkSpec],
+    ) -> Result<(), SqlError> {
+        for (definition, sink) in self.sinks.iter().zip(sinks) {
+            if !self
+                .sink_factory
+                .may_create_transactional(&definition.options)
+                && sink.sink.capabilities()
+                    == hotlap_connectors::sink::SinkCapabilities::Transactional
+            {
+                return Err(SqlError::Unsupported(format!(
+                    "sink factory declared `{}` non-transactional but created a transactional sink",
+                    definition.name
+                )));
+            }
+        }
+        Ok(())
     }
 }
 

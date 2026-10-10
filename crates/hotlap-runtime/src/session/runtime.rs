@@ -12,7 +12,7 @@ use hotlap_sql::mv_schema::mv_schema;
 use super::mv_provider::MvTableProvider;
 use super::{QueryResult, Snapshotter, SqlError, SqlSession, to_engine};
 use crate::runtime::handle::EngineHandle;
-use crate::runtime::pipeline::{Pipeline, SinkSpec};
+use crate::runtime::pipeline::Pipeline;
 
 impl SqlSession {
     /// Start the engine with the declared source and views.
@@ -108,7 +108,7 @@ impl SqlSession {
             .all(|sink| !self.sink_factory.may_create_transactional(&sink.options));
         self.validate_recovery_views(&views, replay_safe)?;
         let sinks = self.build_sinks().await?;
-        self.validate_sink_recovery_declarations(&sinks)?;
+        self.validate_recovery_declarations(&sinks)?;
         let sources = self.build_sources(bindings)?;
         let mut pipeline = Pipeline {
             sources,
@@ -122,45 +122,6 @@ impl SqlSession {
         // a rejected pipeline never drops the durable config a retry needs.
         pipeline.checkpoint = self.checkpoint.take();
         Ok(pipeline)
-    }
-
-    /// Ensure the opened sink did not contradict its preflight declaration.
-    fn validate_sink_recovery_declarations(&self, sinks: &[SinkSpec]) -> Result<(), SqlError> {
-        for (definition, sink) in self.sinks.iter().zip(sinks) {
-            if !self
-                .sink_factory
-                .may_create_transactional(&definition.options)
-                && sink.sink.capabilities()
-                    == hotlap_connectors::sink::SinkCapabilities::Transactional
-            {
-                return Err(SqlError::Unsupported(format!(
-                    "sink factory declared `{}` non-transactional but created a transactional sink",
-                    definition.name
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Open every declared sink via the factory, resolving its view schema.
-    async fn build_sinks(&self) -> Result<Vec<SinkSpec>, SqlError> {
-        let mut sinks = Vec::with_capacity(self.sinks.len());
-        for def in &self.sinks {
-            let schema = self
-                .mv_schemas
-                .get(&def.view)
-                .cloned()
-                .ok_or_else(|| SqlError::Catalog(format!("unknown view: {}", def.view)))?;
-            let sink = self
-                .sink_factory
-                .create(&def.name, &def.options, schema)
-                .await?;
-            sinks.push(SinkSpec {
-                view: def.view.clone(),
-                sink,
-            });
-        }
-        Ok(sinks)
     }
 
     /// Build a view on the running engine and expose it as an MV table.
