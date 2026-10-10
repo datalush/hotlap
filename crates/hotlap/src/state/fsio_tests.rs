@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::fsio::{FsOps, RealFs, create_dirs_synced_with, remove_file_pruning};
+use super::fsio::{FsOps, RealFs, create_dirs_synced_with, remove_file_pruning, sync_dir_with};
 
 /// Scratch directory removed on drop.
 struct Scratch(PathBuf);
@@ -23,6 +23,17 @@ impl Scratch {
         let name = format!("hotlap-fsio-{tag}-{}-{nanos}", std::process::id());
         let path = std::env::temp_dir().join(name);
         fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn new_relative(tag: &str) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("hotlap-fsio-{tag}-{}-{nanos}", std::process::id());
+        let path = PathBuf::from(".").join(name);
+        fs::create_dir(&path).unwrap();
         Self(path)
     }
 
@@ -42,6 +53,9 @@ fn ancestors_including_root(path: &Path) -> Vec<PathBuf> {
     let mut current = path;
     loop {
         paths.push(current.to_path_buf());
+        if current == Path::new(".") {
+            break;
+        }
         let Some(parent) = current.parent() else {
             break;
         };
@@ -162,6 +176,62 @@ fn retry_propagates_not_found_from_an_existing_parent_sync() {
             scratch.path().to_path_buf(),
         ]
     );
+}
+
+#[test]
+fn retry_propagates_parent_failure_before_later_success_on_same_tree() {
+    let scratch = Scratch::new_relative("retry-three-attempts");
+    let target = scratch.path().join("a").join("b");
+    let anchor = scratch.path().to_path_buf();
+
+    let first = RecordingFs::failing_on(anchor.clone());
+    let error = create_dirs_synced_with(&first, &target).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(target.is_dir());
+    assert_eq!(
+        &*first.synced.borrow(),
+        &[
+            target.clone(),
+            target.parent().unwrap().to_path_buf(),
+            anchor.clone(),
+        ]
+    );
+
+    let second = RecordingFs::failing_on_kind(anchor.clone(), io::ErrorKind::NotFound);
+    let error = create_dirs_synced_with(&second, &target).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(target.is_dir());
+    assert_eq!(
+        &*second.synced.borrow(),
+        &[
+            target.clone(),
+            target.parent().unwrap().to_path_buf(),
+            anchor,
+        ]
+    );
+
+    let third = RecordingFs::default();
+    create_dirs_synced_with(&third, &target).unwrap();
+    assert!(target.is_dir());
+    assert_eq!(&*third.synced.borrow(), &ancestors_including_root(&target));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_directory_sync_propagates_invalid_input() {
+    let error = RealFs.sync_dir(Path::new("/proc")).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn directory_sync_propagates_unsupported() {
+    let error = sync_dir_with(Path::new("."), |_| {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    })
+    .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 }
 
 #[test]

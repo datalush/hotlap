@@ -148,22 +148,19 @@ fn missing_ancestors(ops: &impl FsOps, dir: &Path) -> Vec<PathBuf> {
     missing
 }
 
-/// Fsync a directory. Some filesystems reject directory fsync; those errors are
-/// treated as a no-op so durability does not hinge on an optional feature, while
-/// genuine failures are surfaced.
+/// Fsync a directory. Every sync failure is returned because a successful
+/// durable-backend operation requires directory-sync support.
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    match File::open(dir).and_then(|handle| handle.sync_all()) {
-        Ok(()) => Ok(()),
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
-            ) =>
-        {
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
+    sync_dir_with(dir, |path| {
+        File::open(path).and_then(|handle| handle.sync_all())
+    })
+}
+
+pub(super) fn sync_dir_with(
+    dir: &Path,
+    sync: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    sync(dir)
 }
 
 /// Error kinds that mean "nothing stored here" rather than a real failure.

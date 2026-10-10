@@ -78,20 +78,24 @@ Implementaciones:
   recorren el subárbol relevante.
 - `put` es **atómico y duradero**: escribe `<name>.tmp`, hace `fsync`, renombra
   sobre el nombre final (`rename` atómico), y luego hace `fsync` del directorio
-  padre y de los ancestros recién creados (`state/fsio.rs`). Un fallo de
-  escritura **nunca** expone un valor a medio escribir, y un crash no pierde uno
-  ya confirmado.
-- La creación de directorios sincroniza cada directorio nuevo y el **primer
-  ancestro existente** que enlaza el subárbol, para que una entrada recién
-  creada sea durable. Con una raíz relativa sin componente existente, ese
-  ancestro es el directorio actual (`.`).
+  padre y de los ancestros recién creados (`state/fsio.rs`).
+- `open(root)` sincroniza toda la cadena de directorios existente hasta el
+  ancestro superior de la ruta; una ruta relativa llega a `.`. Así, un nuevo
+  intento vuelve a completar los syncs de enlaces que pudieron quedar pendientes
+  tras un `open` fallido, aunque el árbol ya exista.
+- Cada error de sincronización de directorio se propaga, incluidos
+  `InvalidInput` y `Unsupported`: el backend no declara éxito durable si el
+  filesystem no permite `fsync` de directorios. El objetivo soportado es Linux
+  sobre ext4; no se promete durabilidad en sistemas operativos o filesystems que
+  no soportan esta operación.
 - `delete` sincroniza **cada** directorio que pierde una entrada justo después
   del borrado y **antes** de podarlo; si el directorio se poda, su padre queda
   modificado y se sincroniza en el paso siguiente (incluido `root`, que nunca se
   poda). La ausencia se clasifica **sólo** a partir del borrado del fichero: un
   error posterior, aunque sea de tipo `NotFound`/`NotADirectory`, se **propaga**;
   la operación no se declara exitosa.
-- `open(root)` crea el directorio raíz (con `fsync` de directorios) si no existe.
+- `open(root)` crea el directorio raíz si no existe y sincroniza también los
+  directorios existentes de su cadena.
 
 > Nota: los tests de orden de `fsync` y de propagación de fallos inyectan el
 > fallo sobre un árbol de directorios real (`state/fsio_tests.rs`) o sobre un
