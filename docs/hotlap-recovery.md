@@ -1,38 +1,39 @@
-# Hotlap — recovery, dynamic views y verificación de durabilidad
+# Hotlap — recuperación, vistas dinámicas y durabilidad
 
 - Fecha: 2026-10-09
-- Estado: implementado, tests verdes
+- Estado histórico: implementación y pruebas registradas al 2026-10-09.
 - Alcance: recuperación de checkpoint + replay, vistas materializadas creadas
   tras `START` y cobertura de tests.
 - Complementa `docs/hotlap-durability.md` (backend, snapshot, checkpointer) y
   `docs/hotlap-sink-2pc.md` (2PC y ventana de commit).
 
-> Código y comentarios en **inglés**; este documento en español.
+> El documento está en español; el código y los comentarios del código, en inglés.
 
-## 1. Recovery: checkpoint + replay
+## 1. Recuperación: checkpoint y replay
 
 `Recovery` (`runtime/recovery.rs`):
 
 1. **Resolver un commit interrumpido** (`Recovery::inspect` / `start`): si hay
-   un marker `commit` sin `valid` con el cuerpo completo, C estaba en curso de
+   un marcador `commit` sin `valid` con el cuerpo completo, C estaba en curso de
    commit; se **promueve** (re-conducir commit + publicar `valid`) si todos los
-   sinks son re-conducibles; si ninguno es transaccional, se **descarta C con
-   señal explícita** y se replaya desde el anterior; y si algún sink es
-   **transaccional** y no re-conducible, se **rechaza** conservando el marcador y
-   el cuerpo, porque replayar podría duplicar una transacción confirmada (ver
-   `docs/hotlap-sink-2pc.md`). El rechazo también aplica cuando el cuerpo
-   pendiente **no se puede decodificar** y cuando la re-conducción falla con un
-   error no operativo: un sink transaccional impide caer a un predecesor. Sin
-   marker, este paso no hace nada. Si publicar el commit promovido falla de forma
-   **operativa** (`Storage`), el error **propaga** sin leer un fallback, sin
-   descartar el pending y sin reabrir ninguna fuente.
+    sinks son re-conducibles; si alguno no lo es y todos los sinks son no
+    transaccionales, se **descarta C con señal explícita** y se replaya desde el
+    anterior (un sink al menos una vez puede duplicar). Si participa **cualquier
+    sink transaccional**, se **rechaza** conservando marcador/cuerpo disponible
+    porque podría duplicarse una transacción confirmada (ver `hotlap-sink-2pc.md`).
+    Esto también rige si es re-conducible: cuerpo pendiente **ilegible** o fallo
+    de promoción no autoriza fallback/replay. Solo si no hay participantes
+    transaccionales puede descartarse y replayarse tras fallo no operativo de
+    re-conducción. Sin marker, este paso no hace nada. Si publicar el commit promovido
+   falla de forma **operativa** (`Storage`), el error **se propaga** sin fallback,
+   descartar lo pendiente ni reabrir fuentes.
 2. **Cargar el último checkpoint válido**: `latest` se lee solo para
    clasificarlo, no para elegir. Se escanea el namespace de más nuevo a más
    viejo y se toma el `valid` más nuevo, así un puntero `latest` que se quedó
    atrás (p.ej. su escritura falló) **no** oculta uno ya publicado. Un puntero
-   `latest` dañado o un cuerpo del formato actual **corrupto** (truncado, longitud
-   incoherente, payload ilegible) se saltan: un tip corrupto no aborta el arranque
-   mientras quede un predecesor válido. En cambio, un formato **ajeno o
+    `latest` dañado o un cuerpo del formato actual **corrupto** (truncado, longitud
+    incoherente, payload ilegible) o **ausente** se saltan como candidatos: un tip
+    incompleto no aborta el arranque mientras quede un predecesor válido. En cambio, un formato **ajeno o
    incompatible** (magic o versión desconocida, frame interno del motor o
    snapshot del engine con versión no soportada) o un checkpoint que **no valida**
    contra las fuentes declaradas (ids, schema, watermark, renombrado) es
@@ -46,16 +47,16 @@
    silencioso. Sin ningún checkpoint válido (y sin error fatal), es un
    **arranque limpio** (`None`).
 3. **Restaurar** el motor con `EngineSnapshot` (`hotlap.restore`).
-4. **Reabrir cada source** en los offsets capturados (`Source::resume`) y
-   **replayar** desde ahí, alimentando el mismo circuito.
+4. **Reabrir cada fuente** en offsets capturados (`Source::resume`) y
+   **reproducir** desde allí, alimentando el mismo circuito.
 
 Invariante de replay: `SourceState` guarda el offset del **siguiente** registro a
 leer (`records < offset` ya aplicados, `records >= offset` a replayar). Como los
 checkpoints se toman **entre polls** del source, reabrir en `offset` **ni pierde
 ni duplica** en la frontera.
 
-**Identidad por fuente.** El checkpoint es multifuente (§ `hotlap-durability.md`)
-y recovery reanuda **cada** fuente desde su propio offset aplicado: dos fuentes
+**Identidad por fuente.** El checkpoint es multifuente (ver `hotlap-durability.md`)
+y la recuperación reanuda **cada** fuente desde su propio offset aplicado: dos fuentes
 que usan `SplitId` 0 mantienen mapas de estado separados y no colapsan sus
 offsets. Un schema, lag o columna event-time incompatible se rechaza **antes** de
 restaurar o consumir.
@@ -76,8 +77,11 @@ desajuste es `Unsupported` **antes** de restaurar el motor, re-conducir un commi
 o abrir cualquier writer, y `Recovery::resume` vuelve a validar la identidad por
 su cuenta (no confía en el caller). La sesión SQL valida el mismo registro contra
 las vistas compiladas **antes** de que el `SinkFactory` abra un writer, y el
-`Pipeline` público lo valida **antes** de arrancar el pump y su commit EOF; así
-un rechazo deja `factory creates`, reads y commits en cero. El orden de
+`Pipeline` público lo valida **antes** de arrancar el pump; el commit EOF requiere
+además un cierre global sano, nunca se infiere solo de EOF. Así un rechazo deja
+`factory creates`, reads y commits en cero. En SQL, el preflight consulta
+`SinkFactory::accepts_retractions(options)` antes de abrir writers y revalida la
+capacidad del sink construido. El orden de
 declaración de las **fuentes** sigue siendo libre (ids canónicos y ordenados);
 solo el orden de las **vistas** cambia los handles y puede rechazarse
 explícitamente.
@@ -87,7 +91,7 @@ explícitamente.
 un error **explícito**: la recuperación falla ruidosamente en lugar de perder
 registros en silencio.
 
-## 2. Dynamic views (retención de inputs)
+## 2. Vistas dinámicas (retención de entradas)
 
 Permitir `CREATE MATERIALIZED VIEW` **después de `START`** requiere reconstruir
 el estado como si la vista hubiera existido desde el principio. El motor
@@ -118,80 +122,7 @@ pero un `build_view` post-start se rechaza **para siempre** en esa sesión. La
 persistencia de la historia de inputs (o el replay desde el source) es un
 follow-up fuera de alcance.
 
-## 3. Testing
+## 3. Cobertura de pruebas
 
-- **`StateBackend` durable** (`crates/hotlap/tests/state_backend.rs`): memoria y
-  durable coinciden para la misma secuencia; persistencia a través de reapertura;
-  namespace nuevo persistido; `put` atómico/sobrescritura; subdirectorios por
-  prefijo; `list` ignora restos no-hex. Errores en
-  `hotlap/tests/state_backend_errors.rs`.
-- **Checkpoint/restore** (`crates/hotlap-engine/tests/checkpoint.rs`):
-  `restore_then_continue_matches_no_restart` (differential). Codec en
-  `tests/codec.rs`: round-trip por frame binario, versión desconocida rechazada,
-  frames corruptos son errores (no `panic`).
-- **Checkpointer** (`hotlap-runtime/tests/`): `checkpoint.rs`
-  (`on_demand_checkpoint_is_coherent_and_readable`), `checkpoint_retention.rs`
-  (solo los N más nuevos), `checkpoint_periodic.rs` (disparo periódico, rechazo
-  sin config y supresión tras fail-stop).
-- **Identidad y errores** (`tests/checkpoint_identity.rs`,
-  `tests/checkpoint_storage_errors.rs`, `tests/checkpoint_reserve_faults.rs`,
-  `tests/checkpoint_recovery_selection.rs`,
-  `tests/checkpoint_recovery_storage.rs`): un id reservado no se reutiliza tras
-  un intento ambiguo (incluso con el mismo `Checkpointer`), un crash ni una poda,
-  y un `Checkpointer` nuevo parte del mayor id presente/reservado; el marker de
-  commit se conserva ante una escritura ambigua; la limpieza de un marker obsoleto
-  propaga `Storage`; recovery elige el `valid` más nuevo aunque `latest` se quede
-  atrás y un fallo de `get`/`list`/publicación se propaga sin descartar ni borrar
-  ni reabrir fuentes, mientras que la corrupción del formato actual se tolera y
-  una versión desconocida sigue siendo fatal. `tests/checkpoint_legacy_format.rs`
-  fija además que un snapshot v4 real (no sólo la versión mutada) es fatal: ni
-  cae al checkpoint anterior ni descarta el commit pendiente.
-- **2PC** (`tests/sink_barrier.rs`): transaccional prepara→commit→valid;
-  fallo **operativo** de escritura del cuerpo conserva el marker/cuerpo y no
-  aborta los sinks preparados; fallo de prepare aborta los ya preparados;
-  fallo de commit aborta el sink que falló y el resto de preparados sin
-  confirmar; fallo de flush idempotente aborta los transaccionales preparados;
-  idempotente se flushea sin prepare; at-least-once no se coordina.
-- **Checkpoint + sink** (`tests/checkpoint_sink.rs`): la barrera drena el canal
-  del sink antes de `valid`, de modo que un delta encolado nunca se pierde.
-- **Recovery** (`tests/recovery.rs`, `tests/recovery_startup.rs`):
-  crash + recovery ≡ sin crash; sin pérdida ni duplicado en la frontera;
-  checkpoint ausente = arranque limpio; `latest` corrupto cae a uno anterior;
-  retención insuficiente = error explícito.
-- **Commit recuperable** (`tests/recovery_commit_marker.rs`,
-  `tests/recovery_redrivable.rs`, `tests/recovery_pending_source.rs`,
-  `tests/cross_source_pending.rs`, `tests/cross_source_pending_schema.rs`): el
-  marker `commit` es durable antes de
-  `Sink::commit` y se borra tras `valid`; un commit interrumpido se **promueve**
-  (re-conduce commit, sin replay) o se **descarta** con señal explícita
-  (warning + `checkpoints_discarded`); `commit_redriable` se puede sobreescribir
-  por encima/debajo de la capacidad; sin marker, recovery coincide con el
-  válido más nuevo.
-- **Identidad de vistas** (`crates/hotlap-runtime/tests/view_identity.rs`,
-  `tests/view_identity_resume.rs`, `tests/view_identity_pipeline.rs`,
-  `tests/view_identity_session.rs`,
-  `crates/hotlap-engine/tests/restore_identity.rs` y la guarda del facade en
-  `crates/hotlap/src/engine/tests.rs`): dos vistas con el mismo schema y
-  contenido distinto declaradas en orden invertido, un nombre reutilizado con
-  otro plan, una vista eliminada (primera o **última**), handles duplicados en el
-  snapshot y un `Recovery::resume` con vista renombrada se rechazan
-  (`Unsupported`) antes de restaurar el motor o reabrir el source; la sesión SQL
-  y el `Pipeline` público lo rechazan antes de abrir un writer/arrancar el pump
-  (`factory creates`, reads y commits en cero), el checkpoint sobrevive al
-  rechazo para un reintento corregido y el registro completo sigue recuperando
-  ambas vistas.
-- **Dynamic views** (`crates/hotlap-engine/tests/dynamic_view.rs`):
-  `late_views_match_full_recomputation_and_keep_updating`,
-  `late_view_without_retention_is_rejected`,
-  `late_view_with_truncated_retention_is_rejected`; e2e SQL en
-  `crates/hotlap-runtime/tests/sql_dynamic_view.rs` y
-  `tests/sql_cross_source_late.rs`
-  (`view_created_after_start_matches_full_recomputation`).
-
-## 4. Verificación
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
+La matriz histórica de pruebas de backend, checkpoint, recuperación y vistas se
+conserva en [evidencia de recuperación](hotlap-recovery-evidence.md).

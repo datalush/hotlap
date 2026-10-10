@@ -15,7 +15,8 @@
 - Catálogo persistente o multisesión: el `Catalog` es en memoria y por sesión.
 - Escritura (`Sink`), 2PC o persistencia de estado: fuera de esta capa.
 - Dynamic views / `CREATE MV` tras `START`: cubierto por la durabilidad.
-- El kernel `crates/hotlap` no gana dependencias de Arrow ni DataFusion.
+- El kernel `crates/hotlap` conserva su propia representación columnar; Arrow y DataFusion
+  se usan en las fronteras y en la capa SQL.
 
 ## 2. Verificación
 
@@ -38,20 +39,16 @@ pendiente.
 
 ## 3. Límites conocidos (v1, low priority)
 
-Residuos de la implementación de SP3, no bloqueantes (parkeados con ruling). Los
-más sustantivos tienen issue de kata para repararse; el resto queda aquí:
+Residuos de la implementación, no bloqueantes (parkeados con ruling). El resto
+queda aquí:
 
 - **Proyección identidad laxa:** la proyección que DataFusion coloca sobre un
   `Aggregate` se desenvuelve comprobando solo que cada expresión sea una columna
   resoluble; no se valida que sea una identidad exacta (orden/subconjunto de
   columnas). `SELECT count(*), k ...` o `SELECT count(*) ...` se aceptan y su
   orden/subconjunto se descarta en favor del orden normalizado del kernel.
-  (Issue kata pendiente.)
-- **`built==false` enmascara errores:** el snapshot de una MV usa
-  `SnapshotHandle::is_built` (flag de motor, global) y, si el dataflow aún no se
-  ha construido, sirve **vacío** en vez de propagar un error del engine anterior
-  al primer push. Tolerable para el motor de v1; un motor con estados por input
-  necesitaría una señal por input. (Issue kata pendiente.)
+- **Snapshot de vista vacía:** una vista sin filas produce un snapshot vacío con
+  su esquema; las vistas restauradas también exponen el estado recuperado.
 - **Escáner DDL minimalista** (`ddl_scan.rs`): reconoce `k='v'` separados por
   comas; no cubre comillas escapadas ni comas dentro de literales. El anclaje de
   `WITH` no es estricto (busca la primera aparición) y la normalización de
@@ -98,4 +95,3 @@ El snapshot es la salida **consolidada** del motor
 (`hotlap-engine/src/core/output.rs`), verificado en
 `hotlap-sql/src/convert.rs` (unit) y `hotlap-runtime/tests/sql_cross_source_bag.rs`
 (paridad de `SELECT`/agregados contra un `VALUES` de DataFusion independiente).
-

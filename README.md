@@ -1,88 +1,86 @@
 # Hotlap
 
-Hotlap is a native Rust streaming engine with an Arrow-native incremental core
-(`hotlap-engine`) and an embedded SQL/DDL surface (`hotlap-sql`). The
-DataFusion-based Fluss provider integration (`fluss-datafusion`) and the Fluss
-Rust client (`fluss-rs`) retain their component names and responsibilities; the
-earlier `differential-dataflow` spike has been removed.
+Hotlap es un motor de streaming nativo en Rust, con núcleo incremental columnar
+(`hotlap-engine`) y superficie SQL/DDL embebida (`hotlap-sql`). La integración de
+providers Fluss con DataFusion (`fluss-datafusion`) y el cliente Rust de Fluss
+(`fluss-rs`) conservan sus nombres y responsabilidades.
 
 ```text
-crates/hotlap/             Public facade over the incremental core
-crates/hotlap-core/        Engine contract (Plan IR, IncrementalCore, ZSetBatch)
-crates/hotlap-engine/      Arrow-native incremental engine (no differential-dataflow)
-crates/hotlap-connectors/  Source/Sink SPI and Fluss source/sink
-crates/hotlap-runtime/     Kernel composition root, engine thread and checkpointing
-crates/hotlap-sql/         Embedded SQL/DDL surface and catalog
-crates/fluss-datafusion/   DataFusion Fluss provider integration
-clients/rust/crates/fluss/ Native protocol, metadata, routing, Arrow codecs and writers
-vendor/datafusion-55.1.0/  Published core with documented generic DELETE/UPDATE backport
-docs/                      Contracts, ownership boundaries and verification evidence
+crates/hotlap/             Fachada pública del núcleo incremental
+crates/hotlap-core/        Contrato del motor (IR Plan, IncrementalCore, ZSetBatch)
+crates/hotlap-engine/      Motor incremental columnar
+crates/hotlap-connectors/  SPI Source/Sink y fuente/sink Fluss
+crates/hotlap-runtime/     Composición, hilo de motor y checkpoints
+crates/hotlap-sql/         Superficie SQL/DDL embebida y catálogo
+crates/fluss-datafusion/   Integración de providers Fluss con DataFusion
+clients/rust/crates/fluss/ Protocolo nativo, metadatos, routing, codecs Arrow y writers
+vendor/datafusion-55.1.0/  Core publicado con backport genérico DELETE/UPDATE documentado
+docs/                      Contratos, propiedad de recursos y evidencia de verificación
 ```
 
-The incremental engine owns Arrow-native Z-set batches and row-format key
-encoding behind the `hotlap-core` `IncrementalCore` contract, so the
-`differential-dataflow`/`timely` dependency is gone. `hotlap-connectors` carries
-the Source/Sink SPI and the Fluss source/sink; `hotlap-runtime` is the
-composition root that selects a kernel and drives the engine thread, so the
-connector crate never depends on a concrete engine. `hotlap-sql` translates
-embedded SQL/DDL into engine plans, including `INNER JOIN`s across two
-independent sources (see [cross-source joins](docs/hotlap-cross-source-joins.md)).
-Durability lives in `hotlap-runtime`: checkpoints and recovery, capacity-gated
-sink 2PC coordination and materialized views created after `START` (see
-[durability](docs/hotlap-durability.md) and [recovery](docs/hotlap-recovery.md)).
+El motor incremental posee estado columnar, lotes Arrow Z-set en su frontera y
+codificación de claves por filas detrás del contrato `IncrementalCore` de `hotlap-core`, por lo que
+se retiraron las dependencias `differential-dataflow`/`timely`. `hotlap-connectors`
+contiene SPI Source/Sink y fuente/sink Fluss; `hotlap-runtime` compone el sistema,
+selecciona un núcleo y conduce el hilo del motor, sin que connectors dependa de
+un motor concreto. `hotlap-sql` traduce SQL/DDL embebido a planes, incluidos
+`INNER JOIN` entre dos fuentes independientes (ver
+[joins entre fuentes](docs/hotlap-cross-source-joins.md)). La durabilidad reside
+en `hotlap-runtime`: checkpoints y recuperación, coordinación 2PC de sinks con
+control de capacidad y vistas materializadas creadas después de `START` (ver
+[durabilidad](docs/hotlap-durability.md) y [recuperación](docs/hotlap-recovery.md)).
 
-The imported Rust client originates at `dc427e1290847b4a569b6745fcb87b256292bf6a`.
-Its Apache licenses/notices remain intact. Java/reference and non-Rust bindings
-are removed from the current tree; their provenance remains in Git history.
-The client includes the protocol schema needed for regeneration without Java.
-See [Hotlap layout and migration](docs/hotlap-layout.md).
-The repository history is also [selectively cleaned](docs/history-cleanup.md);
-older evidence SHA identifiers resolve through the preserved old→new commit map.
+El cliente Rust importado proviene de `dc427e1290847b4a569b6745fcb87b256292bf6a`.
+Se conservan sus licencias y avisos Apache. Java/referencias y bindings no Rust se
+retiraron del árbol actual; su proveniencia permanece en historial Git. El cliente
+incluye esquema de protocolo para regenerar sin Java. Ver
+[estructura y migración Hotlap](docs/hotlap-layout.md) y [notas de historial](docs/history-cleanup.md).
 
-## Native API and semantics
+## API nativa y semántica
 
-- `FlussLogTable::open` reads a finite batch range captured per execution.
-- `FlussLogTable::open_with_options(..., LogReadOptions::default())` streams from
-  earliest retained offsets; explicit latest/complete offset maps are supported.
-- `FlussKvTable::open` reads finite server KV snapshots, one per bucket rather
-  than one atomic cross-bucket transaction.
-- Register providers explicitly or load the optional snapshot `FlussCatalog`.
-- SQL `INSERT INTO` appends to logs or sends native full-row KV upserts, finite
-  or continuous. Native writers handle mixed partitions/effective bucket layouts.
-- SQL KV DELETE selects snapshot keys with exact DataFusion predicates and
-  requires an allowing table policy. MERGE uses native join/filter/CASE operators,
-  requires a finite source and ordinary KV replacement semantics, and cannot
-  change primary/partition keys or perform partial-column INSERT.
-- `subscribe_progress()` observes offered/excluded source positions;
-  `subscribe_writes()` observes ACKs and conservative partial outcomes. Neither
-  is an engine checkpoint. Final SQL write counts appear only after EOF/success.
+- `FlussLogTable::open` lee un rango batch finito capturado por ejecución.
+- `FlussLogTable::open_with_options(..., LogReadOptions::default())` transmite desde
+  offsets retenidos más antiguos; admite mapas explícitos latest/completos.
+- `FlussKvTable::open` lee snapshots KV finitos del servidor, uno por bucket y
+  no una transacción atómica entre buckets.
+- Registre providers explícitamente o cargue `FlussCatalog` snapshot opcional.
+- SQL `INSERT INTO` agrega a logs o hace upsert KV de fila completa, finito o
+  continuo. Writers nativos gestionan particiones/layouts efectivos mixtos.
+- DELETE KV SQL selecciona claves snapshot con predicados exactos DataFusion y
+  requiere política de tabla que lo permita. MERGE usa operadores nativos
+  join/filter/CASE, exige fuente finita y semántica KV ordinaria de reemplazo;
+  no cambia PK/claves partición ni admite INSERT con columnas parciales.
+- `subscribe_progress()` observa posiciones fuente ofrecidas/excluidas;
+  `subscribe_writes()` observa ACK y resultados parciales conservadores. Ninguno
+  es checkpoint de motor. Conteos finales SQL aparecen solo tras EOF/éxito.
 
-There is no statement rollback, conditional write, globally consistent snapshot,
-automatic job replay or exactly-once source/sink commit. Engine/application owns
-pool policy, concurrency, job state, checkpoints and reconciliation. Source/sink
-leases and native writer guards account retained resources in the real supplied
-DataFusion pool, not a separate allocator or a process-RSS limit.
+No hay rollback de sentencia, escritura condicional, snapshot globalmente
+consistente, replay automático del trabajo ni commit exactly-once source/sink.
+Motor/aplicación poseen política de pool, concurrencia, estado del trabajo,
+checkpoints y conciliación. Leases source/sink y guards nativos contabilizan
+recursos retenidos en el pool DataFusion real, no en otro asignador ni como límite
+RSS del proceso.
 
-The dependency stack remains DataFusion 55.1 / Arrow 59. The core backport preserves
-empty optimized DELETE/UPDATE selection and rejects unsupported row restrictions;
-see [vendor provenance](vendor/README.md).
+La pila sigue en DataFusion 55.1 / Arrow 59. El backport core conserva selección
+vacía optimizada DELETE/UPDATE y rechaza restricciones de fila no soportadas; ver
+[proveniencia vendor](vendor/README.md).
 
-The runnable native example uses an explicit provider, the normal DataFusion
-parser/planner/operators and a bounded host pool. Results are printed batch by
-batch rather than collected into an unbounded output Vec:
+El ejemplo nativo usa provider explícito, parser/planner/operadores DataFusion
+normales y pool host acotado. Imprime resultados lote a lote, no los acumula en
+un Vec de salida ilimitado:
 
 ```sh
 FLUSS_BOOTSTRAP=localhost:9123 DATAFUSION_POOL_MIB=64 DATAFUSION_TARGET_PARTITIONS=2 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 cargo run --locked -p fluss-datafusion --example native_query -- my_database my_table log 'SELECT COUNT(*) FROM fluss_source'
 ```
 
-Use `kv` for a primary-key table. Fluss TLS/SASL settings use `FLUSS_CA_FILE`,
-`FLUSS_USER` and `FLUSS_PASSWORD`; engine memory/concurrency remain separate
-`DATAFUSION_*` settings. The default SQL is COUNT; supplied SQL is planned by
-DataFusion with the registered name `fluss_source`.
+Use `kv` para tablas con clave primaria. Ajustes TLS/SASL Fluss usan `FLUSS_CA_FILE`,
+`FLUSS_USER` y `FLUSS_PASSWORD`; memoria/concurrencia del motor usan por separado
+ajustes `DATAFUSION_*`. El SQL predeterminado es COUNT; DataFusion planifica el SQL
+indicado con nombre registrado `fluss_source`.
 
-## Build and verification
+## Compilación y verificación
 
-Functional builds use DEBUG and eight jobs. Release is for profiles/delivery.
+Builds funcionales usan DEBUG y ocho jobs. RELEASE se reserva para perfiles/entrega.
 
 ```sh
 cargo metadata --no-deps --format-version 1
@@ -93,41 +91,41 @@ CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace --locked
 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 CARGO_TARGET_DIR="$PWD/target" cargo test --manifest-path clients/rust/Cargo.toml -p fluss-rs --locked --lib
 ```
 
-Live native-sni tests use exported `FLUSS_BOOTSTRAP`, `FLUSS_CA_FILE`, `FLUSS_USER`
-and `FLUSS_PASSWORD` credentials. They create isolated tables and clean them up.
-An optional environment-file launcher can load the lab's ignored `.env` without
-any Python package/virtualenv dependency in this project:
+Pruebas native-sni usan credenciales exportadas `FLUSS_BOOTSTRAP`, `FLUSS_CA_FILE`,
+`FLUSS_USER` y `FLUSS_PASSWORD`. Crean tablas aisladas y las limpian. Un launcher
+opcional carga `.env` ignorado del laboratorio sin dependencias Python/virtualenv
+en este proyecto:
 
 ```sh
 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 uv run --no-project --env-file ../lab/.env cargo test -p fluss-datafusion --locked --test write_sql -- --ignored --test-threads=1
 FLUSS_IMAGE=ghcr.io/midnattsol/fluss FLUSS_VERSION=1.0.0-midnattsol.6 CARGO_BUILD_JOBS=8 CARGO_PROFILE_DEV_DEBUG=0 cargo test -p fluss-datafusion --locked --test write_pressure -- --ignored --test-threads=1
 ```
 
-Long storage/STS/resource profiles have separate opt-in commands and isolated
-object prefixes; consult their evidence before rerunning them. Credentials and
-local build outputs are never part of the source repository.
+Perfiles largos de almacenamiento/STS/recursos tienen comandos opt-in y prefijos
+aislados; consulte evidencia antes de repetirlos. Credenciales y artefactos locales
+de build nunca forman parte del repositorio.
 
-## Current acceptance scope
+## Alcance de aceptación actual
 
-Architecture, reads and finite/continuous writes have verified scoped milestones.
-Native functional/failure checks and final sustained profiles have scoped evidence.
-Clean Git verification is [recorded](docs/native-checkout-verification.md), including
-the passing remote-read smoke after recovery of the existing RustFS endpoint. The
-engine under acceptance is **DataFusion native in this repository**: caller
-SessionState/RuntimeEnv, planning/operators, concurrency/backpressure,
-cancellation/reexecution and recovery.
-Provider tests alone do not establish those engine guarantees. FFI/Python is not
-an active delivery phase or a dependency of Rust validation.
+Arquitectura, lecturas y escrituras finitas/continuas tienen hitos verificados de
+alcance acotado. Las comprobaciones funcionales/fallos nativos y perfiles sostenidos
+finales cuentan con evidencia delimitada. Verificación Git limpia está
+[registrada](docs/native-checkout-verification.md), incluido smoke remoto exitoso
+tras recuperar endpoint RustFS existente. El motor bajo aceptación es **DataFusion
+nativo en este repo**: SessionState/RuntimeEnv del llamador, planificación/
+operadores, concurrencia/contrapresión, cancelación/reejecución y recuperación.
+Pruebas de providers por sí solas no establecen esas garantías. FFI/Python no es
+fase activa ni dependencia de validación Rust.
 
-- [Canonical Rust contract](docs/rust-contract.md)
-- [Reading semantics](docs/reading-semantics.md)
-- [Implementation audit/history](docs/rust-implementation-audit.md)
-- [Production-readiness evidence](docs/production-readiness.md)
-- [Read pressure](docs/read-pressure-verification.md)
-- [Write pressure](docs/write-pressure-verification.md)
-- [Write observations](docs/write-observation-contract.md)
-- [DELETE](docs/delete-contract.md) and [MERGE](docs/merge-contract.md)
-- [Continuous INSERT acceptance](docs/streaming-write-acceptance.md)
-- [Native engine acceptance](docs/native-engine-acceptance.md)
-- [Native failures](docs/native-failure-verification.md)
-- [Final-route profiles](docs/native-profile-plan.md)
+- [Contrato Rust canónico](docs/rust-contract.md)
+- [Semántica de lectura](docs/reading-semantics.md)
+- [Auditoría e historial de implementación](docs/rust-implementation-audit.md)
+- [Evidencia de preparación para producción](docs/production-readiness.md)
+- [Presión de lectura](docs/read-pressure-verification.md)
+- [Presión de escritura](docs/write-pressure-verification.md)
+- [Observaciones de escritura](docs/write-observation-contract.md)
+- [DELETE](docs/delete-contract.md) y [MERGE](docs/merge-contract.md)
+- [Aceptación de INSERT continuo](docs/streaming-write-acceptance.md)
+- [Aceptación del motor nativo](docs/native-engine-acceptance.md)
+- [Fallos nativos](docs/native-failure-verification.md)
+- [Perfiles de la ruta final](docs/native-profile-plan.md)

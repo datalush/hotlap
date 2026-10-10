@@ -18,9 +18,9 @@ simple o compuesta) sin condiciones residuales en el `ON`. Cada relación
 conserva su propia identidad (`InputId`), schema, offsets y watermark; ninguna
 tabla colapsa en el input de la otra.
 
-El kernel no cambia: DataFusion sigue siendo el front-end y su `LogicalPlan` se
-traduce al `Plan::Join` del IR propio. El join incremental existente produce los
-resultados; este slice solo conecta identidades y durabilidad.
+DataFusion sigue siendo el front-end y su `LogicalPlan` se traduce al
+`Plan::Join` del IR propio. El join incremental actualiza los resultados por
+delta; la recomputación completa solo se usa como oráculo en pruebas.
 
 ## 2. Ejemplo completo
 
@@ -102,10 +102,11 @@ No hay lectores de **formatos anteriores**, migraciones ni fallbacks. Un
 checkpoint monofuente previo o de versión/magic **incompatible** —incluida una
 versión desconocida del frame interno del engine— produce
 `ConnectorError::Unsupported` **fatal**: recovery **no** arranca en vacío ni cae
-a un checkpoint anterior. Un schema, nombre o identidad que no valida contra las
+a un checkpoint anterior. También son fatales los errores de almacenamiento.
+Un schema, nombre o identidad que no valida contra las
 fuentes declaradas también es fatal. Solo la **corrupción del formato actual**
 (truncado o payload ilegible) es tolerada, cayendo al predecesor válido más
-nuevo (SP8).
+nuevo.
 
 ## 7. Recovery
 
@@ -114,10 +115,12 @@ schemas contra las fuentes declaradas; una fuente ausente, renombrada o con
 schema/lag/columna event-time incompatible falla en este punto.
 
 Después, restaura el engine y reanuda **cada** fuente desde su offset aplicado.
-Se conserva el protocolo SP8: un commit pendiente se **promueve** (re-conduce el
-commit de los sinks si todos son re-conducibles y publica `valid`) o se
-**descarta** con señal explícita y replay desde el checkpoint válido anterior.
-No se añade 2PC nuevo ni exactly-once: el techo del sink no cambia.
+Se conserva el protocolo de commit recuperable: un commit pendiente se promueve
+solo cuando todos los sinks permiten re-conducirlo. Si cualquier sink es
+transaccional, un fallo de promoción o cuerpo ilegible se rechaza sin replay,
+aunque el commit sea re-conducible. Solo sin sinks transaccionales se descarta con
+señal explícita y se replaya; los appends pueden duplicarse. Fluss no ofrece
+garantía exactly-once desde Hotlap.
 
 Un error de lectura, ingesta o ack detiene la ingesta de **todo** el runtime: se
 registra el error y no se siguen publicando nuevos resultados ni checkpoints
@@ -155,8 +158,8 @@ del kernel. El límite se caracteriza en
   independientes.
 - `sql_cross_source_recovery.rs`, `cross_source_recovery.rs`: restart con
   declaraciones reordenadas y resume de offsets independientes.
-- `cross_source_pending.rs` y `cross_source_pending_schema.rs`: SP8
-  promovible/descartable con dos fuentes, schema cambiado y formato ajeno antes
+- `cross_source_pending.rs` y `cross_source_pending_schema.rs`: protocolo de
+  commit recuperable promovible/descartable con dos fuentes, schema cambiado y formato ajeno antes
   de cualquier commit de sink.
 - `cross_source_incompatible_codec.rs`: una versión interna de frame o snapshot
   no soportada es **fatal** (sin fallback ni arranque limpio) antes de leer

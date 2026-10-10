@@ -1,21 +1,18 @@
 # Hotlap — durabilidad: checkpoints, recovery, 2PC y vistas dinámicas
 
-- Fecha: 2026-10-08
-- Estado: implementado (SP4; commit recuperable en SP8), tests verdes
-- Alcance: durabilidad end-to-end del motor (estado, checkpoints, recuperación),
-  coordinación 2PC de sinks con capacidades, y vistas materializadas creadas
-  después de `START`.
+- Fecha del registro: 2026-10-08
+- Estado histórico: implementación y pruebas registradas al 2026-10-08.
+- Alcance histórico: durabilidad del motor (estado, checkpoints, recuperación),
+  coordinación 2PC de sinks y vistas materializadas creadas después de `START`.
 - Motor: `docs/hotlap-engine.md`; conectores `docs/hotlap-connectors.md`; sink
   `docs/hotlap-sink.md`.
-- Rama: `feat/durability`. Diseño:
-  `2026-10-08-hotlap-durability-design.md` (local, fuera del repo).
 
-> Código y comentarios en **inglés**; este documento en español.
+> El documento está en español; el código y los comentarios del código, en inglés.
 
 ## 1. Propósito
 
-El motor (`hotlap-engine`, Arrow-nativo) es **en memoria**. SP4 añade
-**durabilidad**: persistir y restaurar el estado, recuperarse de un fallo,
+El motor (`hotlap-engine`, de estado columnar) es **en memoria**. La capa de durabilidad
+aporta **persistencia**: persistir y restaurar el estado, recuperarse de un fallo,
 coordinar los sinks con consistencia y permitir **vistas creadas en caliente**.
 El kernel `crates/hotlap` expone la frontera de estado (`StateBackend`); el
 runtime (`hotlap-connectors`) orquesta checkpoints, 2PC y recovery.
@@ -27,12 +24,13 @@ runtime (`hotlap-connectors`) orquesta checkpoints, 2PC y recovery.
 retención); protocolo **2PC** del sink + capacidades; recovery (checkpoint +
 replay); dynamic views por retención de inputs.
 
-**Fuera (no-goals):**
+**Fuera de alcance:**
 
-- **2PC en Fluss**: no se modifica Fluss ni su protocolo. Fluss no ofrece
+- **Transacciones de sink en Fluss**: no se modifica Fluss ni su protocolo. Fluss no ofrece
   transacciones de sink; el motor solo puede orquestar 2PC real si un sink lo
-  implementa. Con Fluss, el techo es **effectively-once** (upsert/PK,
-  idempotente) o **at-least-once** (append).
+  implementa. Con Fluss, los upserts por clave pueden deduplicar replays de la
+  misma fila y los appends pueden duplicarse; Hotlap no promete
+  exactly-once.
 - **Multi-nodo / cluster**: v1 es **single-process**; el `StateBackend` es local.
 - Estado compartido entre procesos.
 - Exactly-once estricto con sinks no transaccionales.
@@ -68,7 +66,7 @@ pub trait StateBackend {
 
 Implementaciones:
 
-| Impl | Uso | Notas |
+| Implementación | Uso | Notas |
 | --- | --- | --- |
 | `BTreeMap<Vec<u8>, Vec<u8>>` | tests / in-memory | Mismo contrato; `scan` por rango. |
 | `DurableStateBackend` (`state/durable.rs`) | persistencia local | **Un fichero por clave** bajo subdirectorios con prefijo. |
@@ -108,11 +106,11 @@ El motor captura y reconstruye su estado como un **snapshot versionado**
 
 ```rust
 pub struct EngineSnapshot {
-    pub format_version: u32,          // ENGINE_SNAPSHOT_FORMAT_VERSION = 1
-    pub epoch: u64,                   // epoch lógico al capturar
-    pub frozen: bool,                 // ¿el esquema estaba congelado?
-    pub inputs: Vec<InputSnapshot>,   // por input, ordenado por id
-    pub views: Vec<ViewSnapshot>,     // por vista, ordenado por id
+    pub format_version: u32,          // ENGINE_SNAPSHOT_FORMAT_VERSION = 5
+    pub epoch: u64,                   // logical epoch at capture time
+    pub frozen: bool,                 // whether the schema was frozen
+    pub inputs: Vec<InputSnapshot>,   // inputs ordered by id
+    pub views: Vec<ViewSnapshot>,     // views ordered by id
 }
 ```
 
@@ -140,144 +138,12 @@ motor. `EngineCore::restore(&mut self, &EngineSnapshot)`:
 La fachada `Hotlap` (`crates/hotlap/src/engine.rs`) delega en el core; el borde
 de conectores usa `hotlap.checkpoint()` / `hotlap.restore()`.
 
-## 5. Checkpointer: barrera, codec binario y retención
+## 5. Checkpointer
 
-`Checkpointer` (`crates/hotlap-connectors/src/runtime/checkpoint.rs`) escribe
-checkpoints **coherentes y versionados** en un `StateBackend`:
+Formato, publicación durable, IDs, fallos y retención se detallan en
+[checkpointer](hotlap-durability-checkpointer.md).
 
-- `Checkpointer::new(backend, retain)` fija el store y cuántos checkpoints
-  conservar (`DEFAULT_RETAIN = 3`, recortado a ≥1).
-- `with_sinks(Vec<Arc<SharedSink>>)` añade los sinks a la barrera 2PC.
-- `resume_after(id)`: continúa la secuencia tras un checkpoint recuperado, para
-  no sobrescribirlo.
-- `take(engine, sources)` captura y persiste un checkpoint nuevo (async).
+## 6. Recuperación, sinks y vistas dinámicas
 
-**Formato binario.** El snapshot del motor se codifica con un **frame binario
-versionado** (`crates/hotlap-engine/src/core/ipc.rs`); el estado de las fuentes,
-como un `SourcesCheckpoint` multifuente en un contenedor `HLSR`
-(`runtime/source_checkpoint/`):
-
-- Cabecera fija del frame del engine: magic `HLSP` (4) + versión de frame (4) +
-  longitud del payload (8, little-endian), seguido de un payload `bincode`.
-- El contenedor de fuentes: magic `HLSR` (4) + versión de layout (4) + el frame
-  del engine con el payload `SourcesCheckpoint`.
-- El decode **rechaza** magic incorrecto, versión desconocida, longitud que no
-  coincide, bytes sobrantes o payloads por encima del límite (`MAX_FRAME_BYTES`),
-  devolviendo error en vez de `panic`.
-- El `format_version` del `EngineSnapshot` y la versión de layout del contenedor
-  son guardas adicionales contra layouts incompatibles.
-
-**Un único formato multifuente.** El mismo contenedor sirve para una o varias
-fuentes: cada entrada guarda id, nombre canónico, schema Arrow IPC, lag de
-watermark, columna event-time y `SourceState` (offsets por split). Además, el
-contenedor **versión 2** guarda el **registro de vistas** (`nombre↔handle↔plan`)
-para atar cada nombre declarado a su handle numérico y su plan, no solo al
-schema. No hay **lectores de formatos anteriores**, migraciones ni fallbacks: un
-checkpoint monofuente previo o de versión incompatible produce `Unsupported`
-(ver `hotlap-cross-source-joins.md`). La corrupción del **formato actual** sí es
-tolerada: recovery cae al predecesor válido más nuevo; una versión incompatible,
-un **namespace de vistas que no coincide exactamente** (nombre, handle o plan
-desajustado, o handles duplicados) o un schema que no valida contra las fuentes
-declaradas es fatal.
-
-**Layout en disco** (namespace bajo `checkpoint/`):
-
-| Clave | Contenido |
-| --- | --- |
-| `checkpoint/<id>/engine` | snapshot del motor (frame binario) |
-| `checkpoint/<id>/sources` | `SourcesCheckpoint` multifuente (contenedor `HLSR`) |
-| `checkpoint/<id>/commit` | marcador `1`: intención de commit durable (se borra tras `valid`) |
-| `checkpoint/<id>/valid` | marcador `1`: el checkpoint está completo |
-| `checkpoint/latest` | id (8 bytes LE) del checkpoint nuevo más reciente |
-| `checkpoint/reserved` | id (8 bytes LE) más alto reservado nunca reutilizable |
-
-**Publicación coherente.** Un checkpoint solo es visible cuando **todas** sus
-partes están escritas: primero el cuerpo (`engine` + `sources`), luego el
-marcador durable `commit`, después el marcador `valid`, y solo entonces el
-puntero `latest`. Una escritura interrumpida **nunca** expone un checkpoint
-parcial como el actual. El marcador `commit` se borra tras publicar `valid`: un
-`commit` presente **sin** `valid` señala a recovery que el proceso cayó en la
-ventana de commit (`hotlap-sink-2pc.md`).
-
-**Publicación y limpieza son pasos distintos.** Publicar (`valid` + `latest`) y
-podar los antiguos son operaciones separadas: un fallo al escribir `latest` o al
-podar **después** de que `valid` se escribió **no** des-publica el checkpoint ni
-autoriza a sobrescribir `engine`/`sources` bajo ese id. La poda solo puede
-eliminar checkpoints más antiguos que el recién publicado; el puntero `latest`
-nunca se poda. El puntero `latest` es **orientativo**: recovery no se fía de él
-para elegir el checkpoint, sino que escanea el namespace y toma el `valid` más
-nuevo, de modo que un `latest` que se quedó atrás no oculta uno ya publicado. Un
-fallo **operativo** (`Storage`) al publicar un commit promovido **propaga** sin
-leer un fallback, sin descartar el pending ni tocar las fuentes; solo un fallo de
-re-conducción del sink se descarta y se replaya.
-
-**Identidad nunca reutilizada.** El id se **reserva** en `checkpoint/reserved`
-con la secuencia en memoria **avanzada antes** del `put`, de modo que un intento
-ambiguo (un fallo o un crash después de una escritura ya confirmada) no puede
-entregar el mismo id a un intento posterior, ni siquiera reintentando desde el
-mismo `Checkpointer`. La reserva vive **fuera** de `checkpoint/<id>/`, así que la
-poda no la borra. Un `Checkpointer` nuevo parte del mayor id presente **y** del
-mayor reservado, y `resume_after` nunca baja de ese suelo; agotar el espacio de
-ids falla en vez de envolver a cero.
-
-**Fallo de escritura ambiguo.** Si escribir el cuerpo falla con `Storage`, el
-marcador `commit` y el cuerpo ya persistidos **se conservan** y los sinks
-preparados **no** se abortan: la incertidumbre se preserva como evidencia en vez
-de borrar la garantía. Una fase de commit fallida **tampoco** aborta: un
-participante puede haber confirmado, así que solo un reinicio resuelve la
-ventana. La limpieza de un marcador `commit` obsoleto (un checkpoint ya `valid`)
-también propaga un fallo de borrado como `Storage`.
-
-**Estado explícito y fail-stop.** Un intento que falla tras `prepare` deja el
-runtime inconsistente: el motor y los offsets de las fuentes **no** se revierten
-con los sinks, así que abortar los sinks no restaura el estado. El
-`Checkpointer` mantiene un estado explícito (`Ready`, `Failed`,
-`CommitUncertain`) y **rechaza nuevos intentos** hasta el reinicio; el bucle de
-servicio deja de sondear fuentes y deja de aceptar checkpoints y vistas
-posteriores a `START`. Solo los fallos de reserva o previos a `prepare` (que no
-descartan ninguna escritura) quedan reintentables. Al reiniciar, recovery
-resuelve el marcador pendiente: re-conduce el commit y promueve, o descarta y
-replaya desde el predecesor válido.
-
-**Cobertura del sink.** El pump del motor drena los deltas de cada vista a un
-canal acotado que la tarea del sink consume de forma asíncrona. Antes de
-preparar y confirmar, la barrera **drena ese canal**: envía una marca de flush
-detrás de los lotes encolados y espera la confirmación de la tarea, que responde
-solo tras escribirlos. Por tanto, al escribir `valid` **todos** los deltas de
-salida hasta ese punto ya llegaron al sink; un checkpoint no puede quedar válido
-con salida aún encolada (que un crash no volvería a entregar).
-
-**Fronteras de error.** Los fallos de checkpoint se clasifican por **tipo**, no
-por el texto del mensaje:
-
-- **Ausencia** (`Missing`): falta el checkpoint o una de sus partes, o falta el
-  marcador `valid`. Recovery puede saltarlo y buscar un predecesor.
-- **Corrupción del formato actual** (`Corruption`): los bytes tienen el formato
-  vigente pero están dañados (cabecera truncada, longitud incoherente, payload
-  ilegible). Es el **único** caso de bytes que recovery tolera cayendo al
-  predecesor válido más nuevo.
-- **Incompatibilidad fatal** (`Unsupported`): magic ajeno o versión desconocida
-  en el contenedor de fuentes, en el frame interno del motor o en el snapshot.
-  Es fatal: no hay lector antiguo, no se cae a un predecesor y nunca arranca en
-  vacío.
-- **Almacenamiento** (`Storage`): una operación de `StateBackend` falló. Conserva
-  el `StateError` subyacente (y su causa de I/O) como `source`. Es **operativo**,
-  nunca una clasificación de bytes: recovery debe propagarlo y **no** puede
-  confundirlo con ausencia o corrupción, ni borrar markers ni arrancar en limpio.
-
-Un error de **codificación** (al producir un frame desde estado vivo) es
-interno, no corrupción persistida, y no puede clasificarse como decodificable.
-
-**Retención** (`runtime/retention.rs`): tras publicar, se **podan** los
-checkpoints más antiguos para conservar los `retain` más nuevos. El borrado solo
-toca claves `checkpoint/<id>/...` (nunca `latest`) y es **idempotente**, así que
-un store parcialmente podado se puede podar de nuevo.
-
-**Disparo.** Periódico (config `CheckpointConfig { interval, backend, retain }`)
-y **on-demand** (`CHECKPOINT` por el canal de comandos).
-
-## 6. 2PC, recovery y dynamic views
-
-Ver `docs/hotlap-sink-2pc.md`, `docs/hotlap-recovery.md` y
-`docs/hotlap-cross-source-joins.md`.
-
+Los contratos detallados se mantienen en [2PC de sinks](hotlap-sink-2pc.md),
+[recuperación](hotlap-recovery.md) y [joins entre fuentes](hotlap-cross-source-joins.md).

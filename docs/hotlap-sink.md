@@ -1,33 +1,30 @@
-# Hotlap — Sink: changelog tap y sink Fluss (SINK)
+# Hotlap — Sink: changelog tap y sink Fluss
 
 - Fecha: 2026-10-07
-- Estado: implementado (SINK), tests verdes
+- Estado histórico: implementación y pruebas registradas al 2026-10-07.
 - Alcance: cerrar el primer slice de salida — escribir de forma continua el changelog de una MV a Fluss
-- Crates: `hotlap` (kernel, Arrow-free), `hotlap-connectors` (runtime + `FlussSink`), `hotlap-sql` (DDL)
-- Plan: SINK (`2026-10-07-hotlap-sink-fluss.md`)
-- Diseño: `2026-10-07-hotlap-sink-fluss-design.md`
-- Depende de: SP2 (`hotlap-connectors`), SP3 (`hotlap-sql`)
+- Crates: `hotlap` (fachada del kernel columnar), `hotlap-connectors` (runtime + `FlussSink`), `hotlap-sql` (DDL)
 
 ## 1. Propósito
 
-SP1 (kernel), SP2 (conectores) y SP3 (SQL) cubrían el camino de **entrada**
-(`Source → kernel → MV consultable`). Este sub-proyecto cierra el primer slice
-del lado de **salida**: exponer el **changelog** (los deltas) de una vista
+El camino de **entrada** (`Source → kernel → MV consultable`) ya estaba cubierto
+por el kernel, los conectores y la capa SQL. Este primer incremento completa la
+salida: exponer el **changelog** (los deltas) de una vista
 materializada como un stream continuo y escribirlo a **Fluss** en modo
 **append-only**.
 
-Hay tres capas nuevas, deliberadamente separadas:
+Hay tres capas diferenciadas:
 
-1. **Kernel** (`crates/hotlap`): primitiva *pull* `take_changes(view)` — pura,
-   Arrow-free.
+1. **Kernel** (`crates/hotlap`): primitiva de extracción `take_changes(view)` — pura,
+   Arrow-nativa.
 2. **Runtime** (`hotlap-connectors`): `ChangelogStream` sobre un canal acotado
    con **backpressure**, y el trait `Sink` **async**.
-3. **Sink Fluss** (`hotlap-connectors`): `FlussSink` append-only.
+3. **Sink Fluss** (`hotlap-connectors`): `FlussSink` de solo append.
 
 La capa **SQL** (`hotlap-sql`) expone la DDL `CREATE SINK ... AS SELECT * FROM mv`
 y conecta el tap en `START`.
 
-## 2. Arquitectura (3 capas)
+## 2. Arquitectura (tres capas)
 
 ```
 kernel (crates/hotlap)        runtime (hotlap-connectors)         sink (hotlap-connectors)
@@ -35,11 +32,11 @@ take_changes(view) ─drena──▶  ChangelogStream (mpsc acotado) ──▶  
  (buffer en inspect)          backpressure: pausa el source        (task por sink)
 ```
 
-El **kernel** solo calcula deltas; el **runtime** es dueño de la entrega
-(buffer/backpressure/fan-out); el **sink** consume el stream. No se mete política
+El **kernel** solo calcula deltas; el **runtime** gestiona la entrega
+(buffer/contrapresión/distribución); el **sink** consume el stream. No se añade política
 de entrega en el kernel.
 
-## 3. Tap del kernel
+## 3. Captura del changelog en el kernel
 
 Dos métodos nuevos en `Hotlap` (y en el trait `IncrementalCore`):
 
@@ -60,24 +57,24 @@ Dos métodos nuevos en `Hotlap` (y en el trait `IncrementalCore`):
 Propiedad diferencial: consolidar la secuencia de changelogs reconstruye el
 `snapshot` de la vista (test `changes.rs`).
 
-## 4. Runtime: `ChangelogStream` y backpressure
+## 4. Runtime: `ChangelogStream` y contrapresión
 
 En `hotlap-connectors/src/runtime/sink.rs`:
 
 - Por sink, un canal **`tokio::sync::mpsc` acotado** (`CHANNEL_CAPACITY = 64`).
 - `ChangelogStream` es el extremo receptor adaptado a `futures::Stream`
   (`Item = Result<ChangeBatch, ConnectorError>`); es lo que recibe `Sink::write`.
-- Un **task** por sink ejecuta `sink.write(ChangelogStream).await` hasta el cierre
-  del canal y, al terminar, `commit` (o `abort` si `write` falló).
+- Una **tarea** por sink ejecuta `sink.write(ChangelogStream).await` hasta cerrar
+  el canal; el cierre coordinado decide si se permite el commit EOF.
 - `SinkPump::pump` corre **tras cada `ingest`**: por cada vista suscrita toma sus
   deltas y hace `sender.send(...).await`. Si el canal está lleno, el `await`
   **bloquea el bucle del engine**, que pausa la lectura del source: un sink lento
   **ralentiza la ingesta, no pierde datos**. Un buffer vacío no envía nada.
 
-## 5. Trait `Sink` async
+## 5. Trait `Sink` asíncrono
 
-`hotlap-connectors/src/sink.rs`. El trait de SP2 (síncrono, solo forma) pasa a
-**async** con `#[async_trait]`:
+`hotlap-connectors/src/sink.rs`. El trait, inicialmente síncrono y solo forma,
+pasa a **async** con `#[async_trait]`:
 
 ```rust
 pub type ChangeStream =
@@ -94,18 +91,20 @@ pub trait Sink: Send + Sync {
 - `write` consume el stream hasta que termina (cierre del canal) y vuelve.
 - `commit` = confirmar lo escrito desde el último commit.
 - `abort` = descartar lo escrito desde el último commit.
-- `accepts_retractions` = si el sink aplica diffs negativos; por defecto `false`
-  (append-only). El runtime rechaza un plan retractor antes de escribir.
+- `accepts_retractions` indica si el sink aplica deltas negativos; por defecto
+  `false` (solo append). El runtime rechaza planes retractores antes de escribir.
 - `commit_redriable` = si un commit interrumpido puede re-conducirse tras un
   reinicio; por defecto `false`. Una cola volátil en memoria no habilita el
   re-drive aunque el replay sea idempotente.
 
-El task del runtime dirige el ciclo de vida completo: `write` hasta el cierre del
-canal y, al terminar, `commit` (que entrega lo fire-and-forget del sink Fluss) o
-`abort` si `write` falló. La forma sigue siendo nominal (sin transacción ni
-exactly-once), pero el runtime ya invoca el contrato, no solo el test live.
+La tarea consume `write` hasta el EOF del canal. El commit final (que espera el
+flush/ACK del writer Fluss) solo se intenta si **todo el cierre global** terminó
+sin fallo ni cancelación; EOF por sí solo no es autorización. Un error de source,
+push, writer/ACK o checkpoint hace inseguro el EOF y se propaga en el cierre.
+Este commit final está acotado a 5 s. El runtime invoca el contrato en ejecución,
+sin añadir transacción ni exactly-once.
 
-## 6. `FlussSink` (append-only)
+## 6. `FlussSink` (solo append)
 
 `hotlap-connectors/src/fluss/sink.rs`.
 
@@ -113,28 +112,28 @@ exactly-once), pero el runtime ya invoca el contrato, no solo el test live.
   (`Config`), resuelve la tabla `<database>/<table>` con `parse_path` y abre un
   `AppendWriter` (`table.new_append().create_writer()`).
 - `write`: por cada `ChangeBatch`, convierte filas del kernel → `RecordBatch`
-  Arrow con el **schema de la MV** (`sink_convert::rows_to_batch`) y llama
-  `append_arrow_batch`. Los batches sin filas se saltan.
+  Arrow con el **esquema de la MV** (`sink_convert::rows_to_batch`) y llama a
+  `append_arrow_batch`. Se omiten lotes sin filas.
 - **Rechazo de retracciones:** `accepts_retractions()` es `false`, así que el
-  runtime rechaza antes de arrancar/escribir un plan que pueda retractar; además
+  runtime rechaza antes de arrancar/escribir un plan que pueda retraer; además
   `retraction_check` exige `diff >= 0` en cada lote (defensa residual): cualquier
-  `diff < 0` devuelve `ConnectorError::Unsupported` (una tabla log append-only no
+  `diff < 0` devuelve `ConnectorError::Unsupported` (una tabla log de solo append no
   borra). Se invoca dentro de `rows_to_batch`, por lo que `write` lo aplica.
-- `commit` → `writer.flush().await`; los errores de `append` diferidos (fire and
-  forget) afloran aquí. Fluss **no** declara el commit re-conducible: su writer
+- `commit` → `writer.flush().await`; errores de `append` diferidos (fire-and-forget)
+  aparecen aquí. Fluss **no** declara el commit re-conducible: su writer
   encola en memoria y una instancia nueva tras un crash no puede entregar lo
-  perdido, así que recovery replaya en vez de promover.
+  perdido, así que la recuperación reproduce en vez de promover.
 - `abort` → `Ok(())`: el append no tiene transacción; lo ya encolado es visible.
 
 Conversión de tipos (`sink_convert.rs`): `diff` es la **multiplicidad** (cada
 fila se repite `diff` veces; `diff = 0` se descarta); se soportan `Int64`,
-`Timestamp(ms)`, `Utf8` y `Boolean` (`null → Null`); cualquier otro tipo Arrow es
-`Unsupported`. Los `Timestamp` se construyen como `Int64` epoch-ms y se castean al
-tipo declarado.
+  `Timestamp(ms)`, `Utf8` y `Boolean` (`null → Null`); otro tipo Arrow produce
+  `Unsupported`. `Timestamp` se construye como `Int64` epoch-ms y se convierte al
+  tipo declarado.
 
 ## 7. SQL: `CREATE SINK`
 
-`hotlap-sql` reconoce la gramática mínima (parser de strings, como el resto de
+`hotlap-sql` reconoce la gramática mínima (parser de cadenas, como el resto de
 DDL):
 
 ```sql
@@ -146,123 +145,24 @@ START;
 ```
 
 - `ddl::CreateSink { name, options, view }`; `view` es el nombre tras `FROM`.
-- `create_sink` valida que la vista exista y que el nombre del sink no esté
+- `create_sink` valida que la vista exista y que el nombre sink no esté
   repetido; registra el `SinkDef` en el catálogo. **No** abre el connector aquí.
-- La apertura ocurre en `START`: tras un **preflight** que rechaza vistas
+- La apertura ocurre en `START`: tras una validación preliminar que rechaza vistas
   repetidas y planes retractores para sinks sin soporte, `build_sinks` resuelve el
   **schema de la MV** y pide al `SinkFactory` que construya el sink. Así el factory
-  puede ser async y el schema ya está validado.
-- `SinkFactory` (async) abstrae la creación; el default es `FlussSinkFactory`,
+  ser asíncrono y el esquema ya está validado.
+- `SinkFactory` asíncrono abstrae creación; el predeterminado es `FlussSinkFactory`,
   que exige `connector='fluss'`, `bootstrap` y `table`. `SqlSession::open_with_factories`
-  inyecta factories fake en tests.
+  inyecta factories de prueba.
 - `SinkFactory::accepts_retractions(options)` (por defecto `false`) se comprueba
   antes de `create`, de modo que un plan retractor o una vista repetida se
-  rechazan sin abrir ningún writer; el sink creado se revalida para que un factory
+  rechazan sin abrir writers; el sink creado se revalida para que factory
   no pueda quedarse corto. `START` sólo consume la config de checkpoint tras pasar
-  el preflight y la validación, así un rechazo no pierde la durabilidad.
-- **Ventana DDL:** `CREATE SINK` después de `START` → `SqlError::Unsupported`
-  (`reject_after_start`), igual que source/MV.
+  validación preliminar, así un rechazo no pierde durabilidad.
+- **Ventana DDL:** `CREATE SINK` tras `START` → `SqlError::Unsupported`
+  (`reject_after_start`), igual que fuente/MV.
 
-## 8. Ciclo de vida y cierre ordenado
+## 8. Ciclo de vida y límites
 
-1. En `setup` (antes del primer push) se registran inputs/views y se hace
-   `hotlap.tap_view(view)` por cada sink.
-2. Tras cada `ingest`, `SinkPump::pump` drena cada vista suscrita y envía los
-   deltas a su canal (backpressure).
-3. En `shutdown` (o cuando el canal de comandos se cierra), el motor libera
-   primero el checkpointer —y con él los clones del sender que el barrier retiene
-   para drenar— y después `SinkPump::close` suelta los senders, espera a cada task
-   y devuelve el primer error. Sin liberar el checkpointer el canal nunca
-   alcanzaría EOF y el cierre solo terminaría por timeout. Al aceptar el stream,
-   el task llama a `commit` (o a `abort` si `write` falló), de modo que el **último
-   lote se entrega** antes de que el task termine. Si un envío del pump queda
-   bloqueado con el canal lleno, el motor lo cancela antes de esperar: un envío
-   listo siempre gana, así que un cierre limpio no pierde lotes; un envío encolado
-   se abandona y el cierre lo reporta como error. La misma cancelación cubre un
-   **checkpoint activo**: el barrier compite cada `Flush`, `prepare` y `commit`
-   contra la cancelación, de modo que un checkpoint periódico o manual parkeado en
-   un sink detenido tampoco retiene el bucle. Un intento cancelado se marca
-   inconsistente (queda `Failed` antes de evidencia de commit y `CommitUncertain`
-   en cuanto existe marker), conserva reserva, body y marker para que el restart
-   los resuelva, y `shutdown` lo reporta en vez de devolver `Ok`. El join de cada
-   task está acotado por un **timeout** de 5 s; al superarlo se aborta y se recoge
-   la task con un reap también acotado. El hilo del motor corre en su propio
-   runtime *current-thread*, así que un sink que bloquea sin ceder nunca puede
-   sondear el comando de parada ni un timer; `EngineHandle::shutdown` espera la
-   señal de fin con un **timeout del lado del llamante (10 s)**, independiente de
-   ese runtime, y si no llega **desacopla** el hilo y devuelve error: no se puede
-   terminar a la fuerza un hilo de Rust, así que no se promete entrega.
-   `EngineHandle::shutdown` propaga el fallo de cierre, el commit final fallido,
-   el checkpoint cancelado, el panic de una task de sink y el panic del hilo del
-   motor, en vez de devolver `Ok` incondicionalmente.
-
-## 9. No-goals
-
-- `upsert`/`delete` sobre tablas con PK — v1 solo **append**.
-- **2PC real / exactly-once**: `commit`/`abort` son forma nominal.
-- **N sinks / fan-out**: v1 un sink por vista; un segundo sink sobre la misma
-  vista se **rechaza** con `SqlError::Unsupported` en `CREATE SINK` y, en la
-  frontera pública, `Pipeline::validate` lo rechaza antes de abrir writers,
-  streams o taps (ver §10).
-- `CREATE SINK` tras `START`.
-- Persistencia de estado / recuperación desde checkpoint.
-- **Proyección explícita**: solo `AS SELECT * FROM <mv>`; cualquier otra
-  proyección (`SELECT k ...`) se **rechaza** con `SqlError::Unsupported`.
-
-## 10. Límites y residuos v1
-
-- **`commit` cableado al cierre del stream.** El task del sink llama a `commit`
-  al aceptar el changelog (o a `abort` si `write` falló), de modo que el `flush`
-  de Fluss ya no depende solo del cierre del writer. Falta el **commit
-  periódico** por ciclo y la semántica 2PC real.
-- **Un sink por vista.** `take_changes` **drena** el buffer, así que dos sinks
-  sobre la misma vista se pisarían; el segundo `CREATE SINK` sobre una vista ya
-  suscrita se **rechaza** en la capa SQL (`SqlError::Unsupported`) y
-  `Pipeline::validate` lo rechaza antes de abrir writers, streams o taps. Sinks
-  sobre vistas **distintas** funcionan; el fan-out no es un objetivo v1.
-- **Capacidad de retracción negociada.** `Sink::accepts_retractions` por defecto
-  `false`; un plan que pueda retractar (agregado por clave o ventana tumbling)
-  se **rechaza** antes de arrancar/escribir en `Pipeline::validate` y en
-  `SqlSession::start`. No se añaden deletes/upserts nuevos.
-- **`SinkPump::close` y join acotados.** El join de cada task está acotado a 5 s;
-  superarlo aborta y recoge la task (reap igualmente acotado) y reporta un error de
-  infraestructura en vez de colgar `shutdown`. La cancelación es **cooperativa**:
-  aborta una task parkeada en un `await` (por ejemplo un sink detenido), pero no
-  puede interrumpir trabajo que nunca cede; en ese caso `close` sigue reportando el
-  timeout, no una entrega completada. El hilo del motor se espera con un **timeout
-  del llamante (10 s)**; si no responde, se **desacopla** y `shutdown` devuelve
-  error: no existe terminación forzada de un hilo de Rust. No se garantiza
-  cancelación ni entrega tras un timeout.
-- **Parkeado (LOW) — sin drenado final antes de `close`.** `close` no hace un
-  último `pump` defensivo: se confía en que el bucle del engine drena tras cada
-  `ingest`. Un `close` sin drenado previo podría perder los deltas pendientes;
-  queda como endurecimiento defensivo si el orden cambia.
-- **Parkeado (LOW) — materialización de multiplicidad en el hilo del engine.**
-  `rows_to_batch` expande `diff` repitiendo filas en el hilo del engine (no hay
-  límite de `diff`), por lo que un multiplicidad grande consume CPU/memoria del
-  engine. Se acepta mientras la ventana v1 no genere multiplicidades grandes.
-- **Schema mismatch:** la tabla Fluss destino debe coincidir con el schema de la
-  MV; si no, el error aflora en el writer.
-- **Tipos:** solo `Int64`/`Timestamp(ms)`/`Utf8`/`Boolean`; otros son
-  `Unsupported`.
-
-## 11. Verificación
-
-```bash
-cargo fmt --all -- --check
-cargo clippy -p hotlap -p hotlap-connectors -p hotlap-sql --all-targets -- -D warnings
-cargo test -p hotlap
-cargo test -p hotlap-connectors
-cargo test -p hotlap-sql
-```
-
-Cobertura: `hotlap::changes` (`changelog_reconstructs_snapshot`,
-`tap_after_first_push_rejected`); `hotlap-connectors::sink_e2e`
-(`sink_consolidated_state_matches_snapshot`, `backpressure_loses_no_batch`,
-`shutdown_delivers_the_last_changelog`, `commit_runs_after_the_stream_ends`) y
-`fluss/sink.rs` unit (`rejects_retraction`, `expands_multiplicity_into_rows`,
-`builds_timestamp_column`, `rejects_unsupported_type`); `hotlap-sql::ddl::sink`
-(`parses_create_sink`, `rejects_non_star_projection`); `hotlap-sql::sink_e2e`
-(wiring completo, sink tras `START` rechazado, vista desconocida rechazada,
-segundo sink sobre la misma vista rechazado).
-`fluss_sink_live.rs` es un test **ignored** (requiere un cluster Fluss vivo).
+Los detalles de cierre, límites de la versión 1 y verificación se conservan en
+[ciclo de vida del sink](hotlap-sink-lifecycle.md).

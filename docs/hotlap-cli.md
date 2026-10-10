@@ -1,11 +1,9 @@
-# Hotlap — CLI: REPL `hotlap` (SP5)
+# Hotlap — CLI: REPL `hotlap`
 
 - Fecha: 2026-10-08
-- Estado: implementado (SP5), tests verdes
+- Estado: implementado, tests verdes
 - Alcance: binario `hotlap` y crate `hotlap-cli`, un REPL sobre la API embebida.
-- API: `docs/hotlap-api.md`. Diseño:
-  `2026-10-08-hotlap-api-cli-observability-design.md` (local, fuera del repo).
-- Kata: SP5.
+- API: `docs/hotlap-api.md`.
 
 > Código y comentarios en **inglés**; este documento en español.
 

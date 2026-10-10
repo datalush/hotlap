@@ -1,10 +1,8 @@
-# Hotlap — event-time y ventanas tumbling (SP1c)
+# Hotlap — event-time y ventanas tumbling
 
 - Fecha: 2026-10-06
-- Estado: implementado y verificado (SP1c Tasks 1–5)
+- Estado: implementado y verificado
 - Alcance: reloj event-time por input, late-drop, `Plan::TumbleCount`, GC
-- Diseño externo: `2026-10-06-hotlap-sp1c-event-time-windows-design.md` (local, fuera del repo)
-- Spec padre: `2026-10-06-hotlap-streaming-engine-design.md` §7.6
 - Núcleo relacionado: `docs/hotlap-incremental-core.md`
 
 ## 1. Modelo híbrido
@@ -13,8 +11,7 @@ Dos ejes que no se funden:
 
 1. **Reloj de orden/cierre** = event-time/watermark. Decide el cierre de ventana, el
    descarte de tardíos y el GC.
-2. **Modelo de cambio del core** = Z-sets del kernel Arrow-native `hotlap-engine`
-   (el spike `differential-dataflow` fue reemplazado).
+2. **Modelo de cambio del core** = Z-sets del kernel columnar `hotlap-engine`.
 
 El event-time es un **atributo de fila** (no el tiempo lógico del core), pero el
 watermark **gobierna el descarte de tardíos y el cierre de ventanas** por input. Así la
@@ -25,7 +22,7 @@ del motor a los timestamps de negocio, y no se obliga a que toda tabla tenga tie
 
 - Event-time = `i64` en **milisegundos** (no negativos; los timestamps de Fluss son ms
   desde epoch). Los negativos y los valores no-`I64` se tratan como `0`.
-- El timestamp lógico de DD es `u64`. La frontera se escala por `TIME_SCALE` para poder
+- El reloj interno es `u64`. La frontera se escala por `TIME_SCALE` para poder
   registrar avisos a resolución sub-ms de forma segura:
   `TIME_SCALE = 1 << 20` (`session.rs`).
 
@@ -33,8 +30,8 @@ del motor a los timestamps de negocio, y no se obliga a que toda tabla tenga tie
 
 Fijados al construir el dataflow, sin fallback silencioso:
 
-- **epoch** — ningún input declara watermark; comportamiento SP1a/b (`+1` por push).
-  No admite ventanas.
+- **epoch** — ningún input declara watermark; avance `+1` por push. No admite
+  ventanas.
 - **event-time** — **todos** los inputs declaran watermark
   (`Hotlap::declare_watermark(input, time_col, lag)`). Las ventanas solo aplican en este
   modo.
@@ -47,7 +44,7 @@ fuente sin watermark, se **rechaza explícito**.
 Por push, e independiente del batching:
 
 ```
-watermark = max(watermark, max(event_ts del lote) - lag)   // monótono, nunca decrece
+watermark = max(watermark, max(event_ts del lote) - lag)   // monotonic; never decreases
 ```
 
 No se fuerza `+1`. Un lote sin filas no mueve el watermark. El descarte de tardíos
@@ -71,7 +68,7 @@ reloj ni cuenta tardíos.
 Al cerrar una ventana, el operador elimina su cubo del mapa de ventanas abiertas: el
 estado del operador queda acotado por las ventanas abiertas. El **resultado consolidado
 del MV** es append-only y crece con el número de ventanas emitidas; su retención queda
-fuera de SP1c.
+fuera de esta capa.
 
 ## 8. Constraint del `Notificator`
 

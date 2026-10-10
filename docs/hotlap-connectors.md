@@ -1,17 +1,17 @@
 # Hotlap — conectores: SPI propio, source Fluss y adaptador DataFusion
 
-- Fecha: 2026-10-07
-- Estado: implementado (SP2), tests verdes
+- Registro: 2026-10-07
+- Estado: arquitectura histórica; ver contratos enlazados para semántica actual.
 - Alcance: contrato de conectores propio del motor, source Fluss y adaptador DataFusion
-- Crate: `hotlap-connectors` (kernel `crates/hotlap` sin cambios)
-- Plan: SP2 (`2026-10-07-hotlap-sp2-connectors-spi-fluss.md`)
+- Crate: `hotlap-connectors` (el kernel `crates/hotlap` conserva su propia representación)
 
 ## 1. Propósito
 
 `hotlap-connectors` aporta un **contrato de conectores propio del motor** (SPI),
 una **implementación de `Source` sobre Fluss** y un **adaptador DataFusion** que
-expone cualquier `Source` como tabla consultable. El kernel `crates/hotlap`
-permanece ajeno a estos tipos: la frontera entra por `Pipeline`/`EngineHandle`.
+expone cualquier `Source` como tabla consultable. El runtime de Hotlap usa ese
+SPI para `Pipeline`/`EngineHandle`; la integración `fluss-datafusion` es un
+provider separado y su aceptación no certifica este runtime.
 
 ## 2. Contrato `Source`/`Sink`
 
@@ -38,37 +38,36 @@ Métodos del trait `Source` (`Send + Sync`):
 | `event_time_column` | `fn event_time_column(&self) -> Option<usize>` | índice de la columna event-time (ms), si existe |
 | `is_unbounded` | `fn is_unbounded(&self) -> bool` | ¿el source nunca termina? (por defecto `false`) |
 
-Métodos del trait `Sink` (`Send + Sync`), solo **forma** en SP2 (sin implementación
-Fluss): `write(&self, changes: ChangeStream) -> Result<(), ConnectorError>`,
-`commit(&self)`, `abort(&self)`. El 2PC real llega en SP4.
+El trait `Sink` (`Send + Sync`) ofrece `write(&self, changes: ChangeStream) ->
+Result<(), ConnectorError>`, `prepare(&self)`, `commit(&self)`, `abort(&self)` y
+las capacidades declaradas por el sink (`capabilities`, `accepts_retractions`,
+`commit_redriable`). Ver `docs/hotlap-sink.md` y `docs/hotlap-sink-2pc.md`.
 
 `ConnectorError` (`error.rs`) distingue `Fluss(String)`, `Arrow(String)`,
 `Unsupported(String)` e `Infrastructure(String)`.
 
-## 3. Modelo Arrow-first, kernel Arrow-free
+## 3. Representación Arrow y kernel columnar
 
 - El **plano de datos del SPI es Arrow**: `Source` produce `RecordBatch` y
   `Sink`/`ChangeStream` consumen `ChangeBatch` del kernel.
-- `crates/hotlap` **no arrastra Arrow**; la conversión Arrow → kernel vive en
-  `convert.rs` (`ensure_supported` + `to_change_batch`), con mapeo
-  `Int64→Scalar::I64`, `Utf8→Scalar::Str`, `Boolean→Scalar::Bool` y `null→Scalar::Null`.
-  Tipos no representables se **rechazan explícitamente** (`Unsupported`).
-- El kernel interno columnar (SoA con `Columnar`/`Columnation`) es un
-  **sub-proyecto posterior**, separado de este SPI. Arrow no implementa esos
-  traits; el relayout Arrow↔columnar sería por columnas, no serialización.
+- `crates/hotlap-core` define `ZSetBatch` como un `RecordBatch` y una columna
+  firmada `diff`; el motor conserva estado interno columnar. El motor también
+  depende de Arrow para expresiones y materialización de lotes.
+- El conector valida tipos soportados y envuelve lotes Arrow como Z-sets. Los
+  tipos no admitidos se rechazan explícitamente (`Unsupported`).
 
-## 4. Seam A1 (duplicación Fluss acotada)
+## 4. Integración Fluss
 
-Decisión **A1**: el connector Fluss se implementa **directo sobre `fluss-rs`**,
-aislado tras un seam en `fluss/log_reader.rs` (open/subscribe/poll de un bucket,
-`Rec { timestamp, offset, row }`) más el ensamblado de lotes en
+La integración Fluss de Hotlap se implementa **directamente sobre `fluss-rs`**, mediante
+`fluss/log_reader.rs` (open/subscribe/poll de un bucket,
+`Rec { timestamp, offset, row }`) y ensamblado de lotes en
 `fluss/stream.rs` y `fluss/assemble.rs`. `crates/fluss-datafusion` **no se toca**.
 
-La extracción de una capa Fluss compartida entre ambos integradores queda
-**pendiente** como follow-up, a decidir **con evidencia** de las dos
-implementaciones (no antes).
+No hay una capa Fluss compartida entre ambos integradores: este runtime consume
+el SPI propio de Hotlap, mientras que `fluss-datafusion` implementa providers
+nativos para DataFusion.
 
-## 5. Event-time
+## 5. Tiempo de evento
 
 El source Fluss añade la columna **`_event_time`** (`Int64`, milisegundos),
 tomada del `timestamp` que el broker adjunta a cada registro. La columna se
@@ -82,7 +81,7 @@ agrega en `assemble.rs` (`with_event_time`) y su índice se reporta por
 
 - Un **hilo dedicado** (`runtime/engine.rs`) posee `Hotlap`; `EngineHandle`
   (`runtime/handle.rs`) habla con él por canal de comandos.
-- El bucle usa `tokio::select!` entre el **stream del source** (merge de splits
+- El bucle usa `tokio::select!` entre el **stream de fuente** (mezcla de splits
   vía `select_all` e ingestión por lote) y los **comandos**.
 - `EngineHandle` expone `snapshot(view)`, `late_dropped(input)` y `shutdown()`
   (este último libera el checkpointer, cierra los sinks, une el hilo y propaga
@@ -93,38 +92,28 @@ agrega en `assemble.rs` (`with_event_time`) y su índice se reporta por
 `datafusion/provider.rs` implementa `SourceTableProvider` sobre un
 `Arc<dyn Source>`:
 
-- `scan` proyecta el esquema y crea una `PartitionStream` por split, montadas en
+- `scan` proyecta esquema y crea una `PartitionStream` por split, montada en
   `StreamingTableExec`.
-- La **boundedness** del plan sigue a `Source::is_unbounded()`
+- El **alcance acotado** del plan sigue a `Source::is_unbounded()`
   (`Bounded` vs `Unbounded`).
-- **Caveat:** el cursor es único. El reparto live de un mismo split entre varias
-  particiones/consultas consumidoras queda **fuera de SP2**.
+- **Límite:** el cursor es único. El reparto live de un mismo split entre varias
+  particiones/consultas consumidoras no está soportado.
 
 ## 8. Estado
 
-`SourceState` es **in-memory y serializable** (`serde`), pensado para
-checkpoints futuros. La **persistencia** (y el arranque desde checkpoint) llega
-en **SP4**; en SP2 el estado se mantiene vivo en el proceso.
+`SourceState` es **en memoria y serializable** (`serde`). Persistencia y arranque
+desde checkpoint se describen en [durabilidad](hotlap-durability.md) y
+[recuperación](hotlap-recovery.md).
 
-## 9. No-goals
+## 9. Fuera de alcance
 
-- 2PC real de escritura (solo forma de `Sink`).
-- `Sink` sobre Fluss.
-- Tap de changelog.
-- Persistencia de estado / recuperación desde checkpoint.
-- Kernel columnar (SoA).
+- 2PC distribuido con Fluss.
+- Reparto de un cursor entre consumidores concurrentes.
 
-## 10. Verificación
+## 10. Cobertura registrada
 
-```bash
-cargo fmt --all -- --check
-cargo clippy -p hotlap-connectors --all-targets -- -D warnings
-cargo test -p hotlap-connectors
-cargo test -p hotlap
-```
-
-Cobertura: unit (`convert`, `source`) e integración
+Cobertura: pruebas unitarias (`convert`, `source`) e integración
 (`pipeline_differential.rs` — paridad vs recomputación completa,
 `engine_lifecycle.rs` — arranque/snapshot/shutdown, `adapter.rs` — tabla
-DataFusion y boundedness). `fluss_live.rs` es un test **ignored** (requiere un
-broker Fluss vivo).
+DataFusion y alcance acotado/no acotado). `fluss_live.rs` está ignorada por
+defecto y requiere un broker Fluss activo.

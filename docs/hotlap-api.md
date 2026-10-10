@@ -1,17 +1,16 @@
-# Hotlap — API embebida y métricas in-process (SP5)
+# Hotlap — API embebida y métricas en proceso
 
 - Fecha: 2026-10-08
-- Estado: implementado (SP5), tests verdes
+- Estado: implementado, tests verdes
 - Alcance: superficie embebida `hotlap-runtime::Session`, `SessionConfig`,
   registro de métricas in-process (`hotlap-core::MetricsRegistry`).
-- Diseño: `2026-10-08-hotlap-api-cli-observability-design.md` (local, fuera del repo).
-- CLI: `docs/hotlap-cli.md`. Kata: SP5.
+- CLI: `docs/hotlap-cli.md`.
 
 > Código y comentarios en **inglés**; este documento en español.
 
 ## 1. Propósito
 
-SP5 cierra la **API embebida**: un único handle síncrono,
+Esta capa cierra la **API embebida**: un único handle síncrono,
 `hotlap-runtime::Session`, que envuelve la capa SQL (`SqlSession`) y el motor
 (`EngineHandle`), y expone además las **métricas in-process**. El objetivo es
 que un integrador use Hotlap desde Rust sin conocer el hilo del motor, los
@@ -50,10 +49,10 @@ defecto** y **sin checkpointing periódico**. Configuración encadenable:
 use hotlap_runtime::SessionConfig;
 
 let config = SessionConfig::new()
-    // Fuentes/sinks inyectables (los tests usan fakes aquí).
+// Fuentes y sinks inyectables (las pruebas usan dobles aquí).
     // .with_source_factory(...)
     // .with_sink_factory(...)
-    // Checkpoint periódico: cada `interval`, conservando `retain` snapshots.
+// Periodic checkpoint every `interval`, retaining `retain` snapshots.
     // .with_checkpoint(interval, retain, backend)
     ;
 ```
@@ -81,14 +80,14 @@ internamente y nunca se invoca el handle del motor desde un executor ajeno.
 | `snapshot` | `fn snapshot(&self, view: &str) -> Result<ZSetBatch, SessionError>` | Lee la salida consolidada de una vista materializada. |
 | `metrics` | `fn metrics(&self) -> MetricsSnapshot` | Copia puntual de las métricas (vacía antes de `START`). |
 | `checkpoint` | `fn checkpoint(&self) -> Result<u64, SessionError>` | Toma un checkpoint **ahora** y devuelve su id. |
-| `shutdown` | `fn shutdown(self) -> Result<(), SessionError>` | Detiene el motor, une su hilo trabajador (con timeout del llamante) y propaga errores de cierre, commit final, checkpoint cancelado, task de sink o hilo del motor. |
+| `shutdown` | `fn shutdown(self) -> Result<(), SessionError>` | Detiene el motor, permite commit EOF solo tras cierre global sano, une su hilo trabajador con timeout del llamante de 10 s y propaga errores de cierre, commit final (límite 5 s), checkpoint cancelado, task de sink o hilo del motor. El timeout no puede terminar a la fuerza trabajo no cooperativo. |
 
 `QueryResult` distingue:
 
 ```rust
 pub enum QueryResult {
-    Ack(String),                 // DDL/START aceptado
-    Rows(Vec<RecordBatch>),      // consulta con resultados Arrow
+Ack(String),                 // accepted DDL/START
+Rows(Vec<RecordBatch>),      // consulta con resultados Arrow
 }
 ```
 
@@ -107,7 +106,7 @@ session.start()?;
 let rows = session.sql("SELECT * FROM mv")?;
 let snapshot = session.snapshot("mv")?;
 let metrics = session.metrics();
-let id = session.checkpoint()?;     // falla si no se configuró checkpointing
+let id = session.checkpoint()?;     // fails when checkpointing is not configured
 session.shutdown()?;
 ```
 
@@ -117,8 +116,8 @@ session.shutdown()?;
 
 ```rust
 pub enum SessionError {
-    Sql(hotlap_sql::SqlError),   // parseo/planificación/catálogo
-    Engine(String),              // motor/runtime/conectores
+Sql(hotlap_sql::SqlError),   // parsing, planning, or catalog
+Engine(String),              // engine, runtime, or connectors
 }
 ```
 
@@ -127,7 +126,7 @@ inválido (p. ej. `DDL after START`) ya se reportan como `SqlError::Unsupported`
 desde `hotlap-sql`, por lo que no hay una variante `State` propia. Las consultas
 (`Rows`) **no** abortan la sesión; el consumidor decide qué hacer con el error.
 
-## 6. Métricas in-process
+## 6. Métricas en proceso
 
 `hotlap-core::MetricsRegistry` guarda contadores y gauges con nombre en celdas
 `AtomicU64`; se comparte con `Arc` y se actualiza con `&self`. `metric(nombre)`
@@ -140,11 +139,11 @@ use hotlap_core::MetricsRegistry;
 
 let metrics = MetricsRegistry::new();
 metrics.inc("rows_ingested");        // +1
-metrics.add("rows_ingested", 4);     // +n (contador)
+metrics.add("rows_ingested", 4);     // +n (counter)
 metrics.set("windows_open", 3);      // =n (gauge)
-let rows = metrics.metric("rows_ingested"); // handle cacheado, lock-free
+let rows = metrics.metric("rows_ingested"); // cached, lock-free handle
 rows.add(1);
-let snap = metrics.snapshot();       // BTreeMap<String, u64> ordenado por nombre
+let snap = metrics.snapshot();       // BTreeMap<String, u64> sorted by name
 ```
 
 `Session::metrics()` devuelve `MetricsSnapshot { entries: BTreeMap<String, u64> }`,
