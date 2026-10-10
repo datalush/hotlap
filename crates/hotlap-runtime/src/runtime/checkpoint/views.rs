@@ -72,6 +72,10 @@ impl Checkpointer {
                             .into(),
                     ));
                 }
+                // Validate any available body before allowing SQL to open its
+                // writers. Missing/current-corrupt bodies remain discardable;
+                // foreign or identity-inconsistent bodies are fatal.
+                self.read_body_for_recovery(id)?;
                 return Ok(valid);
             }
             PendingPhase::Missing => return Ok(valid),

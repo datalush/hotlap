@@ -41,6 +41,7 @@ pub struct Stats {
     pub source_reads: AtomicU32,
     pub sink_creates: AtomicU32,
     pub sink_writes: AtomicU32,
+    pub sink_commits: AtomicU32,
     pub resumed: Mutex<Vec<i64>>,
 }
 
@@ -375,6 +376,7 @@ impl Sink for BagSink {
     }
 
     async fn commit(&self) -> Result<(), ConnectorError> {
+        self.stats.sink_commits.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 

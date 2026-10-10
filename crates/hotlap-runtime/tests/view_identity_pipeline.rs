@@ -23,6 +23,7 @@ use hotlap_runtime::runtime::pipeline;
 use hotlap_runtime::runtime::pipeline::{Pipeline, SinkSpec};
 use hotlap_runtime::runtime::recovery::Recovery;
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
+use hotlap_runtime::runtime::source_checkpoint::{decode_sources, encode_sources};
 
 use support::{
     RecordingSink, ResumableSource, SharedBackend, SpySource, corrupt_pending, filter, log, rows,
@@ -123,6 +124,125 @@ fn pending_prepare_without_a_valid_manifest_is_fatal_and_preserves_evidence() {
         );
         assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
         assert!(backend.get(b"checkpoint/2/valid").unwrap().is_none());
+    }
+}
+
+#[test]
+fn replay_safe_prepare_identity_mismatch_fails_pipeline_preflight_before_pump() {
+    let backend = SharedBackend::default();
+    seed_output(&backend);
+    let original_sources = backend.get(b"checkpoint/1/sources").unwrap().unwrap();
+    let mut changed = decode_sources(&original_sources).unwrap();
+    changed.entries[0].physical_identity.push_str("-changed");
+    let mut writer = backend.clone();
+    for part in ["engine", "participants"] {
+        let value = backend
+            .get(format!("checkpoint/1/{part}").as_bytes())
+            .unwrap()
+            .unwrap();
+        writer
+            .put(format!("checkpoint/2/{part}").as_bytes(), value)
+            .unwrap();
+    }
+    writer
+        .put(b"checkpoint/2/sources", encode_sources(&changed).unwrap())
+        .unwrap();
+    writer
+        .put(b"checkpoint/2/prepare", b"prepare-v1".to_vec())
+        .unwrap();
+    let evidence_before = backend.scan(b"").unwrap();
+
+    let inner: Arc<dyn Source> = Arc::new(ResumableSource::new(log()));
+    let spy = Arc::new(SpySource::new(inner));
+    let mut pipeline = Pipeline {
+        sources: sources(spy.clone()),
+        views: vec![("a".into(), filter(1))],
+        sinks: vec![],
+        checkpoint: Some(CheckpointConfig {
+            interval: Duration::from_secs(3600),
+            backend: Box::new(backend.clone()),
+            retain: DEFAULT_RETAIN,
+        }),
+        retention: None,
+    };
+
+    let error = match pipeline.preflight_recovery() {
+        Ok(()) => panic!("inconsistent prepare body must fail public preflight"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, ConnectorError::Unsupported(ref message)
+            if message == "source checkpoint and participant manifest disagree"),
+        "got {error:?}"
+    );
+    assert_eq!(spy.resumed(), 0);
+    assert_eq!(backend.scan(b"").unwrap(), evidence_before);
+    assert_eq!(
+        backend.get(b"checkpoint/2/prepare").unwrap(),
+        Some(b"prepare-v1".to_vec())
+    );
+
+    let inner: Arc<dyn Source> = Arc::new(ResumableSource::new(log()));
+    let pump_spy = Arc::new(SpySource::new(inner));
+    let pipeline = Pipeline {
+        sources: sources(pump_spy.clone()),
+        views: vec![("a".into(), filter(1))],
+        sinks: vec![],
+        checkpoint: Some(CheckpointConfig {
+            interval: Duration::from_secs(3600),
+            backend: Box::new(backend.clone()),
+            retain: DEFAULT_RETAIN,
+        }),
+        retention: None,
+    };
+    let error = match EngineHandle::start(pipeline) {
+        Ok(_) => panic!("inconsistent prepare body must fail before the pump starts"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ConnectorError::Unsupported(_)));
+    assert_eq!(pump_spy.resumed(), 0);
+    assert_eq!(backend.scan(b"").unwrap(), evidence_before);
+}
+
+#[test]
+fn replay_safe_prepare_with_missing_or_corrupt_body_uses_valid_fallback() {
+    for corrupt in [false, true] {
+        let backend = SharedBackend::default();
+        seed_output(&backend);
+        let mut writer = backend.clone();
+        let participants = backend.get(b"checkpoint/1/participants").unwrap().unwrap();
+        writer
+            .put(b"checkpoint/2/participants", participants)
+            .unwrap();
+        writer
+            .put(b"checkpoint/2/prepare", b"prepare-v1".to_vec())
+            .unwrap();
+        if corrupt {
+            writer
+                .put(b"checkpoint/2/engine", b"HLSR\x03broken".to_vec())
+                .unwrap();
+        }
+
+        let inner: Arc<dyn Source> = Arc::new(ResumableSource::new(log()));
+        let spy = Arc::new(SpySource::new(inner));
+        let pipeline = Pipeline {
+            sources: sources(spy.clone()),
+            views: vec![("a".into(), filter(1))],
+            sinks: vec![],
+            checkpoint: Some(CheckpointConfig {
+                interval: Duration::from_secs(3600),
+                backend: Box::new(backend.clone()),
+                retain: DEFAULT_RETAIN,
+            }),
+            retention: None,
+        };
+
+        let handle = EngineHandle::start(pipeline)
+            .expect("safe prepare with an absent or current-corrupt body discards to fallback");
+        assert_eq!(rows(&handle.snapshot("a").unwrap()), vec![vec![1]]);
+        assert_eq!(spy.resumed(), 1);
+        assert_eq!(spy.offset(), Some(1));
+        handle.shutdown().unwrap();
     }
 }
 
