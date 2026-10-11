@@ -93,38 +93,6 @@ pub(crate) fn checked_capacity_bytes(
         .ok_or_else(|| EngineError::Infrastructure("memory report capacity overflow".into()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::MemoryReport;
-
-    #[test]
-    fn output_backing_capacity_deduplicates_same_allocation_but_not_equal_bytes() {
-        let first = vec![7u8; 8];
-        let equal_but_distinct = vec![7u8; 8];
-        assert_eq!(first, equal_but_distinct);
-        assert_ne!(first.as_ptr(), equal_but_distinct.as_ptr());
-
-        let mut report = MemoryReport::default();
-        let mut allocations = std::collections::HashSet::new();
-        report
-            .add_output(
-                0,
-                [
-                    (first.as_ptr() as usize, first.capacity()),
-                    (first.as_ptr() as usize, first.capacity()),
-                    (
-                        equal_but_distinct.as_ptr() as usize,
-                        equal_but_distinct.capacity(),
-                    ),
-                ],
-                &mut allocations,
-            )
-            .unwrap();
-        assert_eq!(report.known_backing_capacity_bytes, 16);
-        assert_eq!(format!("{report:?}").contains("0x"), false);
-    }
-}
-
 impl super::EngineCore {
     /// Measures memory reachable through the currently covered core state.
     /// This is a shared-reachable partial report, not exclusive heap or RSS.
@@ -159,5 +127,37 @@ impl super::EngineCore {
             report.unknown_categories.is_empty() && report.opaque_external_categories.is_empty();
         drop(allocations);
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemoryReport;
+
+    #[test]
+    fn output_backing_capacity_deduplicates_same_allocation_but_not_equal_bytes() {
+        let first = vec![7u8; 8];
+        let equal_but_distinct = vec![7u8; 8];
+        assert_eq!(first, equal_but_distinct);
+        assert_ne!(first.as_ptr(), equal_but_distinct.as_ptr());
+
+        let mut report = MemoryReport::default();
+        let mut allocations = std::collections::HashSet::new();
+        report
+            .add_output(
+                0,
+                [
+                    (first.as_ptr() as usize, first.capacity()),
+                    (first.as_ptr() as usize, first.capacity()),
+                    (
+                        equal_but_distinct.as_ptr() as usize,
+                        equal_but_distinct.capacity(),
+                    ),
+                ],
+                &mut allocations,
+            )
+            .unwrap();
+        assert_eq!(report.known_backing_capacity_bytes, 16);
+        assert!(!format!("{report:?}").contains("0x"));
     }
 }
