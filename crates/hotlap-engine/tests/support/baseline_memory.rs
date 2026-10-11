@@ -64,6 +64,7 @@ impl MemoryReport {
             "output_rows": self.output_rows, "schema_fingerprint": self.schema_fingerprint,
             "drained_tap_rows": self.drained_tap_rows,
             "core_memory_report": self.memory_report,
+            "core_memory_report_phase": "separate_equivalent_replay_after_allocator_samples",
             "logical_retained_bytes": self.logical_retained_bytes,
             "memory_semantics": self.memory_semantics,
         })
@@ -94,6 +95,7 @@ fn validate_emitted_report(value: &serde_json::Value) -> Result<(), String> {
         "schema_fingerprint",
         "drained_tap_rows",
         "core_memory_report",
+        "core_memory_report_phase",
         "logical_retained_bytes",
         "memory_semantics",
     ];
@@ -147,6 +149,9 @@ fn validate_emitted_report(value: &serde_json::Value) -> Result<(), String> {
         || value["core_memory_report"].get("allocations").is_some()
     {
         return Err("memory report must not expose allocation identities".into());
+    }
+    if value["core_memory_report_phase"] != "separate_equivalent_replay_after_allocator_samples" {
+        return Err("memory observer phase must be distinct from allocator samples".into());
     }
     if value["output_rows"].as_u64().is_none() || value["drained_tap_rows"].as_u64().is_none() {
         return Err("missing output/tap row count".into());
@@ -543,6 +548,7 @@ mod report_contract_tests {
                 "peak_live_since_process_baseline_bytes":1, "output_rows":1, "schema_fingerprint":schema,
                 "drained_tap_rows":1, "logical_retained_bytes":null,
                 "core_memory_report":{"complete":false},
+                "core_memory_report_phase":"separate_equivalent_replay_after_allocator_samples",
                 "core_memory_report_categories":{"complete":false},
                 "memory_semantics":"process_live_allocator_state_proxy_not_logical_retained_heap"
             });
