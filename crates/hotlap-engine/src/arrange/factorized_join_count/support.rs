@@ -17,6 +17,13 @@ pub(super) fn schema() -> SchemaRef {
     ]))
 }
 
+fn output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("count", DataType::Int64, true),
+    ]))
+}
+
 pub(super) fn batch(rows: &[Row]) -> ZSetBatch {
     batch_at(rows, 0)
 }
@@ -160,8 +167,10 @@ fn nullable_join_behavior_is_confirmed_against_reference() {
     let left = [(None, Some(10), 2)];
     let right = [(None, Some(20), 3)];
     let mut reference = Reference::new(0, 0);
-    let actual = output(&reference.apply(&batch(&left), &batch(&right)).unwrap());
+    let result = reference.apply(&batch(&left), &batch(&right)).unwrap();
+    let actual = output(&result);
     assert_eq!(actual, [((None, 6), 1)].into());
+    assert_eq!(result.batch.schema(), output_schema());
 }
 
 #[test]
@@ -175,12 +184,25 @@ fn reference_matches_oracle_for_count_rows() {
 }
 
 #[test]
+fn swapped_right_key_preserves_exact_output_schema() {
+    let left = [(Some(1), Some(10), 2)];
+    let right = [(Some(1), Some(20), 3)];
+    let mut reference = Reference::new(0, 1);
+    let result = reference
+        .apply(&batch_at(&left, 0), &batch_at(&right, 1))
+        .unwrap();
+
+    assert_eq!(output(&result), [((Some(1), 6), 1)].into());
+    assert_eq!(result.batch.schema(), output_schema());
+}
+
+#[test]
 fn empty_batches_preserve_schema_and_output_weights() {
     let left = empty_batch(schema());
     let right = empty_batch(schema());
     let mut reference = Reference::new(0, 0);
     let result = reference.apply(&left, &right).unwrap();
-    assert_eq!(result.batch.schema().fields().len(), 2);
+    assert_eq!(result.batch.schema(), output_schema());
     assert_eq!(output(&result), Output::new());
     let mut folded = [((Some(8), 2), 3)].into();
     fold_output(&mut folded, &result);
