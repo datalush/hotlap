@@ -150,7 +150,7 @@ impl KeyedArrangement {
     }
 
     /// Returns the canonical payload used when the arrangement has no payload.
-    fn unit_payload(&self) -> OwnedRow {
+    pub(super) fn unit_payload(&self) -> OwnedRow {
         self.payload_converter.parser().parse(&[]).owned()
     }
 

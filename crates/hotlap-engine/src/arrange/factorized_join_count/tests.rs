@@ -316,7 +316,17 @@ fn schema_row_bound_and_numeric_bound_rejections_are_atomic() {
         Ok(Err(_)) => "error",
         Err(_) => "panic",
     };
-    assert_eq!(row_observed, "panic");
+    let expected_row_behavior = std::panic::catch_unwind(|| {
+        let mut value = std::hint::black_box(i64::MAX);
+        value += std::hint::black_box(1_i64);
+        std::hint::black_box(value)
+    });
+    let expected_row_behavior = if expected_row_behavior.is_err() {
+        "panic"
+    } else {
+        "ok"
+    };
+    assert_eq!(row_observed, expected_row_behavior);
 
     let mut numeric_reference = Reference::new(0, 0);
     numeric_reference
@@ -387,6 +397,114 @@ fn manual_keeps_duplicate_count_field_names_and_column_positions() {
     assert_eq!(outputs[1].batch.schema().field(1).name(), "count");
     assert_eq!(output(&outputs[0]), [((Some(7), 6), 1)].into());
     assert_eq!(output(&outputs[2]), output(&outputs[1]));
+}
+
+#[test]
+fn key_only_nullable_int64_rows_use_canonical_unit_payload() {
+    use arrow::{
+        array::{ArrayRef, Int64Array},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+    use std::sync::Arc;
+
+    let key_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+    let payload_schema = schema();
+    let key_batch = |rows: &[(Option<i64>, i64)]| {
+        hotlap_core::ZSetBatch::new(
+            RecordBatch::try_new(
+                key_schema.clone(),
+                vec![Arc::new(Int64Array::from(
+                    rows.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+                )) as ArrayRef],
+            )
+            .unwrap(),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, weight)| *weight).collect::<Vec<_>>(),
+            )),
+        )
+        .unwrap()
+    };
+    let payload_batch = |rows: &[Row]| batch(rows);
+
+    for key_only_left in [true, false] {
+        let left_schema = if key_only_left {
+            key_schema.clone()
+        } else {
+            payload_schema.clone()
+        };
+        let right_schema = if key_only_left {
+            payload_schema.clone()
+        } else {
+            key_schema.clone()
+        };
+        let mut candidate = Candidate::new(left_schema, right_schema, 0, 0).unwrap();
+        let (left, right) = if key_only_left {
+            (
+                key_batch(&[(Some(7), 2)]),
+                payload_batch(&[(Some(7), Some(10), 3)]),
+            )
+        } else {
+            (
+                payload_batch(&[(Some(7), Some(10), 3)]),
+                key_batch(&[(Some(7), 2)]),
+            )
+        };
+        let actual = candidate.apply(&left, &right).unwrap();
+        assert_eq!(output(&actual), [((Some(7), 6), 1)].into());
+
+        let duplicate_unit = if key_only_left {
+            (
+                key_batch(&[(Some(7), 4)]),
+                payload_batch(&[(Some(7), Some(10), 2)]),
+            )
+        } else {
+            (
+                payload_batch(&[(Some(7), Some(10), 2)]),
+                key_batch(&[(Some(7), 4)]),
+            )
+        };
+        assert_eq!(
+            output(
+                &candidate
+                    .apply(&duplicate_unit.0, &duplicate_unit.1)
+                    .unwrap()
+            ),
+            [((Some(7), 6), -1), ((Some(7), 30), 1)].into()
+        );
+
+        let left_retract = if key_only_left {
+            key_batch(&[(Some(7), -1)])
+        } else {
+            payload_batch(&[(Some(7), Some(10), -2)])
+        };
+        let right_retract = if key_only_left {
+            payload_batch(&[(Some(7), Some(10), -2)])
+        } else {
+            key_batch(&[(Some(7), -1)])
+        };
+        let retracted = candidate.apply(&left_retract, &right_retract).unwrap();
+        assert_eq!(
+            output(&retracted),
+            [((Some(7), 15), 1), ((Some(7), 30), -1)].into()
+        );
+
+        let null_key = if key_only_left {
+            (
+                key_batch(&[(None, 1)]),
+                payload_batch(&[(None, Some(11), 1)]),
+            )
+        } else {
+            (
+                payload_batch(&[(None, Some(11), 1)]),
+                key_batch(&[(None, 1)]),
+            )
+        };
+        assert_eq!(
+            output(&candidate.apply(&null_key.0, &null_key.1).unwrap()),
+            [((None, 1), 1)].into()
+        );
+    }
 }
 
 fn batch_with_payload_name(name: &str, rows: &[Row]) -> hotlap_core::ZSetBatch {

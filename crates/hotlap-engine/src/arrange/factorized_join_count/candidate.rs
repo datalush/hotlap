@@ -319,10 +319,16 @@ fn stage(batch: &ZSetBatch, arrangement: &KeyedArrangement) -> Result<Vec<Staged
         .iter()
         .map(|&i| batch.batch.column(i).clone())
         .collect();
-    let payload_rows = arrangement
-        .payload_converter
-        .convert_columns(&payload_columns)
-        .map_err(|_| NotEligible::Encoding)?;
+    let payload_rows = if payload_columns.is_empty() {
+        None
+    } else {
+        Some(
+            arrangement
+                .payload_converter
+                .convert_columns(&payload_columns)
+                .map_err(|_| NotEligible::Encoding)?,
+        )
+    };
     let diffs = batch
         .diff()
         .as_any()
@@ -353,7 +359,13 @@ fn stage(batch: &ZSetBatch, arrangement: &KeyedArrangement) -> Result<Vec<Staged
             )
         };
         let entry = rows
-            .entry((key_row, payload_rows.row(index).owned()))
+            .entry((
+                key_row,
+                payload_rows.as_ref().map_or_else(
+                    || arrangement.unit_payload(),
+                    |rows| rows.row(index).owned(),
+                ),
+            ))
             .or_insert((key_value, 0, 0));
         entry.1 = entry.1.checked_add(diff).ok_or(NotEligible::NumericBound)?;
         entry.2 = entry
