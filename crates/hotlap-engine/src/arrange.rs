@@ -1,6 +1,9 @@
 mod per_key;
 mod state;
 
+#[cfg(test)]
+mod factorized_join_count;
+
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, new_empty_array};
