@@ -944,7 +944,7 @@ mod report_contract_tests {
     fn family_probe_contract_rejects_unknown_family_and_missing_metrics() {
         let mut valid = serde_json::json!({
             "family":"join", "phase":"retained", "rows":128, "rep":0,
-            "repeats":3, "profile":"release", "observer_phase":"quiescent",
+            "repeats":3, "profile":"release", "observer_phase":"quiescent_afteroutputsdrained",
             "logical_payload_bytes":1, "known_backing_capacity_bytes":1,
             "join_logical_payload_bytes":1, "join_known_key_capacity_bytes":1,
             "window_logical_payload_bytes":0, "window_known_key_capacity_bytes":0,
