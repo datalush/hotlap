@@ -2112,6 +2112,7 @@ dependencies = [
  "bincode",
  "hotlap-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

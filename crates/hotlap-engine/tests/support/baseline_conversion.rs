@@ -9,7 +9,16 @@ use crate::baseline_workloads::{batch, metric, schema};
 
 pub(super) fn run(n: usize) {
     let input_schema = schema(&["k", "v"]);
-    let fixture = vec![(1, 10, 2), (1, 10, -1), (1, 10, 1), (2, 20, -3), (2, 20, 1)];
+    let fixture = vec![
+        (1, 10, 2),
+        (1, 10, -1),
+        (1, 10, 1),
+        (2, 20, -3),
+        (2, 20, 1),
+        (3, 30, 5),
+        (3, 30, -5),
+        (4, 40, 0),
+    ];
     let expected = BTreeMap::from([(vec![1, 10], 2), (vec![2, 20], -2)]);
     let setup_started = std::time::Instant::now();
     let input = row_records_to_zset(input_schema, &fixture);
@@ -32,19 +41,40 @@ pub(super) fn run(n: usize) {
     assert_eq!(actual, expected);
     assert_eq!(
         input.len(),
-        5,
-        "input Arrow records preserve duplicate and zero-net rows"
+        fixture.len(),
+        "input Arrow batch preserves source records"
     );
-    assert_eq!(distinct, 2);
+    assert_eq!(distinct, 4);
     let _ = n;
 }
 
 pub(super) fn assert_signed_conversion_fixture() {
     let input_schema = schema(&["k", "v"]);
-    let fixture = vec![(1, 10, 2), (1, 10, -1), (1, 10, 1), (2, 20, -3), (2, 20, 1)];
+    let fixture = vec![
+        (1, 10, 2),
+        (1, 10, -1),
+        (1, 10, 1),
+        (2, 20, -3),
+        (2, 20, 1),
+        (3, 30, 5),
+        (3, 30, -5),
+        (4, 40, 0),
+    ];
     let input = row_records_to_zset(input_schema, &fixture);
     let expected = BTreeMap::from([(vec![1, 10], 2), (vec![2, 20], -2)]);
+    assert_eq!(input.len(), 8, "raw Arrow zset preserves source records");
+    let raw = zset_records(&input);
+    assert!(
+        raw.contains(&(vec![4, 40], 0)),
+        "zero-weight source record is retained by this batch representation"
+    );
     assert_eq!(consolidate_records(zset_records(&input)), expected);
+    assert!(
+        std::panic::catch_unwind(|| {
+            consolidate_records(vec![(vec![9, 90], i64::MAX), (vec![9, 90], 1)])
+        })
+        .is_err()
+    );
 }
 
 fn consolidate_records(records: Vec<(Vec<i64>, i64)>) -> BTreeMap<Vec<i64>, i64> {

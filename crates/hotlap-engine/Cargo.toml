@@ -12,3 +12,4 @@ hotlap-core = { path = "../hotlap-core" }
 [dev-dependencies]
 # Enables the deterministic multiset copy counter used by the cost tests.
 hotlap-core = { path = "../hotlap-core", features = ["test-instrumentation"] }
+serde_json = "1"
