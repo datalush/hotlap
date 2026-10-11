@@ -45,7 +45,11 @@ derechas en una clave caliente; cada paso reemplaza una fila de ambos lados.
 Los primeros 40 pasos son calentamiento; se miden los 400 siguientes. Los
 conteos analíticos esperados son 10.000, 10.000, 1 por clave y 8.000,
 respectivamente. Las multiplicidades y fronteras exactas están fijadas en la
-prueba de construcción de cargas.
+prueba de construcción de cargas. Una prueba ordinaria no ignorada ejecuta las
+cuatro formas con cargas reducidas a través del mismo constructor, contrasta
+schema y deltas de las tres rutas en cada paso frente a `Reference`, y verifica
+los outputs acumulados contra el oráculo independiente desde seed, durante el
+calentamiento y sin reiniciar el estado en la frontera de medición.
 
 Cada proceso genera las entradas Arrow una vez antes de construir una sola
 estrategia y conserva los mismos batches durante seed, calentamiento y medición.
