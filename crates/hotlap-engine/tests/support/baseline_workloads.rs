@@ -481,6 +481,8 @@ pub fn run() {
         join_workload(rows, "join_skewed_fanout_duplicates", true, true);
         aggregate_workload(rows);
         filter_project_workload(rows);
+        crate::baseline_conversion::run(rows);
+        crate::baseline_views::run(rows);
         crate::baseline_lifecycle::window_workload(rows);
         crate::baseline_lifecycle::recovery_multiview_workload(rows);
     }

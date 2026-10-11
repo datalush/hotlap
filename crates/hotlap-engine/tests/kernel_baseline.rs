@@ -1,7 +1,11 @@
 #[path = "support/baseline_alloc.rs"]
 mod baseline_alloc;
+#[path = "support/baseline_conversion.rs"]
+mod baseline_conversion;
 #[path = "support/baseline_lifecycle.rs"]
 mod baseline_lifecycle;
+#[path = "support/baseline_views.rs"]
+mod baseline_views;
 #[path = "support/baseline_workloads.rs"]
 mod baseline_workloads;
 
@@ -11,6 +15,11 @@ fn minimum_three_row_fixture_can_retract_a_filtered_out_row() {
     let selected = baseline_workloads::filter_retract_index(&rows);
     assert_eq!(selected, 0);
     assert!(rows[selected].1 < 50);
+}
+
+#[test]
+fn matched_multiview_outputs_equal_independent_view_cores() {
+    baseline_views::assert_matched_multiview_correctness(8);
 }
 
 #[test]
