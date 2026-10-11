@@ -25,6 +25,11 @@ fn matched_multiview_outputs_equal_independent_view_cores() {
 }
 
 #[test]
+fn checkpoint_encoding_reports_nonzero_serialized_payload_size() {
+    assert!(baseline_views::serialized_snapshot_size(8) > 0);
+}
+
+#[test]
 #[ignore = "manual CPU/allocation baseline; run with --ignored --nocapture"]
 fn kernel_families_cpu_and_allocation_baseline() {
     baseline_workloads::run();

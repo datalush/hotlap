@@ -2,11 +2,13 @@
 
 use arrow::array::Int64Array;
 use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
-use hotlap_engine::EngineCore;
+use hotlap_engine::{EngineCore, encode_snapshot};
 use std::collections::BTreeMap;
 use std::hint::black_box;
+use std::time::Instant;
 
-use crate::baseline_workloads::{batch, int_rows, metric, schema};
+use crate::baseline_alloc::{self, Stats};
+use crate::baseline_workloads::{batch, int_rows, metric, rep, repeats, schema};
 
 fn plans() -> [Plan; 2] {
     [
@@ -92,6 +94,50 @@ pub(super) fn assert_matched_multiview_correctness(n: usize) {
     }
 }
 
+pub(super) fn serialized_snapshot_size(n: usize) -> usize {
+    let setup_start = Instant::now();
+    let input_schema = schema(&["k", "v"]);
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &plans()[0]).unwrap();
+    let setup_ns = setup_start.elapsed().as_nanos();
+    let fixture_start = Instant::now();
+    let input = batch(
+        input_schema,
+        vec![
+            (0..n).map(|i| (i % 4) as i64).collect(),
+            (0..n).map(|i| i as i64).collect(),
+        ],
+        vec![1; n],
+    );
+    let fixture_setup_ns = fixture_start.elapsed().as_nanos();
+    core.push(InputId(0), &input).unwrap();
+    let snapshot = core.checkpoint().unwrap();
+    let (head, allocated_live_before_bytes) = baseline_alloc::capture_baseline(|| {
+        std::env::var("HOTLAP_BASELINE_HEAD").unwrap_or_else(|_| "unknown".into())
+    });
+    let started = Instant::now();
+    let bytes = encode_snapshot(&snapshot).unwrap();
+    let elapsed_ns = started.elapsed().as_nanos();
+    let stats = Stats::read();
+    println!(
+        "{{\"case\":\"multiview_shared\",\"phase\":\"snapshot_serialized_size\",\"seed\":7,\"rep\":{},\"repeats\":{},\"head\":\"{head}\",\"profile\":\"{}\",\"arch\":\"{}\",\"os\":\"{}\",\"input_rows\":{n},\"setup_ns\":{setup_ns},\"fixture_setup_ns\":{fixture_setup_ns},\"elapsed_ns\":{elapsed_ns},\"allocated_live_before_bytes\":{allocated_live_before_bytes},\"peak_allocated_live_bytes\":{},\"allocated_live_after_bytes\":{},\"serialized_snapshot_bytes\":{},\"serialized_bytes_semantics\":\"encoded_checkpoint_payload_only_not_retained_heap\"}}",
+        rep(),
+        repeats(),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        stats.peak,
+        stats.live,
+        bytes.len()
+    );
+    bytes.len()
+}
+
 pub(super) fn materialize_rows(zset: &ZSetBatch) -> BTreeMap<Vec<i64>, i64> {
     let columns: Vec<_> = zset
         .batch
@@ -111,6 +157,7 @@ pub(super) fn materialize_rows(zset: &ZSetBatch) -> BTreeMap<Vec<i64>, i64> {
 }
 
 pub(super) fn run(n: usize) {
+    serialized_snapshot_size(n);
     assert_matched_multiview_correctness(n);
     matched_multiview_workload(n);
 }
