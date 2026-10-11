@@ -47,6 +47,73 @@ fn view_output_rejects_diff_sum_overflow() {
 }
 
 #[test]
+fn memory_report_counts_group_state_and_keeps_unsupported_families_explicit() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
+    core.push(InputId(0), &zset(&[(1, 1), (2, 1)])).unwrap();
+
+    let report = core.memory_report().unwrap();
+
+    assert_eq!(report.logical_payload_bytes, 16 + 2 * 19);
+    assert_eq!(report.known_backing_capacity_bytes, 16 + 2 * 19);
+    assert_eq!(
+        report.estimated_structural_bytes,
+        2 * std::mem::size_of::<(Vec<u8>, hotlap_core::snapshot::GroupEntry)>()
+    );
+    assert!(
+        report
+            .unknown_categories
+            .contains(&"view_plans_and_taps".to_string())
+    );
+    assert!(
+        report
+            .opaque_external_categories
+            .contains(&"arrow_buffers".to_string())
+    );
+    assert!(!report.complete);
+}
+
+#[test]
+fn memory_report_rejects_poisoned_core_without_mutating_checkpoint() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
+    core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+    let before = core.checkpoint().unwrap();
+    let report = core.memory_report().unwrap();
+    let after = core.checkpoint().unwrap();
+    assert_eq!(before, after);
+    assert_eq!(report.logical_payload_bytes, 8 + 19);
+
+    core.failed = true;
+    assert!(core.memory_report().is_err());
+}
+
+#[test]
+fn memory_report_query_does_not_change_output_after_retraction() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
+    core.push(InputId(0), &zset(&[(1, 2)])).unwrap();
+    core.push(InputId(0), &zset(&[(1, -1)])).unwrap();
+    let before = core.snapshot(ViewId(0)).unwrap();
+    let first = core.memory_report().unwrap();
+    let second = core.memory_report().unwrap();
+    let after = core.snapshot(ViewId(0)).unwrap();
+    assert_eq!(
+        crate::zset::consolidate(&before).unwrap().batch,
+        crate::zset::consolidate(&after).unwrap().batch
+    );
+    assert_eq!(first, second);
+}
+
+#[test]
+fn memory_report_checked_counter_rejects_overflow() {
+    assert!(super::memory::MemoryReport::checked_capacity_sum_for_test(&[usize::MAX, 1]).is_err());
+}
+
+#[test]
 fn view_output_state_does_not_grow_with_history() {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();

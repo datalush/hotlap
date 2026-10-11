@@ -31,6 +31,18 @@ pub(super) struct ViewOutput {
 }
 
 impl ViewOutput {
+    pub(super) fn memory_usage(&self) -> Result<(usize, Vec<(usize, usize)>), EngineError> {
+        let mut payload = 0usize;
+        let mut capacities = Vec::with_capacity(self.diffs.len());
+        for key in self.diffs.keys() {
+            payload = payload.checked_add(key.len()).ok_or_else(|| {
+                EngineError::Infrastructure("memory report output payload overflow".into())
+            })?;
+            capacities.push((key.as_ptr() as usize, key.capacity()));
+        }
+        Ok((payload, capacities))
+    }
+
     /// Number of live consolidated rows retained.
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {

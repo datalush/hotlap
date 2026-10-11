@@ -23,6 +23,7 @@ pub use core::EngineCore;
 pub use core::ipc::{
     decode_framed, decode_schema, decode_snapshot, encode_framed, encode_schema, encode_snapshot,
 };
+pub use core::memory::MemoryReport;
 pub use error::EngineError;
 pub use keys::KeyConverter;
 pub use time::Frontier;

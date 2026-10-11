@@ -4,6 +4,7 @@ mod checkpoint;
 mod graph;
 mod helpers;
 pub mod ipc;
+pub mod memory;
 mod metrics;
 mod output;
 mod restore;

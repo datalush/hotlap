@@ -40,6 +40,43 @@ fn checkpoint_encoding_reports_nonzero_serialized_payload_size() {
 }
 
 #[test]
+fn memory_observability_baseline_separates_live_categories_and_serialized_size() {
+    use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId};
+    use hotlap_engine::EngineCore;
+
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::GroupAggregate {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![0],
+            aggs: vec![AggSpec::count()],
+        },
+    )
+    .unwrap();
+    let report = core.memory_report().unwrap();
+    assert!(!report.complete);
+    assert_eq!(report.known_backing_capacity_bytes, 0);
+    assert!(
+        report
+            .unknown_categories
+            .contains(&"core_registries_schemas_and_watermarks".to_string())
+    );
+    assert!(
+        report
+            .opaque_external_categories
+            .contains(&"arrow_buffers".to_string())
+    );
+    assert!(
+        !report
+            .unknown_categories
+            .iter()
+            .any(|category| category == "joins")
+    );
+}
+
+#[test]
 #[ignore = "manual CPU/allocation baseline; run with --ignored --nocapture"]
 fn kernel_families_cpu_and_allocation_baseline() {
     baseline_workloads::run();

@@ -41,6 +41,8 @@ struct MemoryReport {
     output_rows: usize,
     schema_fingerprint: String,
     drained_tap_rows: usize,
+    memory_report: Option<serde_json::Value>,
+    observed_memory_report: Option<serde_json::Value>,
     logical_retained_bytes: Option<usize>,
     memory_semantics: &'static str,
 }
@@ -62,6 +64,8 @@ impl MemoryReport {
             "peak_live_since_process_baseline_bytes": self.peak_live_since_process_baseline_bytes,
             "output_rows": self.output_rows, "schema_fingerprint": self.schema_fingerprint,
             "drained_tap_rows": self.drained_tap_rows,
+            "core_memory_report": self.memory_report,
+            "core_memory_report_categories": self.observed_memory_report,
             "logical_retained_bytes": self.logical_retained_bytes,
             "memory_semantics": self.memory_semantics,
         })
@@ -91,6 +95,8 @@ fn validate_emitted_report(value: &serde_json::Value) -> Result<(), String> {
         "output_rows",
         "schema_fingerprint",
         "drained_tap_rows",
+        "core_memory_report",
+        "core_memory_report_categories",
         "logical_retained_bytes",
         "memory_semantics",
     ];
@@ -136,6 +142,9 @@ fn validate_emitted_report(value: &serde_json::Value) -> Result<(), String> {
         || value["fixture_live_bytes"].as_u64().is_none()
     {
         return Err("missing lifecycle allocator sample".into());
+    }
+    if value["core_memory_report"].is_null() || value["core_memory_report_categories"].is_null() {
+        return Err("missing live core memory report".into());
     }
     if value["output_rows"].as_u64().is_none() || value["drained_tap_rows"].as_u64().is_none() {
         return Err("missing output/tap row count".into());
@@ -199,6 +208,9 @@ fn single_view_checkpoint_metric(n: usize, rep: usize, repeats: usize) {
     let drained = tap.len();
     drop(tap);
     let after_drain_live = Stats::read().live;
+    let report = core.memory_report().unwrap();
+    let memory_report = Some(serde_json::to_value(&report).unwrap());
+    let observed_memory_report = Some(serde_json::to_value(&report).unwrap());
     drop(core);
     let live_after_core_drop = Stats::read().live;
     let peak_live = Stats::read().peak;
@@ -231,6 +243,8 @@ fn single_view_checkpoint_metric(n: usize, rep: usize, repeats: usize) {
         output_rows,
         schema_fingerprint,
         drained_tap_rows: drained,
+        memory_report,
+        observed_memory_report,
         logical_retained_bytes: None,
         memory_semantics: "process_live_allocator_state_proxy_not_logical_retained_heap",
     });
@@ -321,6 +335,41 @@ fn quiescent_live_metric(n: usize, shared: bool, rep: usize, repeats: usize) {
         }
     }
     let after_tap_drain_live = Stats::read().live;
+    let report = if let Some(core) = shared_core.as_ref() {
+        Some(serde_json::to_value(core.memory_report().unwrap()).unwrap())
+    } else {
+        let mut logical = 0usize;
+        let mut capacity = 0usize;
+        let mut estimate = 0usize;
+        let mut unknown = Vec::new();
+        let mut opaque = Vec::new();
+        for core in independent.as_ref().unwrap() {
+            let report = core.memory_report().unwrap();
+            logical = logical.checked_add(report.logical_payload_bytes).unwrap();
+            capacity = capacity
+                .checked_add(report.known_backing_capacity_bytes)
+                .unwrap();
+            estimate = estimate
+                .checked_add(report.estimated_structural_bytes)
+                .unwrap();
+            unknown.extend(report.unknown_categories);
+            opaque.extend(report.opaque_external_categories);
+        }
+        unknown.sort();
+        unknown.dedup();
+        opaque.sort();
+        opaque.dedup();
+        Some(serde_json::json!({
+            "logical_payload_bytes":logical,
+            "known_backing_capacity_bytes":capacity,
+            "estimated_structural_bytes":estimate,
+            "unknown_categories":unknown,
+            "opaque_external_categories":opaque,
+            "complete":false
+        }))
+    };
+    let memory_report = report.clone();
+    let observed_memory_report = report;
     drop(shared_core);
     drop(independent);
     let live_after_core_drop = Stats::read().live;
@@ -361,6 +410,8 @@ fn quiescent_live_metric(n: usize, shared: bool, rep: usize, repeats: usize) {
         output_rows,
         schema_fingerprint,
         drained_tap_rows: tap_rows,
+        memory_report,
+        observed_memory_report,
         logical_retained_bytes: None,
         memory_semantics: "process_live_allocator_state_proxy_not_logical_retained_heap",
     });
@@ -400,6 +451,8 @@ mod report_contract_tests {
             output_rows: 16,
             schema_fingerprint: "k,count|k,count,sum".into(),
             drained_tap_rows: 8,
+            memory_report: Some(serde_json::json!({"complete":false})),
+            observed_memory_report: Some(serde_json::json!({"complete":false})),
             logical_retained_bytes: None,
             memory_semantics: "process_live_allocator_state_proxy_not_logical_retained_heap",
         };
@@ -433,6 +486,8 @@ mod report_contract_tests {
                 "live_delta_from_empty_core_bytes":0, "live_delta_from_process_baseline_bytes":0,
                 "peak_live_since_process_baseline_bytes":1, "output_rows":1, "schema_fingerprint":schema,
                 "drained_tap_rows":1, "logical_retained_bytes":null,
+                "core_memory_report":{"complete":false},
+                "core_memory_report_categories":{"complete":false},
                 "memory_semantics":"process_live_allocator_state_proxy_not_logical_retained_heap"
             });
             assert!(validate_emitted_report(&report).is_ok(), "phase {phase}");

@@ -46,6 +46,44 @@ pub struct GroupAggregate {
 }
 
 impl GroupAggregate {
+    pub(crate) fn has_minmax(&self) -> bool {
+        self.aggs.iter().any(|agg| {
+            matches!(
+                agg.func,
+                hotlap_core::AggFunc::Min | hotlap_core::AggFunc::Max
+            )
+        })
+    }
+
+    pub(crate) fn memory_usage(
+        &self,
+    ) -> Result<super::super::core::memory::GroupMemory, crate::error::EngineError> {
+        let mut payload = 0usize;
+        let mut capacity = 0usize;
+        for key in self.groups.keys() {
+            payload = payload.checked_add(key.len()).ok_or_else(|| {
+                crate::error::EngineError::Infrastructure("memory report overflow".into())
+            })?;
+            capacity = capacity.checked_add(key.capacity()).ok_or_else(|| {
+                crate::error::EngineError::Infrastructure("memory report overflow".into())
+            })?;
+        }
+        Ok(super::super::core::memory::GroupMemory {
+            payload,
+            capacity,
+            estimate: self
+                .groups
+                .len()
+                .checked_mul(std::mem::size_of::<(
+                    Vec<u8>,
+                    hotlap_core::snapshot::GroupEntry,
+                )>())
+                .ok_or_else(|| {
+                    crate::error::EngineError::Infrastructure("memory report overflow".into())
+                })?,
+        })
+    }
+
     /// Creates a reducer over `key` computing `aggs` in order.
     pub fn new(key: &[usize], aggs: Vec<AggSpec>) -> Self {
         Self {

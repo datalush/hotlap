@@ -99,6 +99,13 @@ impl ViewGraph {
         };
         self.root.eval(&mut ctx)
     }
+
+    pub(super) fn memory_usage(
+        &self,
+        report: &mut super::memory::MemoryReport,
+    ) -> Result<(), crate::error::EngineError> {
+        self.root.memory_usage(report)
+    }
 }
 
 /// Recursively compiles a plan into nodes.

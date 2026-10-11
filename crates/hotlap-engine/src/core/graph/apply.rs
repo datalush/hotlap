@@ -32,6 +32,40 @@ pub(crate) fn accumulate(
 }
 
 impl Node {
+    pub(super) fn memory_usage(
+        &self,
+        report: &mut super::super::memory::MemoryReport,
+    ) -> Result<(), EngineError> {
+        match self {
+            Node::Source(_) => {}
+            Node::Filter { input, pred } => {
+                report.add_estimate(std::mem::size_of_val(pred))?;
+                input.memory_usage(report)?;
+            }
+            Node::Project { input, cols } => {
+                report.add_capacity(cols.capacity())?;
+                input.memory_usage(report)?;
+            }
+            Node::Group { input, reducer } => {
+                report.add_group(reducer.memory_usage()?)?;
+                if reducer.has_minmax() {
+                    report.mark_unknown("aggregate_minmax");
+                }
+                input.memory_usage(report)?;
+            }
+            Node::Joined { left, right, .. } => {
+                report.mark_unknown("joins");
+                left.memory_usage(report)?;
+                right.memory_usage(report)?;
+            }
+            Node::Window { input, .. } => {
+                report.mark_unknown("windows");
+                input.memory_usage(report)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Applies this node's operator to its inputs' deltas.
     pub(super) fn eval(&mut self, ctx: &mut EvalCtx) -> Result<Option<ZSetBatch>, EngineError> {
         match self {
