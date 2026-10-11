@@ -119,7 +119,8 @@ fn join_workload(n: usize, case: &str, skewed: bool, duplicates: bool) {
     core.tap_view(ViewId(0)).unwrap();
     let memory = core.memory_report().unwrap();
     assert!(!memory.complete);
-    assert!(memory.unknown_categories.contains(&"joins".to_string()));
+    assert!(memory.covered_categories.contains(&"joins".to_string()));
+    assert!(!memory.unknown_categories.contains(&"joins".to_string()));
     let setup_ns = setup_start.elapsed().as_nanos();
     let fixture_start = Instant::now();
     let left: Vec<_> = (0..n)
