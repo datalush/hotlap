@@ -89,5 +89,12 @@ fn kernel_memory_coverage_probe() {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(128);
+    let repeats = std::env::var("HOTLAP_BASELINE_REPEATS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3);
     baseline_memory::run(rows);
+    for rep in 0..repeats {
+        baseline_memory::run_family_coverage(rows, rep, repeats);
+    }
 }

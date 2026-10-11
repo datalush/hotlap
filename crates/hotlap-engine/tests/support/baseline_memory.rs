@@ -6,7 +6,8 @@ use crate::baseline_alloc::{self, Stats};
 use crate::baseline_views::{isolated_cores, materialize_rows, shared_core};
 use crate::baseline_workloads::batch;
 use crate::baseline_workloads::schema;
-use hotlap_core::{IncrementalCore, InputId, ViewId, ZSetBatch};
+use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
+use hotlap_engine::EngineCore;
 
 fn schema_fingerprint(batch: &ZSetBatch) -> String {
     batch
@@ -205,6 +206,280 @@ pub(super) fn run_isolated(n: usize) {
         quiescent_live_metric(n, false, rep, repeats);
         single_view_checkpoint_metric(n, rep, repeats);
     }
+}
+
+pub(super) fn run_family_coverage(n: usize, rep: usize, repeats: usize) {
+    probe_join(n, rep, repeats);
+    probe_minmax(n, rep, repeats);
+    probe_window(n, rep, repeats);
+    probe_retention(n, rep, repeats);
+    probe_pending_tap(n, rep, repeats);
+}
+
+fn emit_family_probe(
+    family: &str,
+    phase: &str,
+    n: usize,
+    rep: usize,
+    repeats: usize,
+    report: &hotlap_engine::MemoryReport,
+) {
+    let json = serde_json::json!({
+        "case":"kernel_memory_family", "family":family, "phase":phase, "rows":n,
+        "rep":rep, "repeats":repeats,
+        "profile":if cfg!(debug_assertions) {"debug"} else {"release"},
+        "observer_phase":"quiescent_after_outputs_and_taps_drained_before_report_allocations",
+        "logical_payload_bytes":report.logical_payload_bytes,
+        "known_backing_capacity_bytes":report.known_backing_capacity_bytes,
+        "join_logical_payload_bytes":report.join_logical_payload_bytes,
+        "join_known_key_capacity_bytes":report.join_known_key_capacity_bytes,
+        "window_logical_payload_bytes":report.window_logical_payload_bytes,
+        "window_known_key_capacity_bytes":report.window_known_key_capacity_bytes,
+        "minmax_distinct_entries":report.minmax_distinct_entries,
+        "arrow_buffer_capacity_bytes":report.arrow_buffer_capacity_bytes,
+        "covered_categories":report.covered_categories,
+        "unknown_categories":report.unknown_categories,
+        "opaque_external_categories":report.opaque_external_categories,
+        "complete":report.complete, "exact_heap_bytes":report.exact_heap_bytes
+    });
+    validate_family_probe(&json).expect("invalid family memory probe");
+    println!("{}", serde_json::to_string(&json).unwrap());
+}
+
+fn validate_family_probe(value: &serde_json::Value) -> Result<(), String> {
+    for key in [
+        "family", "phase", "rows", "rep", "repeats", "profile", "observer_phase",
+        "logical_payload_bytes", "known_backing_capacity_bytes", "join_logical_payload_bytes",
+        "join_known_key_capacity_bytes", "window_logical_payload_bytes",
+        "window_known_key_capacity_bytes", "minmax_distinct_entries",
+        "arrow_buffer_capacity_bytes", "covered_categories", "unknown_categories",
+        "opaque_external_categories", "complete", "exact_heap_bytes",
+    ] {
+        if value.get(key).is_none() {
+            return Err(format!("family probe missing {key}"));
+        }
+    }
+    let family = value["family"].as_str().ok_or("family is not a string")?;
+    if !["join", "minmax", "tumble_count", "input_retention", "pending_tap"]
+        .contains(&family)
+    {
+        return Err("unknown family probe".into());
+    }
+    if value["complete"] != false || !value["exact_heap_bytes"].is_null() {
+        return Err("family probe must preserve partial/unknown memory semantics".into());
+    }
+    Ok(())
+}
+
+fn probe_join(n: usize, rep: usize, repeats: usize) {
+    let mut core = EngineCore::new();
+    for id in [InputId(0), InputId(1)] {
+        core.register_input(id).unwrap();
+    }
+    core.build_view(
+        ViewId(0),
+        &Plan::Join {
+            left: Box::new(Plan::Source(InputId(0))),
+            right: Box::new(Plan::Source(InputId(1))),
+            left_key: vec![0],
+            right_key: vec![0],
+        },
+    )
+    .unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+    let input_schema = schema(&["k", "v"]);
+    let keys = (0..n as i64).collect::<Vec<_>>();
+    let values = (0..n as i64).map(|i| i + 1).collect::<Vec<_>>();
+    let input = batch(input_schema, vec![keys, values], vec![1; n]);
+    core.push(InputId(0), &input).unwrap();
+    core.push(InputId(1), &input).unwrap();
+    drop(core.snapshot(ViewId(0)).unwrap());
+    drop(core.take_changes(ViewId(0)).unwrap());
+    let report = core.memory_report().unwrap();
+    assert!(report.join_logical_payload_bytes > 0);
+    assert!(report.join_known_key_capacity_bytes > 0);
+    assert!(report.covered_categories.contains(&"joins".to_string()));
+    emit_family_probe("join", "retained", n, rep, repeats, &report);
+    let retract = batch(
+        schema(&["k", "v"]),
+        vec![
+            (0..n as i64).collect(),
+            (0..n as i64).map(|i| i + 1).collect(),
+        ],
+        vec![-1; n],
+    );
+    core.push(InputId(0), &retract).unwrap();
+    drop(core.snapshot(ViewId(0)).unwrap());
+    drop(core.take_changes(ViewId(0)).unwrap());
+    let retracted = core.memory_report().unwrap();
+    assert!(retracted.join_logical_payload_bytes < report.join_logical_payload_bytes);
+    emit_family_probe("join", "left_retracted", n, rep, repeats, &retracted);
+}
+
+fn probe_minmax(n: usize, rep: usize, repeats: usize) {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::GroupAggregate {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![0],
+            aggs: vec![AggSpec::min(1), AggSpec::max(1)],
+        },
+    )
+    .unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+    let input = batch(
+        schema(&["k", "v"]),
+        vec![vec![1; n], (0..n as i64).collect()],
+        vec![1; n],
+    );
+    core.push(InputId(0), &input).unwrap();
+    drop(core.snapshot(ViewId(0)).unwrap());
+    drop(core.take_changes(ViewId(0)).unwrap());
+    let report = core.memory_report().unwrap();
+    assert!(report.minmax_distinct_entries > 0);
+    assert!(
+        report
+            .covered_categories
+            .contains(&"aggregates".to_string())
+    );
+    emit_family_probe("minmax", "retained", n, rep, repeats, &report);
+    let retract = batch(
+        schema(&["k", "v"]),
+        vec![vec![1; n], (0..n as i64).collect()],
+        vec![-1; n],
+    );
+    core.push(InputId(0), &retract).unwrap();
+    drop(core.snapshot(ViewId(0)).unwrap());
+    drop(core.take_changes(ViewId(0)).unwrap());
+    let retracted = core.memory_report().unwrap();
+    assert_eq!(retracted.minmax_distinct_entries, 0);
+    emit_family_probe("minmax", "retracted", n, rep, repeats, &retracted);
+}
+
+fn probe_window(n: usize, rep: usize, repeats: usize) {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.declare_watermark(
+        InputId(0),
+        WatermarkSpec {
+            time_col: 2,
+            lag: 100,
+        },
+    )
+    .unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::TumbleCount {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![0],
+            time_col: 2,
+            size: 10,
+        },
+    )
+    .unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+    let input = batch(
+        schema(&["k", "v", "ts"]),
+        vec![
+            (0..n as i64).map(|i| i % 8).collect(),
+            (0..n as i64).collect(),
+            vec![0; n],
+        ],
+        vec![1; n],
+    );
+    core.push(InputId(0), &input).unwrap();
+    drop(core.snapshot(ViewId(0)).unwrap());
+    drop(core.take_changes(ViewId(0)).unwrap());
+    let report = core.memory_report().unwrap();
+    assert!(report.window_logical_payload_bytes > 0);
+    assert!(report.covered_categories.contains(&"windows".to_string()));
+    emit_family_probe("tumble_count", "open", n, rep, repeats, &report);
+    let advance = batch(
+        schema(&["k", "v", "ts"]),
+        vec![vec![99], vec![0], vec![131]],
+        vec![1],
+    );
+    core.push(InputId(0), &advance).unwrap();
+    drop(core.snapshot(ViewId(0)).unwrap());
+    drop(core.take_changes(ViewId(0)).unwrap());
+    let closed = core.memory_report().unwrap();
+    assert!(closed.window_logical_payload_bytes < report.window_logical_payload_bytes);
+    emit_family_probe("tumble_count", "closed", n, rep, repeats, &closed);
+}
+
+fn probe_retention(n: usize, rep: usize, repeats: usize) {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.set_input_retention(1).unwrap();
+    core.build_view(ViewId(0), &Plan::Source(InputId(0)))
+        .unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+    let large = batch(
+        schema(&["k", "v"]),
+        vec![(0..n as i64).collect(), (0..n as i64).collect()],
+        vec![1; n],
+    );
+    core.push(InputId(0), &large).unwrap();
+    drop(core.take_changes(ViewId(0)).unwrap());
+    let before = core.memory_report().unwrap();
+    assert!(
+        before
+            .covered_categories
+            .contains(&"input_retention_arrow_buffers".to_string())
+    );
+    emit_family_probe(
+        "input_retention",
+        "large_batch_retained",
+        n,
+        rep,
+        repeats,
+        &before,
+    );
+    let small = batch(
+        schema(&["k", "v"]),
+        vec![vec![n as i64], vec![n as i64]],
+        vec![1],
+    );
+    core.push(InputId(0), &small).unwrap();
+    drop(core.take_changes(ViewId(0)).unwrap());
+    let after = core.memory_report().unwrap();
+    assert!(after.arrow_buffer_capacity_bytes < before.arrow_buffer_capacity_bytes);
+    emit_family_probe(
+        "input_retention",
+        "evicted_to_small_batch",
+        n,
+        rep,
+        repeats,
+        &after,
+    );
+}
+
+fn probe_pending_tap(n: usize, rep: usize, repeats: usize) {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &Plan::Source(InputId(0)))
+        .unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+    let input = batch(
+        schema(&["k", "v"]),
+        vec![(0..n as i64).collect(), (0..n as i64).collect()],
+        vec![1; n],
+    );
+    core.push(InputId(0), &input).unwrap();
+    let pending = core.memory_report().unwrap();
+    assert!(pending.arrow_buffer_capacity_bytes > 0);
+    assert!(
+        pending
+            .covered_categories
+            .contains(&"tap_pending_batches".to_string())
+    );
+    emit_family_probe("pending_tap", "queued", n, rep, repeats, &pending);
+    drop(core.take_changes(ViewId(0)).unwrap());
+    let drained = core.memory_report().unwrap();
+    assert!(drained.arrow_buffer_capacity_bytes < pending.arrow_buffer_capacity_bytes);
+    emit_family_probe("pending_tap", "drained", n, rep, repeats, &drained);
 }
 
 fn single_view_checkpoint_metric(n: usize, rep: usize, repeats: usize) {
@@ -567,6 +842,26 @@ fn quiescent_live_metric(n: usize, shared: bool, rep: usize, repeats: usize) {
 #[cfg(test)]
 mod report_contract_tests {
     use super::*;
+
+    #[test]
+    fn family_probe_contract_rejects_unknown_family_and_missing_metrics() {
+        let mut valid = serde_json::json!({
+            "family":"join", "phase":"retained", "rows":128, "rep":0,
+            "repeats":3, "profile":"release", "observer_phase":"quiescent",
+            "logical_payload_bytes":1, "known_backing_capacity_bytes":1,
+            "join_logical_payload_bytes":1, "join_known_key_capacity_bytes":1,
+            "window_logical_payload_bytes":0, "window_known_key_capacity_bytes":0,
+            "minmax_distinct_entries":0, "arrow_buffer_capacity_bytes":0,
+            "covered_categories":["joins"], "unknown_categories":["partial"],
+            "opaque_external_categories":[], "complete":false, "exact_heap_bytes":null
+        });
+        assert!(validate_family_probe(&valid).is_ok());
+        valid["family"] = serde_json::json!("other");
+        assert!(validate_family_probe(&valid).is_err());
+        valid["family"] = serde_json::json!("join");
+        valid.as_object_mut().unwrap().remove("join_known_key_capacity_bytes");
+        assert!(validate_family_probe(&valid).is_err());
+    }
 
     #[test]
     fn emitted_json_validator_checks_phases_schema_and_cleanup_metrics() {

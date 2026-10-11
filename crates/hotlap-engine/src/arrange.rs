@@ -47,9 +47,9 @@ impl KeyedArrangement {
             .ok_or_else(|| {
                 EngineError::Infrastructure("arrangement index capacity overflow".into())
             })?;
-        let capacity = state_capacity.checked_add(index_capacity).ok_or_else(|| {
-            EngineError::Infrastructure("arrangement capacity overflow".into())
-        })?;
+        let capacity = state_capacity
+            .checked_add(index_capacity)
+            .ok_or_else(|| EngineError::Infrastructure("arrangement capacity overflow".into()))?;
         Ok((payload, capacity, structural))
     }
 
