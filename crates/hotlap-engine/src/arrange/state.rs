@@ -42,14 +42,23 @@ impl RowState {
 
     /// Adds `diff` to one entry, forgetting entries whose sum becomes zero.
     pub(super) fn add(&mut self, key: OwnedRow, payload: OwnedRow, diff: i64) {
-        let payloads = self.entries.entry(key.as_ref().to_vec()).or_default();
-        let sum = payloads.entry(payload.clone()).or_insert(0);
-        *sum += diff;
-        if *sum == 0 {
-            payloads.remove(&payload);
-        }
-        if payloads.is_empty() {
-            self.entries.remove(key.as_ref());
+        let key_bytes = key.as_ref();
+        if let Some(payloads) = self.entries.get_mut(key_bytes) {
+            if let Some(sum) = payloads.get_mut(&payload) {
+                *sum += diff;
+                if *sum == 0 {
+                    payloads.remove(&payload);
+                }
+            } else {
+                payloads.insert(payload, diff);
+            }
+            let remove_key = payloads.is_empty();
+            if remove_key {
+                self.entries.remove(key_bytes);
+            }
+        } else {
+            self.entries
+                .insert(key_bytes.to_vec(), HashMap::from([(payload, diff)]));
         }
     }
 
