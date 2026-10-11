@@ -277,6 +277,11 @@ fn memory_report_visits_current_join_arrangements_and_tracks_retractions() {
     assert_eq!(core.checkpoint().unwrap(), checkpoint_before_report);
     assert!(!retained.unknown_categories.contains(&"joins".to_string()));
     assert!(retained.join_logical_payload_bytes >= 16);
+    assert!(
+        retained.join_known_key_capacity_bytes >= 5 * std::mem::size_of::<usize>(),
+        "join key capacity: {}",
+        retained.join_known_key_capacity_bytes
+    );
 
     core.push(InputId(0), &zset(&[(1, -1)])).unwrap();
     let retracted = core.memory_report().unwrap();

@@ -38,7 +38,19 @@ impl KeyedArrangement {
     }
 
     pub(crate) fn memory_usage(&self) -> Result<(usize, usize, usize), EngineError> {
-        self.state.memory_usage()
+        let (payload, state_capacity, structural) = self.state.memory_usage()?;
+        let index_capacity = self
+            .key_indices
+            .capacity()
+            .checked_add(self.payload_indices.capacity())
+            .and_then(|count| count.checked_mul(std::mem::size_of::<usize>()))
+            .ok_or_else(|| {
+                EngineError::Infrastructure("arrangement index capacity overflow".into())
+            })?;
+        let capacity = state_capacity.checked_add(index_capacity).ok_or_else(|| {
+            EngineError::Infrastructure("arrangement capacity overflow".into())
+        })?;
+        Ok((payload, capacity, structural))
     }
 
     /// Builds an arrangement over the key columns named by `key_indices`.
