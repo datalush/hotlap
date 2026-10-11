@@ -150,6 +150,31 @@ fn validate_emitted_report(value: &serde_json::Value) -> Result<(), String> {
     {
         return Err("memory report must not expose allocation identities".into());
     }
+    for key in [
+        "logical_payload_bytes",
+        "known_backing_capacity_bytes",
+        "arrow_buffer_capacity_bytes",
+        "arrow_visible_buffer_bytes",
+        "opaque_external_bytes_lower_bound",
+        "join_logical_payload_bytes",
+        "join_known_key_capacity_bytes",
+        "window_logical_payload_bytes",
+        "window_known_key_capacity_bytes",
+        "minmax_distinct_entries",
+        "estimated_structural_bytes",
+        "covered_categories",
+        "unknown_categories",
+        "opaque_external_categories",
+        "complete",
+        "exact_heap_bytes",
+    ] {
+        if value["core_memory_report"].get(key).is_none() {
+            return Err(format!("memory report missing {key}"));
+        }
+    }
+    if !value["core_memory_report"]["exact_heap_bytes"].is_null() {
+        return Err("memory report must not claim an exact heap size".into());
+    }
     if value["core_memory_report_phase"] != "separate_equivalent_replay_after_allocator_samples" {
         return Err("memory observer phase must be distinct from allocator samples".into());
     }
@@ -311,6 +336,50 @@ fn collect_live_report(
             .map(|report| report.estimated_structural_bytes)
             .try_fold(0usize, usize::checked_add)
             .unwrap();
+        let arrow_capacity = reports
+            .iter()
+            .map(|report| report.arrow_buffer_capacity_bytes)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap();
+        let arrow_visible = reports
+            .iter()
+            .map(|report| report.arrow_visible_buffer_bytes)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap();
+        let external_lower_bound = reports
+            .iter()
+            .map(|report| report.opaque_external_bytes_lower_bound)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap();
+        let joins = reports
+            .iter()
+            .map(|report| report.join_logical_payload_bytes)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap();
+        let join_capacity = reports
+            .iter()
+            .map(|report| report.join_known_key_capacity_bytes)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap();
+        let windows = reports
+            .iter()
+            .map(|report| report.window_logical_payload_bytes)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap();
+        let window_capacity = reports
+            .iter()
+            .map(|report| report.window_known_key_capacity_bytes)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap();
+        let minmax_entries = reports
+            .iter()
+            .map(|report| report.minmax_distinct_entries)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap();
+        let covered = reports
+            .iter()
+            .flat_map(|report| report.covered_categories.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
         let unknown = reports
             .iter()
             .flat_map(|report| report.unknown_categories.iter().cloned())
@@ -322,10 +391,20 @@ fn collect_live_report(
         let serialized = serde_json::json!({
             "logical_payload_bytes":logical,
             "known_backing_capacity_bytes":capacity,
+            "arrow_buffer_capacity_bytes":arrow_capacity,
+            "arrow_visible_buffer_bytes":arrow_visible,
+            "opaque_external_bytes_lower_bound":external_lower_bound,
+            "join_logical_payload_bytes":joins,
+            "join_known_key_capacity_bytes":join_capacity,
+            "window_logical_payload_bytes":windows,
+            "window_known_key_capacity_bytes":window_capacity,
+            "minmax_distinct_entries":minmax_entries,
             "estimated_structural_bytes":estimate,
+            "covered_categories":covered,
             "unknown_categories":unknown,
             "opaque_external_categories":opaque,
-            "complete":false
+            "complete":false,
+            "exact_heap_bytes":null
         });
         drop(reports);
         drop(cores);
@@ -513,7 +592,24 @@ mod report_contract_tests {
             output_rows: 16,
             schema_fingerprint: "k,count|k,count,sum".into(),
             drained_tap_rows: 8,
-            memory_report: Some(serde_json::json!({"complete":false})),
+            memory_report: Some(serde_json::json!({
+                "logical_payload_bytes":0,
+                "known_backing_capacity_bytes":0,
+                "arrow_buffer_capacity_bytes":0,
+                "arrow_visible_buffer_bytes":0,
+                "opaque_external_bytes_lower_bound":0,
+                "join_logical_payload_bytes":0,
+                "join_known_key_capacity_bytes":0,
+                "window_logical_payload_bytes":0,
+                "window_known_key_capacity_bytes":0,
+                "minmax_distinct_entries":0,
+                "estimated_structural_bytes":0,
+                "covered_categories":[],
+                "unknown_categories":[],
+                "opaque_external_categories":[],
+                "complete":false,
+                "exact_heap_bytes":null
+            })),
             logical_retained_bytes: None,
             memory_semantics: "process_live_allocator_state_proxy_not_logical_retained_heap",
         };
@@ -547,7 +643,24 @@ mod report_contract_tests {
                 "live_delta_from_empty_core_bytes":0, "live_delta_from_process_baseline_bytes":0,
                 "peak_live_since_process_baseline_bytes":1, "output_rows":1, "schema_fingerprint":schema,
                 "drained_tap_rows":1, "logical_retained_bytes":null,
-                "core_memory_report":{"complete":false},
+                "core_memory_report":{
+                    "logical_payload_bytes":0,
+                    "known_backing_capacity_bytes":0,
+                    "arrow_buffer_capacity_bytes":0,
+                    "arrow_visible_buffer_bytes":0,
+                    "opaque_external_bytes_lower_bound":0,
+                    "join_logical_payload_bytes":0,
+                    "join_known_key_capacity_bytes":0,
+                    "window_logical_payload_bytes":0,
+                    "window_known_key_capacity_bytes":0,
+                    "minmax_distinct_entries":0,
+                    "estimated_structural_bytes":0,
+                    "covered_categories":[],
+                    "unknown_categories":[],
+                    "opaque_external_categories":[],
+                    "complete":false,
+                    "exact_heap_bytes":null
+                },
                 "core_memory_report_phase":"separate_equivalent_replay_after_allocator_samples",
                 "core_memory_report_categories":{"complete":false},
                 "memory_semantics":"process_live_allocator_state_proxy_not_logical_retained_heap"

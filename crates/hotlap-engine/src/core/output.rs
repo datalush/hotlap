@@ -30,8 +30,14 @@ pub(super) struct ViewOutput {
     diffs: HashMap<Vec<u8>, i64>,
 }
 
+pub(super) struct OutputMemoryUsage {
+    pub payload: usize,
+    pub capacities: Vec<(usize, usize)>,
+    pub estimate: usize,
+}
+
 impl ViewOutput {
-    pub(super) fn memory_usage(&self) -> Result<(usize, Vec<(usize, usize)>), EngineError> {
+    pub(super) fn memory_usage(&self) -> Result<OutputMemoryUsage, EngineError> {
         let mut payload = 0usize;
         let mut capacities = Vec::with_capacity(self.diffs.len());
         for key in self.diffs.keys() {
@@ -40,7 +46,16 @@ impl ViewOutput {
             })?;
             capacities.push((key.as_ptr() as usize, key.capacity()));
         }
-        Ok((payload, capacities))
+        let estimate = self
+            .diffs
+            .capacity()
+            .checked_mul(std::mem::size_of::<(Vec<u8>, i64)>())
+            .ok_or_else(|| EngineError::Infrastructure("output estimate overflow".into()))?;
+        Ok(OutputMemoryUsage {
+            payload,
+            capacities,
+            estimate,
+        })
     }
 
     /// Number of live consolidated rows retained.

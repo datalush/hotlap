@@ -43,6 +43,54 @@ pub struct Join {
 }
 
 impl Join {
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.left.is_some() || self.right.is_some()
+    }
+
+    pub(crate) fn has_arrangement_storage(&self) -> bool {
+        [&self.left, &self.right]
+            .into_iter()
+            .flatten()
+            .any(|arrangement| arrangement.has_storage())
+    }
+
+    pub(crate) fn has_retained_rows(&self) -> bool {
+        [&self.left, &self.right]
+            .into_iter()
+            .flatten()
+            .any(|arrangement| !arrangement.is_empty())
+    }
+
+    pub(crate) fn memory_usage(&self) -> Result<(usize, usize, usize), EngineError> {
+        let mut totals = (
+            0usize,
+            self.left_keys
+                .capacity()
+                .checked_add(self.right_keys.capacity())
+                .and_then(|count| count.checked_mul(std::mem::size_of::<usize>()))
+                .ok_or_else(|| {
+                    EngineError::Infrastructure("join config capacity overflow".into())
+                })?,
+            0usize,
+        );
+        for arrangement in [&self.left, &self.right].into_iter().flatten() {
+            let (payload, capacity, estimate) = arrangement.memory_usage()?;
+            totals.0 = totals
+                .0
+                .checked_add(payload)
+                .ok_or_else(|| EngineError::Infrastructure("join payload overflow".into()))?;
+            totals.1 = totals
+                .1
+                .checked_add(capacity)
+                .ok_or_else(|| EngineError::Infrastructure("join capacity overflow".into()))?;
+            totals.2 = totals
+                .2
+                .checked_add(estimate)
+                .ok_or_else(|| EngineError::Infrastructure("join estimate overflow".into()))?;
+        }
+        Ok(totals)
+    }
+
     /// Creates a join over the join column indices `left_keys` and `right_keys`.
     /// Side schemas are learned from the first `apply`.
     pub fn new(left_keys: &[usize], right_keys: &[usize]) -> Self {

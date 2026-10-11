@@ -42,6 +42,35 @@ impl Default for InputRetention {
 }
 
 impl InputRetention {
+    pub(super) fn memory_usage(
+        &self,
+        report: &mut super::memory::MemoryReport,
+        allocations: &mut std::collections::HashSet<(usize, usize)>,
+        external_ranges: &mut HashMap<usize, usize>,
+    ) -> Result<(), EngineError> {
+        if self.events.capacity() == 0 {
+            return Ok(());
+        }
+        report.mark_covered("input_retention_queue");
+        report.add_estimate(
+            self.events
+                .capacity()
+                .checked_mul(std::mem::size_of::<Event>())
+                .ok_or_else(|| EngineError::Infrastructure("retention estimate overflow".into()))?,
+        )?;
+        report.mark_unknown("input_retention_queue_allocator_overhead");
+        if self.events.is_empty() {
+            return Ok(());
+        }
+        report.mark_covered("input_retention_arrow_buffers");
+        report.mark_unknown("input_retention_batch_metadata");
+        for event in &self.events {
+            report.add_arrow_batch(&event.batch.batch, allocations, external_ranges)?;
+            report.add_arrow_array(&event.batch.diff, allocations, external_ranges)?;
+        }
+        Ok(())
+    }
+
     /// A disabled log: no input delta is retained.
     pub(super) fn disabled() -> Self {
         Self {

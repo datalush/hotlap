@@ -33,6 +33,14 @@ pub struct KeyedArrangement {
 }
 
 impl KeyedArrangement {
+    pub(crate) fn has_storage(&self) -> bool {
+        self.state.has_storage()
+    }
+
+    pub(crate) fn memory_usage(&self) -> Result<(usize, usize, usize), EngineError> {
+        self.state.memory_usage()
+    }
+
     /// Builds an arrangement over the key columns named by `key_indices`.
     ///
     /// Remaining schema columns are payload. Keys must be non-empty and in range.

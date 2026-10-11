@@ -115,6 +115,14 @@ impl Clone for OrderedMultiset {
 }
 
 impl OrderedMultiset {
+    /// Summary for internal read-only observers; does not expose retained values.
+    #[doc(hidden)]
+    pub fn memory_usage_summary(&self) -> Option<(usize, usize)> {
+        let entries = self.counts.len();
+        let estimate = entries.checked_mul(std::mem::size_of::<(ExtremeValue, i64)>())?;
+        Some((entries, estimate))
+    }
+
     /// Adds `diff` occurrences of `value`, dropping values that reach zero.
     ///
     /// Retracting a value more often than it was inserted saturates at zero

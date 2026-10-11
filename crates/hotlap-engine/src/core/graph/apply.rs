@@ -35,35 +35,74 @@ impl Node {
     pub(super) fn memory_usage(
         &self,
         report: &mut super::super::memory::MemoryReport,
+        allocations: &mut std::collections::HashSet<(usize, usize)>,
+        external_ranges: &mut std::collections::HashMap<usize, usize>,
     ) -> Result<(), EngineError> {
         match self {
-            Node::Source(_) => {}
+            Node::Source(_) => report.mark_covered("source_nodes"),
             Node::Filter { input, pred } => {
+                report.mark_covered("filters");
                 report.add_estimate(std::mem::size_of_val(pred))?;
-                input.memory_usage(report)?;
+                input.memory_usage(report, allocations, external_ranges)?;
             }
             Node::Project { input, cols } => {
+                report.mark_covered("projections");
                 report.add_capacity(super::super::memory::checked_capacity_bytes(
                     cols.capacity(),
                     std::mem::size_of::<usize>(),
                 )?)?;
-                input.memory_usage(report)?;
+                input.memory_usage(report, allocations, external_ranges)?;
             }
             Node::Group { input, reducer } => {
+                report.mark_covered("aggregates");
                 report.add_group(reducer.memory_usage()?)?;
-                if reducer.has_minmax() {
-                    report.mark_unknown("aggregate_minmax");
+                if reducer.has_group_map_storage() {
+                    report.mark_unknown("aggregate_hash_map_allocator_overhead");
                 }
-                input.memory_usage(report)?;
+                if reducer.has_minmax_state() {
+                    report.mark_unknown("minmax_btree_allocator_overhead");
+                }
+                input.memory_usage(report, allocations, external_ranges)?;
             }
-            Node::Joined { left, right, .. } => {
-                report.mark_unknown("joins");
-                left.memory_usage(report)?;
-                right.memory_usage(report)?;
+            Node::Joined {
+                left,
+                right,
+                join,
+                left_pending,
+                right_pending,
+            } => {
+                report.mark_covered("joins");
+                let (payload, capacity, estimate) = join.memory_usage()?;
+                report.add_join(payload, capacity, estimate)?;
+                if join.is_initialized() {
+                    report.mark_unknown("join_converter_and_schema_metadata");
+                }
+                if join.has_retained_rows() {
+                    report.mark_unknown("join_owned_row_capacity");
+                }
+                if join.has_arrangement_storage() {
+                    report.mark_unknown("join_hash_map_allocator_overhead");
+                }
+                for pending in [left_pending, right_pending].into_iter().flatten() {
+                    report.mark_unknown("join_pending_batch_metadata");
+                    report.add_arrow_batch(&pending.batch, allocations, external_ranges)?;
+                    report.add_arrow_array(&pending.diff, allocations, external_ranges)?;
+                }
+                left.memory_usage(report, allocations, external_ranges)?;
+                right.memory_usage(report, allocations, external_ranges)?;
             }
-            Node::Window { input, .. } => {
-                report.mark_unknown("windows");
-                input.memory_usage(report)?;
+            Node::Window { input, reducer } => {
+                report.mark_covered("windows");
+                if reducer.has_open_windows() {
+                    report.mark_unknown("window_owned_row_capacity");
+                    report.mark_unknown("window_btree_allocator_overhead");
+                }
+                if reducer.is_initialized() {
+                    report.mark_unknown("window_converter_and_schema_metadata");
+                }
+                let (payload, capacity, estimate) = reducer.memory_usage()?;
+                report.add_window(payload, capacity, estimate)?;
+                input.memory_usage(report, allocations, external_ranges)?;
             }
         }
         Ok(())

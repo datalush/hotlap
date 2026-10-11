@@ -25,6 +25,44 @@ fn zset(rows: &[(i64, i64)]) -> ZSetBatch {
     ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs))).unwrap()
 }
 
+fn time_zset(rows: &[(i64, i64, i64)]) -> ZSetBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let keys = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+    let times = rows.iter().map(|row| row.1).collect::<Vec<_>>();
+    let diffs = rows.iter().map(|row| row.2).collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(Int64Array::from(times)),
+        ],
+    )
+    .unwrap();
+    ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs))).unwrap()
+}
+
+fn aggregate_zset(rows: &[(i64, i64, i64)]) -> ZSetBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let keys = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+    let values = rows.iter().map(|row| row.1).collect::<Vec<_>>();
+    let diffs = rows.iter().map(|row| row.2).collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )
+    .unwrap();
+    ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs))).unwrap()
+}
+
 fn group_plan() -> Plan {
     Plan::GroupAggregate {
         input: Box::new(Plan::Source(InputId(0))),
@@ -56,24 +94,38 @@ fn memory_report_counts_group_state_and_keeps_unsupported_families_explicit() {
     let report = core.memory_report().unwrap();
 
     assert_eq!(report.logical_payload_bytes, 16 + 2 * 19);
+    assert!(
+        report
+            .covered_categories
+            .contains(&"aggregates".to_string())
+    );
+    assert!(
+        report
+            .covered_categories
+            .contains(&"consolidated_outputs".to_string())
+    );
+    assert_eq!(report.exact_heap_bytes, None);
     assert_eq!(
         report.known_backing_capacity_bytes,
         2 * (19 + std::mem::size_of::<hotlap_core::snapshot::AggValue>() + 8)
+            + std::mem::size_of::<usize>()
+            + std::mem::size_of::<AggSpec>()
     );
-    assert_eq!(
-        report.estimated_structural_bytes,
-        2 * std::mem::size_of::<(Vec<u8>, hotlap_core::snapshot::GroupEntry)>()
+    assert!(
+        report.estimated_structural_bytes
+            >= 2 * std::mem::size_of::<(Vec<u8>, hotlap_core::snapshot::GroupEntry)>()
+    );
+    assert!(
+        report
+            .unknown_categories
+            .contains(&"aggregate_hash_map_allocator_overhead".to_string())
     );
     assert!(
         report
             .unknown_categories
             .contains(&"view_plans_and_taps".to_string())
     );
-    assert!(
-        report
-            .opaque_external_categories
-            .contains(&"arrow_buffers".to_string())
-    );
+    assert_eq!(report.arrow_buffer_capacity_bytes, 0);
     assert!(!report.complete);
 }
 
@@ -146,7 +198,7 @@ fn memory_report_counts_aggregate_values_vec_capacity_in_bytes() {
     let aggregate_capacity = std::mem::size_of::<hotlap_core::snapshot::AggValue>();
     assert_eq!(
         report.known_backing_capacity_bytes,
-        19 + aggregate_capacity + 8
+        19 + aggregate_capacity + 8 + std::mem::size_of::<usize>() + std::mem::size_of::<AggSpec>()
     );
 }
 
@@ -169,6 +221,7 @@ fn memory_report_tracks_pending_tap_bytes_only_until_the_tap_is_drained() {
     core.tap_view(ViewId(0)).unwrap();
     core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
     let pending = core.memory_report().unwrap();
+    assert!(pending.arrow_buffer_capacity_bytes > 0);
     assert!(
         pending
             .unknown_categories
@@ -177,11 +230,181 @@ fn memory_report_tracks_pending_tap_bytes_only_until_the_tap_is_drained() {
     );
     drop(core.take_changes(ViewId(0)).unwrap());
     let drained = core.memory_report().unwrap();
+    assert_eq!(drained.arrow_buffer_capacity_bytes, 0);
     assert!(
         !drained
             .unknown_categories
             .iter()
             .any(|item| item == "view_pending")
+    );
+}
+
+#[test]
+fn memory_report_counts_arrow_buffers_retained_by_pending_taps() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+    core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+
+    let report = core.memory_report().unwrap();
+
+    assert!(report.arrow_buffer_capacity_bytes >= 3 * std::mem::size_of::<i64>());
+    assert!(
+        !report
+            .opaque_external_categories
+            .contains(&"arrow_external_buffers".to_string())
+    );
+}
+
+#[test]
+fn memory_report_visits_current_join_arrangements_and_tracks_retractions() {
+    let join_plan = Plan::Join {
+        left: Box::new(Plan::Source(InputId(0))),
+        right: Box::new(Plan::Source(InputId(1))),
+        left_key: vec![0],
+        right_key: vec![0],
+    };
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    core.build_view(ViewId(0), &join_plan).unwrap();
+    core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+    core.push(InputId(1), &zset(&[(1, 1)])).unwrap();
+
+    let checkpoint_before_report = core.checkpoint().unwrap();
+    let retained = core.memory_report().unwrap();
+    assert_eq!(core.checkpoint().unwrap(), checkpoint_before_report);
+    assert!(!retained.unknown_categories.contains(&"joins".to_string()));
+    assert!(retained.join_logical_payload_bytes >= 16);
+
+    core.push(InputId(0), &zset(&[(1, -1)])).unwrap();
+    let retracted = core.memory_report().unwrap();
+    assert!(!retracted.unknown_categories.contains(&"joins".to_string()));
+    assert_eq!(retracted.join_logical_payload_bytes, 9);
+}
+
+#[test]
+fn memory_report_tracks_join_pending_batches_until_the_sibling_schema_arrives() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::Join {
+            left: Box::new(Plan::Source(InputId(0))),
+            right: Box::new(Plan::Source(InputId(1))),
+            left_key: vec![0],
+            right_key: vec![0],
+        },
+    )
+    .unwrap();
+    core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+
+    let pending = core.memory_report().unwrap();
+    assert!(pending.arrow_buffer_capacity_bytes > 0);
+    assert!(
+        pending
+            .unknown_categories
+            .contains(&"join_pending_batch_metadata".to_string())
+    );
+
+    core.push(InputId(1), &zset(&[(1, 1)])).unwrap();
+    let initialized = core.memory_report().unwrap();
+    assert_eq!(initialized.arrow_buffer_capacity_bytes, 0);
+    assert!(initialized.join_logical_payload_bytes > 0);
+}
+
+#[test]
+fn memory_report_visits_open_windows_and_drops_closed_window_payloads() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.declare_watermark(
+        InputId(0),
+        hotlap_core::WatermarkSpec {
+            time_col: 1,
+            lag: 100,
+        },
+    )
+    .unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::TumbleCount {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![0],
+            time_col: 1,
+            size: 10,
+        },
+    )
+    .unwrap();
+    core.push(InputId(0), &time_zset(&[(1, 1, 1)])).unwrap();
+    core.push(InputId(0), &time_zset(&[(1, 11, 1)])).unwrap();
+    core.push(InputId(0), &time_zset(&[(1, 21, 1)])).unwrap();
+
+    let open = core.memory_report().unwrap();
+    assert!(!open.unknown_categories.contains(&"windows".to_string()));
+    assert_eq!(open.window_logical_payload_bytes, 54);
+
+    core.push(InputId(0), &time_zset(&[(1, 131, 1)])).unwrap();
+    let closed = core.memory_report().unwrap();
+    assert_eq!(closed.window_logical_payload_bytes, 18);
+}
+
+#[test]
+fn memory_report_visits_minmax_multiset_entries_across_retractions() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::GroupAggregate {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![0],
+            aggs: vec![AggSpec::min(1), AggSpec::max(1)],
+        },
+    )
+    .unwrap();
+    core.push(InputId(0), &aggregate_zset(&[(1, 4, 1), (1, 8, 1)]))
+        .unwrap();
+
+    let before = core.memory_report().unwrap();
+    assert!(
+        !before
+            .unknown_categories
+            .contains(&"aggregate_minmax".to_string())
+    );
+    assert_eq!(before.minmax_distinct_entries, 4);
+
+    core.push(InputId(0), &aggregate_zset(&[(1, 4, -1)]))
+        .unwrap();
+    let after = core.memory_report().unwrap();
+    assert!(
+        !after
+            .unknown_categories
+            .contains(&"aggregate_minmax".to_string())
+    );
+    assert_eq!(after.minmax_distinct_entries, 2);
+}
+
+#[test]
+fn memory_report_counts_arrow_buffers_held_by_input_retention() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.set_input_retention(2).unwrap();
+    core.build_view(ViewId(0), &Plan::Source(InputId(0)))
+        .unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+    core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+
+    let report = core.memory_report().unwrap();
+
+    assert_eq!(
+        report.arrow_buffer_capacity_bytes,
+        2 * std::mem::size_of::<i64>()
+    );
+    assert!(
+        report
+            .unknown_categories
+            .contains(&"input_retention_batch_metadata".to_string())
     );
 }
 

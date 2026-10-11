@@ -23,7 +23,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::row::{RowConverter, Rows};
 
 use hotlap_core::plan::AggSpec;
-use hotlap_core::snapshot::GroupEntry;
+use hotlap_core::snapshot::{AggValue, GroupEntry};
 
 use crate::batch::ZSetBatch;
 use crate::error::EngineError;
@@ -46,13 +46,19 @@ pub struct GroupAggregate {
 }
 
 impl GroupAggregate {
-    pub(crate) fn has_minmax(&self) -> bool {
-        self.aggs.iter().any(|agg| {
-            matches!(
-                agg.func,
-                hotlap_core::AggFunc::Min | hotlap_core::AggFunc::Max
-            )
+    pub(crate) fn has_minmax_state(&self) -> bool {
+        self.groups.values().any(|entry| {
+            entry.values.iter().any(|value| match value {
+                AggValue::Min(values) | AggValue::Max(values) => values
+                    .memory_usage_summary()
+                    .is_some_and(|(entries, _)| entries > 0),
+                _ => false,
+            })
         })
+    }
+
+    pub(crate) fn has_group_map_storage(&self) -> bool {
+        self.groups.capacity() > 0
     }
 
     pub(crate) fn memory_usage(
@@ -61,6 +67,8 @@ impl GroupAggregate {
         let mut payload = 0usize;
         let mut capacity = 0usize;
         let mut accumulator_capacity = 0usize;
+        let mut minmax_entries = 0usize;
+        let mut minmax_estimate = 0usize;
         for key in self.groups.keys() {
             payload = payload.checked_add(key.len()).ok_or_else(|| {
                 crate::error::EngineError::Infrastructure("memory report overflow".into())
@@ -80,13 +88,51 @@ impl GroupAggregate {
                         "memory report accumulator capacity overflow".into(),
                     )
                 })?;
+            for value in &entry.values {
+                let multiset = match value {
+                    AggValue::Min(values) | AggValue::Max(values) => Some(values),
+                    _ => None,
+                };
+                if let Some(multiset) = multiset {
+                    let (entries, estimate) = multiset.memory_usage_summary().ok_or_else(|| {
+                        crate::error::EngineError::Infrastructure(
+                            "memory report MIN/MAX estimate overflow".into(),
+                        )
+                    })?;
+                    minmax_entries = crate::core::memory::checked_add(
+                        minmax_entries,
+                        entries,
+                        "MIN/MAX entry count",
+                    )?;
+                    minmax_estimate = crate::core::memory::checked_add(
+                        minmax_estimate,
+                        estimate,
+                        "MIN/MAX estimate",
+                    )?;
+                }
+            }
         }
+        let config_capacity = crate::core::memory::checked_add(
+            crate::core::memory::checked_capacity_bytes(
+                self.key.capacity(),
+                std::mem::size_of::<usize>(),
+            )?,
+            crate::core::memory::checked_capacity_bytes(
+                self.aggs.capacity(),
+                std::mem::size_of::<AggSpec>(),
+            )?,
+            "aggregate configuration capacity",
+        )?;
         Ok(super::super::core::memory::GroupMemory {
             payload,
-            capacity: crate::core::memory::checked_add(capacity, accumulator_capacity, "capacity")?,
+            capacity: crate::core::memory::checked_add(
+                crate::core::memory::checked_add(capacity, accumulator_capacity, "capacity")?,
+                config_capacity,
+                "capacity",
+            )?,
             estimate: self
                 .groups
-                .len()
+                .capacity()
                 .checked_mul(std::mem::size_of::<(
                     Vec<u8>,
                     hotlap_core::snapshot::GroupEntry,
@@ -94,6 +140,8 @@ impl GroupAggregate {
                 .ok_or_else(|| {
                     crate::error::EngineError::Infrastructure("memory report overflow".into())
                 })?,
+            minmax_entries,
+            minmax_estimate,
         })
     }
 

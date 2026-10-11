@@ -35,6 +35,50 @@ pub struct TumbleCount {
 }
 
 impl TumbleCount {
+    pub(crate) fn has_open_windows(&self) -> bool {
+        !self.windows.is_empty()
+    }
+
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.schema.is_some()
+    }
+
+    pub(crate) fn memory_usage(&self) -> Result<(usize, usize, usize), EngineError> {
+        let mut payload = 0usize;
+        let mut key_capacity = self
+            .key
+            .capacity()
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(|| EngineError::Infrastructure("window config capacity overflow".into()))?;
+        let mut structural = self
+            .windows
+            .len()
+            .checked_mul(std::mem::size_of::<(i64, BTreeMap<Vec<u8>, (OwnedRow, i64)>)>())
+            .ok_or_else(|| EngineError::Infrastructure("window estimate overflow".into()))?;
+        for buckets in self.windows.values() {
+            structural = structural
+                .checked_add(
+                    buckets
+                        .len()
+                        .checked_mul(std::mem::size_of::<(Vec<u8>, (OwnedRow, i64))>())
+                        .ok_or_else(|| {
+                            EngineError::Infrastructure("window estimate overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| EngineError::Infrastructure("window estimate overflow".into()))?;
+            for (key, (row, _)) in buckets {
+                payload = payload
+                    .checked_add(key.len())
+                    .and_then(|total| total.checked_add(row.as_ref().len()))
+                    .ok_or_else(|| EngineError::Infrastructure("window payload overflow".into()))?;
+                key_capacity = key_capacity.checked_add(key.capacity()).ok_or_else(|| {
+                    EngineError::Infrastructure("window capacity overflow".into())
+                })?;
+            }
+        }
+        Ok((payload, key_capacity, structural))
+    }
+
     /// Creates a window over the given key and event-time columns. The input
     /// schema is learned from the first `apply`; `size` is in event-time units.
     pub fn new(key: &[usize], time_col: usize, size: i64) -> Self {

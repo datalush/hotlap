@@ -103,8 +103,10 @@ impl ViewGraph {
     pub(super) fn memory_usage(
         &self,
         report: &mut super::memory::MemoryReport,
+        allocations: &mut std::collections::HashSet<(usize, usize)>,
+        external_ranges: &mut std::collections::HashMap<usize, usize>,
     ) -> Result<(), crate::error::EngineError> {
-        self.root.memory_usage(report)
+        self.root.memory_usage(report, allocations, external_ranges)
     }
 }
 

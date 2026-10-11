@@ -81,3 +81,13 @@ fn memory_observability_baseline_separates_live_categories_and_serialized_size()
 fn kernel_families_cpu_and_allocation_baseline() {
     baseline_workloads::run();
 }
+
+#[test]
+#[ignore = "manual memory coverage probe; run with --ignored --nocapture"]
+fn kernel_memory_coverage_probe() {
+    let rows = std::env::var("HOTLAP_BASELINE_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(128);
+    baseline_memory::run(rows);
+}
