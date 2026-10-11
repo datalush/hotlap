@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int64Array};
@@ -47,6 +47,15 @@ pub(super) struct Candidate {
     output_schema: SchemaRef,
     work: Work,
     fail_output: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct StateDigest {
+    left: Vec<(Vec<u8>, Vec<u8>, i64)>,
+    right: Vec<(Vec<u8>, Vec<u8>, i64)>,
+    summaries: BTreeMap<Vec<u8>, Summary>,
+    output: Output,
+    work: Work,
 }
 
 impl Candidate {
@@ -136,11 +145,6 @@ impl Candidate {
             let (right_net, right_abs) = right_sides.get(bytes).copied().unwrap_or_default();
             let left = side_after(previous.left, left_net).ok_or(NotEligible::NegativeState)?;
             let right = side_after(previous.right, right_net).ok_or(NotEligible::NegativeState)?;
-            if previous.left > 0 && left_abs > previous.left
-                || previous.right > 0 && right_abs > previous.right
-            {
-                return Err(NotEligible::NegativeState);
-            }
             count_bound(previous.left, previous.right, left_abs, right_abs)
                 .ok_or(NotEligible::NumericBound)?;
             let new_count = count_bound(left, right, 0, 0).ok_or(NotEligible::NumericBound)?;
@@ -206,10 +210,10 @@ impl Candidate {
                 .collect::<Vec<_>>(),
         );
         let mut columns = Vec::with_capacity(self.output_schema.fields().len());
-        for (index, field) in self.output_schema.fields().iter().enumerate() {
-            let array: ArrayRef = match field.name().as_str() {
-                "count" => Arc::new(count_array.clone()),
-                _ if index == 0 => Arc::new(key_array.clone()),
+        for index in 0..self.output_schema.fields().len() {
+            let array: ArrayRef = match index {
+                0 => Arc::new(key_array.clone()),
+                1 => Arc::new(count_array.clone()),
                 _ => return Err(NotEligible::Encoding),
             };
             columns.push(array);
@@ -217,7 +221,7 @@ impl Candidate {
         let batch = RecordBatch::try_new(self.output_schema.clone(), columns)
             .map_err(|_| NotEligible::Encoding)?;
         let raw = ZSetBatch::new(batch, Arc::new(diffs)).map_err(|_| NotEligible::Encoding)?;
-        Ok(raw)
+        crate::zset::consolidate(&raw).map_err(|_| NotEligible::Encoding)
     }
 
     pub(super) fn snapshot(&self) -> Output {
@@ -238,6 +242,21 @@ impl Candidate {
     }
     pub(super) fn summary_count(&self) -> usize {
         self.summaries.len()
+    }
+    pub(super) fn digest(&self) -> StateDigest {
+        let mut summaries: Vec<_> = self
+            .summaries
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        summaries.sort_by(|left, right| left.0.cmp(&right.0));
+        StateDigest {
+            left: self.left.iter().collect(),
+            right: self.right.iter().collect(),
+            summaries: summaries.into_iter().collect(),
+            output: self.snapshot(),
+            work: self.work,
+        }
     }
     pub(super) fn inject_output_failure(&mut self, enabled: bool) {
         self.fail_output = enabled;
