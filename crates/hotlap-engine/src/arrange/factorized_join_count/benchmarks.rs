@@ -17,13 +17,11 @@ fn workload(case: &str) -> Workload {
     let (left, right, steps, warmup, measured, expected) = match case {
         "distinct" => (
             (0..10_000).map(|p| (Some(0), Some(p), 1)).collect(),
-            vec![(Some(0), Some(0), 1)],
+            vec![],
             (0..440)
                 .map(|n| {
-                    (
-                        vec![],
-                        vec![(Some(0), Some(0), if n % 2 == 0 { -1 } else { 1 })],
-                    )
+                    let diff = if n % 2 == 0 { -1 } else { 1 };
+                    (vec![], vec![(Some(0), Some(0), diff)])
                 })
                 .collect(),
             40,
@@ -32,13 +30,11 @@ fn workload(case: &str) -> Workload {
         ),
         "duplicates" => (
             vec![(Some(0), Some(0), 10_000)],
-            vec![(Some(0), Some(0), 1)],
+            vec![],
             (0..440)
                 .map(|n| {
-                    (
-                        vec![],
-                        vec![(Some(0), Some(0), if n % 2 == 0 { -1 } else { 1 })],
-                    )
+                    let diff = if n % 2 == 0 { -1 } else { 1 };
+                    (vec![], vec![(Some(0), Some(0), diff)])
                 })
                 .collect(),
             40,
@@ -98,7 +94,9 @@ fn workload_shapes_and_boundaries_are_exact() {
     let duplicates = workload("duplicates");
     assert_eq!(duplicates.left, [(Some(0), Some(0), 10_000)]);
     assert_eq!(distinct.expected, 10_000);
-    assert_eq!(distinct.right, [(Some(0), Some(0), 1)]);
+    assert!(distinct.right.is_empty());
+    assert_eq!(distinct.steps[0].1, [(Some(0), Some(0), -1)]);
+    assert_eq!(distinct.steps[1].1, [(Some(0), Some(0), 1)]);
     let low = workload("low");
     assert_eq!(low.left.len(), 1_000);
     assert_eq!(low.right.len(), 1_000);
@@ -177,36 +175,54 @@ fn measure() {
         }
         _ => panic!("unsupported strategy: {strategy}"),
     };
-    let mut folded = Output::new();
-    fold_output(&mut folded, &seed_output);
+    let mut warmup_output = Output::new();
+    fold_output(&mut warmup_output, &seed_output);
     let mut warmup_left = data.left.clone();
     let mut warmup_right = data.right.clone();
     for (left, right) in data.steps.iter().take(data.warmup) {
         warmup_left.extend(left.iter().copied());
         warmup_right.extend(right.iter().copied());
+        let warm_result = match strategy.as_str() {
+            "reference" => reference
+                .as_mut()
+                .unwrap()
+                .apply(&batch(left), &batch(right))
+                .unwrap(),
+            "candidate" => candidate
+                .as_mut()
+                .unwrap()
+                .apply(&batch(left), &batch(right))
+                .unwrap(),
+            "manual" => manual
+                .as_mut()
+                .unwrap()
+                .apply(&batch(left), &batch(right))
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        fold_output(&mut warmup_output, &warm_result);
+        if case == "low" || case == "mixed" {
+            let expected_count = if case == "low" { 1 } else { 8_000 };
+            assert!(
+                warmup_output
+                    .iter()
+                    .all(|((_, count), weight)| *count == expected_count && *weight == 1)
+            );
+        }
     }
-    assert_eq!(folded, super::support::oracle(&warmup_left, &warmup_right));
-    let expected_count = match case.as_str() {
-        "distinct" | "duplicates" => 10_000,
-        "low" => 1,
-        "mixed" => 8_000,
-        _ => unreachable!(),
-    };
-    assert!(
-        folded
-            .iter()
-            .all(|((_, count), weight)| *count == expected_count && *weight == 1)
+    assert_eq!(
+        warmup_output,
+        super::support::oracle(&warmup_left, &warmup_right)
     );
+    let mut folded = warmup_output.clone();
     let mut oracle_left = warmup_left;
     let mut oracle_right = warmup_right;
     let mut samples = Vec::with_capacity(data.measured);
     let mut input_rows = 0usize;
-    for (index, (left_rows, right_rows)) in data.steps.iter().enumerate() {
+    for (left_rows, right_rows) in data.steps.iter().skip(data.warmup) {
         let left = batch(left_rows);
         let right = batch(right_rows);
-        if index >= data.warmup {
-            input_rows += left.len() + right.len();
-        }
+        input_rows += left.len() + right.len();
         let start = std::time::Instant::now();
         let result = match strategy.as_str() {
             "reference" => reference.as_mut().unwrap().apply(&left, &right).unwrap(),
@@ -216,19 +232,18 @@ fn measure() {
         };
         let elapsed = start.elapsed().as_nanos();
         fold_output(&mut folded, &result);
-        if index >= data.warmup {
-            oracle_left.extend(left_rows.iter().copied());
-            oracle_right.extend(right_rows.iter().copied());
-            assert_eq!(folded, super::support::oracle(&oracle_left, &oracle_right));
+        oracle_left.extend(left_rows.iter().copied());
+        oracle_right.extend(right_rows.iter().copied());
+        assert_eq!(folded, super::support::oracle(&oracle_left, &oracle_right));
+        if case == "low" || case == "mixed" {
+            let expected_count = if case == "low" { 1 } else { 8_000 };
+            assert!(
+                folded
+                    .iter()
+                    .all(|((_, count), weight)| *count == expected_count && *weight == 1)
+            );
         }
-        assert!(
-            folded
-                .iter()
-                .all(|((_, count), weight)| *count == expected_count && *weight == 1)
-        );
-        if index >= data.warmup {
-            samples.push(elapsed);
-        }
+        samples.push(elapsed);
     }
     assert_eq!(samples.len(), data.measured);
     assert!(samples.iter().all(|sample| *sample > 0));
