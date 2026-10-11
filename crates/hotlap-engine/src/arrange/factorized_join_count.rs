@@ -110,10 +110,19 @@ mod candidate_tests {
         row_candidate
             .apply(&batch(&[(Some(2), Some(10), i64::MAX)]), &batch(&[]))
             .unwrap();
+        row_candidate
+            .apply(
+                &batch(&[(Some(1), Some(10), 1)]),
+                &batch(&[(Some(1), Some(20), 1)]),
+            )
+            .unwrap();
         let before = row_candidate.digest();
         assert_eq!(
             row_candidate
-                .apply(&batch(&[(Some(2), Some(10), 1)]), &batch(&[]))
+                .apply(
+                    &batch(&[(Some(1), Some(11), 1), (Some(2), Some(10), 1)]),
+                    &batch(&[]),
+                )
                 .err()
                 .expect("row bound"),
             NotEligible::RowBound
@@ -123,14 +132,17 @@ mod candidate_tests {
         let mut numeric = Candidate::new(schema(), schema(), 0, 0).unwrap();
         numeric
             .apply(
-                &batch(&[(Some(3), Some(10), i64::MAX)]),
-                &batch(&[(Some(3), Some(20), 1)]),
+                &batch(&[(Some(3), Some(10), i64::MAX), (Some(1), Some(10), 1)]),
+                &batch(&[(Some(3), Some(20), 1), (Some(1), Some(20), 1)]),
             )
             .unwrap();
         let before = numeric.digest();
         assert_eq!(
             numeric
-                .apply(&batch(&[]), &batch(&[(Some(3), Some(21), 1)]))
+                .apply(
+                    &batch(&[(Some(1), Some(11), 1)]),
+                    &batch(&[(Some(3), Some(21), 1)]),
+                )
                 .err()
                 .expect("numeric bound"),
             NotEligible::NumericBound
