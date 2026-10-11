@@ -34,11 +34,12 @@ test harness; al extraerla, elimine el prefijo sin alterar la fila.
 
 Los dos lados tienen schema fijo `(k: nullable Int64, payload: nullable Int64)`;
 la salida es `(k, count: nullable Int64)` con pesos de Z-set. `distinct` tiene
-10.000 payloads izquierdos distintos de peso 1 y una fila derecha de peso 1.
+10.000 payloads izquierdos distintos de peso 1 y una fila derecha `(0,0,+1)`.
 El valor de count está en el payload de salida; el peso Z-set del grupo es 1.
 `duplicates` usa una fila izquierda repetida con multiplicidad 10.000 (no diez
-mil payloads). Ambos alternan la fila derecha con retracción/inserción en 440
-pasos. `low` inicia 1.000 claves con una fila por lado y reemplaza payload
+mil payloads) y la misma fila derecha. Ambos alternan la derecha empezando con
+`-1`; el seed aporta el count 10.000, el primer paso deja el grupo ausente y el
+siguiente lo restaura. `low` inicia 1.000 claves con una fila por lado y reemplaza payload
 izquierdo en cada clave una vez. `mixed` inicia 1.000 filas izquierdas y ocho
 derechas en una clave caliente; cada paso reemplaza una fila de ambos lados.
 Los primeros 40 pasos son calentamiento; se miden los 400 siguientes. Los
@@ -46,11 +47,17 @@ conteos analíticos esperados son 10.000, 10.000, 1 por clave y 8.000,
 respectivamente. Las multiplicidades y fronteras exactas están fijadas en la
 prueba de construcción de cargas.
 
-Cada proceso genera las entradas Arrow una vez y conserva los mismos batches
-para todas las rutas. La preparación inicial se informa aparte. El reloj por
-paso cubre `apply` y fold/consolidación del delta de salida; excluye generación,
+Cada proceso genera las entradas Arrow una vez antes de construir una sola
+estrategia y conserva los mismos batches durante seed, calentamiento y medición.
+La preparación queda fuera de `setup_ns`, que mide la construcción del operador;
+`seed_ns` informa la aplicación del seed. Los 40 pasos de calentamiento
+actualizan la misma instancia y el estado resultante pasa directamente a los 400
+pasos medidos. El reloj por paso empieza antes de `apply` y termina después del
+fold/consolidación del delta de salida; excluye generación, validaciones exactas,
 oráculo e impresión. Se informan nanosegundos acumulados de pasos medidos y
-p50/p99 por nearest-rank (`ceil(p*N)-1`), no una media global. `input_rows`
+p50/p99 por nearest-rank (`ceil(p*N)-1`), no una media global. El throughput de
+filas de entrada por segundo se deriva de `input_rows / (total_ns / 1e9)`.
+`input_rows`
 cuenta los registros de ambos deltas de entrada, incluidas retracciones.
 
 ## Memoria y límites

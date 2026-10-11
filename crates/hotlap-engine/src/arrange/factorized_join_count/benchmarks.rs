@@ -13,11 +13,39 @@ struct Workload {
     expected: i64,
 }
 
+struct PreparedWorkload {
+    seed_left: hotlap_core::ZSetBatch,
+    seed_right: hotlap_core::ZSetBatch,
+    steps: Vec<(hotlap_core::ZSetBatch, hotlap_core::ZSetBatch)>,
+}
+
+fn prepare(data: &Workload) -> PreparedWorkload {
+    PreparedWorkload {
+        seed_left: batch(&data.left),
+        seed_right: batch(&data.right),
+        steps: data
+            .steps
+            .iter()
+            .map(|(left, right)| (batch(left), batch(right)))
+            .collect(),
+    }
+}
+
+fn expected_output(case: &str, count: i64) -> Output {
+    match case {
+        "distinct" | "duplicates" if count == 0 => Output::new(),
+        "distinct" | "duplicates" => [((Some(0), count), 1)].into(),
+        "low" => (0..1_000).map(|key| ((Some(key), 1), 1)).collect(),
+        "mixed" => [((Some(0), 8_000), 1)].into(),
+        _ => panic!("unsupported benchmark case: {case}"),
+    }
+}
+
 fn workload(case: &str) -> Workload {
     let (left, right, steps, warmup, measured, expected) = match case {
         "distinct" => (
             (0..10_000).map(|p| (Some(0), Some(p), 1)).collect(),
-            vec![],
+            vec![(Some(0), Some(0), 1)],
             (0..440)
                 .map(|n| {
                     let diff = if n % 2 == 0 { -1 } else { 1 };
@@ -30,7 +58,7 @@ fn workload(case: &str) -> Workload {
         ),
         "duplicates" => (
             vec![(Some(0), Some(0), 10_000)],
-            vec![],
+            vec![(Some(0), Some(0), 1)],
             (0..440)
                 .map(|n| {
                     let diff = if n % 2 == 0 { -1 } else { 1 };
@@ -93,8 +121,9 @@ fn workload_shapes_and_boundaries_are_exact() {
     assert_eq!(distinct.left.iter().map(|r| r.2).sum::<i64>(), 10_000);
     let duplicates = workload("duplicates");
     assert_eq!(duplicates.left, [(Some(0), Some(0), 10_000)]);
+    assert_eq!(distinct.right, [(Some(0), Some(0), 1)]);
+    assert_eq!(duplicates.right, [(Some(0), Some(0), 1)]);
     assert_eq!(distinct.expected, 10_000);
-    assert!(distinct.right.is_empty());
     assert_eq!(distinct.steps[0].1, [(Some(0), Some(0), -1)]);
     assert_eq!(distinct.steps[1].1, [(Some(0), Some(0), 1)]);
     let low = workload("low");
@@ -121,6 +150,74 @@ fn workload_shapes_and_boundaries_are_exact() {
 }
 
 #[test]
+fn small_workload_outputs_match_oracle_for_every_strategy() {
+    for (left, right, steps, expected, after_step) in [
+        (
+            vec![(Some(0), Some(0), 2), (Some(0), Some(1), 1)],
+            vec![(Some(0), Some(2), 1)],
+            vec![(vec![], vec![(Some(0), Some(2), -1)])],
+            [((Some(0), 3), 1)].into(),
+            Output::new(),
+        ),
+        (
+            vec![(Some(0), Some(0), 3)],
+            vec![(Some(0), Some(0), 1)],
+            vec![(vec![], vec![(Some(0), Some(0), -1)])],
+            [((Some(0), 3), 1)].into(),
+            Output::new(),
+        ),
+    ] {
+        for strategy in ["candidate", "reference", "manual"] {
+            let mut candidate = (strategy == "candidate")
+                .then(|| Candidate::new(schema(), schema(), 0, 0).unwrap());
+            let mut reference = (strategy == "reference").then(|| Reference::new(0, 0));
+            let mut manual = (strategy == "manual").then(|| Manual::new(0, 0));
+            let apply = |candidate: &mut Option<Candidate>,
+                         reference: &mut Option<Reference>,
+                         manual: &mut Option<Manual>,
+                         left: &[Row],
+                         right: &[Row]| {
+                if let Some(op) = candidate {
+                    op.apply(&batch(left), &batch(right)).unwrap()
+                } else if let Some(op) = reference {
+                    op.apply(&batch(left), &batch(right)).unwrap()
+                } else {
+                    manual
+                        .as_mut()
+                        .unwrap()
+                        .apply(&batch(left), &batch(right))
+                        .unwrap()
+                }
+            };
+            let mut folded = Output::new();
+            let seed = apply(&mut candidate, &mut reference, &mut manual, &left, &right);
+            fold_output(&mut folded, &seed);
+            assert_eq!(folded, expected);
+            assert_eq!(folded, super::support::oracle(&left, &right));
+            let mut history_left = left.clone();
+            let mut history_right = right.clone();
+            for (delta_left, delta_right) in &steps {
+                let result = apply(
+                    &mut candidate,
+                    &mut reference,
+                    &mut manual,
+                    delta_left,
+                    delta_right,
+                );
+                fold_output(&mut folded, &result);
+                history_left.extend(delta_left.iter().copied());
+                history_right.extend(delta_right.iter().copied());
+                assert_eq!(folded, after_step);
+                assert_eq!(
+                    folded,
+                    super::support::oracle(&history_left, &history_right)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "wall-clock and process-memory measurements"]
 fn measure() {
     let strategy = std::env::var("HOTLAP_FACTOR_STRATEGY").expect("strategy required");
@@ -131,6 +228,7 @@ fn measure() {
         .unwrap();
     assert!(rep < 5, "rep must be 0..4");
     let data = workload(&case);
+    let prepared = prepare(&data);
     let setup_start = std::time::Instant::now();
     let (mut candidate, mut reference, mut manual) = match strategy.as_str() {
         "candidate" => (
@@ -142,8 +240,6 @@ fn measure() {
         "manual" => (None, None, Some(Manual::new(0, 0))),
         _ => panic!("unsupported strategy: {strategy}"),
     };
-    let seed_left = batch(&data.left);
-    let seed_right = batch(&data.right);
     let setup_ns = setup_start.elapsed().as_nanos();
     let (seed_output, seed_ns) = match strategy.as_str() {
         "candidate" => {
@@ -151,7 +247,7 @@ fn measure() {
             let out = candidate
                 .as_mut()
                 .unwrap()
-                .apply(&seed_left, &seed_right)
+                .apply(&prepared.seed_left, &prepared.seed_right)
                 .unwrap();
             (out, start.elapsed().as_nanos())
         }
@@ -160,7 +256,7 @@ fn measure() {
             let out = reference
                 .as_mut()
                 .unwrap()
-                .apply(&seed_left, &seed_right)
+                .apply(&prepared.seed_left, &prepared.seed_right)
                 .unwrap();
             (out, start.elapsed().as_nanos())
         }
@@ -169,7 +265,7 @@ fn measure() {
             let out = manual
                 .as_mut()
                 .unwrap()
-                .apply(&seed_left, &seed_right)
+                .apply(&prepared.seed_left, &prepared.seed_right)
                 .unwrap();
             (out, start.elapsed().as_nanos())
         }
@@ -177,72 +273,51 @@ fn measure() {
     };
     let mut warmup_output = Output::new();
     fold_output(&mut warmup_output, &seed_output);
-    let mut warmup_left = data.left.clone();
-    let mut warmup_right = data.right.clone();
-    for (left, right) in data.steps.iter().take(data.warmup) {
-        warmup_left.extend(left.iter().copied());
-        warmup_right.extend(right.iter().copied());
+    for (index, (left, right)) in prepared.steps.iter().take(data.warmup).enumerate() {
         let warm_result = match strategy.as_str() {
-            "reference" => reference
-                .as_mut()
-                .unwrap()
-                .apply(&batch(left), &batch(right))
-                .unwrap(),
-            "candidate" => candidate
-                .as_mut()
-                .unwrap()
-                .apply(&batch(left), &batch(right))
-                .unwrap(),
-            "manual" => manual
-                .as_mut()
-                .unwrap()
-                .apply(&batch(left), &batch(right))
-                .unwrap(),
+            "reference" => reference.as_mut().unwrap().apply(left, right).unwrap(),
+            "candidate" => candidate.as_mut().unwrap().apply(left, right).unwrap(),
+            "manual" => manual.as_mut().unwrap().apply(left, right).unwrap(),
             _ => unreachable!(),
         };
         fold_output(&mut warmup_output, &warm_result);
-        if case == "low" || case == "mixed" {
-            let expected_count = if case == "low" { 1 } else { 8_000 };
-            assert!(
-                warmup_output
-                    .iter()
-                    .all(|((_, count), weight)| *count == expected_count && *weight == 1)
-            );
-        }
+        let expected_count = match case.as_str() {
+            "distinct" | "duplicates" => {
+                if index % 2 == 0 {
+                    0
+                } else {
+                    data.expected
+                }
+            }
+            _ => data.expected,
+        };
+        assert_eq!(warmup_output, expected_output(&case, expected_count));
     }
-    assert_eq!(
-        warmup_output,
-        super::support::oracle(&warmup_left, &warmup_right)
-    );
-    let mut folded = warmup_output.clone();
-    let mut oracle_left = warmup_left;
-    let mut oracle_right = warmup_right;
+    let mut folded = warmup_output;
     let mut samples = Vec::with_capacity(data.measured);
     let mut input_rows = 0usize;
-    for (left_rows, right_rows) in data.steps.iter().skip(data.warmup) {
-        let left = batch(left_rows);
-        let right = batch(right_rows);
+    for (index, (left, right)) in prepared.steps.iter().skip(data.warmup).enumerate() {
         input_rows += left.len() + right.len();
         let start = std::time::Instant::now();
         let result = match strategy.as_str() {
-            "reference" => reference.as_mut().unwrap().apply(&left, &right).unwrap(),
-            "candidate" => candidate.as_mut().unwrap().apply(&left, &right).unwrap(),
-            "manual" => manual.as_mut().unwrap().apply(&left, &right).unwrap(),
+            "reference" => reference.as_mut().unwrap().apply(left, right).unwrap(),
+            "candidate" => candidate.as_mut().unwrap().apply(left, right).unwrap(),
+            "manual" => manual.as_mut().unwrap().apply(left, right).unwrap(),
             _ => panic!("unsupported strategy: {strategy}"),
         };
-        let elapsed = start.elapsed().as_nanos();
         fold_output(&mut folded, &result);
-        oracle_left.extend(left_rows.iter().copied());
-        oracle_right.extend(right_rows.iter().copied());
-        assert_eq!(folded, super::support::oracle(&oracle_left, &oracle_right));
-        if case == "low" || case == "mixed" {
-            let expected_count = if case == "low" { 1 } else { 8_000 };
-            assert!(
-                folded
-                    .iter()
-                    .all(|((_, count), weight)| *count == expected_count && *weight == 1)
-            );
-        }
+        let elapsed = start.elapsed().as_nanos();
+        let expected_count = match case.as_str() {
+            "distinct" | "duplicates" => {
+                if index % 2 == 0 {
+                    0
+                } else {
+                    data.expected
+                }
+            }
+            _ => data.expected,
+        };
+        assert_eq!(folded, expected_output(&case, expected_count));
         samples.push(elapsed);
     }
     assert_eq!(samples.len(), data.measured);
@@ -252,6 +327,18 @@ fn measure() {
     let p50 = samples[nearest_rank(50)];
     let p99 = samples[nearest_rank(99)];
     let total_ns: u128 = samples.iter().sum();
+    let distinct_left = data
+        .left
+        .iter()
+        .map(|(key, payload, _)| (key, payload))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let distinct_right = data
+        .right
+        .iter()
+        .map(|(key, payload, _)| (key, payload))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     let memory = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| {
@@ -265,8 +352,8 @@ fn measure() {
     );
     println!(
         "{strategy},{case},{rep},{input_rows},{},{},{},{},{},{seed_ns},{total_ns},{p50},{p99},{}",
-        data.left.len(),
-        data.right.len(),
+        distinct_left,
+        distinct_right,
         if case == "low" { 1_000 } else { 1 },
         data.measured,
         setup_ns,
