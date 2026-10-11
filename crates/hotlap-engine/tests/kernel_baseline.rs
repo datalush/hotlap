@@ -4,6 +4,8 @@ mod baseline_alloc;
 mod baseline_conversion;
 #[path = "support/baseline_lifecycle.rs"]
 mod baseline_lifecycle;
+#[path = "support/baseline_memory.rs"]
+mod baseline_memory;
 #[path = "support/baseline_views.rs"]
 mod baseline_views;
 #[path = "support/baseline_workloads.rs"]

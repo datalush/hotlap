@@ -91,6 +91,14 @@ fn nrows() -> usize {
         .unwrap_or(128)
 }
 
+pub(super) fn rep() -> usize {
+    REP.load(Ordering::Relaxed)
+}
+
+pub(super) fn repeats() -> usize {
+    REPEATS.load(Ordering::Relaxed)
+}
+
 fn join_workload(n: usize, case: &str, skewed: bool, duplicates: bool) {
     let start = Instant::now();
     let input_schema = schema(&["k", "v", "ts"]);
@@ -483,6 +491,7 @@ pub fn run() {
         filter_project_workload(rows);
         crate::baseline_conversion::run(rows);
         crate::baseline_views::run(rows);
+        crate::baseline_memory::run(rows);
         crate::baseline_lifecycle::window_workload(rows);
         crate::baseline_lifecycle::recovery_multiview_workload(rows);
     }
