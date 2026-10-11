@@ -409,6 +409,10 @@ fn key_only_nullable_int64_rows_use_canonical_unit_payload() {
     use std::sync::Arc;
 
     let key_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+    let expected_output_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("count", DataType::Int64, true),
+    ]));
     let payload_schema = schema();
     let key_batch = |rows: &[(Option<i64>, i64)]| {
         hotlap_core::ZSetBatch::new(
@@ -427,83 +431,108 @@ fn key_only_nullable_int64_rows_use_canonical_unit_payload() {
     };
     let payload_batch = |rows: &[Row]| batch(rows);
 
-    for key_only_left in [true, false] {
+    for (key_only_left, key_only_right) in [(true, false), (false, true), (true, true)] {
         let left_schema = if key_only_left {
             key_schema.clone()
         } else {
             payload_schema.clone()
         };
-        let right_schema = if key_only_left {
-            payload_schema.clone()
-        } else {
+        let right_schema = if key_only_right {
             key_schema.clone()
+        } else {
+            payload_schema.clone()
         };
         let mut candidate = Candidate::new(left_schema, right_schema, 0, 0).unwrap();
-        let (left, right) = if key_only_left {
-            (
+        let mut reference = Reference::new(0, 0);
+        let (left, right) = match (key_only_left, key_only_right) {
+            (true, true) => (key_batch(&[(Some(7), 2)]), key_batch(&[(Some(7), 3)])),
+            (true, false) => (
                 key_batch(&[(Some(7), 2)]),
                 payload_batch(&[(Some(7), Some(10), 3)]),
-            )
-        } else {
-            (
+            ),
+            (false, true) => (
                 payload_batch(&[(Some(7), Some(10), 3)]),
                 key_batch(&[(Some(7), 2)]),
-            )
+            ),
+            (false, false) => unreachable!(),
         };
         let actual = candidate.apply(&left, &right).unwrap();
+        let expected = reference.apply(&left, &right).unwrap();
+        assert_eq!(actual.batch.schema(), expected_output_schema);
+        assert_eq!(expected.batch.schema(), expected_output_schema);
+        assert_eq!(actual.batch.schema(), expected.batch.schema());
+        assert_eq!(output(&actual), output(&expected));
         assert_eq!(output(&actual), [((Some(7), 6), 1)].into());
 
-        let duplicate_unit = if key_only_left {
-            (
+        let duplicate_unit = match (key_only_left, key_only_right) {
+            (true, true) => (key_batch(&[(Some(7), 4)]), key_batch(&[(Some(7), 2)])),
+            (true, false) => (
                 key_batch(&[(Some(7), 4)]),
                 payload_batch(&[(Some(7), Some(10), 2)]),
-            )
-        } else {
-            (
-                payload_batch(&[(Some(7), Some(10), 2)]),
-                key_batch(&[(Some(7), 4)]),
-            )
-        };
-        assert_eq!(
-            output(
-                &candidate
-                    .apply(&duplicate_unit.0, &duplicate_unit.1)
-                    .unwrap()
             ),
+            (false, true) => (
+                payload_batch(&[(Some(7), Some(10), 2)]),
+                key_batch(&[(Some(7), 4)]),
+            ),
+            (false, false) => unreachable!(),
+        };
+        let actual = candidate
+            .apply(&duplicate_unit.0, &duplicate_unit.1)
+            .unwrap();
+        let expected = reference
+            .apply(&duplicate_unit.0, &duplicate_unit.1)
+            .unwrap();
+        assert_eq!(actual.batch.schema(), expected_output_schema);
+        assert_eq!(expected.batch.schema(), expected_output_schema);
+        assert_eq!(actual.batch.schema(), expected.batch.schema());
+        assert_eq!(output(&actual), output(&expected));
+        assert_eq!(
+            output(&actual),
             [((Some(7), 6), -1), ((Some(7), 30), 1)].into()
         );
 
-        let left_retract = if key_only_left {
-            key_batch(&[(Some(7), -1)])
-        } else {
-            payload_batch(&[(Some(7), Some(10), -2)])
-        };
-        let right_retract = if key_only_left {
-            payload_batch(&[(Some(7), Some(10), -2)])
-        } else {
-            key_batch(&[(Some(7), -1)])
+        let (left_retract, right_retract) = match (key_only_left, key_only_right) {
+            (true, true) => (key_batch(&[(Some(7), -1)]), key_batch(&[(Some(7), -2)])),
+            (true, false) => (
+                key_batch(&[(Some(7), -1)]),
+                payload_batch(&[(Some(7), Some(10), -2)]),
+            ),
+            (false, true) => (
+                payload_batch(&[(Some(7), Some(10), -2)]),
+                key_batch(&[(Some(7), -1)]),
+            ),
+            (false, false) => unreachable!(),
         };
         let retracted = candidate.apply(&left_retract, &right_retract).unwrap();
+        let expected = reference.apply(&left_retract, &right_retract).unwrap();
+        assert_eq!(retracted.batch.schema(), expected_output_schema);
+        assert_eq!(expected.batch.schema(), expected_output_schema);
+        assert_eq!(retracted.batch.schema(), expected.batch.schema());
+        assert_eq!(output(&retracted), output(&expected));
         assert_eq!(
             output(&retracted),
             [((Some(7), 15), 1), ((Some(7), 30), -1)].into()
         );
 
-        let null_key = if key_only_left {
-            (
+        let null_key = match (key_only_left, key_only_right) {
+            (true, true) => (key_batch(&[(None, 1)]), key_batch(&[(None, 1)])),
+            (true, false) => (
                 key_batch(&[(None, 1)]),
                 payload_batch(&[(None, Some(11), 1)]),
-            )
-        } else {
-            (
+            ),
+            (false, true) => (
                 payload_batch(&[(None, Some(11), 1)]),
                 key_batch(&[(None, 1)]),
-            )
+            ),
+            (false, false) => unreachable!(),
         };
-        assert_eq!(
-            output(&candidate.apply(&null_key.0, &null_key.1).unwrap()),
-            [((None, 1), 1)].into()
-        );
+        let actual = candidate.apply(&null_key.0, &null_key.1).unwrap();
+        let expected = reference.apply(&null_key.0, &null_key.1).unwrap();
+        assert_eq!(actual.batch.schema(), expected_output_schema);
+        assert_eq!(expected.batch.schema(), expected_output_schema);
+        assert_eq!(actual.batch.schema(), expected.batch.schema());
+        assert_eq!(output(&actual), output(&expected));
+        assert_eq!(output(&actual), [((None, 1), 1)].into());
     }
 }
 
