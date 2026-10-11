@@ -237,12 +237,15 @@ fn emit_family_probe(
         "observer_phase":observer_phase,
         "logical_payload_bytes":report.logical_payload_bytes,
         "known_backing_capacity_bytes":report.known_backing_capacity_bytes,
+        "estimated_structural_bytes":report.estimated_structural_bytes,
         "join_logical_payload_bytes":report.join_logical_payload_bytes,
         "join_known_key_capacity_bytes":report.join_known_key_capacity_bytes,
         "window_logical_payload_bytes":report.window_logical_payload_bytes,
         "window_known_key_capacity_bytes":report.window_known_key_capacity_bytes,
         "minmax_distinct_entries":report.minmax_distinct_entries,
         "arrow_buffer_capacity_bytes":report.arrow_buffer_capacity_bytes,
+        "arrow_visible_buffer_bytes":report.arrow_visible_buffer_bytes,
+        "opaque_external_bytes_lower_bound":report.opaque_external_bytes_lower_bound,
         "covered_categories":report.covered_categories,
         "unknown_categories":report.unknown_categories,
         "opaque_external_categories":report.opaque_external_categories,
@@ -281,12 +284,15 @@ fn validate_family_probe(value: &serde_json::Value) -> Result<(), String> {
         "observer_phase",
         "logical_payload_bytes",
         "known_backing_capacity_bytes",
+        "estimated_structural_bytes",
         "join_logical_payload_bytes",
         "join_known_key_capacity_bytes",
         "window_logical_payload_bytes",
         "window_known_key_capacity_bytes",
         "minmax_distinct_entries",
         "arrow_buffer_capacity_bytes",
+        "arrow_visible_buffer_bytes",
+        "opaque_external_bytes_lower_bound",
         "covered_categories",
         "unknown_categories",
         "opaque_external_categories",
@@ -956,6 +962,8 @@ mod report_contract_tests {
             "repeats":3, "profile":"release", "head":"commit", "seed":7,
             "observer_phase":"quiescent_afteroutputsdrained",
             "logical_payload_bytes":1, "known_backing_capacity_bytes":1,
+            "estimated_structural_bytes":1, "arrow_visible_buffer_bytes":0,
+            "opaque_external_bytes_lower_bound":0,
             "join_logical_payload_bytes":1, "join_known_key_capacity_bytes":1,
             "window_logical_payload_bytes":0, "window_known_key_capacity_bytes":0,
             "minmax_distinct_entries":0, "arrow_buffer_capacity_bytes":0,
@@ -972,6 +980,12 @@ mod report_contract_tests {
         valid
             .as_object_mut()
             .unwrap()
+            .remove("estimated_structural_bytes");
+        assert!(validate_family_probe(&valid).is_err());
+        valid["estimated_structural_bytes"] = serde_json::json!(1);
+        valid
+            .as_object_mut()
+            .unwrap()
             .remove("join_known_key_capacity_bytes");
         assert!(validate_family_probe(&valid).is_err());
     }
@@ -982,6 +996,8 @@ mod report_contract_tests {
             "family":"pending_tap", "phase":"queued", "observer_phase":"quiescent_after_outputs_and_taps_drained_before_report_allocations",
             "rows":1,"rep":0,"repeats":1,"profile":"release","head":"commit","seed":7,
             "logical_payload_bytes":1,"known_backing_capacity_bytes":1,
+            "estimated_structural_bytes":1,"arrow_visible_buffer_bytes":0,
+            "opaque_external_bytes_lower_bound":0,
             "join_logical_payload_bytes":0,"join_known_key_capacity_bytes":0,
             "window_logical_payload_bytes":0,"window_known_key_capacity_bytes":0,
             "minmax_distinct_entries":0,"arrow_buffer_capacity_bytes":1,
