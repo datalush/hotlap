@@ -56,7 +56,10 @@ fn memory_report_counts_group_state_and_keeps_unsupported_families_explicit() {
     let report = core.memory_report().unwrap();
 
     assert_eq!(report.logical_payload_bytes, 16 + 2 * 19);
-    assert_eq!(report.known_backing_capacity_bytes, 16 + 2 * 19);
+    assert_eq!(
+        report.known_backing_capacity_bytes,
+        2 * (19 + std::mem::size_of::<hotlap_core::snapshot::AggValue>() + 8)
+    );
     assert_eq!(
         report.estimated_structural_bytes,
         2 * std::mem::size_of::<(Vec<u8>, hotlap_core::snapshot::GroupEntry)>()
@@ -110,7 +113,52 @@ fn memory_report_query_does_not_change_output_after_retraction() {
 
 #[test]
 fn memory_report_checked_counter_rejects_overflow() {
-    assert!(super::memory::MemoryReport::checked_capacity_sum_for_test(&[usize::MAX, 1]).is_err());
+    assert!(super::memory::checked_add(usize::MAX, 1, "capacity").is_err());
+    assert!(super::memory::checked_capacity_bytes(usize::MAX, 2).is_err());
+}
+
+#[test]
+fn memory_report_counts_projection_capacity_in_bytes_not_element_count() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::Project {
+            input: Box::new(Plan::Source(InputId(0))),
+            cols: vec![0],
+        },
+    )
+    .unwrap();
+    let report = core.memory_report().unwrap();
+    assert_eq!(
+        report.known_backing_capacity_bytes,
+        std::mem::size_of::<usize>()
+    );
+}
+
+#[test]
+fn memory_report_counts_aggregate_values_vec_capacity_in_bytes() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
+    core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+    let report = core.memory_report().unwrap();
+    let aggregate_capacity = std::mem::size_of::<hotlap_core::snapshot::AggValue>();
+    assert_eq!(
+        report.known_backing_capacity_bytes,
+        19 + aggregate_capacity + 8
+    );
+}
+
+#[test]
+fn memory_report_debug_does_not_expose_allocation_identities() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
+    core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+    let debug = format!("{:?}", core.memory_report().unwrap());
+    assert!(!debug.contains("allocations"));
+    assert!(!debug.contains("0x"));
 }
 
 #[test]

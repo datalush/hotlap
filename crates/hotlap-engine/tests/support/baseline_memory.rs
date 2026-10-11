@@ -42,7 +42,6 @@ struct MemoryReport {
     schema_fingerprint: String,
     drained_tap_rows: usize,
     memory_report: Option<serde_json::Value>,
-    observed_memory_report: Option<serde_json::Value>,
     logical_retained_bytes: Option<usize>,
     memory_semantics: &'static str,
 }
@@ -65,7 +64,6 @@ impl MemoryReport {
             "output_rows": self.output_rows, "schema_fingerprint": self.schema_fingerprint,
             "drained_tap_rows": self.drained_tap_rows,
             "core_memory_report": self.memory_report,
-            "core_memory_report_categories": self.observed_memory_report,
             "logical_retained_bytes": self.logical_retained_bytes,
             "memory_semantics": self.memory_semantics,
         })
@@ -96,7 +94,6 @@ fn validate_emitted_report(value: &serde_json::Value) -> Result<(), String> {
         "schema_fingerprint",
         "drained_tap_rows",
         "core_memory_report",
-        "core_memory_report_categories",
         "logical_retained_bytes",
         "memory_semantics",
     ];
@@ -143,8 +140,13 @@ fn validate_emitted_report(value: &serde_json::Value) -> Result<(), String> {
     {
         return Err("missing lifecycle allocator sample".into());
     }
-    if value["core_memory_report"].is_null() || value["core_memory_report_categories"].is_null() {
+    if value["core_memory_report"].is_null() {
         return Err("missing live core memory report".into());
+    }
+    if value["core_memory_report"].to_string().contains("0x")
+        || value["core_memory_report"].get("allocations").is_some()
+    {
+        return Err("memory report must not expose allocation identities".into());
     }
     if value["output_rows"].as_u64().is_none() || value["drained_tap_rows"].as_u64().is_none() {
         return Err("missing output/tap row count".into());
@@ -208,12 +210,11 @@ fn single_view_checkpoint_metric(n: usize, rep: usize, repeats: usize) {
     let drained = tap.len();
     drop(tap);
     let after_drain_live = Stats::read().live;
-    let report = core.memory_report().unwrap();
-    let memory_report = Some(serde_json::to_value(&report).unwrap());
-    let observed_memory_report = Some(serde_json::to_value(&report).unwrap());
+    let after_drain_peak = Stats::read().peak;
     drop(core);
     let live_after_core_drop = Stats::read().live;
     let peak_live = Stats::read().peak;
+    let memory_report = collect_live_report(n, true, true);
     let process_baseline_live_bytes = baseline;
     let live_delta_from_process_baseline_bytes = live_after_core_drop as i128 - baseline as i128;
     let live_delta_from_empty_core_bytes = live_after_core_drop as i128 - empty_core_live as i128;
@@ -239,15 +240,105 @@ fn single_view_checkpoint_metric(n: usize, rep: usize, repeats: usize) {
         process_baseline_live_bytes,
         live_delta_from_empty_core_bytes,
         live_delta_from_process_baseline_bytes,
-        peak_live_since_process_baseline_bytes: peak_live,
+        peak_live_since_process_baseline_bytes: peak_live.max(after_drain_peak),
         output_rows,
         schema_fingerprint,
         drained_tap_rows: drained,
         memory_report,
-        observed_memory_report,
         logical_retained_bytes: None,
         memory_semantics: "process_live_allocator_state_proxy_not_logical_retained_heap",
     });
+}
+
+fn collect_live_report(
+    n: usize,
+    single_view: bool,
+    shared_views: bool,
+) -> Option<serde_json::Value> {
+    if single_view {
+        let mut core = isolated_cores().into_iter().next().unwrap();
+        push_probe_rows(&mut core, n);
+        let output = core.snapshot(ViewId(0)).unwrap();
+        drop(output);
+        drop(core.take_changes(ViewId(0)).unwrap());
+        let report = core.memory_report().unwrap();
+        let serialized = serde_json::to_value(&report).unwrap();
+        drop(report);
+        drop(core);
+        return Some(serialized);
+    }
+
+    if shared_views {
+        let mut core = shared_core();
+        push_probe_rows(&mut core, n);
+        for view in 0..2 {
+            drop(core.snapshot(ViewId(view)).unwrap());
+            drop(core.take_changes(ViewId(view)).unwrap());
+        }
+        let report = core.memory_report().unwrap();
+        let serialized = serde_json::to_value(&report).unwrap();
+        drop(report);
+        drop(core);
+        Some(serialized)
+    } else {
+        let mut cores = isolated_cores();
+        for core in &mut cores {
+            push_probe_rows(core, n);
+            drop(core.snapshot(ViewId(0)).unwrap());
+            drop(core.take_changes(ViewId(0)).unwrap());
+        }
+        let reports = cores
+            .iter()
+            .map(|core| core.memory_report().unwrap())
+            .collect::<Vec<_>>();
+        let logical = reports
+            .iter()
+            .map(|report| report.logical_payload_bytes)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap();
+        let capacity = reports
+            .iter()
+            .map(|report| report.known_backing_capacity_bytes)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap();
+        let estimate = reports
+            .iter()
+            .map(|report| report.estimated_structural_bytes)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap();
+        let unknown = reports
+            .iter()
+            .flat_map(|report| report.unknown_categories.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let opaque = reports
+            .iter()
+            .flat_map(|report| report.opaque_external_categories.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let serialized = serde_json::json!({
+            "logical_payload_bytes":logical,
+            "known_backing_capacity_bytes":capacity,
+            "estimated_structural_bytes":estimate,
+            "unknown_categories":unknown,
+            "opaque_external_categories":opaque,
+            "complete":false
+        });
+        drop(reports);
+        drop(cores);
+        Some(serialized)
+    }
+}
+
+fn push_probe_rows(core: &mut hotlap_engine::EngineCore, n: usize) {
+    let input = batch(
+        schema(&["k", "v"]),
+        vec![
+            (0..n).map(|i| (i % 4) as i64).collect(),
+            (0..n).map(|i| i as i64).collect(),
+        ],
+        vec![1; n],
+    );
+    core.push(InputId(0), &input).unwrap();
+    drop(input);
 }
 
 fn quiescent_live_metric(n: usize, shared: bool, rep: usize, repeats: usize) {
@@ -335,45 +426,12 @@ fn quiescent_live_metric(n: usize, shared: bool, rep: usize, repeats: usize) {
         }
     }
     let after_tap_drain_live = Stats::read().live;
-    let report = if let Some(core) = shared_core.as_ref() {
-        Some(serde_json::to_value(core.memory_report().unwrap()).unwrap())
-    } else {
-        let mut logical = 0usize;
-        let mut capacity = 0usize;
-        let mut estimate = 0usize;
-        let mut unknown = Vec::new();
-        let mut opaque = Vec::new();
-        for core in independent.as_ref().unwrap() {
-            let report = core.memory_report().unwrap();
-            logical = logical.checked_add(report.logical_payload_bytes).unwrap();
-            capacity = capacity
-                .checked_add(report.known_backing_capacity_bytes)
-                .unwrap();
-            estimate = estimate
-                .checked_add(report.estimated_structural_bytes)
-                .unwrap();
-            unknown.extend(report.unknown_categories);
-            opaque.extend(report.opaque_external_categories);
-        }
-        unknown.sort();
-        unknown.dedup();
-        opaque.sort();
-        opaque.dedup();
-        Some(serde_json::json!({
-            "logical_payload_bytes":logical,
-            "known_backing_capacity_bytes":capacity,
-            "estimated_structural_bytes":estimate,
-            "unknown_categories":unknown,
-            "opaque_external_categories":opaque,
-            "complete":false
-        }))
-    };
-    let memory_report = report.clone();
-    let observed_memory_report = report;
+    let after_tap_drain_peak = Stats::read().peak;
     drop(shared_core);
     drop(independent);
     let live_after_core_drop = Stats::read().live;
-    let peak_live = Stats::read().peak;
+    let peak_live = Stats::read().peak.max(after_tap_drain_peak);
+    let memory_report = collect_live_report(n, false, shared);
     emit_validated(MemoryReport {
         case: "multiview_state_proxy",
         phase: if shared {
@@ -411,7 +469,6 @@ fn quiescent_live_metric(n: usize, shared: bool, rep: usize, repeats: usize) {
         schema_fingerprint,
         drained_tap_rows: tap_rows,
         memory_report,
-        observed_memory_report,
         logical_retained_bytes: None,
         memory_semantics: "process_live_allocator_state_proxy_not_logical_retained_heap",
     });
@@ -452,7 +509,6 @@ mod report_contract_tests {
             schema_fingerprint: "k,count|k,count,sum".into(),
             drained_tap_rows: 8,
             memory_report: Some(serde_json::json!({"complete":false})),
-            observed_memory_report: Some(serde_json::json!({"complete":false})),
             logical_retained_bytes: None,
             memory_semantics: "process_live_allocator_state_proxy_not_logical_retained_heap",
         };

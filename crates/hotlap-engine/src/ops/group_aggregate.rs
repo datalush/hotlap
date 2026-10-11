@@ -60,6 +60,7 @@ impl GroupAggregate {
     ) -> Result<super::super::core::memory::GroupMemory, crate::error::EngineError> {
         let mut payload = 0usize;
         let mut capacity = 0usize;
+        let mut accumulator_capacity = 0usize;
         for key in self.groups.keys() {
             payload = payload.checked_add(key.len()).ok_or_else(|| {
                 crate::error::EngineError::Infrastructure("memory report overflow".into())
@@ -68,9 +69,21 @@ impl GroupAggregate {
                 crate::error::EngineError::Infrastructure("memory report overflow".into())
             })?;
         }
+        for entry in self.groups.values() {
+            accumulator_capacity = accumulator_capacity
+                .checked_add(crate::core::memory::checked_capacity_bytes(
+                    entry.values.capacity(),
+                    std::mem::size_of::<hotlap_core::snapshot::AggValue>(),
+                )?)
+                .ok_or_else(|| {
+                    crate::error::EngineError::Infrastructure(
+                        "memory report accumulator capacity overflow".into(),
+                    )
+                })?;
+        }
         Ok(super::super::core::memory::GroupMemory {
             payload,
-            capacity,
+            capacity: crate::core::memory::checked_add(capacity, accumulator_capacity, "capacity")?,
             estimate: self
                 .groups
                 .len()

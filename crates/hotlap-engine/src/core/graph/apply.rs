@@ -43,7 +43,10 @@ impl Node {
                 input.memory_usage(report)?;
             }
             Node::Project { input, cols } => {
-                report.add_capacity(cols.capacity())?;
+                report.add_capacity(super::super::memory::checked_capacity_bytes(
+                    cols.capacity(),
+                    std::mem::size_of::<usize>(),
+                )?)?;
                 input.memory_usage(report)?;
             }
             Node::Group { input, reducer } => {

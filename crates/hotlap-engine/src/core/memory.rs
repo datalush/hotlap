@@ -19,8 +19,6 @@ pub struct MemoryReport {
     pub opaque_external_categories: Vec<String>,
     /// Whether every current core category is traversed.
     pub complete: bool,
-    #[serde(skip)]
-    allocations: HashSet<(usize, usize)>,
 }
 
 pub(crate) struct GroupMemory {
@@ -30,36 +28,21 @@ pub(crate) struct GroupMemory {
 }
 
 impl MemoryReport {
-    #[cfg(test)]
-    pub(crate) fn checked_capacity_sum_for_test(values: &[usize]) -> Result<usize, EngineError> {
-        values.iter().try_fold(0usize, |sum, value| {
-            sum.checked_add(*value).ok_or_else(|| {
-                EngineError::Infrastructure("memory report capacity overflow".into())
-            })
-        })
-    }
-
     pub(crate) fn add_capacity(&mut self, bytes: usize) -> Result<(), EngineError> {
-        self.known_backing_capacity_bytes = self
-            .known_backing_capacity_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| EngineError::Infrastructure("memory report capacity overflow".into()))?;
+        self.known_backing_capacity_bytes =
+            checked_add(self.known_backing_capacity_bytes, bytes, "capacity")?;
         Ok(())
     }
 
     pub(crate) fn add_estimate(&mut self, bytes: usize) -> Result<(), EngineError> {
-        self.estimated_structural_bytes = self
-            .estimated_structural_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| EngineError::Infrastructure("memory report estimate overflow".into()))?;
+        self.estimated_structural_bytes =
+            checked_add(self.estimated_structural_bytes, bytes, "estimate")?;
         Ok(())
     }
 
     pub(crate) fn add_group(&mut self, group: GroupMemory) -> Result<(), EngineError> {
-        self.logical_payload_bytes = self
-            .logical_payload_bytes
-            .checked_add(group.payload)
-            .ok_or_else(|| EngineError::Infrastructure("memory report payload overflow".into()))?;
+        self.logical_payload_bytes =
+            checked_add(self.logical_payload_bytes, group.payload, "payload")?;
         self.add_capacity(group.capacity)?;
         self.add_estimate(group.estimate)
     }
@@ -68,13 +51,13 @@ impl MemoryReport {
         &mut self,
         payload: usize,
         capacities: impl IntoIterator<Item = (usize, usize)>,
+        allocations: &mut HashSet<(usize, usize)>,
     ) -> Result<(), EngineError> {
-        self.logical_payload_bytes = self
-            .logical_payload_bytes
-            .checked_add(payload)
-            .ok_or_else(|| EngineError::Infrastructure("memory report payload overflow".into()))?;
+        self.logical_payload_bytes = checked_add(self.logical_payload_bytes, payload, "payload")?;
         for (identity, capacity) in capacities {
-            self.note_allocation(identity, capacity)?;
+            if allocations.insert((identity, capacity)) {
+                self.add_capacity(capacity)?;
+            }
         }
         Ok(())
     }
@@ -94,16 +77,51 @@ impl MemoryReport {
             self.opaque_external_categories.push(category.to_owned());
         }
     }
+}
 
-    pub(crate) fn note_allocation(
-        &mut self,
-        identity: usize,
-        capacity: usize,
-    ) -> Result<(), EngineError> {
-        if self.allocations.insert((identity, capacity)) {
-            self.add_capacity(capacity)?;
-        }
-        Ok(())
+pub(crate) fn checked_add(left: usize, right: usize, category: &str) -> Result<usize, EngineError> {
+    left.checked_add(right)
+        .ok_or_else(|| EngineError::Infrastructure(format!("memory report {category} overflow")))
+}
+
+pub(crate) fn checked_capacity_bytes(
+    capacity: usize,
+    element_size: usize,
+) -> Result<usize, EngineError> {
+    capacity
+        .checked_mul(element_size)
+        .ok_or_else(|| EngineError::Infrastructure("memory report capacity overflow".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemoryReport;
+
+    #[test]
+    fn output_backing_capacity_deduplicates_same_allocation_but_not_equal_bytes() {
+        let first = vec![7u8; 8];
+        let equal_but_distinct = vec![7u8; 8];
+        assert_eq!(first, equal_but_distinct);
+        assert_ne!(first.as_ptr(), equal_but_distinct.as_ptr());
+
+        let mut report = MemoryReport::default();
+        let mut allocations = std::collections::HashSet::new();
+        report
+            .add_output(
+                0,
+                [
+                    (first.as_ptr() as usize, first.capacity()),
+                    (first.as_ptr() as usize, first.capacity()),
+                    (
+                        equal_but_distinct.as_ptr() as usize,
+                        equal_but_distinct.capacity(),
+                    ),
+                ],
+                &mut allocations,
+            )
+            .unwrap();
+        assert_eq!(report.known_backing_capacity_bytes, 16);
+        assert_eq!(format!("{report:?}").contains("0x"), false);
     }
 }
 
@@ -113,6 +131,7 @@ impl super::EngineCore {
     pub fn memory_report(&self) -> Result<MemoryReport, EngineError> {
         self.ensure_healthy().map_err(EngineError::from)?;
         let mut report = MemoryReport::default();
+        let mut allocations = HashSet::new();
         if !self.views.is_empty() {
             report.mark_unknown("view_plans_and_taps");
         }
@@ -129,7 +148,7 @@ impl super::EngineCore {
         for view in self.views.values() {
             view.graph.memory_usage(&mut report)?;
             let (payload, capacities) = view.output.memory_usage()?;
-            report.add_output(payload, capacities)?;
+            report.add_output(payload, capacities, &mut allocations)?;
             if view.pending.is_some() || view.tapped {
                 report.mark_unknown("view_pending");
             }
@@ -138,6 +157,7 @@ impl super::EngineCore {
         report.opaque_external_categories.sort();
         report.complete =
             report.unknown_categories.is_empty() && report.opaque_external_categories.is_empty();
+        drop(allocations);
         Ok(report)
     }
 }
