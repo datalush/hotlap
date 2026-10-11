@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod benchmarks;
 mod candidate;
 mod domain;
 #[cfg(test)]
