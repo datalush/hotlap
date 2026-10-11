@@ -316,7 +316,7 @@ impl super::EngineCore {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int64Array, StructArray};
+    use arrow::array::{ArrayRef, Int64Array, StringArray, StructArray};
     use arrow::datatypes::{DataType, Field, Fields};
 
     use super::MemoryReport;
@@ -386,5 +386,45 @@ mod tests {
             .unwrap();
         assert_eq!(report.arrow_buffer_capacity_bytes, first * 2);
         assert!(!format!("{report:?}").contains("0x"));
+    }
+
+    #[test]
+    fn arrow_collector_deduplicates_string_offsets_values_nulls_and_nested_slices() {
+        let strings: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("long first value"),
+            None,
+            Some("another long value"),
+        ]));
+        let nested: ArrayRef = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new("text", DataType::Utf8, true)]),
+            vec![strings.clone()],
+            None,
+        ));
+        let slice = nested.slice(1, 1);
+        let equal_but_distinct: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("long first value"),
+            None,
+            Some("another long value"),
+        ]));
+
+        let mut report = MemoryReport::default();
+        let mut allocations = std::collections::HashSet::new();
+        let mut external_ranges = std::collections::HashMap::new();
+        report
+            .add_arrow_array(&nested, &mut allocations, &mut external_ranges)
+            .unwrap();
+        let initial_capacity = report.arrow_buffer_capacity_bytes;
+        let initial_visible = report.arrow_visible_buffer_bytes;
+        assert!(initial_capacity > 0);
+        assert!(initial_visible > 0);
+        report
+            .add_arrow_array(&slice, &mut allocations, &mut external_ranges)
+            .unwrap();
+        assert_eq!(report.arrow_buffer_capacity_bytes, initial_capacity);
+        report
+            .add_arrow_array(&equal_but_distinct, &mut allocations, &mut external_ranges)
+            .unwrap();
+        assert!(report.arrow_buffer_capacity_bytes > initial_capacity);
+        assert!(report.arrow_visible_buffer_bytes > initial_visible);
     }
 }
