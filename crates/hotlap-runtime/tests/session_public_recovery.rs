@@ -103,3 +103,39 @@ fn public_start_restores_valid_fallback_output_and_offset() {
     assert_eq!(spy.offset(), Some(1));
     restarted.shutdown().unwrap();
 }
+
+#[test]
+fn public_start_does_not_count_tap_validation_as_a_checkpoint() {
+    let backend = SharedBackend::default();
+    let initial_spies = Arc::new(Mutex::new(Vec::new()));
+    let (release_source, source_gate) = tokio::sync::oneshot::channel();
+    let (first_change, output) = mpsc::channel();
+    let mut initial = Session::open(support::config(
+        &backend,
+        initial_spies,
+        Some(Arc::new(Mutex::new(Some(source_gate)))),
+        Some(first_change),
+    ))
+    .unwrap();
+    declare(&mut initial);
+    initial.sql("START;").unwrap();
+    let _ = release_source.send(());
+    support::wait_for_output(output);
+    assert_eq!(initial.checkpoint().unwrap(), 1);
+    initial.shutdown().unwrap();
+
+    let restart_spies = Arc::new(Mutex::new(Vec::new()));
+    let mut restarted =
+        Session::open(support::config(&backend, restart_spies, None, None)).unwrap();
+    declare(&mut restarted);
+    assert_eq!(restarted.metrics().entries.get("checkpoints_taken"), None);
+    restarted.sql("START;").unwrap();
+    assert_eq!(restarted.metrics().entries.get("checkpoints_taken"), None);
+    assert_eq!(rows(&restarted), vec![vec![1]]);
+    assert_eq!(restarted.checkpoint().unwrap(), 2);
+    assert_eq!(
+        restarted.metrics().entries.get("checkpoints_taken"),
+        Some(&1)
+    );
+    restarted.shutdown().unwrap();
+}

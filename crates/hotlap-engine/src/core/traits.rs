@@ -186,6 +186,14 @@ impl IncrementalCore for EngineCore {
         }
     }
 
+    fn view_tapped(&self, view: ViewId) -> Result<bool, CoreError> {
+        self.ensure_healthy()?;
+        self.views
+            .get(&view)
+            .map(|state| state.tapped)
+            .ok_or_else(|| CoreError::Unsupported(format!("unknown view {view:?}")))
+    }
+
     fn checkpoint(&self) -> Result<EngineSnapshot, CoreError> {
         // Method-call syntax picks the inherent `EngineCore::checkpoint`.
         self.checkpoint().map_err(CoreError::from)

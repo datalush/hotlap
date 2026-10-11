@@ -111,6 +111,14 @@ impl Hotlap {
             .map_err(|e| HotlapError(format!("{e}")))
     }
 
+    /// Read whether the named view is tapped without capturing engine state.
+    pub fn view_tapped(&self, name: &str) -> Result<bool, HotlapError> {
+        let id = self.view_id(name)?;
+        self.core
+            .view_tapped(id)
+            .map_err(|error| HotlapError(format!("{error}")))
+    }
+
     /// Drain the `ZSetBatch` changes of the tapped view registered as `name`,
     /// accumulated by the last push. Empty for an untapped view.
     pub fn take_changes(&mut self, name: &str) -> Result<ZSetBatch, HotlapError> {

@@ -31,19 +31,18 @@ pub(super) fn validate_tap_continuity(
     hotlap: &Hotlap,
     checkpoint: &Checkpoint,
 ) -> Result<(), ConnectorError> {
-    let live = hotlap
-        .checkpoint()
-        .map_err(|error| ConnectorError::Infrastructure(error.0))?;
-    for view in live.views.iter().filter(|view| view.tapped) {
-        let saved = checkpoint
-            .engine
-            .views
-            .iter()
-            .find(|saved| saved.id == view.id);
-        if !saved.is_some_and(|saved| saved.tapped && saved.plan == view.plan) {
+    for (name, id, plan) in hotlap.view_registry() {
+        let tapped = hotlap
+            .view_tapped(&name)
+            .map_err(|error| ConnectorError::Infrastructure(error.0))?;
+        if !tapped {
+            continue;
+        }
+        let saved = checkpoint.engine.views.iter().find(|saved| saved.id == id);
+        if !saved.is_some_and(|saved| saved.tapped && saved.plan == plan) {
             return Err(ConnectorError::Unsupported(format!(
                 "checkpoint would remove the active tap from view {:?}",
-                view.id
+                id
             )));
         }
     }

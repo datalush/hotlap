@@ -88,6 +88,13 @@ pub trait IncrementalCore {
     /// [`build_view`](Self::build_view) and before the first push.
     fn tap_view(&mut self, view: ViewId) -> Result<(), CoreError>;
 
+    /// Read whether a view is tapped without capturing its durable state.
+    fn view_tapped(&self, _view: ViewId) -> Result<bool, CoreError> {
+        Err(CoreError::Unsupported(
+            "view tap metadata is not supported by this core".into(),
+        ))
+    }
+
     /// Capture the engine's durable state as a versioned [`EngineSnapshot`].
     fn checkpoint(&self) -> Result<EngineSnapshot, CoreError>;
 
