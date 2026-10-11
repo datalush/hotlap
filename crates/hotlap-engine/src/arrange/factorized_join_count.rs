@@ -1,6 +1,10 @@
 mod candidate;
 mod domain;
+#[cfg(test)]
+mod manual;
 mod support;
+#[cfg(test)]
+mod tests;
 #[cfg(test)]
 mod candidate_tests {
     use super::{
