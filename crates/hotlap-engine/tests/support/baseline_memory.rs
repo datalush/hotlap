@@ -214,6 +214,7 @@ pub(super) fn run_family_coverage(n: usize, rep: usize, repeats: usize) {
     probe_window(n, rep, repeats);
     probe_retention(n, rep, repeats);
     probe_pending_tap(n, rep, repeats);
+    probe_join_pending_batch(n, rep, repeats);
 }
 
 fn emit_family_probe(
@@ -280,6 +281,7 @@ fn validate_family_probe(value: &serde_json::Value) -> Result<(), String> {
         "tumble_count",
         "input_retention",
         "pending_tap",
+        "join_pending_batch",
     ]
     .contains(&family)
     {
@@ -500,6 +502,55 @@ fn probe_pending_tap(n: usize, rep: usize, repeats: usize) {
     let drained = core.memory_report().unwrap();
     assert!(drained.arrow_buffer_capacity_bytes < pending.arrow_buffer_capacity_bytes);
     emit_family_probe("pending_tap", "drained", n, rep, repeats, &drained);
+}
+
+fn probe_join_pending_batch(n: usize, rep: usize, repeats: usize) {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::Join {
+            left: Box::new(Plan::Source(InputId(0))),
+            right: Box::new(Plan::Source(InputId(1))),
+            left_key: vec![0],
+            right_key: vec![0],
+        },
+    )
+    .unwrap();
+    let input = batch(
+        schema(&["k", "v"]),
+        vec![(0..n as i64).collect(), (0..n as i64).collect()],
+        vec![1; n],
+    );
+    core.push(InputId(0), &input).unwrap();
+    let pending = core.memory_report().unwrap();
+    assert!(pending.arrow_buffer_capacity_bytes > 0);
+    assert!(
+        pending
+            .unknown_categories
+            .contains(&"join_pending_batch_metadata".to_string())
+    );
+    emit_family_probe(
+        "join_pending_batch",
+        "left_waiting_for_schema",
+        n,
+        rep,
+        repeats,
+        &pending,
+    );
+    core.push(InputId(1), &input).unwrap();
+    let initialized = core.memory_report().unwrap();
+    assert_eq!(initialized.arrow_buffer_capacity_bytes, 0);
+    assert!(initialized.join_logical_payload_bytes > 0);
+    emit_family_probe(
+        "join_pending_batch",
+        "arrangement_initialized",
+        n,
+        rep,
+        repeats,
+        &initialized,
+    );
 }
 
 fn single_view_checkpoint_metric(n: usize, rep: usize, repeats: usize) {
