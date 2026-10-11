@@ -117,7 +117,7 @@ impl super::EngineCore {
             view.graph.memory_usage(&mut report)?;
             let (payload, capacities) = view.output.memory_usage()?;
             report.add_output(payload, capacities, &mut allocations)?;
-            if view.pending.is_some() || view.tapped {
+            if view.pending.is_some() {
                 report.mark_unknown("view_pending");
             }
         }

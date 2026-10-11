@@ -162,6 +162,30 @@ fn memory_report_debug_does_not_expose_allocation_identities() {
 }
 
 #[test]
+fn memory_report_tracks_pending_tap_bytes_only_until_the_tap_is_drained() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(0), &group_plan()).unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+    core.push(InputId(0), &zset(&[(1, 1)])).unwrap();
+    let pending = core.memory_report().unwrap();
+    assert!(
+        pending
+            .unknown_categories
+            .iter()
+            .any(|item| item == "view_pending")
+    );
+    drop(core.take_changes(ViewId(0)).unwrap());
+    let drained = core.memory_report().unwrap();
+    assert!(
+        !drained
+            .unknown_categories
+            .iter()
+            .any(|item| item == "view_pending")
+    );
+}
+
+#[test]
 fn view_output_state_does_not_grow_with_history() {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();
