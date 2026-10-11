@@ -89,7 +89,11 @@ fn manual_comparator_red_sequence() {
     assert_eq!(manual_snapshot, oracle(&left_history, &right_history));
 }
 
-fn check_steps(steps: &[(Vec<Row>, Vec<Row>)], left_key: usize, right_key: usize) {
+fn check_steps(
+    steps: &[(Vec<Row>, Vec<Row>)],
+    left_key: usize,
+    right_key: usize,
+) -> Vec<(super::support::Output, arrow::datatypes::SchemaRef)> {
     let left_schema = schema_at(left_key);
     let right_schema = schema_at(right_key);
     let mut candidate = Candidate::new(left_schema, right_schema, left_key, right_key).unwrap();
@@ -97,6 +101,7 @@ fn check_steps(steps: &[(Vec<Row>, Vec<Row>)], left_key: usize, right_key: usize
     let mut manual = Manual::new(left_key, right_key);
     let mut histories = [Vec::new(), Vec::new()];
     let mut snapshots = [Default::default(), Default::default(), Default::default()];
+    let mut frames = Vec::new();
     for (left_rows, right_rows) in steps {
         let left = batch_at(left_rows, left_key);
         let right = batch_at(right_rows, right_key);
@@ -117,7 +122,9 @@ fn check_steps(steps: &[(Vec<Row>, Vec<Row>)], left_key: usize, right_key: usize
         assert_eq!(snapshots[0], snapshots[1]);
         assert_eq!(snapshots[2], snapshots[1]);
         assert_eq!(snapshots[1], oracle(&histories[0], &histories[1]));
+        frames.push((snapshots[1].clone(), outputs[1].batch.schema()));
     }
+    frames
 }
 
 fn schema_at(key_index: usize) -> arrow::datatypes::SchemaRef {
@@ -147,15 +154,50 @@ fn nullable_payloads_duplicates_and_cancellations_match() {
 
 #[test]
 fn key_at_column_one_keeps_real_key_and_exact_schema() {
-    check_steps(
+    let frames = check_steps(
         &[
-            (vec![(Some(10), Some(1), 2)], vec![(Some(20), Some(1), 3)]),
-            (vec![(Some(11), Some(1), 1)], vec![(Some(21), Some(1), 2)]),
-            (vec![(Some(10), Some(1), -2)], vec![(Some(20), Some(1), -3)]),
+            (vec![(Some(1), Some(10), 2)], vec![(Some(1), Some(20), 3)]),
+            (vec![(Some(1), Some(11), 1)], vec![(Some(1), Some(21), 2)]),
+            (vec![(Some(1), Some(10), -2)], vec![(Some(1), Some(20), -3)]),
         ],
         1,
         1,
     );
+    assert_eq!(
+        frames
+            .iter()
+            .map(|(snapshot, _)| snapshot.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            [((Some(1), 6), 1)].into(),
+            [((Some(1), 15), 1)].into(),
+            [((Some(1), 2), 1)].into(),
+        ],
+    );
+    for (_, schema) in &frames {
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "k");
+        assert_eq!(schema.field(1).name(), "count");
+        assert!(schema.field(0).is_nullable());
+        assert!(schema.field(1).is_nullable());
+        assert_eq!(
+            schema.field(0).data_type(),
+            &arrow::datatypes::DataType::Int64
+        );
+        assert_eq!(
+            schema.field(1).data_type(),
+            &arrow::datatypes::DataType::Int64
+        );
+    }
+
+    let mixed_positions = check_steps(
+        &[(vec![(Some(2), Some(7), 2)], vec![(Some(2), Some(9), 3)])],
+        1,
+        0,
+    );
+    assert_eq!(mixed_positions[0].0, [((Some(2), 6), 1)].into());
+    assert_eq!(mixed_positions[0].1.field(0).name(), "k");
+    assert_eq!(mixed_positions[0].1.field(1).name(), "count");
 }
 
 #[test]
