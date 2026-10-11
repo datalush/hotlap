@@ -54,7 +54,7 @@ impl MemoryReport {
         serde_json::json!({
             "case": self.case, "phase": self.phase, "topology": self.topology,
             "rep": self.rep, "repeats": self.repeats, "head": self.head,
-            "profile": self.profile, "rows": self.rows, "setup_ns": self.setup_ns,
+            "profile": self.profile, "seed": MEMORY_PROBE_SEED, "rows": self.rows, "setup_ns": self.setup_ns,
             "fixture_setup_ns": self.fixture_setup_ns,
             "process_baseline_live_bytes": self.process_baseline_live_bytes,
             "empty_core_live_bytes": self.empty_core_live_bytes,
@@ -83,6 +83,7 @@ fn validate_emitted_report(value: &serde_json::Value) -> Result<(), String> {
         "repeats",
         "head",
         "profile",
+        "seed",
         "rows",
         "setup_ns",
         "fixture_setup_ns",
@@ -108,6 +109,9 @@ fn validate_emitted_report(value: &serde_json::Value) -> Result<(), String> {
         }
     }
     let phase = value["phase"].as_str().ok_or("phase is not a string")?;
+    if value["seed"].as_u64() != Some(MEMORY_PROBE_SEED) {
+        return Err("memory probe seed is missing or invalid".into());
+    }
     let topology = value["topology"]
         .as_str()
         .ok_or("topology is not a string")?;
@@ -1056,6 +1060,9 @@ mod report_contract_tests {
         };
         let valid = valid.to_json();
         assert!(validate_emitted_report(&valid).is_ok());
+        let mut missing_seed = valid.clone();
+        missing_seed.as_object_mut().unwrap().remove("seed");
+        assert!(validate_emitted_report(&missing_seed).is_err());
         let mut missing_phase = valid.clone();
         missing_phase.as_object_mut().unwrap().remove("phase");
         assert!(validate_emitted_report(&missing_phase).is_err());
@@ -1077,7 +1084,7 @@ mod report_contract_tests {
         for (phase, schema) in phases {
             let mut report = serde_json::json!({
                 "case":"multiview_state_proxy", "phase":phase, "topology":phase,
-                "rep":0, "repeats":1, "head":"test", "profile":"release", "rows":1,
+                "rep":0, "repeats":1, "head":"test", "profile":"release", "seed":7, "rows":1,
                 "setup_ns":0, "fixture_setup_ns":0, "process_baseline_live_bytes":1,
                 "empty_core_live_bytes":1, "fixture_live_bytes":1,
                 "live_after_outputs_taps_drained_core_state_bytes":1, "live_after_core_drop_bytes":1,
