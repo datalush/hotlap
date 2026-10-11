@@ -73,7 +73,7 @@ pub(super) fn metric<T>(
     let after = Stats::read();
     println!();
     println!(
-        r#"{{"case":"{case}","phase":"{phase}","seed":{SEED},"rep":{},"repeats":{},"head":"{head}","profile":"{PROFILE}","arch":"{}","os":"{}","input_rows":{input_rows},"delta_rows":{delta_rows},"setup_ns":{setup_ns},"fixture_setup_ns":{fixture_setup_ns},"elapsed_ns":{elapsed_ns},"allocated_live_bytes_before":{before},"peak_allocated_live_bytes":{},"allocated_live_bytes_after":{},"logical_retained_bytes":null,"logical_retained_bytes_status":"unavailable"}}"#,
+        r#"{{"case":"{case}","phase":"{phase}","seed":{SEED},"rep":{},"repeats":{},"head":"{head}","profile":"{PROFILE}","arch":"{}","os":"{}","input_rows":{input_rows},"delta_rows":{delta_rows},"setup_ns":{setup_ns},"fixture_setup_ns":{fixture_setup_ns},"setup_timing_semantics":"measured only when explicitly populated; zero denotes not measured, setup excluded from elapsed interval","elapsed_ns":{elapsed_ns},"elapsed_semantics":"wall_clock_not_cpu","allocated_live_bytes_before":{before},"peak_allocated_live_bytes":{},"allocated_live_bytes_after":{},"logical_retained_bytes":null,"logical_retained_bytes_status":"unavailable"}}"#,
         REP.load(Ordering::Relaxed),
         REPEATS.load(Ordering::Relaxed),
         std::env::consts::ARCH,
@@ -100,7 +100,7 @@ pub(super) fn repeats() -> usize {
 }
 
 fn join_workload(n: usize, case: &str, skewed: bool, duplicates: bool) {
-    let start = Instant::now();
+    let setup_start = Instant::now();
     let input_schema = schema(&["k", "v", "ts"]);
     let mut core = EngineCore::new();
     for id in [InputId(0), InputId(1)] {
@@ -117,7 +117,7 @@ fn join_workload(n: usize, case: &str, skewed: bool, duplicates: bool) {
     )
     .unwrap();
     core.tap_view(ViewId(0)).unwrap();
-    let setup_ns = start.elapsed().as_nanos();
+    let setup_ns = setup_start.elapsed().as_nanos();
     let fixture_start = Instant::now();
     let left: Vec<_> = (0..n)
         .map(|i| {
@@ -240,7 +240,7 @@ pub(super) fn int_rows(zset: &ZSetBatch) -> BTreeMap<Vec<i64>, i64> {
 }
 
 fn aggregate_workload(n: usize) {
-    let start = Instant::now();
+    let setup_start = Instant::now();
     let input_schema = schema(&["k", "v", "ts"]);
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();
@@ -259,7 +259,7 @@ fn aggregate_workload(n: usize) {
         },
     )
     .unwrap();
-    let setup_ns = start.elapsed().as_nanos();
+    let setup_ns = setup_start.elapsed().as_nanos();
     let fixture_start = Instant::now();
     let values: Vec<i64> = (0..n).map(|i| ((i + SEED as usize) % n) as i64).collect();
     let seed = batch(
@@ -396,7 +396,7 @@ fn assert_aggregates(snapshot: &ZSetBatch, values: &[i64]) {
 }
 
 fn filter_project_workload(n: usize) {
-    let start = Instant::now();
+    let setup_start = Instant::now();
     let input_schema = schema(&["k", "v", "ts"]);
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();
@@ -415,7 +415,7 @@ fn filter_project_workload(n: usize) {
         },
     )
     .unwrap();
-    let setup_ns = start.elapsed().as_nanos();
+    let setup_ns = setup_start.elapsed().as_nanos();
     let fixture_start = Instant::now();
     let rows: Vec<_> = (0..n)
         .map(|i| (i as i64, ((i * 17 + SEED as usize) % 101) as i64, 0, 1))

@@ -1,6 +1,6 @@
 //! Matched multiview, Arrow conversion, and quiescent allocator workloads.
 
-use arrow::array::Int64Array;
+use arrow::array::{Array, Int64Array};
 use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
 use hotlap_engine::{EngineCore, encode_snapshot};
 use std::collections::BTreeMap;
@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::baseline_alloc::{self, Stats};
 use crate::baseline_workloads::{batch, int_rows, metric, rep, repeats, schema};
 
-fn plans() -> [Plan; 2] {
+pub(super) fn plans() -> [Plan; 2] {
     [
         Plan::GroupAggregate {
             input: Box::new(Plan::Source(InputId(0))),
@@ -94,6 +94,153 @@ pub(super) fn assert_matched_multiview_correctness(n: usize) {
     }
 }
 
+fn dense_aggregate(rows: &BTreeMap<(i64, i64), i64>, with_sum: bool) -> BTreeMap<Vec<i64>, i64> {
+    let mut groups = BTreeMap::<i64, (i64, i64)>::new();
+    for (&(key, value), &diff) in rows {
+        let entry = groups.entry(key).or_default();
+        entry.0 = entry.0.checked_add(diff).expect("oracle count overflow");
+        entry.1 = entry
+            .1
+            .checked_add(value.checked_mul(diff).expect("oracle product overflow"))
+            .expect("oracle sum overflow");
+    }
+    groups
+        .into_iter()
+        .filter_map(|(key, (count, sum))| {
+            if count == 0 {
+                None
+            } else if with_sum {
+                Some((vec![key, count, sum], 1))
+            } else {
+                Some((vec![key, count], 1))
+            }
+        })
+        .collect()
+}
+
+fn assert_delta(actual: &ZSetBatch, expected: &BTreeMap<Vec<i64>, i64>, label: &str) {
+    assert_eq!(
+        int_rows(actual),
+        *expected,
+        "{label} signed changelog differs from dense oracle"
+    );
+}
+
+pub(super) fn assert_dense_multiview_correctness() {
+    let input_schema = schema(&["k", "v"]);
+    let steps = [
+        (vec![0, 0, 1, 2], vec![10, 10, 20, 30], vec![1, 2, 1, 1]),
+        (vec![0, 1, 2], vec![10, 20, 30], vec![-1, 1, -1]),
+        (vec![0, 1], vec![10, 20], vec![-2, -1]),
+    ];
+    let mut oracle = BTreeMap::<(i64, i64), i64>::new();
+    let mut shared = shared_core();
+    let mut independent = isolated_cores();
+    let mut expected_state = [BTreeMap::new(), BTreeMap::new()];
+    for (step, (keys, values, diffs)) in steps.into_iter().enumerate() {
+        let input = batch(
+            input_schema.clone(),
+            vec![keys.clone(), values.clone()],
+            diffs.clone(),
+        );
+        let before = [
+            dense_aggregate(&oracle, false),
+            dense_aggregate(&oracle, true),
+        ];
+        for ((key, value), diff) in keys.into_iter().zip(values).zip(diffs) {
+            let entry = oracle.entry((key, value)).or_default();
+            *entry = entry.checked_add(diff).expect("oracle input diff overflow");
+            if *entry == 0 {
+                oracle.remove(&(key, value));
+            }
+        }
+        let after = [
+            dense_aggregate(&oracle, false),
+            dense_aggregate(&oracle, true),
+        ];
+        for index in 0..2 {
+            let mut delta = after[index].clone();
+            for (row, weight) in &before[index] {
+                let value = delta.entry(row.clone()).or_default();
+                *value = value.checked_sub(*weight).expect("oracle delta overflow");
+                if *value == 0 {
+                    delta.remove(row);
+                }
+            }
+            expected_state[index] = after[index].clone();
+        }
+        shared.push(InputId(0), &input).unwrap();
+        for core in &mut independent {
+            core.push(InputId(0), &input).unwrap();
+        }
+        for index in 0..2 {
+            let mut expected_delta = after[index].clone();
+            for (row, weight) in &before[index] {
+                let value = expected_delta.entry(row.clone()).or_default();
+                *value = value.checked_sub(*weight).expect("oracle delta overflow");
+                if *value == 0 {
+                    expected_delta.remove(row);
+                }
+            }
+            let shared_delta = shared.take_changes(ViewId(index as u32)).unwrap();
+            assert_delta(
+                &shared_delta,
+                &expected_delta,
+                &format!("shared view={index} step={step}"),
+            );
+            assert_eq!(
+                int_rows(&independent[index].take_changes(ViewId(0)).unwrap()),
+                expected_delta
+            );
+            assert_eq!(
+                int_rows(&shared.snapshot(ViewId(index as u32)).unwrap()),
+                expected_state[index]
+            );
+            assert_eq!(
+                int_rows(&independent[index].snapshot(ViewId(0)).unwrap()),
+                expected_state[index]
+            );
+        }
+    }
+    let checkpoint = shared.checkpoint().unwrap();
+    let mut restored = encode_restore(&checkpoint);
+    let continuation = batch(input_schema, vec![vec![1], vec![20]], vec![1]);
+    let before = [
+        dense_aggregate(&oracle, false),
+        dense_aggregate(&oracle, true),
+    ];
+    *oracle.entry((1, 20)).or_default() += 1;
+    let after = [
+        dense_aggregate(&oracle, false),
+        dense_aggregate(&oracle, true),
+    ];
+    shared.push(InputId(0), &continuation).unwrap();
+    restored.push(InputId(0), &continuation).unwrap();
+    for (index, old) in before.iter().enumerate() {
+        let mut expected_delta = after[index].clone();
+        for (row, weight) in old {
+            let value = expected_delta.entry(row.clone()).or_default();
+            *value -= *weight;
+            if *value == 0 {
+                expected_delta.remove(row);
+            }
+        }
+        assert_delta(
+            &shared.take_changes(ViewId(index as u32)).unwrap(),
+            &expected_delta,
+            "shared post-restore continuation",
+        );
+        assert_eq!(
+            int_rows(&restored.take_changes(ViewId(index as u32)).unwrap()),
+            expected_delta
+        );
+        assert_eq!(
+            int_rows(&restored.snapshot(ViewId(index as u32)).unwrap()),
+            after[index]
+        );
+    }
+}
+
 pub(super) fn serialized_snapshot_size(n: usize) -> usize {
     let setup_start = Instant::now();
     let input_schema = schema(&["k", "v"]);
@@ -121,7 +268,7 @@ pub(super) fn serialized_snapshot_size(n: usize) -> usize {
     let elapsed_ns = started.elapsed().as_nanos();
     let stats = Stats::read();
     println!(
-        "{{\"case\":\"multiview_shared\",\"phase\":\"snapshot_serialized_size\",\"seed\":7,\"rep\":{},\"repeats\":{},\"head\":\"{head}\",\"profile\":\"{}\",\"arch\":\"{}\",\"os\":\"{}\",\"input_rows\":{n},\"setup_ns\":{setup_ns},\"fixture_setup_ns\":{fixture_setup_ns},\"elapsed_ns\":{elapsed_ns},\"allocated_live_before_bytes\":{allocated_live_before_bytes},\"peak_allocated_live_bytes\":{},\"allocated_live_after_bytes\":{},\"serialized_snapshot_bytes\":{},\"serialized_bytes_semantics\":\"encoded_checkpoint_payload_only_not_retained_heap\"}}",
+        "{{\"case\":\"single_view_checkpoint\",\"phase\":\"single_view_one_core\",\"seed\":7,\"rep\":{},\"repeats\":{},\"head\":\"{head}\",\"profile\":\"{}\",\"arch\":\"{}\",\"os\":\"{}\",\"input_rows\":{n},\"setup_ns\":{setup_ns},\"fixture_setup_ns\":{fixture_setup_ns},\"elapsed_ns\":{elapsed_ns},\"setup_timing_semantics\":\"setup_and_fixture_creation_measured_once_outside_encoding_interval\",\"elapsed_semantics\":\"wall_clock_not_cpu\",\"allocated_live_before_bytes\":{allocated_live_before_bytes},\"peak_allocated_live_bytes\":{},\"allocated_live_after_bytes\":{},\"serialized_snapshot_bytes\":{},\"serialized_bytes_semantics\":\"encoded_checkpoint_payload_only_not_retained_heap\"}}",
         rep(),
         repeats(),
         if cfg!(debug_assertions) {
@@ -146,24 +293,33 @@ pub(super) fn materialize_rows(zset: &ZSetBatch) -> BTreeMap<Vec<i64>, i64> {
         .map(|column| column.as_any().downcast_ref::<Int64Array>().unwrap())
         .collect();
     let diffs = zset.diff().as_any().downcast_ref::<Int64Array>().unwrap();
-    (0..zset.len())
-        .map(|index| {
-            (
-                columns.iter().map(|column| column.value(index)).collect(),
-                diffs.value(index),
-            )
-        })
-        .collect()
+    let mut rows = BTreeMap::new();
+    for index in 0..zset.len() {
+        let row = columns
+            .iter()
+            .map(|column| column.value(index))
+            .collect::<Vec<_>>();
+        let weight = rows.entry(row.clone()).or_insert(0i64);
+        *weight = weight
+            .checked_add(diffs.value(index))
+            .expect("materialized diff overflow");
+        if *weight == 0 {
+            rows.remove(&row);
+        }
+    }
+    rows
 }
 
 pub(super) fn run(n: usize) {
     serialized_snapshot_size(n);
     assert_matched_multiview_correctness(n);
+    assert_dense_multiview_correctness();
     matched_multiview_workload(n);
 }
 
 fn matched_multiview_workload(n: usize) {
     let input_schema = schema(&["k", "v"]);
+    let fixture_started = Instant::now();
     let seed = batch(
         input_schema.clone(),
         vec![
@@ -173,27 +329,30 @@ fn matched_multiview_workload(n: usize) {
         vec![1; n],
     );
     let retract = batch(input_schema, vec![vec![0], vec![0]], vec![-1]);
+    let fixture_setup_ns = fixture_started.elapsed().as_nanos();
+    let setup_started = Instant::now();
     let mut shared = shared_core();
     let mut independent = isolated_cores();
+    let setup_ns = setup_started.elapsed().as_nanos();
     for (case, input, phase_rows) in [("seed", &seed, n), ("retract", &retract, n + 1)] {
         metric(
-            "multiview_shared",
+            "one_core_two_views",
             case,
             phase_rows,
             input.len(),
-            0,
-            0,
+            setup_ns,
+            fixture_setup_ns,
             || {
                 shared.push(InputId(0), input).unwrap();
             },
         );
         metric(
-            "multiview_independent",
+            "two_cores_one_view_each",
             case,
             phase_rows * 2,
             input.len() * 2,
-            0,
-            0,
+            setup_ns,
+            fixture_setup_ns,
             || {
                 for core in &mut independent {
                     core.push(InputId(0), input).unwrap();
@@ -210,7 +369,7 @@ fn matched_multiview_workload(n: usize) {
     }
     let shared_checkpoint = shared.checkpoint().unwrap();
     let shared_restored = metric(
-        "multiview_shared",
+        "one_core_two_views",
         "checkpoint_encode_restore",
         n,
         0,
@@ -223,7 +382,7 @@ fn matched_multiview_workload(n: usize) {
         .map(|core| core.checkpoint().unwrap())
         .collect::<Vec<_>>();
     let individual_restored = metric(
-        "multiview_independent",
+        "two_cores_one_view_each",
         "checkpoint_encode_restore",
         n * 2,
         0,
@@ -235,6 +394,16 @@ fn matched_multiview_workload(n: usize) {
                 .map(encode_restore)
                 .collect::<Vec<_>>()
         },
+    );
+    let single_checkpoint = independent[0].checkpoint().unwrap();
+    let _single_view_bytes = metric(
+        "single_view_checkpoint",
+        "single_view_one_core",
+        n,
+        0,
+        0,
+        0,
+        || encode_restore(&single_checkpoint),
     );
     assert_outputs_against_restored(
         &mut shared,
