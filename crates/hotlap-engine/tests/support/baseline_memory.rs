@@ -248,20 +248,40 @@ fn emit_family_probe(
 
 fn validate_family_probe(value: &serde_json::Value) -> Result<(), String> {
     for key in [
-        "family", "phase", "rows", "rep", "repeats", "profile", "observer_phase",
-        "logical_payload_bytes", "known_backing_capacity_bytes", "join_logical_payload_bytes",
-        "join_known_key_capacity_bytes", "window_logical_payload_bytes",
-        "window_known_key_capacity_bytes", "minmax_distinct_entries",
-        "arrow_buffer_capacity_bytes", "covered_categories", "unknown_categories",
-        "opaque_external_categories", "complete", "exact_heap_bytes",
+        "family",
+        "phase",
+        "rows",
+        "rep",
+        "repeats",
+        "profile",
+        "observer_phase",
+        "logical_payload_bytes",
+        "known_backing_capacity_bytes",
+        "join_logical_payload_bytes",
+        "join_known_key_capacity_bytes",
+        "window_logical_payload_bytes",
+        "window_known_key_capacity_bytes",
+        "minmax_distinct_entries",
+        "arrow_buffer_capacity_bytes",
+        "covered_categories",
+        "unknown_categories",
+        "opaque_external_categories",
+        "complete",
+        "exact_heap_bytes",
     ] {
         if value.get(key).is_none() {
             return Err(format!("family probe missing {key}"));
         }
     }
     let family = value["family"].as_str().ok_or("family is not a string")?;
-    if !["join", "minmax", "tumble_count", "input_retention", "pending_tap"]
-        .contains(&family)
+    if ![
+        "join",
+        "minmax",
+        "tumble_count",
+        "input_retention",
+        "pending_tap",
+    ]
+    .contains(&family)
     {
         return Err("unknown family probe".into());
     }
@@ -859,7 +879,10 @@ mod report_contract_tests {
         valid["family"] = serde_json::json!("other");
         assert!(validate_family_probe(&valid).is_err());
         valid["family"] = serde_json::json!("join");
-        valid.as_object_mut().unwrap().remove("join_known_key_capacity_bytes");
+        valid
+            .as_object_mut()
+            .unwrap()
+            .remove("join_known_key_capacity_bytes");
         assert!(validate_family_probe(&valid).is_err());
     }
 

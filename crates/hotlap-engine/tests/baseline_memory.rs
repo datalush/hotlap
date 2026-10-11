@@ -7,6 +7,7 @@ mod baseline_conversion;
 #[allow(dead_code)]
 mod baseline_lifecycle;
 #[path = "support/baseline_memory.rs"]
+#[allow(dead_code)]
 mod baseline_memory;
 #[path = "support/baseline_views.rs"]
 #[allow(dead_code)]

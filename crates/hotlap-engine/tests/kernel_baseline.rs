@@ -57,14 +57,14 @@ fn memory_observability_baseline_separates_live_categories_and_serialized_size()
     .unwrap();
     let report = core.memory_report().unwrap();
     assert!(!report.complete);
-    assert_eq!(report.known_backing_capacity_bytes, 0);
+    assert!(report.known_backing_capacity_bytes > 0);
     assert!(
         report
             .unknown_categories
             .contains(&"core_registries_schemas_and_watermarks".to_string())
     );
     assert!(
-        report
+        !report
             .opaque_external_categories
             .contains(&"arrow_buffers".to_string())
     );
