@@ -225,11 +225,12 @@ fn emit_family_probe(
     repeats: usize,
     report: &hotlap_engine::MemoryReport,
 ) {
+    let observer_phase = family_observer_phase(family, phase).expect("known family probe phase");
     let json = serde_json::json!({
         "case":"kernel_memory_family", "family":family, "phase":phase, "rows":n,
         "rep":rep, "repeats":repeats,
         "profile":if cfg!(debug_assertions) {"debug"} else {"release"},
-        "observer_phase":"quiescent_after_outputs_and_taps_drained_before_report_allocations",
+        "observer_phase":observer_phase,
         "logical_payload_bytes":report.logical_payload_bytes,
         "known_backing_capacity_bytes":report.known_backing_capacity_bytes,
         "join_logical_payload_bytes":report.join_logical_payload_bytes,
@@ -245,6 +246,22 @@ fn emit_family_probe(
     });
     validate_family_probe(&json).expect("invalid family memory probe");
     println!("{}", serde_json::to_string(&json).unwrap());
+}
+
+fn family_observer_phase(family: &str, phase: &str) -> Option<&'static str> {
+    match (family, phase) {
+        ("pending_tap", "queued") => Some("retained_state_tap_queued"),
+        ("join_pending_batch", "left_waiting_for_schema") => Some("join_input_queued_beforeflush"),
+        ("join", "retained" | "left_retracted")
+        | ("minmax", "retained" | "retracted")
+        | ("tumble_count", "open" | "closed")
+        | ("input_retention", "large_batch_retained" | "evicted_to_small_batch")
+        | ("pending_tap", "drained")
+        | ("join_pending_batch", "arrangement_initialized") => {
+            Some("quiescent_afteroutputsdrained")
+        }
+        _ => None,
+    }
 }
 
 fn validate_family_probe(value: &serde_json::Value) -> Result<(), String> {
@@ -275,6 +292,7 @@ fn validate_family_probe(value: &serde_json::Value) -> Result<(), String> {
         }
     }
     let family = value["family"].as_str().ok_or("family is not a string")?;
+    let phase = value["phase"].as_str().ok_or("phase is not a string")?;
     if ![
         "join",
         "minmax",
@@ -286,6 +304,9 @@ fn validate_family_probe(value: &serde_json::Value) -> Result<(), String> {
     .contains(&family)
     {
         return Err("unknown family probe".into());
+    }
+    if family_observer_phase(family, phase) != value["observer_phase"].as_str() {
+        return Err("observer phase does not match family/state phase".into());
     }
     if value["complete"] != false || !value["exact_heap_bytes"].is_null() {
         return Err("family probe must preserve partial/unknown memory semantics".into());
@@ -444,6 +465,7 @@ fn probe_retention(n: usize, rep: usize, repeats: usize) {
         vec![1; n],
     );
     core.push(InputId(0), &large).unwrap();
+    drop(core.snapshot(ViewId(0)).unwrap());
     drop(core.take_changes(ViewId(0)).unwrap());
     let before = core.memory_report().unwrap();
     assert!(
@@ -465,6 +487,7 @@ fn probe_retention(n: usize, rep: usize, repeats: usize) {
         vec![1],
     );
     core.push(InputId(0), &small).unwrap();
+    drop(core.snapshot(ViewId(0)).unwrap());
     drop(core.take_changes(ViewId(0)).unwrap());
     let after = core.memory_report().unwrap();
     assert!(after.arrow_buffer_capacity_bytes < before.arrow_buffer_capacity_bytes);
@@ -490,6 +513,7 @@ fn probe_pending_tap(n: usize, rep: usize, repeats: usize) {
         vec![1; n],
     );
     core.push(InputId(0), &input).unwrap();
+    drop(core.snapshot(ViewId(0)).unwrap());
     let pending = core.memory_report().unwrap();
     assert!(pending.arrow_buffer_capacity_bytes > 0);
     assert!(
@@ -499,6 +523,7 @@ fn probe_pending_tap(n: usize, rep: usize, repeats: usize) {
     );
     emit_family_probe("pending_tap", "queued", n, rep, repeats, &pending);
     drop(core.take_changes(ViewId(0)).unwrap());
+    drop(core.snapshot(ViewId(0)).unwrap());
     let drained = core.memory_report().unwrap();
     assert!(drained.arrow_buffer_capacity_bytes < pending.arrow_buffer_capacity_bytes);
     emit_family_probe("pending_tap", "drained", n, rep, repeats, &drained);
@@ -540,6 +565,7 @@ fn probe_join_pending_batch(n: usize, rep: usize, repeats: usize) {
         &pending,
     );
     core.push(InputId(1), &input).unwrap();
+    drop(core.snapshot(ViewId(0)).unwrap());
     let initialized = core.memory_report().unwrap();
     assert_eq!(initialized.arrow_buffer_capacity_bytes, 0);
     assert!(initialized.join_logical_payload_bytes > 0);
@@ -935,6 +961,23 @@ mod report_contract_tests {
             .unwrap()
             .remove("join_known_key_capacity_bytes");
         assert!(validate_family_probe(&valid).is_err());
+    }
+
+    #[test]
+    fn family_probe_contract_rejects_phase_mismatched_with_queued_state() {
+        let mut report = serde_json::json!({
+            "family":"pending_tap", "phase":"queued", "observer_phase":"quiescent_after_outputs_and_taps_drained_before_report_allocations",
+            "rows":1,"rep":0,"repeats":1,"profile":"release",
+            "logical_payload_bytes":1,"known_backing_capacity_bytes":1,
+            "join_logical_payload_bytes":0,"join_known_key_capacity_bytes":0,
+            "window_logical_payload_bytes":0,"window_known_key_capacity_bytes":0,
+            "minmax_distinct_entries":0,"arrow_buffer_capacity_bytes":1,
+            "covered_categories":[],"unknown_categories":[],"opaque_external_categories":[],
+            "complete":false,"exact_heap_bytes":null
+        });
+        assert!(validate_family_probe(&report).is_err());
+        report["observer_phase"] = serde_json::json!("retained_state_tap_queued");
+        assert!(validate_family_probe(&report).is_ok());
     }
 
     #[test]
