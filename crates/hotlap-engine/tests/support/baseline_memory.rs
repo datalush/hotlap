@@ -9,6 +9,8 @@ use crate::baseline_workloads::schema;
 use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, WatermarkSpec, ZSetBatch};
 use hotlap_engine::EngineCore;
 
+const MEMORY_PROBE_SEED: u64 = 7;
+
 fn schema_fingerprint(batch: &ZSetBatch) -> String {
     batch
         .schema()
@@ -230,6 +232,8 @@ fn emit_family_probe(
         "case":"kernel_memory_family", "family":family, "phase":phase, "rows":n,
         "rep":rep, "repeats":repeats,
         "profile":if cfg!(debug_assertions) {"debug"} else {"release"},
+        "head":std::env::var("HOTLAP_BASELINE_HEAD").unwrap_or_else(|_| "unknown".into()),
+        "seed":MEMORY_PROBE_SEED,
         "observer_phase":observer_phase,
         "logical_payload_bytes":report.logical_payload_bytes,
         "known_backing_capacity_bytes":report.known_backing_capacity_bytes,
@@ -272,6 +276,8 @@ fn validate_family_probe(value: &serde_json::Value) -> Result<(), String> {
         "rep",
         "repeats",
         "profile",
+        "head",
+        "seed",
         "observer_phase",
         "logical_payload_bytes",
         "known_backing_capacity_bytes",
@@ -293,6 +299,9 @@ fn validate_family_probe(value: &serde_json::Value) -> Result<(), String> {
     }
     let family = value["family"].as_str().ok_or("family is not a string")?;
     let phase = value["phase"].as_str().ok_or("phase is not a string")?;
+    if value["head"].as_str().is_none() || value["seed"].as_u64().is_none() {
+        return Err("missing head/seed metadata".into());
+    }
     if ![
         "join",
         "minmax",
@@ -944,7 +953,8 @@ mod report_contract_tests {
     fn family_probe_contract_rejects_unknown_family_and_missing_metrics() {
         let mut valid = serde_json::json!({
             "family":"join", "phase":"retained", "rows":128, "rep":0,
-            "repeats":3, "profile":"release", "observer_phase":"quiescent_afteroutputsdrained",
+            "repeats":3, "profile":"release", "head":"commit", "seed":7,
+            "observer_phase":"quiescent_afteroutputsdrained",
             "logical_payload_bytes":1, "known_backing_capacity_bytes":1,
             "join_logical_payload_bytes":1, "join_known_key_capacity_bytes":1,
             "window_logical_payload_bytes":0, "window_known_key_capacity_bytes":0,
@@ -956,6 +966,9 @@ mod report_contract_tests {
         valid["family"] = serde_json::json!("other");
         assert!(validate_family_probe(&valid).is_err());
         valid["family"] = serde_json::json!("join");
+        valid.as_object_mut().unwrap().remove("head");
+        assert!(validate_family_probe(&valid).is_err());
+        valid["head"] = serde_json::json!("commit");
         valid
             .as_object_mut()
             .unwrap()
@@ -967,7 +980,7 @@ mod report_contract_tests {
     fn family_probe_contract_rejects_phase_mismatched_with_queued_state() {
         let mut report = serde_json::json!({
             "family":"pending_tap", "phase":"queued", "observer_phase":"quiescent_after_outputs_and_taps_drained_before_report_allocations",
-            "rows":1,"rep":0,"repeats":1,"profile":"release",
+            "rows":1,"rep":0,"repeats":1,"profile":"release","head":"commit","seed":7,
             "logical_payload_bytes":1,"known_backing_capacity_bytes":1,
             "join_logical_payload_bytes":0,"join_known_key_capacity_bytes":0,
             "window_logical_payload_bytes":0,"window_known_key_capacity_bytes":0,
