@@ -1,8 +1,7 @@
 //! Versioned export/import of [`Join`]'s retained side relations.
 //!
 //! The delta join derives each change from the retained sides, so no cached
-//! join product is stored or restored. `JoinState::joined` is kept in the
-//! snapshot schema for wire compatibility but is always empty in new exports.
+//! join product is stored or restored.
 
 use hotlap_core::snapshot::JoinState;
 
@@ -29,7 +28,6 @@ impl Join {
         Ok(JoinState {
             left,
             right,
-            joined: Vec::new(),
             left_pending: None,
             right_pending: None,
         })
@@ -37,8 +35,6 @@ impl Join {
 
     /// Restores both side arrangements.
     ///
-    /// Any `joined` table in `state` is ignored: the next push recomputes the
-    /// join change from the restored sides.
     pub(crate) fn import_state(&mut self, state: &JoinState) -> Result<(), EngineError> {
         self.left = None;
         self.right = None;

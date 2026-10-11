@@ -29,7 +29,7 @@ registrada, no afirmación de una corrida reciente.
   propaga `Storage`; recovery elige el `valid` más nuevo aunque `latest` se quede
   atrás y un fallo de `get`/`list`/publicación se propaga sin descartar ni borrar
   ni reabrir fuentes, mientras que la corrupción del formato actual se tolera y
-  una versión desconocida sigue siendo fatal. `tests/checkpoint_legacy_format.rs`
+  una versión desconocida sigue siendo fatal. `tests/checkpoint_foreign_format.rs`
   fija además que un snapshot v4 real (no sólo la versión mutada) es fatal: ni
   cae al checkpoint anterior ni descarta el commit pendiente.
 - **Barrera y entrega** (`tests/sink_barrier.rs`): la intención durable `prepare`

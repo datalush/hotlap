@@ -74,9 +74,7 @@ fn decode_table(bytes: &[u8]) -> Result<RecordBatch, EngineError> {
 }
 
 /// Magic bytes at the start of every binary frame.
-const FRAME_MAGIC: [u8; 4] = *b"HLSP";
-/// Layout version of the frame header; unknown values are rejected.
-const FRAME_VERSION: u32 = 1;
+const FRAME_MAGIC: [u8; 4] = *b"HLP1";
 /// Fixed header length: magic (4) + version (4) + payload length (8).
 const FRAME_HEADER: usize = 16;
 /// Upper bound for a payload length, so a corrupt prefix cannot demand an
@@ -88,7 +86,7 @@ pub fn encode_framed<T: Serialize>(value: &T) -> Result<Vec<u8>, EngineError> {
     let payload = codec().serialize(value).map_err(codec_err)?;
     let mut out = Vec::with_capacity(FRAME_HEADER + payload.len());
     out.extend_from_slice(&FRAME_MAGIC);
-    out.extend_from_slice(&FRAME_VERSION.to_le_bytes());
+    out.extend_from_slice(&ENGINE_SNAPSHOT_FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     out.extend_from_slice(&payload);
     Ok(out)
@@ -115,7 +113,7 @@ fn frame_payload(bytes: &[u8]) -> Result<(&[u8], u64), EngineError> {
         ));
     }
     let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    if version != FRAME_VERSION {
+    if version != ENGINE_SNAPSHOT_FORMAT_VERSION {
         return Err(EngineError::Unsupported(format!(
             "unknown frame version {version}"
         )));
@@ -148,10 +146,8 @@ pub fn encode_snapshot(snapshot: &EngineSnapshot) -> Result<Vec<u8>, EngineError
 /// Decodes an [`EngineSnapshot`], rejecting a foreign layout version.
 ///
 /// The version is read from the leading `format_version` field of the body
-/// *before* the body is decoded, so a genuine older snapshot (whose float
-/// layout no longer decodes) is reported as [`EngineError::Unsupported`] rather
-/// than a decode failure. Recovery treats `Unsupported` as fatal instead of
-/// falling back to an older checkpoint.
+/// *before* the body is decoded. Recovery treats `Unsupported` as fatal
+/// instead of falling back to an older checkpoint.
 pub fn decode_snapshot(bytes: &[u8]) -> Result<EngineSnapshot, EngineError> {
     let (payload, length) = frame_payload(bytes)?;
     let version = snapshot_prefix_version(payload)?;
@@ -181,9 +177,8 @@ fn snapshot_prefix_version(payload: &[u8]) -> Result<u32, EngineError> {
 /// Fixed, deterministic bincode 1.x configuration: fixed-width integers and no
 /// trailing bytes, so bytes produced once are read back identically.
 ///
-/// The payload layout is coupled to bincode 1.x. Moving to a different bincode
-/// major is a wire break and must bump `FRAME_VERSION`, not just the crate
-/// version, or old frames would decode incorrectly.
+/// The payload layout is coupled to bincode 1.x; its format identity is the
+/// current snapshot version.
 fn codec() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()

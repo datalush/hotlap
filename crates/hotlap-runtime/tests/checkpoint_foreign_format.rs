@@ -1,8 +1,5 @@
-//! A genuine older snapshot format is fatal: never a silent fallback to an
-//! older checkpoint and never a discard of an interrupted commit.
-
-#[path = "common/legacy_snapshot.rs"]
-mod legacy_snapshot;
+//! A foreign engine format is fatal: never a silent fallback to an older
+//! checkpoint and never a discard of an interrupted commit.
 #[path = "common/recovery.rs"]
 mod recovery;
 
@@ -53,10 +50,9 @@ fn seed_pending(backend: &SharedBackend, valid: u64, pending: u64) {
         .unwrap();
 }
 
-/// A genuine v4 body as the newest complete checkpoint must be fatal, never a
-/// silent fallback to the older body.
+/// A foreign-format body as newest checkpoint must be fatal, never fallback.
 #[test]
-fn an_old_snapshot_version_is_fatal_not_a_fallback() {
+fn a_foreign_snapshot_format_is_fatal_not_a_fallback() {
     let backend = SharedBackend::default();
     seed_valid(&backend);
     let mut writer = backend.clone();
@@ -70,10 +66,7 @@ fn an_old_snapshot_version_is_fatal_not_a_fallback() {
             .unwrap();
     }
     writer
-        .put(
-            b"checkpoint/2/engine",
-            legacy_snapshot::old_v4_snapshot_bytes(),
-        )
+        .put(b"checkpoint/2/engine", b"foreign engine format".to_vec())
         .unwrap();
     writer.put(b"checkpoint/2/valid", b"1".to_vec()).unwrap();
     writer
@@ -82,7 +75,7 @@ fn an_old_snapshot_version_is_fatal_not_a_fallback() {
 
     let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);
     let error = Recovery::load(&checkpointer, &sources(ResumableSource::new(log())))
-        .expect_err("an old snapshot version is fatal");
+        .expect_err("a foreign snapshot format is fatal");
     assert!(
         matches!(error, ConnectorError::Unsupported(_)),
         "got {error:?}"
@@ -93,19 +86,16 @@ fn an_old_snapshot_version_is_fatal_not_a_fallback() {
     );
 }
 
-/// A genuine v4 body left by an interrupted commit must be fatal too, and must
+/// A foreign-format body left by an interrupted commit must be fatal too, and must
 /// not be discarded or fall back to the older checkpoint.
 #[test]
-fn an_old_pending_snapshot_version_is_fatal_without_discard() {
+fn a_foreign_pending_snapshot_format_is_fatal_without_discard() {
     let backend = SharedBackend::default();
     seed_valid(&backend);
     seed_pending(&backend, 1, 2);
     let mut writer = backend.clone();
     writer
-        .put(
-            b"checkpoint/2/engine",
-            legacy_snapshot::old_v4_snapshot_bytes(),
-        )
+        .put(b"checkpoint/2/engine", b"foreign engine format".to_vec())
         .unwrap();
 
     let checkpointer = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN);

@@ -19,7 +19,7 @@ versionado** (`crates/hotlap-engine/src/core/ipc.rs`); el estado de las fuentes,
 como un `SourcesCheckpoint` multifuente en un contenedor `HLSR`
 (`runtime/source_checkpoint/`):
 
-- Cabecera fija del frame del motor: magic `HLSP` (4) + versión de frame (4) +
+- Cabecera fija del frame del motor: magic `HLP1` (4) + versión de snapshot (4) +
   longitud del payload (8, little-endian), seguida de payload `bincode`.
 - Contenedor fuentes: magic `HLSR` (4) + versión de layout (4) + frame del motor
   con payload `SourcesCheckpoint`.

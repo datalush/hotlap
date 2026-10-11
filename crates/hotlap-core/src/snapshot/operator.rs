@@ -155,16 +155,14 @@ pub struct WindowState {
     pub open: Vec<WindowBucket>,
 }
 
-/// Join retained state: both side relations, the cached join, and any deltas
-/// buffered while a sibling side's schema was still unknown.
+/// Join retained state: both side relations and deltas buffered while a
+/// sibling side's schema was still unknown.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinState {
     /// Materialized left arrangement, or `None` before initialization.
     pub left: Option<SnapshotTable>,
     /// Materialized right arrangement, or `None` before initialization.
     pub right: Option<SnapshotTable>,
-    /// Cached per-key join output, ordered by key bytes.
-    pub joined: Vec<(Vec<u8>, SnapshotTable)>,
     /// Left delta buffered until the right schema was known.
     pub left_pending: Option<SnapshotTable>,
     /// Right delta buffered until the left schema was known.

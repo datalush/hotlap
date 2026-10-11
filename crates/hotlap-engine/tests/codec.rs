@@ -18,17 +18,17 @@ fn empty_snapshot() -> EngineSnapshot {
 fn snapshot_round_trips_through_a_binary_frame() {
     let snapshot = empty_snapshot();
     let bytes = encode_snapshot(&snapshot).unwrap();
-    assert_eq!(&bytes[..4], b"HLSP", "frame must carry the codec magic");
+    assert_eq!(&bytes[..4], b"HLP1", "frame must carry the v1 codec magic");
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
     assert_eq!(decode_snapshot(&bytes).unwrap(), snapshot);
 }
 
 #[test]
-fn previous_format_version_is_rejected_on_decode() {
-    // Version 4 predates the separate finite-sum/special-count float layout.
+fn unknown_format_version_is_rejected_on_decode() {
     let mut snapshot = empty_snapshot();
-    snapshot.format_version = 4;
+    snapshot.format_version = ENGINE_SNAPSHOT_FORMAT_VERSION + 1;
     let bytes = encode_framed(&snapshot).unwrap();
-    let err = decode_snapshot(&bytes).expect_err("the old layout must be rejected");
+    let err = decode_snapshot(&bytes).expect_err("unknown format must be rejected");
     assert!(
         matches!(err, hotlap_engine::EngineError::Unsupported(_)),
         "expected Unsupported, got {err:?}"

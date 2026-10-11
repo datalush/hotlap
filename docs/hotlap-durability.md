@@ -110,7 +110,7 @@ El motor captura y reconstruye su estado como un **snapshot versionado**
 
 ```rust
 pub struct EngineSnapshot {
-    pub format_version: u32,          // ENGINE_SNAPSHOT_FORMAT_VERSION = 5
+    pub format_version: u32,          // ENGINE_SNAPSHOT_FORMAT_VERSION = 1
     pub epoch: u64,                   // logical epoch at capture time
     pub frozen: bool,                 // whether the schema was frozen
     pub inputs: Vec<InputSnapshot>,   // inputs ordered by id
