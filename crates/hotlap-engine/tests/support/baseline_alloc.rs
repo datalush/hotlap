@@ -62,6 +62,14 @@ fn remove_live(bytes: usize) {
     LIVE.fetch_sub(bytes, Ordering::Relaxed);
 }
 
+#[allow(dead_code)]
 pub fn reset_peak() {
     PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+pub fn capture_baseline(read_metadata: impl FnOnce() -> String) -> (String, usize) {
+    let metadata = read_metadata();
+    let live = LIVE.load(Ordering::Relaxed);
+    PEAK.store(live, Ordering::Relaxed);
+    (metadata, live)
 }

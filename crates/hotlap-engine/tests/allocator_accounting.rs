@@ -31,4 +31,10 @@ fn benchmark_allocator_accounts_live_bytes_and_peak_reset() {
     assert_eq!(Stats::read().live - baseline.live, 2_048);
     unsafe { dealloc(shrunk, Layout::from_size_align(2_048, 8).unwrap()) };
     assert_eq!(Stats::read().live, baseline.live);
+
+    let (metadata, metadata_baseline) =
+        baseline_alloc::capture_baseline(|| "metadata allocation sentinel".to_owned());
+    assert_eq!(Stats::read().live, metadata_baseline);
+    assert_eq!(Stats::read().peak, metadata_baseline);
+    drop(metadata);
 }

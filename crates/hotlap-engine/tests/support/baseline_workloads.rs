@@ -64,9 +64,9 @@ pub(super) fn metric<T>(
     fixture_setup_ns: u128,
     operation: impl FnOnce() -> T,
 ) -> T {
-    let before = Stats::read().live;
-    let head = std::env::var("HOTLAP_BASELINE_HEAD").unwrap_or_else(|_| "unknown".into());
-    baseline_alloc::reset_peak();
+    let (head, before) = baseline_alloc::capture_baseline(|| {
+        std::env::var("HOTLAP_BASELINE_HEAD").unwrap_or_else(|_| "unknown".into())
+    });
     let start = Instant::now();
     let output = operation();
     let elapsed_ns = start.elapsed().as_nanos();
@@ -145,51 +145,35 @@ fn join_workload(n: usize, case: &str, skewed: bool, duplicates: bool) {
     let retract_batch = rows_batch(&retract, input_schema);
     let fixture_setup_ns = fixture_start.elapsed().as_nanos();
     core.push(InputId(0), &left_batch).unwrap();
+    assert!(int_rows(&core.take_changes(ViewId(0)).unwrap()).is_empty());
     core.push(InputId(1), &right_batch).unwrap();
+    let seeded_output = join_oracle(&left, &right);
     assert_eq!(
-        join_rows(&core.snapshot(ViewId(0)).unwrap()),
-        join_oracle(&left, &right)
+        int_rows(&core.take_changes(ViewId(0)).unwrap()),
+        seeded_output
     );
+    assert_eq!(int_rows(&core.snapshot(ViewId(0)).unwrap()), seeded_output);
     for (phase, update, history) in [
         ("insert", &insert_batch, insert[0]),
         ("retract", &retract_batch, retract[0]),
     ] {
+        let before = join_oracle(&left, &right);
         metric(case, phase, n * 2, 1, setup_ns, fixture_setup_ns, || {
             core.push(InputId(1), update).unwrap();
         });
         right.push(history);
+        let after = join_oracle(&left, &right);
         assert_eq!(
-            join_rows(&core.snapshot(ViewId(0)).unwrap()),
-            join_oracle(&left, &right)
+            int_rows(&core.take_changes(ViewId(0)).unwrap()),
+            delta_rows(&after, &before),
+            "{case} {phase} changelog"
+        );
+        assert_eq!(
+            int_rows(&core.snapshot(ViewId(0)).unwrap()),
+            after,
+            "{case} {phase} state"
         );
     }
-}
-
-fn join_rows(zset: &ZSetBatch) -> BTreeMap<Vec<i64>, i64> {
-    let mut rows = BTreeMap::new();
-    for row in 0..zset.len() {
-        let values = zset
-            .batch
-            .columns()
-            .iter()
-            .map(|column| {
-                column
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .value(row)
-            })
-            .collect::<Vec<_>>();
-        let diff = zset
-            .diff()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(row);
-        *rows.entry(values).or_default() += diff;
-    }
-    rows.retain(|_, diff| *diff != 0);
-    rows
 }
 
 fn join_oracle(
@@ -206,6 +190,18 @@ fn join_oracle(
     }
     rows.retain(|_, diff| *diff != 0);
     rows
+}
+
+fn delta_rows(
+    after: &BTreeMap<Vec<i64>, i64>,
+    before: &BTreeMap<Vec<i64>, i64>,
+) -> BTreeMap<Vec<i64>, i64> {
+    let mut delta = after.clone();
+    for (row, diff) in before {
+        *delta.entry(row.clone()).or_default() -= diff;
+    }
+    delta.retain(|_, diff| *diff != 0);
+    delta
 }
 
 pub(super) fn int_rows(zset: &ZSetBatch) -> BTreeMap<Vec<i64>, i64> {
@@ -417,7 +413,7 @@ fn filter_project_workload(n: usize) {
         .map(|i| (i as i64, ((i * 17 + SEED as usize) % 101) as i64, 0, 1))
         .collect();
     let seed = rows_batch(&rows, input_schema.clone());
-    let retract_index = rows.iter().position(|row| row.1 >= 50).unwrap();
+    let retract_index = filter_retract_index(&rows);
     let (key, value, _, _) = rows[retract_index];
     let retract = rows_batch(&[(key, value, 0, -1)], input_schema);
     let fixture_setup_ns = fixture_start.elapsed().as_nanos();
@@ -441,7 +437,11 @@ fn filter_project_workload(n: usize) {
     assert_eq!(int_rows(&core.snapshot(ViewId(0)).unwrap()), expected_rows);
     metric(
         "filter_project",
-        "retract",
+        if value >= 50 {
+            "retract_selected"
+        } else {
+            "retract_filtered_out"
+        },
         n,
         1,
         setup_ns,
@@ -459,7 +459,11 @@ fn filter_project_workload(n: usize) {
         .map(|row| (vec![row.1, row.0], 1))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(int_rows(&core.snapshot(ViewId(0)).unwrap()), expected_after);
-    assert_eq!(expected_after.len(), expected - 1);
+    assert_eq!(expected_after.len(), expected - usize::from(value >= 50));
+}
+
+pub(super) fn filter_retract_index(rows: &[(i64, i64, i64, i64)]) -> usize {
+    rows.iter().position(|row| row.1 >= 50).unwrap_or(0)
 }
 
 pub fn run() {
