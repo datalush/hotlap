@@ -1,3 +1,5 @@
+//! Process-local allocation accounting for isolated benchmark test binaries.
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 

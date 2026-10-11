@@ -1,7 +1,7 @@
-#[path = "baseline_alloc.rs"]
+#[path = "support/baseline_alloc.rs"]
 mod baseline_alloc;
 
-use std::alloc::{alloc, dealloc, realloc, Layout};
+use std::alloc::{Layout, alloc, dealloc, realloc};
 
 use baseline_alloc::Stats;
 
