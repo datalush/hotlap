@@ -164,7 +164,7 @@ fn replay_safe_prepare_body_identity_mismatch_rejects_before_effects_and_retries
         .put(b"checkpoint/2/prepare", b"prepare-v1".to_vec())
         .unwrap();
     writer
-        .put(b"checkpoint/reserved", 2_u64.to_be_bytes().to_vec())
+        .put(b"checkpoint/reserved", 2_u64.to_le_bytes().to_vec())
         .unwrap();
     let pending_sources = fixture.backend.get(b"checkpoint/2/sources").unwrap();
     let evidence_before = fixture.backend.scan(b"").unwrap();
@@ -213,7 +213,10 @@ fn replay_safe_prepare_body_identity_mismatch_rejects_before_effects_and_retries
     let after_future_row: BTreeMap<_, _> = (1..=8).map(|key| (key, 1)).collect();
     fixture.wait_for_remote_bag(&after_future_row);
     let checkpoint = retry.checkpoint().unwrap();
-    assert!(checkpoint > 2, "recovery must not reuse pending id 2");
+    assert_eq!(
+        checkpoint, 3,
+        "recovery must choose exactly the next reserved ID"
+    );
     assert_eq!(
         fixture.read_checkpoint(checkpoint).sources.entries[0]
             .state
@@ -285,7 +288,7 @@ fn replay_safe_prepare_source_name_mismatch_rejects_before_effects_and_retries()
         .put(b"checkpoint/2/prepare", b"prepare-v1".to_vec())
         .unwrap();
     writer
-        .put(b"checkpoint/reserved", 2_u64.to_be_bytes().to_vec())
+        .put(b"checkpoint/reserved", 2_u64.to_le_bytes().to_vec())
         .unwrap();
     let evidence_before = fixture.backend.scan(b"").unwrap();
 
@@ -318,7 +321,10 @@ fn replay_safe_prepare_source_name_mismatch_rejects_before_effects_and_retries()
     fixture.wait_for_remote_bag(&after_future_row);
     assert!(retry_stats.sink_writes.load(Ordering::SeqCst) > 0);
     let checkpoint = retry.checkpoint().unwrap();
-    assert!(checkpoint > 2);
+    assert_eq!(
+        checkpoint, 3,
+        "recovery must choose exactly the next reserved ID"
+    );
     assert_eq!(
         fixture.read_checkpoint(checkpoint).sources.entries[0]
             .state
