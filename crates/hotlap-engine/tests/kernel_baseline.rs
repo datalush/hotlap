@@ -25,6 +25,16 @@ fn matched_multiview_outputs_equal_independent_view_cores() {
 }
 
 #[test]
+fn multiview_deltas_and_recovery_match_dense_signed_oracle() {
+    baseline_views::assert_dense_multiview_correctness();
+}
+
+#[test]
+fn signed_arrow_row_conversion_preserves_duplicate_and_negative_weights() {
+    baseline_conversion::assert_signed_conversion_fixture();
+}
+
+#[test]
 fn checkpoint_encoding_reports_nonzero_serialized_payload_size() {
     assert!(baseline_views::serialized_snapshot_size(8) > 0);
 }
