@@ -184,8 +184,7 @@ impl KeyedArrangement {
                 Some(&weight) => weight,
                 None => self
                     .state
-                    .get(&identity.0)
-                    .and_then(|rows| rows.get(&identity.1))
+                    .get(&identity.0, &identity.1)
                     .copied()
                     .unwrap_or(0),
             };

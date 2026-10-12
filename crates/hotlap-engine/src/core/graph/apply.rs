@@ -81,7 +81,9 @@ impl Node {
                     report.mark_unknown("join_owned_row_capacity");
                 }
                 if join.has_arrangement_storage() {
-                    report.mark_unknown("join_hash_map_allocator_overhead");
+                    report.mark_unknown("join_outer_hash_map_allocator_overhead");
+                    report.mark_unknown("join_many_payload_hash_map_allocator_overhead");
+                    report.mark_unknown("join_singleton_box_allocator_overhead");
                 }
                 for pending in [left_pending, right_pending].into_iter().flatten() {
                     report.mark_unknown("join_pending_batch_metadata");

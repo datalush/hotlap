@@ -110,8 +110,7 @@ impl Candidate {
             let old = self
                 .left
                 .state
-                .get(row.key.as_ref())
-                .and_then(|rows| rows.get(&row.payload))
+                .get(row.key.as_ref(), &row.payload)
                 .copied()
                 .unwrap_or(0);
             let after = row_after(old, row.net, row.absolute)
@@ -123,8 +122,7 @@ impl Candidate {
             let old = self
                 .right
                 .state
-                .get(row.key.as_ref())
-                .and_then(|rows| rows.get(&row.payload))
+                .get(row.key.as_ref(), &row.payload)
                 .copied()
                 .unwrap_or(0);
             let after = row_after(old, row.net, row.absolute)

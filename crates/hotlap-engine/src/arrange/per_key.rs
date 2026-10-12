@@ -12,12 +12,11 @@ impl KeyedArrangement {
     /// Returns an empty batch over the arrangement schema when the key is
     /// absent, so callers can subtract it from a stored per-key state directly.
     pub fn to_zset_for_key(&self, key: &[u8]) -> Result<ZSetBatch, EngineError> {
-        let Some(payloads) = self.state.get(key) else {
+        let Some(payloads) = self.state.rows(key) else {
             return self.empty_zset();
         };
         let mut entries: Vec<(&[u8], i64)> = payloads
-            .iter()
-            .map(|(payload, &diff)| (payload.as_ref(), diff))
+            .map(|(payload, diff)| (payload.as_ref(), *diff))
             .collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         let keys: Vec<&[u8]> = vec![key; entries.len()];
