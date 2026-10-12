@@ -20,6 +20,7 @@ struct PairTerm {
 
 /// Enumerates exact join delta terms by key, never retaining Cartesian pairs.
 /// The stored batches are only touched input rows and touched old-side buckets.
+/// Chunking bounds pair workspace, not touched-key bucket storage.
 pub(super) struct FlatRowsCursor {
     terms: Vec<PairTerm>,
     schema: SchemaRef,
@@ -195,6 +196,8 @@ impl FlatRowsCursor {
 
     /// Privately consumes every bounded chunk and returns one consolidated Z-set.
     /// Errors discard the collector state; no partial output escapes this call.
+    /// Its identity map retains distinct full output rows, so total collector
+    /// memory is O(output); only temporary pair materialization is chunk-bounded.
     pub(super) fn collect(mut self) -> Result<ZSetBatch, EngineError> {
         let converter = full_converter(self.schema.as_ref())?;
         let mut consolidated: BTreeMap<Vec<u8>, (Vec<ArrayRef>, i64)> = BTreeMap::new();
