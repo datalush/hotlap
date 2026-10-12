@@ -41,14 +41,16 @@ impl RowState {
     }
 
     /// Adds `diff` to one entry, forgetting entries whose sum becomes zero.
-    pub fn add(&mut self, key: OwnedRow, payload: OwnedRow, diff: i64) {
+    pub fn add(&mut self, key: OwnedRow, payload: OwnedRow, diff: i64) -> Result<(), EngineError> {
         if diff == 0 {
-            return;
+            return Ok(());
         }
         let key_bytes = key.as_ref();
         if let Some(payloads) = self.entries.get_mut(key_bytes) {
             if let Some(sum) = payloads.get_mut(&payload) {
-                *sum += diff;
+                *sum = sum.checked_add(diff).ok_or(EngineError::NumericOverflow(
+                    "arrangement multiplicity addition",
+                ))?;
                 if *sum == 0 {
                     payloads.remove(&payload);
                 }
@@ -59,6 +61,25 @@ impl RowState {
             if remove_key {
                 self.entries.remove(key_bytes);
             }
+        } else {
+            self.entries
+                .insert(key_bytes.to_vec(), HashMap::from([(payload, diff)]));
+        }
+        Ok(())
+    }
+
+    /// Sets one entry to its prevalidated final weight, pruning zero weights.
+    pub(super) fn set_weight(&mut self, key: OwnedRow, payload: OwnedRow, diff: i64) {
+        let key_bytes = key.as_ref();
+        if diff == 0 {
+            if let Some(payloads) = self.entries.get_mut(key_bytes) {
+                payloads.remove(&payload);
+                if payloads.is_empty() {
+                    self.entries.remove(key_bytes);
+                }
+            }
+        } else if let Some(payloads) = self.entries.get_mut(key_bytes) {
+            payloads.insert(payload, diff);
         } else {
             self.entries
                 .insert(key_bytes.to_vec(), HashMap::from([(payload, diff)]));

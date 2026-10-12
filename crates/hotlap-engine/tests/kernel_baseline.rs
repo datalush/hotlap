@@ -47,11 +47,13 @@ fn arrangement_update_allocation_window_compares_original_and_borrowed_lookup() 
         let mut optimized = RowState::default();
         let mut original = std::collections::HashMap::new();
         for value in 0..cardinality {
-            optimized.add(
-                row(&converter, value),
-                row(&converter, value + cardinality),
-                8,
-            );
+            optimized
+                .add(
+                    row(&converter, value),
+                    row(&converter, value + cardinality),
+                    8,
+                )
+                .unwrap();
             original_add(
                 &mut original,
                 row(&converter, value),
@@ -83,7 +85,7 @@ fn arrangement_update_allocation_window_compares_original_and_borrowed_lookup() 
             let start = std::time::Instant::now();
             optimized_events += crate::baseline_alloc::count_events(|| {
                 let (key, payload) = allocated_inputs.remove(0);
-                optimized.add(key, payload, -1);
+                optimized.add(key, payload, -1).unwrap();
             });
             optimized_ns += start.elapsed().as_nanos();
 
@@ -113,7 +115,9 @@ fn arrangement_update_allocation_window_compares_original_and_borrowed_lookup() 
         assert_eq!(optimized_values, original_values);
         let mut zero_new_key = RowState::default();
         let mut zero_new_key_reference = std::collections::HashMap::new();
-        zero_new_key.add(row(&converter, cardinality + 1), row(&converter, 1), 0);
+        zero_new_key
+            .add(row(&converter, cardinality + 1), row(&converter, 1), 0)
+            .unwrap();
         original_add(
             &mut zero_new_key_reference,
             row(&converter, cardinality + 1),
@@ -124,14 +128,18 @@ fn arrangement_update_allocation_window_compares_original_and_borrowed_lookup() 
         assert!(zero_new_key_reference.is_empty());
         let mut zero_new_payload = RowState::default();
         let mut zero_new_payload_reference = std::collections::HashMap::new();
-        zero_new_payload.add(row(&converter, 1), row(&converter, 2), 3);
+        zero_new_payload
+            .add(row(&converter, 1), row(&converter, 2), 3)
+            .unwrap();
         original_add(
             &mut zero_new_payload_reference,
             row(&converter, 1),
             row(&converter, 2),
             3,
         );
-        zero_new_payload.add(row(&converter, 1), row(&converter, 3), 0);
+        zero_new_payload
+            .add(row(&converter, 1), row(&converter, 3), 0)
+            .unwrap();
         original_add(
             &mut zero_new_payload_reference,
             row(&converter, 1),
@@ -193,16 +201,18 @@ fn arrangement_join_update_benchmark() {
     for sample in 0..samples {
         let mut optimized = RowState::default();
         for key in 0..cardinality {
-            optimized.add(to_row(key), to_row(key), 8);
+            optimized.add(to_row(key), to_row(key), 8).unwrap();
         }
         let started = Instant::now();
         for index in 0..4096 {
             let value = (index as i64 * 31 + seed as i64) % cardinality;
-            optimized.add(
-                to_row(value),
-                to_row(value),
-                if index % 2 == 0 { -1 } else { 1 },
-            );
+            optimized
+                .add(
+                    to_row(value),
+                    to_row(value),
+                    if index % 2 == 0 { -1 } else { 1 },
+                )
+                .unwrap();
         }
         let elapsed_ns = started.elapsed().as_nanos();
         let expected = run_original_fixture(cardinality, 1, seed, &to_row);

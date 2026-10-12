@@ -197,6 +197,9 @@ impl Recovery {
                             hotlap::CoreError::Infrastructure(message) => {
                                 ConnectorError::Corruption(message)
                             }
+                            hotlap::CoreError::NumericOverflow(operation) => {
+                                ConnectorError::Corruption(format!("numeric overflow: {operation}"))
+                            }
                         })?;
                 }
                 let reason = format!("commit re-drive failed ({error})");

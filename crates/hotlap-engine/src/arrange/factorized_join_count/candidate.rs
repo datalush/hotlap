@@ -440,7 +440,9 @@ fn commit_rows(state: &mut RowState, rows: &[StagedRow], after: &[(i64, i64)]) {
         let delta = i128::from(value) - i128::from(old);
         if delta != 0 {
             let delta = i64::try_from(delta).expect("validated row delta");
-            state.add(row.key.clone(), row.payload.clone(), delta);
+            state
+                .add(row.key.clone(), row.payload.clone(), delta)
+                .expect("candidate rows were validated before commit");
         }
     }
 }

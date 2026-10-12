@@ -5,6 +5,7 @@ pub mod state;
 #[cfg(test)]
 mod factorized_join_count;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, new_empty_array};
@@ -17,6 +18,9 @@ use crate::error::EngineError;
 use crate::keys::{KeyConverter, converter_for};
 use crate::zset::int64_diffs;
 use state::RowState;
+
+#[cfg(test)]
+mod numeric_arrangement_tests;
 
 /// Incremental keyed state: `key-row -> payload-row -> diff`.
 ///
@@ -159,13 +163,45 @@ impl KeyedArrangement {
             Some(self.payload_converter.convert_columns(&payload_columns)?)
         };
         let diffs = int64_diffs(batch.diff())?;
+        let mut staged: HashMap<(Vec<u8>, OwnedRow), i64> = HashMap::new();
+        let mut touched = Vec::new();
         for index in 0..batch.len() {
             let key = key_rows.row(index).owned();
             let payload = match &payload_rows {
                 Some(rows) => rows.row(index).owned(),
                 None => self.unit_payload(),
             };
-            self.state.add(key, payload, sign * diffs.value(index));
+            let incoming =
+                sign.checked_mul(diffs.value(index))
+                    .ok_or(EngineError::NumericOverflow(
+                        "arrangement sign multiplication",
+                    ))?;
+            if incoming == 0 {
+                continue;
+            }
+            let identity = (key.as_ref().to_vec(), payload.clone());
+            let old = match staged.get(&identity) {
+                Some(&weight) => weight,
+                None => self
+                    .state
+                    .get(&identity.0)
+                    .and_then(|rows| rows.get(&identity.1))
+                    .copied()
+                    .unwrap_or(0),
+            };
+            let next = old
+                .checked_add(incoming)
+                .ok_or(EngineError::NumericOverflow(
+                    "arrangement multiplicity addition",
+                ))?;
+            if !staged.contains_key(&identity) {
+                touched.push((key, payload));
+            }
+            staged.insert(identity, next);
+        }
+        for (key, payload) in touched {
+            let weight = staged[&(key.as_ref().to_vec(), payload.clone())];
+            self.state.set_weight(key, payload, weight);
         }
         Ok(())
     }

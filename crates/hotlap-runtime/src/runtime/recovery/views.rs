@@ -58,6 +58,9 @@ fn validate_engine_for_hotlap(
         .map_err(|error| match error {
             CoreError::Unsupported(message) => ConnectorError::Unsupported(message),
             CoreError::Infrastructure(message) => ConnectorError::Corruption(message),
+            CoreError::NumericOverflow(operation) => {
+                ConnectorError::Corruption(format!("numeric overflow: {operation}"))
+            }
         })
 }
 

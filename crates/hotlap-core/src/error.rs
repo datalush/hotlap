@@ -12,6 +12,8 @@ pub enum CoreError {
     Unsupported(String),
     /// The backing engine failed (an Arrow failure or an internal invariant).
     Infrastructure(String),
+    /// A signed multiplicity operation exceeded the supported `i64` range.
+    NumericOverflow(&'static str),
 }
 
 impl fmt::Display for CoreError {
@@ -19,6 +21,7 @@ impl fmt::Display for CoreError {
         match self {
             CoreError::Unsupported(message) => write!(f, "unsupported: {message}"),
             CoreError::Infrastructure(message) => write!(f, "infrastructure: {message}"),
+            CoreError::NumericOverflow(operation) => write!(f, "numeric overflow: {operation}"),
         }
     }
 }

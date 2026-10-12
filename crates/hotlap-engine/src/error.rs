@@ -7,6 +7,8 @@ pub enum EngineError {
     Unsupported(String),
     /// An underlying Arrow or infrastructure failure.
     Infrastructure(String),
+    /// A signed multiplicity operation exceeded the supported `i64` range.
+    NumericOverflow(&'static str),
 }
 
 impl fmt::Display for EngineError {
@@ -14,6 +16,7 @@ impl fmt::Display for EngineError {
         match self {
             EngineError::Unsupported(message) => write!(f, "unsupported: {message}"),
             EngineError::Infrastructure(message) => write!(f, "infrastructure: {message}"),
+            EngineError::NumericOverflow(operation) => write!(f, "numeric overflow: {operation}"),
         }
     }
 }
@@ -31,6 +34,9 @@ impl From<hotlap_core::CoreError> for EngineError {
         match error {
             hotlap_core::CoreError::Unsupported(message) => EngineError::Unsupported(message),
             hotlap_core::CoreError::Infrastructure(message) => EngineError::Infrastructure(message),
+            hotlap_core::CoreError::NumericOverflow(operation) => {
+                EngineError::NumericOverflow(operation)
+            }
         }
     }
 }
@@ -40,6 +46,9 @@ impl From<EngineError> for hotlap_core::CoreError {
         match error {
             EngineError::Unsupported(message) => hotlap_core::CoreError::Unsupported(message),
             EngineError::Infrastructure(message) => hotlap_core::CoreError::Infrastructure(message),
+            EngineError::NumericOverflow(operation) => {
+                hotlap_core::CoreError::NumericOverflow(operation)
+            }
         }
     }
 }
