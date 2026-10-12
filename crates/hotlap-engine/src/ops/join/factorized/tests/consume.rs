@@ -11,16 +11,21 @@ fn staged_group_changes_have_a_production_consumer() {
         Arc::new(simple(&[10, 20], &[1, 1])),
         Arc::new(simple(&[10, 20], &[1, 1])),
     );
-    let aggs = [AggSpec::count(), AggSpec::sum(1), AggSpec::avg(1)];
+    let aggs = [
+        AggSpec::count(),
+        AggSpec::count(),
+        AggSpec::sum(1),
+        AggSpec::avg(1),
+    ];
     let recognized = Recognition::Eligible(ColumnMapping {
         left_source: InputId(0),
         right_source: InputId(1),
         left_join_key: vec![0],
         right_join_key: vec![0],
         group_key: vec![0],
-        aggregate_inputs: vec![None, Some(1), Some(1)],
+        aggregate_inputs: vec![None, None, Some(1), Some(1)],
         join_key_types: vec![DataType::Int64],
-        aggregate_input_types: vec![None, Some(DataType::Int64), Some(DataType::Int64)],
+        aggregate_input_types: vec![None, None, Some(DataType::Int64), Some(DataType::Int64)],
     });
     let CutDecision::Eligible(prepared) =
         run_with_aggs(inputs, &left, &right, &empty, recognized, &aggs)
@@ -30,8 +35,9 @@ fn staged_group_changes_have_a_production_consumer() {
     let consumed =
         crate::ops::join::factorized::consume::consume(&prepared, output_schema, &[0], &aggs)
             .unwrap();
-    assert_eq!(consumed.changes.len(), 1);
-    assert_eq!(consumed.changes[0].1.rows, 4);
+    drop(prepared); // Output and snapshot own their data after input Arcs are released.
+    assert_eq!(consumed.groups.len(), 1);
+    assert_eq!(consumed.groups[0].1.rows, 4);
     // Joining left payloads 10 and 20 with two right rows yields these four
     // rows. The join/group key is 7 (simple() fixes it); 10/20 are aggregate
     // payload values, not output group keys.
@@ -174,13 +180,13 @@ fn nullable_updates_match_dense_after_each_insert_retract_remove_and_recreate() 
         expected_rows.sort();
         assert_eq!(consumed.output.schema(), expected.schema(), "epoch {epoch}");
         assert_eq!(actual_rows, expected_rows, "epoch {epoch}");
-        assert_eq!(consumed.changes, prepared.groups, "epoch {epoch}");
+        assert_eq!(consumed.groups, prepared.groups, "epoch {epoch}");
 
         let keys = KeyConverter::new(delta_left.schema().as_ref(), &[0]).unwrap();
         left.apply(&delta_left, &keys).unwrap();
         prior = GroupState {
             schema: None,
-            groups: consumed.changes,
+            groups: consumed.groups,
         };
     }
 
@@ -193,4 +199,230 @@ fn nullable_updates_match_dense_after_each_insert_retract_remove_and_recreate() 
         other => panic!("unexpected COUNT(expr) state: {other:?}"),
     };
     assert_eq!(count_expr, 2);
+}
+
+#[test]
+fn simultaneous_side_deltas_match_dense_including_cross_term() {
+    let old_left = simple(&[2], &[1]);
+    let old_right = simple(&[100], &[1]);
+    let left = arrangement(&old_left, &[0]);
+    let right = arrangement(&old_right, &[0]);
+    let aggs = [AggSpec::count(), AggSpec::sum(1), AggSpec::avg(1)];
+    let mapping = Recognition::Eligible(ColumnMapping {
+        left_source: InputId(0),
+        right_source: InputId(1),
+        left_join_key: vec![0],
+        right_join_key: vec![0],
+        group_key: vec![0],
+        aggregate_inputs: vec![None, Some(1), Some(1)],
+        join_key_types: vec![DataType::Int64],
+        aggregate_input_types: vec![None, Some(DataType::Int64), Some(DataType::Int64)],
+    });
+    let mut dense = crate::ops::GroupAggregate::new(&[0], aggs.to_vec());
+    dense.apply(&old_left).unwrap();
+    let prior = dense.export_state().unwrap();
+    let delta_left = simple(&[4], &[1]);
+    let delta_right = simple(&[200], &[1]);
+    // ΔL×Rold + Lold×ΔR + ΔL×ΔR. Aggregates read the left payload.
+    let dense_delta = simple(&[4, 2, 4], &[1, 1, 1]);
+    let expected = dense.apply(&dense_delta).unwrap();
+    let prepared = match prepare(PrepareInput {
+        recognition: &mapping,
+        aggregates: &aggs,
+        inputs: DeltaPair::new(2, Arc::new(delta_left), Arc::new(delta_right)),
+        state: OldState {
+            left: &left,
+            right: &right,
+            groups: &prior.groups,
+        },
+        consumer: ConsumerCaps::FactorizedAggregates,
+    }) {
+        CutDecision::Eligible(prepared) => prepared,
+        CutDecision::Dense(reason) => panic!("both-sided delta rejected: {reason:?}"),
+    };
+    let consumed = crate::ops::join::factorized::consume::consume(
+        &prepared,
+        simple(&[], &[]).schema(),
+        &[0],
+        &aggs,
+    )
+    .unwrap();
+    let mut actual_rows = typed_rows(&consumed.output);
+    let mut expected_rows = typed_rows(&expected);
+    actual_rows.sort();
+    expected_rows.sort();
+    assert_eq!(consumed.output.schema(), expected.schema());
+    assert_eq!(actual_rows, expected_rows);
+}
+
+#[test]
+fn projected_group_subset_keeps_untouched_group_in_snapshot_and_output_keys() {
+    let s = schema(&[
+        ("join", DataType::Int64),
+        ("group", DataType::Int64),
+        ("value", DataType::Int64),
+    ]);
+    let batch = |rows: &[(i64, i64, i64)], diffs: &[i64]| {
+        zset(
+            s.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+            ],
+            diffs,
+        )
+    };
+    let old = batch(&[(1, 7, 10), (3, 7, 11), (2, 8, 30)], &[1, 1, 1]);
+    let left = arrangement(&old, &[0, 1]);
+    let right = arrangement(
+        &batch(&[(1, 7, 100), (3, 7, 300), (2, 8, 200)], &[1, 1, 1]),
+        &[0, 1],
+    );
+    let aggs = [AggSpec::count(), AggSpec::sum(2), AggSpec::avg(2)];
+    let mapping = Recognition::Eligible(ColumnMapping {
+        left_source: InputId(0),
+        right_source: InputId(1),
+        left_join_key: vec![0, 1],
+        right_join_key: vec![0, 1],
+        group_key: vec![1],
+        aggregate_inputs: vec![None, Some(2), Some(2)],
+        join_key_types: vec![DataType::Int64, DataType::Int64],
+        aggregate_input_types: vec![None, Some(DataType::Int64), Some(DataType::Int64)],
+    });
+    let mut dense = crate::ops::GroupAggregate::new(&[1], aggs.to_vec());
+    dense.apply(&old).unwrap();
+    let prior = dense.export_state().unwrap();
+    let delta_left = batch(&[(1, 7, 20)], &[1]);
+    let expected = dense.apply(&delta_left).unwrap();
+    let prepared = match prepare(PrepareInput {
+        recognition: &mapping,
+        aggregates: &aggs,
+        inputs: DeltaPair::new(2, Arc::new(delta_left), Arc::new(batch(&[], &[]))),
+        state: OldState {
+            left: &left,
+            right: &right,
+            groups: &prior.groups,
+        },
+        consumer: ConsumerCaps::FactorizedAggregates,
+    }) {
+        CutDecision::Eligible(prepared) => prepared,
+        CutDecision::Dense(reason) => panic!("subset grouping rejected: {reason:?}"),
+    };
+    let consumed =
+        crate::ops::join::factorized::consume::consume(&prepared, s, &[1], &aggs).unwrap();
+    let mut actual_rows = typed_rows(&consumed.output);
+    let mut expected_rows = typed_rows(&expected);
+    actual_rows.sort();
+    expected_rows.sort();
+    assert_eq!(consumed.output.schema(), expected.schema());
+    assert_eq!(actual_rows, expected_rows);
+    assert_eq!(
+        prepared.prior_groups.len(),
+        1,
+        "only touched group is retained as prior"
+    );
+    assert_eq!(prepared.prior_groups[0].0, super::simple_key(7));
+    assert_eq!(consumed.groups, dense.export_state().unwrap().groups);
+    assert_eq!(
+        consumed.groups.len(),
+        2,
+        "untouched group 8 remains in candidate"
+    );
+    assert_eq!(consumed.groups[1].0, super::simple_key(8));
+}
+
+#[test]
+fn output_render_error_returns_no_candidate_or_partial_changelog() {
+    let empty = simple(&[], &[]);
+    let left = arrangement(&empty, &[0]);
+    let right = arrangement(&empty, &[0]);
+    let old_groups = Vec::<(Vec<u8>, GroupEntry)>::new();
+    let aggs = [AggSpec::count(), AggSpec::sum(1)];
+    let mapping = recognition(vec![None, Some(1)], vec![None, Some(DataType::Int64)]);
+    let mut prepared = match prepare(PrepareInput {
+        recognition: &mapping,
+        aggregates: &aggs,
+        inputs: DeltaPair::new(
+            1,
+            Arc::new(simple(&[10], &[1])),
+            Arc::new(simple(&[20], &[1])),
+        ),
+        state: OldState {
+            left: &left,
+            right: &right,
+            groups: &old_groups,
+        },
+        consumer: ConsumerCaps::FactorizedAggregates,
+    }) {
+        CutDecision::Eligible(prepared) => prepared,
+        CutDecision::Dense(reason) => panic!("fixture rejected: {reason:?}"),
+    };
+    for change in &mut prepared.group_changes {
+        if let GroupChange::Upsert { entry, .. } = change {
+            entry.values[1] = AggValue::SumInteger {
+                sum: i128::from(i64::MAX) + 1,
+                count: 1,
+            };
+        }
+    }
+    let error =
+        crate::ops::join::factorized::consume::consume(&prepared, empty.schema(), &[0], &aggs);
+    assert!(
+        error.is_err(),
+        "out-of-range SUM must reject whole candidate"
+    );
+    assert!(
+        old_groups.is_empty(),
+        "authoritative old snapshot remains untouched"
+    );
+    assert_eq!(prepared.prior_groups, old_groups);
+}
+
+#[test]
+fn dense_cap_rejection_leaves_old_arrangements_and_group_state_untouched() {
+    let old = simple(&[3], &[1]);
+    let left = arrangement(&old, &[0]);
+    let right = arrangement(&old, &[0]);
+    let old_groups = [(
+        simple_key(7),
+        GroupEntry {
+            rows: 1,
+            values: vec![AggValue::Count(1)],
+        },
+    )];
+    let before_left = left.to_zset_for_key(&simple_key(7)).unwrap();
+    let before_right = right.to_zset_for_key(&simple_key(7)).unwrap();
+    let aggs = [AggSpec::count()];
+    let mapping = recognition(vec![None], vec![None]);
+    let decision = prepare(PrepareInput {
+        recognition: &mapping,
+        aggregates: &aggs,
+        inputs: DeltaPair::new(1, Arc::new(simple(&[4], &[1])), Arc::new(simple(&[], &[]))),
+        state: OldState {
+            left: &left,
+            right: &right,
+            groups: &old_groups,
+        },
+        consumer: ConsumerCaps::FlatRows,
+    });
+    assert!(matches!(
+        decision,
+        CutDecision::Dense(DenseReason::UnsupportedConsumer)
+    ));
+    assert_eq!(old_groups[0].1.rows, 1);
+    assert_eq!(
+        left.to_zset_for_key(&simple_key(7)).unwrap().len(),
+        before_left.len()
+    );
+    assert_eq!(
+        right.to_zset_for_key(&simple_key(7)).unwrap().len(),
+        before_right.len()
+    );
 }

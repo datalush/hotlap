@@ -14,7 +14,7 @@ use super::prepare::{GroupChange, PreparedCut};
 #[allow(dead_code)] // Wired by the later graph-cut stage; kept internal meanwhile.
 pub(crate) struct ConsumedGroups {
     /// Deterministic logical snapshot candidate; caller decides whether to publish.
-    pub changes: Vec<(Vec<u8>, GroupEntry)>,
+    pub groups: Vec<(Vec<u8>, GroupEntry)>,
     pub output: crate::batch::ZSetBatch,
 }
 
@@ -72,7 +72,7 @@ pub(crate) fn consume(
     )?;
     let output = materialize(group_key, aggs, Some(&schema), Some(&converter), &changes)?;
     Ok(ConsumedGroups {
-        changes: snapshot,
+        groups: snapshot,
         output,
     })
 }
