@@ -117,7 +117,7 @@ impl Join {
 }
 
 /// Groups a delta by its key bytes, one sub-Z-set per distinct key.
-fn delta_buckets(
+pub(super) fn delta_buckets(
     z: &ZSetBatch,
     converter: &KeyConverter,
 ) -> Result<HashMap<Vec<u8>, ZSetBatch>, EngineError> {
