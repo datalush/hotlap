@@ -118,18 +118,18 @@ fn cursor_emits_exact_full_rows_with_signed_checked_products_in_bounded_chunks()
 fn cursor_rejects_zero_chunk_size() {
     let left = crate::ops::join::factorized::tests::simple(&[], &[]);
     assert!(FlatRowsCursor::new(&left, &left, 0).is_err());
+    assert!(FlatRowsCursor::new(&left, &left, usize::MAX).is_err());
 }
 
 #[test]
-fn cursor_returns_typed_overflow_instead_of_wrapping_pair_weight() {
+fn cursor_returns_dense_typed_error_instead_of_wrapping_pair_weight() {
     let left = simple(&[10], &[i64::MAX]);
     let right = simple(&[20], &[2]);
     let mut cursor = FlatRowsCursor::new(&left, &right, 1).unwrap();
     assert!(matches!(
         cursor.next_chunk(),
-        Err(crate::error::EngineError::NumericOverflow(
-            "flat pair multiplicity product"
-        ))
+        Err(crate::error::EngineError::Infrastructure(message))
+            if message == "join diff product overflowed i64"
     ));
 }
 
@@ -255,4 +255,72 @@ fn factor_terms_handle_empty_sides_and_unmatched_delta_keys() {
     let mut no_terms =
         FlatRowsCursor::from_join_delta(&left, &right, &empty, &empty, &[0], &[0], 1).unwrap();
     assert!(no_terms.next_chunk().unwrap().is_none());
+}
+
+#[test]
+fn collector_consolidates_across_chunks_and_discards_partial_result_on_overflow() {
+    let left = simple(&[10, 10], &[1, -1]);
+    let right = simple(&[20], &[1]);
+    let empty = FlatRowsCursor::new(&left, &right, 1)
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert!(empty.is_empty(), "cross-chunk cancellation removes the row");
+
+    let overflowing_left = simple(&[10, 10], &[i64::MAX, 1]);
+    let err = match FlatRowsCursor::new(&overflowing_left, &right, 1)
+        .unwrap()
+        .collect()
+    {
+        Ok(_) => panic!("collector must return no partial result"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        err,
+        crate::error::EngineError::Infrastructure(message)
+            if message == "consolidated diff sum overflowed i64"
+    ));
+
+    let old_left_batch = simple(&[10], &[1]);
+    let old_right_batch = simple(&[20], &[1]);
+    let old_left = arrangement(&old_left_batch, &[0]);
+    let old_right = arrangement(&old_right_batch, &[0]);
+    let before_left = typed_rows(&old_left.to_zset().unwrap());
+    let before_right = typed_rows(&old_right.to_zset().unwrap());
+    let cursor = FlatRowsCursor::from_join_delta(
+        &old_left,
+        &old_right,
+        &simple(&[10], &[i64::MAX - 1]),
+        &simple(&[20], &[1]),
+        &[0],
+        &[0],
+        1,
+    )
+    .unwrap();
+    assert!(matches!(
+        cursor.collect(),
+        Err(crate::error::EngineError::Infrastructure(message))
+            if message == "consolidated diff sum overflowed i64"
+    ));
+    assert_eq!(typed_rows(&old_left.to_zset().unwrap()), before_left);
+    assert_eq!(typed_rows(&old_right.to_zset().unwrap()), before_right);
+}
+
+fn typed_rows(z: &ZSetBatch) -> Vec<(i64, i64, i64)> {
+    let key = z
+        .batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let value = z
+        .batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let diff = z.diff().as_any().downcast_ref::<Int64Array>().unwrap();
+    (0..z.len())
+        .map(|i| (key.value(i), value.value(i), diff.value(i)))
+        .collect()
 }

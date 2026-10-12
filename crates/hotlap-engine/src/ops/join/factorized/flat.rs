@@ -1,9 +1,7 @@
-// The cursor is exercised here before graph-cut wiring in the later integration slice.
-#![allow(dead_code)]
-
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, UInt32Array};
+use arrow::array::{ArrayRef, Int64Array, UInt32Array, new_empty_array};
 use arrow::compute::{concat, take};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -11,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use crate::arrange::KeyedArrangement;
 use crate::batch::ZSetBatch;
 use crate::error::EngineError;
-use crate::keys::KeyConverter;
+use crate::keys::{KeyConverter, full_converter};
 use crate::ops::join::delta::delta_buckets;
 use crate::ops::join::helpers::touched_union;
 
@@ -32,6 +30,7 @@ pub(super) struct FlatRowsCursor {
 }
 
 impl FlatRowsCursor {
+    #[cfg(test)]
     pub(super) fn new(
         left: &ZSetBatch,
         right: &ZSetBatch,
@@ -136,11 +135,9 @@ impl FlatRowsCursor {
             }
             let left_diff = int64_diff(&term.left)?.value(self.left_row);
             let right_diff = int64_diff(&term.right)?.value(self.right_row);
-            let diff = left_diff
-                .checked_mul(right_diff)
-                .ok_or(EngineError::NumericOverflow(
-                    "flat pair multiplicity product",
-                ))?;
+            let diff = left_diff.checked_mul(right_diff).ok_or_else(|| {
+                EngineError::Infrastructure("join diff product overflowed i64".into())
+            })?;
             selected.push((
                 self.term,
                 u32::try_from(self.left_row).map_err(|_| {
@@ -195,12 +192,74 @@ impl FlatRowsCursor {
             Arc::new(Int64Array::from(diffs)),
         )?))
     }
+
+    /// Privately consumes every bounded chunk and returns one consolidated Z-set.
+    /// Errors discard the collector state; no partial output escapes this call.
+    #[allow(dead_code)]
+    pub(super) fn collect(mut self) -> Result<ZSetBatch, EngineError> {
+        let converter = full_converter(self.schema.as_ref())?;
+        let mut consolidated: BTreeMap<Vec<u8>, (Vec<ArrayRef>, i64)> = BTreeMap::new();
+        while let Some(chunk) = self.next_chunk()? {
+            let rows = converter.convert_columns(chunk.batch.columns())?;
+            let diffs = int64_diff(&chunk)?;
+            for index in 0..chunk.len() {
+                let key = rows.row(index).as_ref().to_vec();
+                if let Some((_, total)) = consolidated.get_mut(&key) {
+                    *total = total.checked_add(diffs.value(index)).ok_or_else(|| {
+                        EngineError::Infrastructure("consolidated diff sum overflowed i64".into())
+                    })?;
+                } else {
+                    let indices = UInt32Array::from(vec![u32::try_from(index).map_err(|_| {
+                        EngineError::Infrastructure("flat chunk index exceeds UInt32".into())
+                    })?]);
+                    let values = chunk
+                        .batch
+                        .columns()
+                        .iter()
+                        .map(|column| take(column.as_ref(), &indices, None))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    consolidated.insert(key, (values, diffs.value(index)));
+                }
+            }
+        }
+
+        let mut columns = Vec::with_capacity(self.schema.fields().len());
+        for column in 0..self.schema.fields().len() {
+            let values = consolidated
+                .values()
+                .filter(|(_, diff)| *diff != 0)
+                .map(|(values, _)| values[column].as_ref())
+                .collect::<Vec<_>>();
+            columns.push(if values.is_empty() {
+                new_empty_array(self.schema.field(column).data_type())
+            } else {
+                concat(&values)?
+            });
+        }
+        let diffs = consolidated
+            .into_values()
+            .filter_map(|(_, diff)| (diff != 0).then_some(diff))
+            .collect::<Vec<_>>();
+        Ok(ZSetBatch::new(
+            RecordBatch::try_new(self.schema, columns)?,
+            Arc::new(Int64Array::from(diffs)),
+        )?)
+    }
 }
 
-fn validate_chunk_size(max_rows: usize) -> Result<(), EngineError> {
+pub(super) fn validate_chunk_size(max_rows: usize) -> Result<(), EngineError> {
     if max_rows == 0 {
         return Err(EngineError::Unsupported(
             "flat factor chunk size must be positive".into(),
+        ));
+    }
+    let selected_row_size = std::mem::size_of::<(usize, u32, u32, i64)>();
+    if max_rows
+        .checked_mul(selected_row_size)
+        .is_none_or(|bytes| bytes > isize::MAX as usize)
+    {
+        return Err(EngineError::Unsupported(
+            "flat factor chunk size exceeds addressable memory".into(),
         ));
     }
     Ok(())
