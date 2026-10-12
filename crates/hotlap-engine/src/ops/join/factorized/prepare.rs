@@ -59,6 +59,8 @@ pub struct PreparedCut {
     pub left: Vec<TouchedRow>,
     pub right: Vec<TouchedRow>,
     pub groups: Vec<(Vec<u8>, GroupEntry)>,
+    /// Prior entries for touched groups, retained for old-row changelog rendering.
+    pub prior_groups: Vec<(Vec<u8>, GroupEntry)>,
     pub group_changes: Vec<GroupChange>,
     pub side_bounds: (u128, u128),
     pub staged_touched: Vec<(Vec<u8>, Vec<u8>, i64)>,
@@ -255,6 +257,18 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         Ok(value) => value,
         Err(_) => return CutDecision::Dense(DenseReason::StateShape),
     };
+    let changed_keys: HashSet<Vec<u8>> = candidates
+        .iter()
+        .map(|change| match change {
+            GroupChange::Upsert { key, .. } | GroupChange::Remove { key } => key.clone(),
+        })
+        .collect();
+    let prior_groups = state
+        .groups
+        .iter()
+        .filter(|(key, _)| changed_keys.contains(key))
+        .cloned()
+        .collect();
     let mut staged_touched = Vec::new();
     for (side, schema, keys) in [
         (&left, inputs.left.schema(), &mapping.left_join_key),
@@ -272,6 +286,7 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         left: left.rows,
         right: right.rows,
         groups,
+        prior_groups,
         group_changes: candidates,
         side_bounds: bounds,
         staged_touched,

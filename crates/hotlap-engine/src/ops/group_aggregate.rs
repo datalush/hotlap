@@ -9,9 +9,9 @@
 
 mod accumulate;
 mod changes;
-mod columns;
+pub(crate) mod columns;
 mod fold;
-mod materialize;
+pub(crate) mod materialize;
 pub(crate) mod read;
 mod snapshot;
 mod validate;

@@ -121,6 +121,7 @@ fn simple_key(value: i64) -> Vec<u8> {
 
 mod aggregates;
 mod avgs;
+mod consume;
 mod guards;
 mod nulls;
 mod state;

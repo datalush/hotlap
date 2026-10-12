@@ -1,3 +1,4 @@
+mod consume;
 mod groups;
 mod history;
 mod keyed;
