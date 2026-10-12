@@ -355,3 +355,107 @@ mod candidate_tests {
         .unwrap()
     }
 }
+
+#[cfg(test)]
+mod numeric_arrangement_tests {
+    use super::support::{batch, schema};
+    use crate::{EngineError, KeyConverter, KeyedArrangement};
+
+    #[test]
+    fn late_batch_overflow_returns_error_without_applying_prefix() {
+        let schema = schema();
+        let keys = KeyConverter::new(&schema, &[0]).unwrap();
+        let mut arrangement = KeyedArrangement::new(schema.clone(), &[0]).unwrap();
+        arrangement
+            .apply(&batch(&[(Some(1), Some(1), i64::MAX)]), &keys)
+            .unwrap();
+        let before: Vec<_> = arrangement.iter().collect();
+
+        let result = arrangement.apply(
+            &batch(&[(Some(2), Some(2), 7), (Some(1), Some(1), 1)]),
+            &keys,
+        );
+
+        assert!(
+            matches!(result, Err(EngineError::NumericOverflow(_))),
+            "overflow must be typed, not a panic"
+        );
+        assert_eq!(arrangement.iter().collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn preflight_preserves_sequential_bounds_not_just_net_delta() {
+        let schema = schema();
+        let keys = KeyConverter::new(&schema, &[0]).unwrap();
+        let mut arrangement = KeyedArrangement::new(schema.clone(), &[0]).unwrap();
+        arrangement
+            .apply(&batch(&[(Some(1), Some(1), i64::MAX)]), &keys)
+            .unwrap();
+        let before = arrangement.iter().collect::<Vec<_>>();
+        assert!(
+            arrangement
+                .apply(
+                    &batch(&[(Some(1), Some(1), 1), (Some(1), Some(1), -1)]),
+                    &keys,
+                )
+                .is_err()
+        );
+        assert_eq!(arrangement.iter().collect::<Vec<_>>(), before);
+
+        let mut low = KeyedArrangement::new(schema.clone(), &[0]).unwrap();
+        low.apply(
+            &batch(&[
+                (Some(1), Some(1), i64::MIN),
+                (Some(1), Some(1), i64::MAX),
+                (Some(1), Some(1), 1),
+            ]),
+            &keys,
+        )
+        .unwrap();
+        assert!(
+            low.is_empty(),
+            "sequentially valid cancellation must remain valid"
+        );
+    }
+
+    #[test]
+    fn retract_min_and_update_overflow_are_errors_without_state_change() {
+        let schema = schema();
+        let keys = KeyConverter::new(&schema, &[0]).unwrap();
+        let mut arrangement = KeyedArrangement::new(schema, &[0]).unwrap();
+        arrangement
+            .apply(&batch(&[(Some(1), Some(1), i64::MIN)]), &keys)
+            .unwrap();
+        let before = arrangement.iter().collect::<Vec<_>>();
+        assert!(
+            arrangement
+                .retract(&batch(&[(Some(1), Some(1), i64::MIN)]), &keys)
+                .is_err()
+        );
+        assert_eq!(arrangement.iter().collect::<Vec<_>>(), before);
+        assert!(
+            arrangement
+                .apply(&batch(&[(Some(1), Some(1), -1)]), &keys)
+                .is_err()
+        );
+        assert_eq!(arrangement.iter().collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn cancellation_prunes_then_reinsertion_restores_entry() {
+        let schema = schema();
+        let keys = KeyConverter::new(&schema, &[0]).unwrap();
+        let mut arrangement = KeyedArrangement::new(schema, &[0]).unwrap();
+        arrangement
+            .apply(
+                &batch(&[(Some(1), Some(1), 3), (Some(1), Some(1), -3)]),
+                &keys,
+            )
+            .unwrap();
+        assert!(arrangement.is_empty());
+        arrangement
+            .insert(&batch(&[(Some(1), Some(1), 2)]), &keys)
+            .unwrap();
+        assert_eq!(arrangement.iter().map(|row| row.2).collect::<Vec<_>>(), [2]);
+    }
+}
