@@ -155,7 +155,9 @@ fn typed_rows(z: &ZSetBatch) -> Vec<(Vec<String>, i64)> {
 mod aggregates;
 mod avgs;
 mod consume;
+mod consume_failures;
 mod consume_nulls;
+mod consume_retractions;
 mod consume_schemas;
 mod guards;
 mod nulls;
