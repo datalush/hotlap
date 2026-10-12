@@ -214,13 +214,14 @@ pub(super) fn run_isolated(n: usize) {
     }
 }
 
-/// Measures retained allocator bytes for a direct arrangement, excluding fixture setup.
+/// Measures retained whole-core join bytes, excluding fixture setup.
 pub(super) fn run_direct_arrangement(keys: usize, fanout: usize, repeats: usize) {
     use arrow::datatypes::{DataType, Field, Schema};
     use hotlap_core::{InputId, Plan, ViewId};
     use hotlap_engine::EngineCore;
     use std::sync::Arc;
 
+    assert!(fanout > 0, "fixture fanout must be non-zero");
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
         Field::new("v", DataType::Int64, false),
@@ -228,6 +229,10 @@ pub(super) fn run_direct_arrangement(keys: usize, fanout: usize, repeats: usize)
     let rows = keys
         .checked_mul(fanout)
         .expect("fixture row count overflow");
+    let expected_output_rows = keys
+        .checked_mul(fanout)
+        .and_then(|count| count.checked_mul(fanout))
+        .expect("join output cardinality overflow");
     let key_values = (0..rows).map(|i| (i / fanout) as i64).collect();
     let payload_values = (0..rows).map(|i| (i % fanout) as i64).collect();
     let input = batch(
@@ -261,19 +266,24 @@ pub(super) fn run_direct_arrangement(keys: usize, fanout: usize, repeats: usize)
         core.push(InputId(0), &input).unwrap();
         core.push(InputId(1), &input).unwrap();
         drop(core.snapshot(ViewId(0)).unwrap());
-        drop(core.take_changes(ViewId(0)).unwrap());
+        let changes = core.take_changes(ViewId(0)).unwrap();
+        assert_eq!(changes.len(), expected_output_rows);
+        let observed_join_output_rows = changes.len();
+        drop(changes);
         let elapsed_ns = start.elapsed().as_nanos();
         let after_apply = Stats::read();
-        let entry_count = rows;
         let memory = core.memory_report().unwrap();
         println!(
             "{}",
             serde_json::json!({
-                "case":"direct_arrangement_retained", "phase":"after_apply_quiescent",
+                "case":"whole_core_join_retained", "component_scope":"arrangements_plus_consolidated_join_outputs",
+                "phase":"after_apply_quiescent",
                 "rows":rows, "keys":keys, "fanout":fanout, "rep":rep, "repeats":repeats,
+                "expected_entries_per_side_from_fixture":rows,
+                "observed_join_output_rows":observed_join_output_rows,
                 "seed":MEMORY_PROBE_SEED, "head":head, "profile":if cfg!(debug_assertions) {"debug"} else {"release"},
                 "setup_ns":setup_ns, "fixture_setup_ns":fixture_setup_ns, "elapsed_ns":elapsed_ns,
-                "elapsed_semantics":"wall_clock_not_cpu", "entries":entry_count,
+                "elapsed_semantics":"wall_clock_not_cpu",
                 "allocator_live_delta_bytes":after_apply.live.saturating_sub(baseline),
                 "allocator_peak_delta_bytes":after_apply.peak.saturating_sub(baseline),
                 "logical_payload_bytes":memory.join_logical_payload_bytes,
