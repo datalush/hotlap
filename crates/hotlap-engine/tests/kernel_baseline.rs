@@ -12,6 +12,7 @@ mod baseline_views;
 mod baseline_workloads;
 
 #[test]
+#[ignore = "process-global allocation event probe; run alone with --test-threads=1"]
 fn arrangement_update_allocation_window_compares_original_and_borrowed_lookup() {
     use arrow::array::{ArrayRef, Int64Array};
     use arrow::datatypes::DataType;
@@ -110,8 +111,50 @@ fn arrangement_update_allocation_window_compares_original_and_borrowed_lookup() 
             .collect();
         original_values.sort();
         assert_eq!(optimized_values, original_values);
+        let mut zero_new_key = RowState::default();
+        let mut zero_new_key_reference = std::collections::HashMap::new();
+        zero_new_key.add(row(&converter, cardinality + 1), row(&converter, 1), 0);
+        original_add(
+            &mut zero_new_key_reference,
+            row(&converter, cardinality + 1),
+            row(&converter, 1),
+            0,
+        );
+        assert!(zero_new_key.sorted().is_empty());
+        assert!(zero_new_key_reference.is_empty());
+        let mut zero_new_payload = RowState::default();
+        let mut zero_new_payload_reference = std::collections::HashMap::new();
+        zero_new_payload.add(row(&converter, 1), row(&converter, 2), 3);
+        original_add(
+            &mut zero_new_payload_reference,
+            row(&converter, 1),
+            row(&converter, 2),
+            3,
+        );
+        zero_new_payload.add(row(&converter, 1), row(&converter, 3), 0);
+        original_add(
+            &mut zero_new_payload_reference,
+            row(&converter, 1),
+            row(&converter, 3),
+            0,
+        );
+        let optimized_zero_values: Vec<_> = zero_new_payload
+            .sorted()
+            .into_iter()
+            .map(|(key, payload, diff)| (key.clone(), payload.as_ref().to_vec(), diff))
+            .collect();
+        let mut reference_zero_values: Vec<_> = zero_new_payload_reference
+            .into_iter()
+            .flat_map(|(key, payloads)| {
+                payloads
+                    .into_iter()
+                    .map(move |(payload, diff)| (key.clone(), payload.as_ref().to_vec(), diff))
+            })
+            .collect();
+        reference_zero_values.sort();
+        assert_eq!(optimized_zero_values, reference_zero_values);
         println!(
-            "arrangement_alloc_compare,cardinality={cardinality},repeats=3,optimized_events={optimized_events},original_events={original_events},optimized_elapsed_ns={optimized_ns},original_elapsed_ns={original_ns},seed=7,setup_outside_window=true"
+            "arrangement_alloc_compare,cardinality={cardinality},updates=3,optimized_events={optimized_events},original_events={original_events},optimized_elapsed_ns={optimized_ns},original_elapsed_ns={original_ns},seed=7,setup_outside_window=true"
         );
     }
 }
@@ -130,7 +173,7 @@ fn arrangement_join_update_benchmark() {
         .unwrap()
         .parse()
         .unwrap();
-    let repeats: usize = std::env::var("HOTLAP_ARRANGE_REPEATS")
+    let samples: usize = std::env::var("HOTLAP_ARRANGE_SAMPLES")
         .unwrap()
         .parse()
         .unwrap();
@@ -139,7 +182,7 @@ fn arrangement_join_update_benchmark() {
         .parse()
         .unwrap();
     assert!([128, 512].contains(&cardinality));
-    assert_eq!(repeats, 3);
+    assert_eq!(samples, 3);
     assert_eq!(seed, 7);
     let converter =
         RowConverter::new(vec![SortField::new(arrow::datatypes::DataType::Int64)]).unwrap();
@@ -147,32 +190,33 @@ fn arrangement_join_update_benchmark() {
         let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![value]))];
         converter.convert_columns(&columns).unwrap().row(0).owned()
     };
-    let mut optimized = RowState::default();
-    for key in 0..cardinality {
-        optimized.add(to_row(key), to_row(key), 8);
-    }
-    let started = Instant::now();
-    for index in 0..repeats * 4096 {
-        let value = (index as i64 * 31 + seed as i64) % cardinality;
-        optimized.add(
-            to_row(value),
-            to_row(value),
-            if index % 2 == 0 { -1 } else { 1 },
+    for sample in 0..samples {
+        let mut optimized = RowState::default();
+        for key in 0..cardinality {
+            optimized.add(to_row(key), to_row(key), 8);
+        }
+        let started = Instant::now();
+        for index in 0..4096 {
+            let value = (index as i64 * 31 + seed as i64) % cardinality;
+            optimized.add(
+                to_row(value),
+                to_row(value),
+                if index % 2 == 0 { -1 } else { 1 },
+            );
+        }
+        let elapsed_ns = started.elapsed().as_nanos();
+        let expected = run_original_fixture(cardinality, 1, seed, &to_row);
+        let actual: Vec<_> = optimized
+            .sorted()
+            .into_iter()
+            .map(|(key, payload, diff)| (key.clone(), payload.as_ref().to_vec(), diff))
+            .collect();
+        assert_eq!(actual, expected);
+        black_box(&optimized);
+        println!(
+            "{{\"kind\":\"arrangement_join_update\",\"cardinality\":{cardinality},\"sample\":{sample},\"samples\":{samples},\"updates_per_sample\":4096,\"elapsed_ns\":{elapsed_ns},\"seed\":{seed},\"setup_outside_interval\":true,\"source\":\"borrowed_RowState_add\"}}"
         );
     }
-    let elapsed_ns = started.elapsed().as_nanos();
-    let expected = run_original_fixture(cardinality, repeats, seed, &to_row);
-    let actual: Vec<_> = optimized
-        .sorted()
-        .into_iter()
-        .map(|(key, payload, diff)| (key.clone(), payload.as_ref().to_vec(), diff))
-        .collect();
-    assert_eq!(actual, expected);
-    black_box(&optimized);
-    println!(
-        "arrangement_join_update,cardinality={cardinality},repeats={repeats},updates={},elapsed_ns={elapsed_ns},seed={seed},source=borrowed_RowState_add",
-        repeats * 4096
-    );
 }
 
 fn run_original_fixture(
@@ -232,7 +276,7 @@ fn arrangement_join_update_original_benchmark() {
         .unwrap()
         .parse()
         .unwrap();
-    let repeats: usize = std::env::var("HOTLAP_ARRANGE_REPEATS")
+    let samples: usize = std::env::var("HOTLAP_ARRANGE_SAMPLES")
         .unwrap()
         .parse()
         .unwrap();
@@ -241,7 +285,7 @@ fn arrangement_join_update_original_benchmark() {
         .parse()
         .unwrap();
     assert!([128, 512].contains(&cardinality));
-    assert_eq!(repeats, 3);
+    assert_eq!(samples, 3);
     assert_eq!(seed, 7);
     let converter =
         RowConverter::new(vec![SortField::new(arrow::datatypes::DataType::Int64)]).unwrap();
@@ -265,44 +309,41 @@ fn arrangement_join_update_original_benchmark() {
             entries.remove(key.as_ref());
         }
     }
-    let mut original = HashMap::<Vec<u8>, HashMap<OwnedRow, i64>>::new();
-    for key in 0..cardinality {
-        let payload = to_row(key);
-        let key = to_row(key);
-        original
-            .entry(key.as_ref().to_vec())
-            .or_default()
-            .insert(payload, 8);
-    }
-    let started = Instant::now();
-    for index in 0..repeats * 4096 {
-        let value = ((index as i64 * 31 + seed as i64) % cardinality) % cardinality;
-        let key = to_row(value);
-        let payload = to_row(value);
-        original_add(
-            &mut original,
-            key,
-            payload,
-            if index % 2 == 0 { -1 } else { 1 },
+    for sample in 0..samples {
+        let expected = run_original_fixture(cardinality, 1, seed, &to_row);
+        let mut original = HashMap::<Vec<u8>, HashMap<OwnedRow, i64>>::new();
+        for key in 0..cardinality {
+            original
+                .entry(to_row(key).as_ref().to_vec())
+                .or_default()
+                .insert(to_row(key), 8);
+        }
+        let started = Instant::now();
+        for index in 0..4096 {
+            let value = (index as i64 * 31 + seed as i64) % cardinality;
+            original_add(
+                &mut original,
+                to_row(value),
+                to_row(value),
+                if index % 2 == 0 { -1 } else { 1 },
+            );
+        }
+        let elapsed_ns = started.elapsed().as_nanos();
+        black_box(&original);
+        let mut actual: Vec<_> = original
+            .into_iter()
+            .flat_map(|(key, payloads)| {
+                payloads
+                    .into_iter()
+                    .map(move |(payload, diff)| (key.clone(), payload.as_ref().to_vec(), diff))
+            })
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected);
+        println!(
+            "{{\"kind\":\"arrangement_join_update_original\",\"cardinality\":{cardinality},\"sample\":{sample},\"samples\":{samples},\"updates_per_sample\":4096,\"elapsed_ns\":{elapsed_ns},\"seed\":{seed},\"setup_outside_interval\":true,\"source\":\"a3de194-parent-RowState_add\"}}"
         );
     }
-    let elapsed_ns = started.elapsed().as_nanos();
-    black_box(&original);
-    let expected = run_original_fixture(cardinality, repeats, seed, &to_row);
-    let mut actual: Vec<_> = original
-        .into_iter()
-        .flat_map(|(key, payloads)| {
-            payloads
-                .into_iter()
-                .map(move |(payload, diff)| (key.clone(), payload.as_ref().to_vec(), diff))
-        })
-        .collect();
-    actual.sort();
-    assert_eq!(actual, expected);
-    println!(
-        "arrangement_join_update_original,cardinality={cardinality},repeats={repeats},updates={},elapsed_ns={elapsed_ns},seed={seed},source=a3de194-parent-RowState_add",
-        repeats * 4096
-    );
 }
 
 #[test]

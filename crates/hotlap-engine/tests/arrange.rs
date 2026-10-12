@@ -162,3 +162,19 @@ fn borrowed_update_input_can_be_dropped_and_key_reinserted_after_zero() {
         .unwrap();
     assert_eq!(entries(&state), vec![(7, "reinserted".into(), 1)]);
 }
+
+#[test]
+fn zero_diff_new_key_does_not_create_an_empty_or_zero_entry() {
+    let mut state = arrangement();
+    state.apply(&zset(&[(9, "payload", 0)]), &keys()).unwrap();
+    assert!(state.is_empty());
+    assert!(entries(&state).is_empty());
+}
+
+#[test]
+fn zero_diff_new_payload_does_not_create_an_entry_under_existing_key() {
+    let mut state = arrangement();
+    state.apply(&zset(&[(9, "retained", 2)]), &keys()).unwrap();
+    state.apply(&zset(&[(9, "zero", 0)]), &keys()).unwrap();
+    assert_eq!(entries(&state), vec![(9, "retained".into(), 2)]);
+}

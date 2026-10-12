@@ -42,6 +42,9 @@ impl RowState {
 
     /// Adds `diff` to one entry, forgetting entries whose sum becomes zero.
     pub fn add(&mut self, key: OwnedRow, payload: OwnedRow, diff: i64) {
+        if diff == 0 {
+            return;
+        }
         let key_bytes = key.as_ref();
         if let Some(payloads) = self.entries.get_mut(key_bytes) {
             if let Some(sum) = payloads.get_mut(&payload) {
