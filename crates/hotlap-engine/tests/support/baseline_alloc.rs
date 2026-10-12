@@ -11,6 +11,8 @@ pub struct Stats {
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+static TRACK_EVENTS: AtomicUsize = AtomicUsize::new(0);
+static EVENTS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct TrackingAllocator;
 
@@ -22,6 +24,9 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
             add_live(layout.size());
+            if TRACK_EVENTS.load(Ordering::Relaxed) != 0 {
+                EVENTS.fetch_add(1, Ordering::Relaxed);
+            }
         }
         pointer
     }
@@ -34,6 +39,9 @@ unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let resized = unsafe { System.realloc(pointer, layout, size) };
         if !resized.is_null() {
+            if TRACK_EVENTS.load(Ordering::Relaxed) != 0 {
+                EVENTS.fetch_add(1, Ordering::Relaxed);
+            }
             if size >= layout.size() {
                 add_live(size - layout.size());
             } else {
@@ -42,6 +50,15 @@ unsafe impl GlobalAlloc for TrackingAllocator {
         }
         resized
     }
+}
+
+#[allow(dead_code)]
+pub fn count_events(f: impl FnOnce()) -> usize {
+    EVENTS.store(0, Ordering::Relaxed);
+    TRACK_EVENTS.store(1, Ordering::SeqCst);
+    f();
+    TRACK_EVENTS.store(0, Ordering::SeqCst);
+    EVENTS.load(Ordering::Relaxed)
 }
 
 impl Stats {

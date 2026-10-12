@@ -6,7 +6,7 @@ use crate::error::EngineError;
 
 /// Byte-keyed `(key, payload) -> diff` state that collapses zero-sum entries.
 #[derive(Default)]
-pub(super) struct RowState {
+pub struct RowState {
     entries: HashMap<Vec<u8>, HashMap<OwnedRow, i64>>,
 }
 
@@ -41,7 +41,7 @@ impl RowState {
     }
 
     /// Adds `diff` to one entry, forgetting entries whose sum becomes zero.
-    pub(super) fn add(&mut self, key: OwnedRow, payload: OwnedRow, diff: i64) {
+    pub fn add(&mut self, key: OwnedRow, payload: OwnedRow, diff: i64) {
         let key_bytes = key.as_ref();
         if let Some(payloads) = self.entries.get_mut(key_bytes) {
             if let Some(sum) = payloads.get_mut(&payload) {
@@ -78,7 +78,7 @@ impl RowState {
     }
 
     /// Returns entries as `(key, payload, diff)`, ordered by key then payload.
-    pub(super) fn sorted(&self) -> Vec<(&Vec<u8>, &OwnedRow, i64)> {
+    pub fn sorted(&self) -> Vec<(&Vec<u8>, &OwnedRow, i64)> {
         let mut entries: Vec<(&Vec<u8>, &OwnedRow, i64)> = Vec::new();
         for (key, payloads) in &self.entries {
             for (payload, &diff) in payloads {

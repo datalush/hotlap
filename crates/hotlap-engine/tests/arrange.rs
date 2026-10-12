@@ -145,3 +145,20 @@ fn applied_changelog_matches_consolidated_full_rows() {
     assert_eq!(entries(&arrangement), vec![(2, "b".to_string(), 1)]);
     assert_eq!(arrangement.len(), 1);
 }
+
+#[test]
+fn borrowed_update_input_can_be_dropped_and_key_reinserted_after_zero() {
+    let mut state = arrangement();
+    {
+        let input = zset(&[(7, "first", 3), (7, "second", 2)]);
+        state.apply(&input, &keys()).unwrap();
+    }
+    state.retract(&zset(&[(7, "first", 3)]), &keys()).unwrap();
+    assert_eq!(entries(&state), vec![(7, "second".into(), 2)]);
+    state.retract(&zset(&[(7, "second", 2)]), &keys()).unwrap();
+    assert!(state.is_empty());
+    state
+        .apply(&zset(&[(7, "reinserted", 1)]), &keys())
+        .unwrap();
+    assert_eq!(entries(&state), vec![(7, "reinserted".into(), 1)]);
+}

@@ -1,5 +1,6 @@
 mod per_key;
-mod state;
+#[doc(hidden)]
+pub mod state;
 
 #[cfg(test)]
 mod factorized_join_count;
