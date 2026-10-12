@@ -316,17 +316,7 @@ fn schema_row_bound_and_numeric_bound_rejections_are_atomic() {
         Ok(Err(_)) => "error",
         Err(_) => "panic",
     };
-    let expected_row_behavior = std::panic::catch_unwind(|| {
-        let mut value = std::hint::black_box(i64::MAX);
-        value += std::hint::black_box(1_i64);
-        std::hint::black_box(value)
-    });
-    let expected_row_behavior = if expected_row_behavior.is_err() {
-        "panic"
-    } else {
-        "ok"
-    };
-    assert_eq!(row_observed, expected_row_behavior);
+    assert_eq!(row_observed, "error");
 
     let mut numeric_reference = Reference::new(0, 0);
     numeric_reference

@@ -1,6 +1,7 @@
 //! Restore, poisoning and counter-rejection tests.
 
 use super::*;
+use hotlap_core::CoreError;
 
 #[test]
 fn restore_rejects_unknown_format_version() {
@@ -118,6 +119,48 @@ fn failed_push_poisons_snapshot_push_and_take_changes() {
     // Counter reads must not serve a partial count either.
     assert!(core.late_dropped(InputId(0)).is_err());
     assert!(core.window_late_closed(ViewId(0)).is_err());
+}
+
+#[test]
+fn join_arrangement_overflow_returns_numeric_error_and_poisons_checkpoint() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    let plan = Plan::Join {
+        left: Box::new(Plan::Source(InputId(0))),
+        right: Box::new(Plan::Source(InputId(1))),
+        left_key: vec![0],
+        right_key: vec![0],
+    };
+    core.build_view(ViewId(0), &plan).unwrap();
+    let healthy = zset(&[(1, i64::MAX)]);
+    core.push(InputId(0), &healthy).unwrap();
+    core.push(InputId(1), &zset(&[])).unwrap();
+    let good_checkpoint = core.checkpoint().unwrap();
+
+    let overflowing = zset(&[(1, 1)]);
+    let error = core.push(InputId(0), &overflowing).unwrap_err();
+    assert!(matches!(error, CoreError::NumericOverflow(_)));
+    assert!(core.snapshot(ViewId(0)).is_err());
+    assert!(core.checkpoint().is_err());
+
+    // Recovery uses the checkpoint made while healthy, not the poisoned core.
+    let mut restored = EngineCore::new();
+    restored.restore(&good_checkpoint).unwrap();
+    restored.push(InputId(1), &zset(&[(1, 1)])).unwrap();
+    let joined = restored.snapshot(ViewId(0)).unwrap();
+    assert_eq!(joined.len(), 1);
+    assert_eq!(
+        joined
+            .diff
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        i64::MAX
+    );
+    restored.push(InputId(0), &zset(&[(1, -i64::MAX)])).unwrap();
+    assert!(restored.snapshot(ViewId(0)).unwrap().is_empty());
 }
 
 /// `late_dropped` rejects an input the engine never registered.
