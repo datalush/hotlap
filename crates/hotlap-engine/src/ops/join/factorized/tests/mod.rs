@@ -119,9 +119,43 @@ fn simple_key(value: i64) -> Vec<u8> {
         .to_vec()
 }
 
+fn typed_rows(z: &ZSetBatch) -> Vec<(Vec<String>, i64)> {
+    use arrow::array::Array;
+    let diff = z.diff.as_any().downcast_ref::<Int64Array>().unwrap();
+    (0..z.len())
+        .map(|i| {
+            (
+                z.batch
+                    .columns()
+                    .iter()
+                    .map(|column| {
+                        if column.is_null(i) {
+                            "NULL".to_string()
+                        } else if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+                            values.value(i).to_string()
+                        } else if let Some(values) =
+                            column.as_any().downcast_ref::<arrow::array::Float64Array>()
+                        {
+                            format!("{:016x}", values.value(i).to_bits())
+                        } else if let Some(values) =
+                            column.as_any().downcast_ref::<arrow::array::StringArray>()
+                        {
+                            values.value(i).to_string()
+                        } else {
+                            panic!("unexpected output type {:?}", column.data_type())
+                        }
+                    })
+                    .collect(),
+                diff.value(i),
+            )
+        })
+        .collect()
+}
+
 mod aggregates;
 mod avgs;
 mod consume;
+mod consume_schemas;
 mod guards;
 mod nulls;
 mod state;
