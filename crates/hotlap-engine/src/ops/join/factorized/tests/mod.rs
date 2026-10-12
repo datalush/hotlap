@@ -15,6 +15,8 @@ use crate::arrange::KeyedArrangement;
 use crate::batch::ZSetBatch;
 use crate::keys::KeyConverter;
 
+mod flat_cursor;
+
 fn schema(fields: &[(&str, DataType)]) -> SchemaRef {
     Arc::new(Schema::new(
         fields
