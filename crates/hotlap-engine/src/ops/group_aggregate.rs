@@ -12,7 +12,7 @@ mod changes;
 mod columns;
 mod fold;
 mod materialize;
-mod read;
+pub(crate) mod read;
 mod snapshot;
 mod validate;
 

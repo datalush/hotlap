@@ -1,4 +1,5 @@
 mod delta;
+mod factorized;
 mod helpers;
 mod snapshot;
 mod state;

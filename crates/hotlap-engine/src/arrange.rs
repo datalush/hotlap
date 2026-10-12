@@ -114,6 +114,11 @@ impl KeyedArrangement {
         &self.key_indices
     }
 
+    /// Arrow schema used to decode this arrangement's key and payload rows.
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
     /// Iterates `(key bytes, payload bytes, diff)` in deterministic order.
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>, i64)> + '_ {
         self.state
