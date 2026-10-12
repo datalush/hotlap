@@ -33,6 +33,8 @@ pub(super) struct SideStage {
     pub key_indices: Vec<usize>,
     pub schema: SchemaRef,
     pub key_row_counts: HashMap<Vec<u8>, u128>,
+    /// Sum of absolute raw input diffs per touched join key, before row consolidation.
+    pub key_delta_abs_bounds: HashMap<Vec<u8>, u128>,
 }
 
 pub(super) fn stage_side(
@@ -182,6 +184,7 @@ pub(super) fn stage_side(
         key_indices: key_indices.to_vec(),
         schema: schema.clone(),
         key_row_counts,
+        key_delta_abs_bounds: bounds,
     })
 }
 

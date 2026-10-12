@@ -28,13 +28,23 @@ pub enum DenseReason {
     NegativeOrOverflow,
     UnsupportedNumeric,
     UnsupportedConsumer,
+    InvalidChunkSize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ConsumerCaps {
     FactorizedAggregates,
-    FlatRows,
+    FlatRows { max_rows: usize },
+}
+
+#[allow(dead_code)]
+impl ConsumerCaps {
+    pub const DEFAULT_FLAT_CHUNK_ROWS: usize = 1024;
+
+    pub const fn flat_rows(max_rows: usize) -> Self {
+        Self::FlatRows { max_rows }
+    }
 }
 
 #[derive(Clone)]
@@ -64,6 +74,8 @@ pub struct PreparedCut {
     pub group_changes: Vec<GroupChange>,
     pub side_bounds: (u128, u128),
     pub staged_touched: Vec<(Vec<u8>, Vec<u8>, i64)>,
+    /// Present only for a guarded flat-row consumer; already fully consolidated.
+    pub flat_rows: Option<ZSetBatch>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,10 +126,27 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
     let Recognition::Eligible(mapping) = recognition else {
         return CutDecision::Dense(DenseReason::Unrecognized);
     };
-    if consumer == ConsumerCaps::FlatRows {
-        return CutDecision::Dense(DenseReason::UnsupportedConsumer);
-    }
-    if aggregates.is_empty()
+    let flat_chunk_rows = match consumer {
+        ConsumerCaps::FactorizedAggregates => None,
+        ConsumerCaps::FlatRows { max_rows } => {
+            if super::flat::validate_chunk_size(max_rows).is_err() {
+                return CutDecision::Dense(DenseReason::InvalidChunkSize);
+            }
+            Some(max_rows)
+        }
+    };
+    let flat_rows = flat_chunk_rows.is_some();
+    if flat_rows {
+        if !aggregates.is_empty()
+            || !mapping.aggregate_inputs.is_empty()
+            || !mapping.aggregate_input_types.is_empty()
+        {
+            return CutDecision::Dense(DenseReason::UnsupportedConsumer);
+        }
+        if !state.groups.is_empty() {
+            return CutDecision::Dense(DenseReason::StateShape);
+        }
+    } else if aggregates.is_empty()
         || aggregates.len() != mapping.aggregate_inputs.len()
         || aggregates.len() != mapping.aggregate_input_types.len()
         || state
@@ -127,27 +156,29 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
     {
         return CutDecision::Dense(DenseReason::StateShape);
     }
-    if state.groups.iter().any(|(_, entry)| {
-        entry.rows <= 0
-            || entry.values.len() != aggregates.len()
-            || entry.values.iter().zip(aggregates).any(|(value, agg)| {
-                match (agg.func, agg.input, value) {
-                    (AggFunc::Count, None, AggValue::Count(count)) => {
-                        *count != entry.rows || *count < 0
+    if !flat_rows
+        && state.groups.iter().any(|(_, entry)| {
+            entry.rows <= 0
+                || entry.values.len() != aggregates.len()
+                || entry.values.iter().zip(aggregates).any(|(value, agg)| {
+                    match (agg.func, agg.input, value) {
+                        (AggFunc::Count, None, AggValue::Count(count)) => {
+                            *count != entry.rows || *count < 0
+                        }
+                        (AggFunc::Count, Some(_), AggValue::Count(count)) => {
+                            *count < 0 || *count > entry.rows
+                        }
+                        (AggFunc::Sum, Some(_), AggValue::SumInteger { sum, count }) => {
+                            *count < 0 || *count > entry.rows || i64::try_from(*sum).is_err()
+                        }
+                        (AggFunc::Avg, Some(_), AggValue::Avg { count, .. }) => {
+                            *count < 0 || *count > entry.rows
+                        }
+                        _ => true,
                     }
-                    (AggFunc::Count, Some(_), AggValue::Count(count)) => {
-                        *count < 0 || *count > entry.rows
-                    }
-                    (AggFunc::Sum, Some(_), AggValue::SumInteger { sum, count }) => {
-                        *count < 0 || *count > entry.rows || i64::try_from(*sum).is_err()
-                    }
-                    (AggFunc::Avg, Some(_), AggValue::Avg { count, .. }) => {
-                        *count < 0 || *count > entry.rows
-                    }
-                    _ => true,
-                }
-            })
-    }) {
+                })
+        })
+    {
         return CutDecision::Dense(DenseReason::StateShape);
     }
     if state.left.key_indices() != mapping.left_join_key
@@ -157,30 +188,32 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
     {
         return CutDecision::Dense(DenseReason::InputMapping);
     }
-    for ((agg, mapped_input), ty) in aggregates
-        .iter()
-        .zip(&mapping.aggregate_inputs)
-        .zip(&mapping.aggregate_input_types)
-    {
-        if agg.input != *mapped_input {
-            return CutDecision::Dense(DenseReason::InputMapping);
-        }
-        if !matches!(
-            (agg.func, agg.input, ty),
-            (AggFunc::Count, None, None)
-                | (AggFunc::Count, Some(_), Some(_))
-                | (
-                    AggFunc::Sum,
-                    Some(_),
-                    Some(DataType::Int32 | DataType::Int64)
-                )
-                | (
-                    AggFunc::Avg,
-                    Some(_),
-                    Some(DataType::Int32 | DataType::Int64)
-                )
-        ) {
-            return CutDecision::Dense(DenseReason::UnsupportedNumeric);
+    if !flat_rows {
+        for ((agg, mapped_input), ty) in aggregates
+            .iter()
+            .zip(&mapping.aggregate_inputs)
+            .zip(&mapping.aggregate_input_types)
+        {
+            if agg.input != *mapped_input {
+                return CutDecision::Dense(DenseReason::InputMapping);
+            }
+            if !matches!(
+                (agg.func, agg.input, ty),
+                (AggFunc::Count, None, None)
+                    | (AggFunc::Count, Some(_), Some(_))
+                    | (
+                        AggFunc::Sum,
+                        Some(_),
+                        Some(DataType::Int32 | DataType::Int64)
+                    )
+                    | (
+                        AggFunc::Avg,
+                        Some(_),
+                        Some(DataType::Int32 | DataType::Int64)
+                    )
+            ) {
+                return CutDecision::Dense(DenseReason::UnsupportedNumeric);
+            }
         }
     }
     let left_extra = encoded_keys(&inputs.right, &mapping.right_join_key);
@@ -207,7 +240,11 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         Ok(value) => value,
         Err(_) => return CutDecision::Dense(DenseReason::NegativeOrOverflow),
     };
-    let bounds = match validate_pair_bounds(&left, &right) {
+    let bounds = match if flat_rows {
+        validate_flat_pair_bounds(&left, &right)
+    } else {
+        validate_pair_bounds(&left, &right)
+    } {
         Some(value) => value,
         None => return CutDecision::Dense(DenseReason::NegativeOrOverflow),
     };
@@ -217,6 +254,45 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         .chain(&right.rows)
         .map(|r| r.identity.join_key.clone())
         .collect();
+    let mut staged_touched = Vec::new();
+    for (side, schema, keys) in [
+        (&left, inputs.left.schema(), &mapping.left_join_key),
+        (&right, inputs.right.schema(), &mapping.right_join_key),
+    ] {
+        match super::stage::decode_rows(&schema, keys, &side.rows) {
+            Ok(rows) => staged_touched.extend(rows),
+            Err(_) => return CutDecision::Dense(DenseReason::InputMapping),
+        }
+    }
+    if flat_rows {
+        let flat_rows = match super::flat::FlatRowsCursor::from_join_delta(
+            state.left,
+            state.right,
+            &inputs.left,
+            &inputs.right,
+            &mapping.left_join_key,
+            &mapping.right_join_key,
+            flat_chunk_rows.expect("flat capability carries a positive chunk size"),
+        )
+        .and_then(super::flat::FlatRowsCursor::collect)
+        {
+            Ok(rows) => rows,
+            Err(_) => return CutDecision::Dense(DenseReason::NegativeOrOverflow),
+        };
+        return CutDecision::Eligible(PreparedCut {
+            epoch: inputs.epoch,
+            inputs,
+            mapping: mapping.clone(),
+            left: left.rows,
+            right: right.rows,
+            groups: Vec::new(),
+            prior_groups: Vec::new(),
+            group_changes: Vec::new(),
+            side_bounds: bounds,
+            staged_touched,
+            flat_rows: Some(flat_rows),
+        });
+    }
     let state_abs_bounds = match validate_old_group_state(
         mapping,
         aggregates,
@@ -269,16 +345,6 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         .filter(|(key, _)| changed_keys.contains(key))
         .cloned()
         .collect();
-    let mut staged_touched = Vec::new();
-    for (side, schema, keys) in [
-        (&left, inputs.left.schema(), &mapping.left_join_key),
-        (&right, inputs.right.schema(), &mapping.right_join_key),
-    ] {
-        match super::stage::decode_rows(&schema, keys, &side.rows) {
-            Ok(rows) => staged_touched.extend(rows),
-            Err(_) => return CutDecision::Dense(DenseReason::InputMapping),
-        }
-    }
     CutDecision::Eligible(PreparedCut {
         epoch: inputs.epoch,
         inputs,
@@ -290,6 +356,7 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         group_changes: candidates,
         side_bounds: bounds,
         staged_touched,
+        flat_rows: None,
     })
 }
 
@@ -427,4 +494,41 @@ fn validate_pair_bounds(left: &SideStage, right: &SideStage) -> Option<(u128, u1
         bound = bound.checked_add(b)?;
     }
     Some((bound, old))
+}
+
+/// Conservative full-key proof for flat weighted terms, based on raw input
+/// absolute bounds rather than net row deltas. This proves each pair product,
+/// every per-row term subtotal, and old/proposed full-key multiplicity totals.
+fn validate_flat_pair_bounds(left: &SideStage, right: &SideStage) -> Option<(u128, u128)> {
+    let keys: HashSet<Vec<u8>> = left
+        .key_row_counts
+        .keys()
+        .chain(right.key_row_counts.keys())
+        .chain(left.key_delta_abs_bounds.keys())
+        .chain(right.key_delta_abs_bounds.keys())
+        .cloned()
+        .collect();
+    let limit = i64::MAX as u128;
+    let mut delta_bound = 0_u128;
+    let mut old_bound = 0_u128;
+    for key in keys {
+        let l = left.key_row_counts.get(&key).copied().unwrap_or(0);
+        let r = right.key_row_counts.get(&key).copied().unwrap_or(0);
+        let dl = left.key_delta_abs_bounds.get(&key).copied().unwrap_or(0);
+        let dr = right.key_delta_abs_bounds.get(&key).copied().unwrap_or(0);
+        let old_pairs = l.checked_mul(r)?;
+        let term_bound = dl
+            .checked_mul(r)?
+            .checked_add(l.checked_mul(dr)?)?
+            .checked_add(dl.checked_mul(dr)?)?;
+        let new_left = l.checked_add(dl)?;
+        let new_right = r.checked_add(dr)?;
+        let new_pairs = new_left.checked_mul(new_right)?;
+        if old_pairs > limit || term_bound > limit || new_pairs > limit {
+            return None;
+        }
+        old_bound = old_bound.checked_add(old_pairs)?;
+        delta_bound = delta_bound.checked_add(term_bound)?;
+    }
+    Some((delta_bound, old_bound))
 }

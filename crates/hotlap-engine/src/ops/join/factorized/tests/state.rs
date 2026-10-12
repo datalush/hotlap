@@ -39,7 +39,7 @@ fn flat_rows_consumer_cannot_receive_aggregate_only_prepared_cut() {
             right: &right,
             groups: &[],
         },
-        consumer: ConsumerCaps::FlatRows,
+        consumer: ConsumerCaps::flat_rows(ConsumerCaps::DEFAULT_FLAT_CHUNK_ROWS),
     });
     assert!(matches!(
         result,

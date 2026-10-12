@@ -177,7 +177,7 @@ fn dense_cap_rejection_leaves_old_arrangements_and_group_state_untouched() {
             right: &right,
             groups: &old_groups,
         },
-        consumer: ConsumerCaps::FlatRows,
+        consumer: ConsumerCaps::flat_rows(ConsumerCaps::DEFAULT_FLAT_CHUNK_ROWS),
     });
     assert!(matches!(
         decision,

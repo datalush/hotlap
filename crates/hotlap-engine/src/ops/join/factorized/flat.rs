@@ -195,7 +195,6 @@ impl FlatRowsCursor {
 
     /// Privately consumes every bounded chunk and returns one consolidated Z-set.
     /// Errors discard the collector state; no partial output escapes this call.
-    #[allow(dead_code)]
     pub(super) fn collect(mut self) -> Result<ZSetBatch, EngineError> {
         let converter = full_converter(self.schema.as_ref())?;
         let mut consolidated: BTreeMap<Vec<u8>, (Vec<ArrayRef>, i64)> = BTreeMap::new();
