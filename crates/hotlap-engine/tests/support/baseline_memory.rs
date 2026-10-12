@@ -214,6 +214,78 @@ pub(super) fn run_isolated(n: usize) {
     }
 }
 
+/// Measures retained allocator bytes for a direct arrangement, excluding fixture setup.
+pub(super) fn run_direct_arrangement(keys: usize, fanout: usize, repeats: usize) {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use hotlap_core::{InputId, Plan, ViewId};
+    use hotlap_engine::EngineCore;
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let rows = keys
+        .checked_mul(fanout)
+        .expect("fixture row count overflow");
+    let key_values = (0..rows).map(|i| (i / fanout) as i64).collect();
+    let payload_values = (0..rows).map(|i| (i % fanout) as i64).collect();
+    let input = batch(
+        schema.clone(),
+        vec![key_values, payload_values],
+        vec![1; rows],
+    );
+    let head = std::env::var("HOTLAP_BASELINE_HEAD").unwrap_or_else(|_| "unknown".into());
+
+    for rep in 0..repeats {
+        let setup_start = Instant::now();
+        let mut core = EngineCore::new();
+        core.register_input(InputId(0)).unwrap();
+        core.register_input(InputId(1)).unwrap();
+        core.build_view(
+            ViewId(0),
+            &Plan::Join {
+                left: Box::new(Plan::Source(InputId(0))),
+                right: Box::new(Plan::Source(InputId(1))),
+                left_key: vec![0],
+                right_key: vec![0],
+            },
+        )
+        .unwrap();
+        core.tap_view(ViewId(0)).unwrap();
+        let setup_ns = setup_start.elapsed().as_nanos();
+        let fixture_setup_ns = 0;
+        let baseline = Stats::read().live;
+        baseline_alloc::reset_peak();
+        let start = Instant::now();
+        core.push(InputId(0), &input).unwrap();
+        core.push(InputId(1), &input).unwrap();
+        drop(core.snapshot(ViewId(0)).unwrap());
+        drop(core.take_changes(ViewId(0)).unwrap());
+        let elapsed_ns = start.elapsed().as_nanos();
+        let after_apply = Stats::read();
+        let entry_count = rows;
+        let memory = core.memory_report().unwrap();
+        println!(
+            "{}",
+            serde_json::json!({
+                "case":"direct_arrangement_retained", "phase":"after_apply_quiescent",
+                "rows":rows, "keys":keys, "fanout":fanout, "rep":rep, "repeats":repeats,
+                "seed":MEMORY_PROBE_SEED, "head":head, "profile":if cfg!(debug_assertions) {"debug"} else {"release"},
+                "setup_ns":setup_ns, "fixture_setup_ns":fixture_setup_ns, "elapsed_ns":elapsed_ns,
+                "elapsed_semantics":"wall_clock_not_cpu", "entries":entry_count,
+                "allocator_live_delta_bytes":after_apply.live.saturating_sub(baseline),
+                "allocator_peak_delta_bytes":after_apply.peak.saturating_sub(baseline),
+                "logical_payload_bytes":memory.join_logical_payload_bytes,
+                "known_backing_capacity_bytes":memory.join_known_key_capacity_bytes,
+                "estimated_structural_bytes":memory.estimated_structural_bytes,
+                "memory_semantics":"allocator_delta_and_partial_structural_estimates_not_exact_heap"
+            })
+        );
+        drop(core);
+    }
+}
+
 pub(super) fn run_family_coverage(n: usize, rep: usize, repeats: usize) {
     probe_join(n, rep, repeats);
     probe_minmax(n, rep, repeats);
