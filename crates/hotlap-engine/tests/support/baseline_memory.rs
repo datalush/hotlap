@@ -276,24 +276,222 @@ pub(super) fn run_direct_arrangement(keys: usize, fanout: usize, repeats: usize)
         println!(
             "{}",
             serde_json::json!({
-                "case":"whole_core_join_retained", "component_scope":"arrangements_plus_consolidated_join_outputs",
-                "phase":"after_apply_quiescent",
-                "rows":rows, "keys":keys, "fanout":fanout, "rep":rep, "repeats":repeats,
-                "expected_entries_per_side_from_fixture":rows,
-                "observed_join_output_rows":observed_join_output_rows,
-                "seed":MEMORY_PROBE_SEED, "head":head, "profile":if cfg!(debug_assertions) {"debug"} else {"release"},
-                "setup_ns":setup_ns, "fixture_setup_ns":fixture_setup_ns, "elapsed_ns":elapsed_ns,
-                "elapsed_semantics":"wall_clock_not_cpu",
-                "allocator_live_delta_bytes":after_apply.live.saturating_sub(baseline),
-                "allocator_peak_delta_bytes":after_apply.peak.saturating_sub(baseline),
-                "logical_payload_bytes":memory.join_logical_payload_bytes,
-                "known_backing_capacity_bytes":memory.join_known_key_capacity_bytes,
-                "estimated_structural_bytes":memory.estimated_structural_bytes,
-                "memory_semantics":"allocator_delta_and_partial_structural_estimates_not_exact_heap"
-            })
+                    "case":"whole_core_join_retained", "component_scope":"arrangements_plus_consolidated_join_outputs",
+                    "phase":"after_apply_quiescent",
+                    "rows":rows, "keys":keys, "fanout":fanout, "rep":rep, "repeats":repeats,
+                    "expected_entries_per_side_from_fixture":rows,
+                    "observed_join_output_rows":observed_join_output_rows,
+                    "seed":MEMORY_PROBE_SEED, "head":head, "profile":if cfg!(debug_assertions) {"debug"} else {"release"},
+                    "setup_ns":setup_ns, "fixture_setup_ns":fixture_setup_ns, "elapsed_ns":elapsed_ns,
+                    "elapsed_semantics":"wall_clock_not_cpu",
+                    "allocator_live_delta_bytes":after_apply.live.saturating_sub(baseline),
+                    "allocator_peak_delta_bytes":after_apply.peak.saturating_sub(baseline),
+                    "logical_payload_bytes":memory.join_logical_payload_bytes,
+                    "known_backing_capacity_bytes":memory.join_known_key_capacity_bytes,
+                    "estimated_structural_bytes":memory.estimated_structural_bytes,
+            "memory_categories":"joins covered; converter/schema, row capacity, outer and per-Many map allocators, and singleton Box allocator unknown",
+                    "memory_semantics":"allocator_delta_and_partial_structural_estimates_not_exact_heap"
+                })
         );
         drop(core);
     }
+}
+
+pub(super) fn run_singleton_churn_exact_reference() {
+    use arrow::datatypes::DataType;
+    use arrow::row::{OwnedRow, RowConverter};
+    use hotlap_engine::error::EngineError;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct BaselineRowState {
+        entries: HashMap<Vec<u8>, HashMap<OwnedRow, i64>>,
+    }
+    impl BaselineRowState {
+        // Exact add implementation copied from caed5de:sha256=9f15865300313dc7da267d5febb969aa5f23103ec589d7417ca7c1efaef68290.
+        fn add(&mut self, key: OwnedRow, payload: OwnedRow, diff: i64) -> Result<(), EngineError> {
+            if diff == 0 {
+                return Ok(());
+            }
+            let key_bytes = key.as_ref();
+            if let Some(payloads) = self.entries.get_mut(key_bytes) {
+                if let Some(sum) = payloads.get_mut(&payload) {
+                    *sum = sum.checked_add(diff).ok_or(EngineError::NumericOverflow(
+                        "arrangement multiplicity addition",
+                    ))?;
+                    if *sum == 0 {
+                        payloads.remove(&payload);
+                    }
+                } else {
+                    payloads.insert(payload, diff);
+                }
+                let remove_key = payloads.is_empty();
+                if remove_key {
+                    self.entries.remove(key_bytes);
+                }
+            } else {
+                self.entries
+                    .insert(key_bytes.to_vec(), HashMap::from([(payload, diff)]));
+            }
+            Ok(())
+        }
+
+        fn sorted(&self) -> Vec<(Vec<u8>, Vec<u8>, i64)> {
+            let mut rows = self
+                .entries
+                .iter()
+                .flat_map(|(key, values)| {
+                    values
+                        .iter()
+                        .map(|(row, weight)| (key.clone(), row.as_ref().to_vec(), *weight))
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        }
+    }
+    let converter = RowConverter::new(vec![arrow::row::SortField::new(DataType::Int64)]).unwrap();
+    let make = |value| {
+        converter
+            .convert_columns(&[Arc::new(arrow::array::Int64Array::from(vec![value]))])
+            .unwrap()
+            .row(0)
+            .owned()
+    };
+    let keys: Vec<_> = (0..512).map(make).collect();
+    let payloads: Vec<Vec<OwnedRow>> = (1..=16)
+        .map(|value| (0..512).map(|_| make(90_000 + value)).collect())
+        .collect();
+    // Semantic checks and overflow checks are outside all timed regions.
+    let mut samples = Vec::with_capacity(24);
+    for (label, fanout) in [
+        ("steady_singleton", 1usize),
+        ("steady_many4", 4),
+        ("steady_many16", 16),
+        ("churn_shapes", 2),
+    ] {
+        for sample in 0..3 {
+            let old_first = sample % 2 == 0;
+            for is_old in [old_first, !old_first] {
+                let mut old = BaselineRowState::default();
+                let mut current = hotlap_engine::arrange::state::RowState::default();
+                if label != "churn_shapes" {
+                    for i in 0..512 {
+                        for payload_rows in payloads.iter().take(fanout) {
+                            if is_old {
+                                old.add(keys[i].clone(), payload_rows[i].clone(), 1)
+                                    .unwrap();
+                            } else {
+                                current
+                                    .add(keys[i].clone(), payload_rows[i].clone(), 1)
+                                    .unwrap();
+                            }
+                        }
+                    }
+                }
+                let before = if is_old {
+                    old.sorted()
+                } else {
+                    current
+                        .sorted()
+                        .into_iter()
+                        .map(|(k, p, w)| (k.clone(), p.as_ref().to_vec(), w))
+                        .collect()
+                };
+                let cpu_before = thread_cpu_ticks();
+                let start = Instant::now();
+                for _ in 0..100 {
+                    for i in 0..512 {
+                        if label == "churn_shapes" {
+                            if is_old {
+                                old.add(keys[i].clone(), payloads[0][i].clone(), 1).unwrap();
+                                old.add(keys[i].clone(), payloads[1][i].clone(), 1).unwrap();
+                                old.add(keys[i].clone(), payloads[1][i].clone(), -1)
+                                    .unwrap();
+                                old.add(keys[i].clone(), payloads[0][i].clone(), -1)
+                                    .unwrap();
+                            } else {
+                                current
+                                    .add(keys[i].clone(), payloads[0][i].clone(), 1)
+                                    .unwrap();
+                                current
+                                    .add(keys[i].clone(), payloads[1][i].clone(), 1)
+                                    .unwrap();
+                                current
+                                    .add(keys[i].clone(), payloads[1][i].clone(), -1)
+                                    .unwrap();
+                                current
+                                    .add(keys[i].clone(), payloads[0][i].clone(), -1)
+                                    .unwrap();
+                            }
+                        } else if is_old {
+                            old.add(keys[i].clone(), payloads[0][i].clone(), 1).unwrap();
+                            old.add(keys[i].clone(), payloads[0][i].clone(), -1)
+                                .unwrap();
+                        } else {
+                            current
+                                .add(keys[i].clone(), payloads[0][i].clone(), 1)
+                                .unwrap();
+                            current
+                                .add(keys[i].clone(), payloads[0][i].clone(), -1)
+                                .unwrap();
+                        }
+                    }
+                }
+                let wall_ns = start.elapsed().as_nanos();
+                let cpu_ticks = thread_cpu_ticks().saturating_sub(cpu_before);
+                let after = if is_old {
+                    old.sorted()
+                } else {
+                    current
+                        .sorted()
+                        .into_iter()
+                        .map(|(k, p, w)| (k.clone(), p.as_ref().to_vec(), w))
+                        .collect()
+                };
+                assert_eq!(
+                    after, before,
+                    "steady-state/churn must preserve exact multiset"
+                );
+                samples.push(serde_json::json!({"case":"arrangement_layout_timing","layout":if is_old {"prechange_nested_map"} else {"OneMany"},"workload":label,"fanout":fanout,"sample":sample,"head":"caed5deed01e99c9b58dce76ee8ff63cd0891f2e","source_sha256":"9f15865300313dc7da267d5febb969aa5f23103ec589d7417ca7c1efaef68290","profile":benchmark_profile(),"keys":512,"cycles_per_key":100,"wall_ns":wall_ns,"cpu_clock_ticks":cpu_ticks,"allocation_count":null}));
+            }
+        }
+    }
+    let json = samples;
+    println!("{}", serde_json::to_string(&json).unwrap());
+}
+
+fn thread_cpu_ticks() -> u64 {
+    let stat =
+        std::fs::read_to_string("/proc/thread-self/stat").expect("read current thread CPU stats");
+    let fields = stat
+        .rsplit_once(')')
+        .expect("comm field")
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+
+fn benchmark_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+#[test]
+fn baseline_profile_metadata_matches_compilation_profile() {
+    assert_eq!(
+        benchmark_profile(),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
 }
 
 pub(super) fn run_family_coverage(n: usize, rep: usize, repeats: usize) {

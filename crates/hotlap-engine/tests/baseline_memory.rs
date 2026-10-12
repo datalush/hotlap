@@ -43,3 +43,9 @@ fn direct_arrangement_fanout_allocator_proxy() {
         .unwrap_or(3);
     baseline_memory::run_direct_arrangement(keys, fanout, repeats);
 }
+
+#[test]
+#[ignore = "manual singleton churn timing probe; run serially with --ignored --nocapture"]
+fn arrangement_layout_comparison() {
+    baseline_memory::run_singleton_churn_exact_reference();
+}
