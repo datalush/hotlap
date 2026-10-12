@@ -315,3 +315,125 @@ fn rejects_self_join_mismatched_keys_and_malformed_outer_projection() {
         Recognition::Dense(DenseReason::ColumnOutOfRange { .. })
     ));
 }
+
+#[test]
+fn mismatched_join_key_types_select_dense() {
+    let mut schemas = schemas();
+    schemas.insert(
+        InputId(1),
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
+        ])
+        .into(),
+    );
+    assert!(matches!(
+        recognize(&plan(), &schemas),
+        Recognition::Dense(DenseReason::UnsupportedJoinType {
+            left: DataType::Int32,
+            right: DataType::Int64,
+        })
+    ));
+}
+
+#[test]
+fn int32_join_keys_are_eligible() {
+    let mut schemas = schemas();
+    for id in [InputId(1), InputId(2)] {
+        let value_type = if id == InputId(1) {
+            DataType::Int32
+        } else {
+            DataType::Int64
+        };
+        schemas.insert(
+            id,
+            Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("value", value_type, false),
+            ])
+            .into(),
+        );
+    }
+    let Recognition::Eligible(mapping) = recognize(&plan(), &schemas) else {
+        panic!("matching Int32 keys should be eligible")
+    };
+    assert_eq!(mapping.join_key_types, vec![DataType::Int32]);
+}
+
+#[test]
+fn missing_source_schema_has_typed_dense_reason() {
+    let mut schemas = schemas();
+    schemas.remove(&InputId(2));
+    assert_eq!(
+        recognize(&plan(), &schemas),
+        Recognition::Dense(DenseReason::MissingSourceSchema(InputId(2)))
+    );
+}
+
+#[test]
+fn multiway_join_selects_dense() {
+    let schemas = schemas();
+    let plan = Plan::GroupAggregate {
+        input: Box::new(Plan::Join {
+            left: Box::new(Plan::Join {
+                left: Box::new(Plan::Source(InputId(1))),
+                right: Box::new(Plan::Source(InputId(2))),
+                left_key: vec![0],
+                right_key: vec![0],
+            }),
+            right: Box::new(Plan::Source(InputId(3))),
+            left_key: vec![0],
+            right_key: vec![0],
+        }),
+        key: vec![0],
+        aggs: vec![AggSpec::count()],
+    };
+    assert_eq!(
+        recognize(&plan, &schemas),
+        Recognition::Dense(DenseReason::UnsupportedInputShape)
+    );
+}
+
+#[test]
+fn min_and_max_select_dense_for_first_scope() {
+    let schemas = schemas();
+    for agg in [AggSpec::min(0), AggSpec::max(0)] {
+        let mut plan = plan();
+        if let Plan::GroupAggregate { aggs, .. } = &mut plan {
+            *aggs = vec![agg];
+        }
+        assert!(matches!(
+            recognize(&plan, &schemas),
+            Recognition::Dense(DenseReason::UnsupportedAggregate(func)) if func == agg.func
+        ));
+    }
+}
+
+#[test]
+fn nonnullable_integer_keys_and_values_keep_their_resolved_types() {
+    let mut schemas = schemas();
+    schemas.insert(
+        InputId(1),
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int32, false),
+        ])
+        .into(),
+    );
+    schemas.insert(
+        InputId(2),
+        Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("w", DataType::Int64, false),
+        ])
+        .into(),
+    );
+    let Recognition::Eligible(mapping) = recognize(&plan(), &schemas) else {
+        panic!("nonnullable integer fields should be eligible")
+    };
+    assert_eq!(mapping.join_key_types, vec![DataType::Int64]);
+    assert_eq!(
+        mapping.aggregate_input_types,
+        vec![None, Some(DataType::Int32), Some(DataType::Int64)]
+    );
+}
