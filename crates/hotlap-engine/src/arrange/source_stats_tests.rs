@@ -941,7 +941,6 @@ fn weight_change_preserves_null_counts_and_negative_row_support() {
             nonnull: 0,
             sum: None,
             abs_sum: None,
-            ..SourceColumnStats::default()
         }]
     );
     let state = state.stage_weight_change(-3, 4, &[null(false)]).unwrap();

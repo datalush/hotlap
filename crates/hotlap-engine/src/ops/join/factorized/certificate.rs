@@ -72,9 +72,7 @@ pub(crate) fn compile_metric_bindings(
                 slot += 1;
             }
             (AggFunc::Count, Some(_)) => {
-                if mapping.aggregate_input_types[aggregate_index].is_none() {
-                    return None;
-                }
+                mapping.aggregate_input_types[aggregate_index].as_ref()?;
                 bindings.push(MetricBinding {
                     kind: BoundKind::NullableCount,
                     memo_index: slot,

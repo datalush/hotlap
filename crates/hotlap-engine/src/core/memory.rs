@@ -32,7 +32,8 @@ pub struct MemoryReport {
     pub window_known_key_capacity_bytes: usize,
     /// Distinct retained values across MIN/MAX multisets.
     pub minmax_distinct_entries: usize,
-    /// Structural lower-level bookkeeping estimate; not allocated heap size.
+    /// Structural/object payload estimate; excludes allocator bookkeeping and
+    /// is not exact allocated heap size.
     pub estimated_structural_bytes: usize,
     /// State families traversed, even when allocator details remain unknown.
     pub covered_categories: Vec<String>,

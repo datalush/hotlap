@@ -162,10 +162,6 @@ impl Join {
         }
     }
 
-    pub(crate) fn has_demand(&self) -> bool {
-        self.demand.is_some()
-    }
-
     pub(crate) fn cut_schema(
         &mut self,
         left: &ZSetBatch,
@@ -178,21 +174,6 @@ impl Join {
         }
         self.ensure_ready(left, right)?;
         self.output_schema()
-    }
-
-    pub(crate) fn old_state<'a>(
-        &'a self,
-        groups: &'a std::collections::HashMap<Vec<u8>, hotlap_core::snapshot::GroupEntry>,
-    ) -> Result<factorized::OldState<'a>, EngineError> {
-        Ok(factorized::OldState {
-            left: self.left.as_ref().ok_or_else(|| {
-                EngineError::Infrastructure("join left arrangement uninitialized".into())
-            })?,
-            right: self.right.as_ref().ok_or_else(|| {
-                EngineError::Infrastructure("join right arrangement uninitialized".into())
-            })?,
-            groups,
-        })
     }
 
     #[allow(dead_code)]

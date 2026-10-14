@@ -18,16 +18,29 @@ pub(super) fn group_key_covers_join_key(mapping: &ColumnMapping) -> bool {
     (0..mapping.join_key_types.len()).all(|position| mapping.group_key.contains(&position))
 }
 
+pub(super) struct OldGroupValidation<'a> {
+    pub(super) mapping: &'a ColumnMapping,
+    pub(super) aggs: &'a [AggSpec],
+    pub(super) touched: &'a HashSet<Vec<u8>>,
+    pub(super) groups: &'a HashMap<Vec<u8>, GroupEntry>,
+    pub(super) left: &'a KeyedArrangement,
+    pub(super) right: &'a KeyedArrangement,
+    pub(super) inputs: &'a DeltaPair,
+}
+
 pub(super) fn validate_old_group_state(
-    mapping: &ColumnMapping,
-    aggs: &[AggSpec],
-    touched: &HashSet<Vec<u8>>,
-    groups: &HashMap<Vec<u8>, GroupEntry>,
-    left: &KeyedArrangement,
-    right: &KeyedArrangement,
-    inputs: &DeltaPair,
+    state: OldGroupValidation<'_>,
     buckets: &mut OldBuckets<'_>,
 ) -> Result<GroupAbsBounds, DenseReason> {
+    let OldGroupValidation {
+        mapping,
+        aggs,
+        touched,
+        groups,
+        left,
+        right,
+        inputs,
+    } = state;
     if touched.is_empty() && !groups.is_empty() {
         return Err(DenseReason::StateShape);
     }
@@ -65,7 +78,19 @@ pub(super) fn validate_old_group_state(
             })
             .collect::<Result<HashSet<_>, _>>()?;
         return validate_old_group_keys(
-            mapping, aggs, &affected, touched, groups, left, inputs, buckets, &join, &group, &keys,
+            OldGroupKeys {
+                mapping,
+                aggs,
+                affected: &affected,
+                touched,
+                groups,
+                left,
+                inputs,
+                join: &join,
+                group: &group,
+                keys: &keys,
+            },
+            buckets,
         );
     }
     let affected = touched
@@ -89,23 +114,51 @@ pub(super) fn validate_old_group_state(
     }
     keys.extend(touched.iter().cloned());
     validate_old_group_keys(
-        mapping, aggs, &affected, touched, groups, left, inputs, buckets, &join, &group, &keys,
+        OldGroupKeys {
+            mapping,
+            aggs,
+            affected: &affected,
+            touched,
+            groups,
+            left,
+            inputs,
+            join: &join,
+            group: &group,
+            keys: &keys,
+        },
+        buckets,
     )
 }
 
+struct OldGroupKeys<'a> {
+    mapping: &'a ColumnMapping,
+    aggs: &'a [AggSpec],
+    affected: &'a HashSet<Vec<u8>>,
+    touched: &'a HashSet<Vec<u8>>,
+    groups: &'a HashMap<Vec<u8>, GroupEntry>,
+    left: &'a KeyedArrangement,
+    inputs: &'a DeltaPair,
+    join: &'a RowConverter,
+    group: &'a RowConverter,
+    keys: &'a HashSet<Vec<u8>>,
+}
+
 fn validate_old_group_keys(
-    mapping: &ColumnMapping,
-    aggs: &[AggSpec],
-    affected: &HashSet<Vec<u8>>,
-    touched: &HashSet<Vec<u8>>,
-    groups: &HashMap<Vec<u8>, GroupEntry>,
-    left: &KeyedArrangement,
-    inputs: &DeltaPair,
+    state: OldGroupKeys<'_>,
     buckets: &mut OldBuckets<'_>,
-    join: &RowConverter,
-    group: &RowConverter,
-    keys: &HashSet<Vec<u8>>,
 ) -> Result<GroupAbsBounds, DenseReason> {
+    let OldGroupKeys {
+        mapping,
+        aggs,
+        affected,
+        touched,
+        groups,
+        left,
+        inputs,
+        join,
+        group,
+        keys,
+    } = state;
     let left_keys = KeyConverter::new(inputs.left.schema().as_ref(), &mapping.left_join_key)
         .map_err(|_| DenseReason::InputMapping)?;
     let right_keys = KeyConverter::new(inputs.right.schema().as_ref(), &mapping.right_join_key)
@@ -116,8 +169,8 @@ fn validate_old_group_keys(
     for key in keys {
         #[cfg(test)]
         super::OLD_HISTORY_DIRECT_LOOKUPS.with(|count| count.set(count.get() + 1));
-        let l = buckets.left(&key).map_err(|_| DenseReason::InputMapping)?;
-        let r = buckets.right(&key).map_err(|_| DenseReason::InputMapping)?;
+        let l = buckets.left(key).map_err(|_| DenseReason::InputMapping)?;
+        let r = buckets.right(key).map_err(|_| DenseReason::InputMapping)?;
         #[cfg(test)]
         super::OLD_HISTORY_DIRECT_LOOKUPS.with(|count| count.set(count.get() + 1));
         #[cfg(test)]
@@ -130,9 +183,9 @@ fn validate_old_group_keys(
         let rs =
             summarize(&r, 1, aggs, mapping, width).map_err(|_| DenseReason::UnsupportedNumeric)?;
         let (new_l, new_r) = if touched.contains(key) {
-            let dl = bucket_for(&inputs.left, &left_keys, &key)
-                .map_err(|_| DenseReason::InputMapping)?;
-            let dr = bucket_for(&inputs.right, &right_keys, &key)
+            let dl =
+                bucket_for(&inputs.left, &left_keys, key).map_err(|_| DenseReason::InputMapping)?;
+            let dr = bucket_for(&inputs.right, &right_keys, key)
                 .map_err(|_| DenseReason::InputMapping)?;
             (
                 combine_bucket(&l, &dl).map_err(|_| DenseReason::StateShape)?,
@@ -161,7 +214,7 @@ fn validate_old_group_keys(
             .rows
             .checked_mul(rs[0].rows)
             .ok_or(DenseReason::NegativeOrOverflow)?;
-        let group_key = group_key_for(&join, &group, &key, &mapping.group_key)
+        let group_key = group_key_for(join, group, key, &mapping.group_key)
             .map_err(|_| DenseReason::InputMapping)?;
         let entry = derived
             .entry(group_key.clone())

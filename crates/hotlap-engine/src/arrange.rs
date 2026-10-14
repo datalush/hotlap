@@ -25,6 +25,9 @@ use source_stats::{SourceColumnDemand, SourceColumnValue, SourceStats};
 use state::RowState;
 
 #[cfg(test)]
+type StagedArrangementBatch = (Vec<(OwnedRow, OwnedRow, i64)>, Vec<StagedProbeRow>);
+
+#[cfg(test)]
 mod numeric_arrangement_tests;
 #[cfg(test)]
 mod source_stats_tests;
@@ -196,18 +199,11 @@ impl KeyedArrangement {
     }
 
     #[cfg(test)]
-    pub(crate) fn weight_for_test(&self, key_bytes: &[u8], payload_bytes: &[u8]) -> i64 {
-        let key = self.key_converter.parser().parse(key_bytes).owned();
-        let payload = self.payload_converter.parser().parse(payload_bytes).owned();
-        self.state.weight(key.as_ref(), &payload)
-    }
-
-    #[cfg(test)]
     pub(crate) fn stage_batch_for_test(
         &self,
         batch: &ZSetBatch,
         keys: &KeyConverter,
-    ) -> Result<(Vec<(OwnedRow, OwnedRow, i64)>, Vec<StagedProbeRow>), EngineError> {
+    ) -> Result<StagedArrangementBatch, EngineError> {
         if keys.column_indices() != self.key_indices.as_slice() {
             return Err(EngineError::Unsupported(
                 "key converter does not match arrangement keys".into(),

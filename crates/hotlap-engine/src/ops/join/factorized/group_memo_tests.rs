@@ -254,7 +254,6 @@ fn joined_metrics_use_borrowed_source_stats_and_bound_before_multiply() {
             nonnull: 2,
             sum: Some(i256::from_i128(11)),
             abs_sum: Some(i256::from_i128(11)),
-            ..SourceColumnStats::default()
         }],
     };
     let right = SourceStats {
@@ -266,7 +265,6 @@ fn joined_metrics_use_borrowed_source_stats_and_bound_before_multiply() {
             nonnull: 3,
             sum: Some(i256::from_i128(13)),
             abs_sum: Some(i256::from_i128(13)),
-            ..SourceColumnStats::default()
         }],
     };
     let demands = [

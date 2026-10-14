@@ -55,42 +55,39 @@ impl Node {
                 if let Node::Joined { join, .. } = joined {
                     let recognition = hotlap_core::plan_normalize::recognize(plan, schemas);
                     if let hotlap_core::plan_normalize::Recognition::Eligible(mapping) = recognition
+                        && let Some((left_schema, right_schema)) = join.source_schemas_for_cut()
+                        && let Ok(demand) = crate::ops::join::factorized::demand::compile_demand(
+                            &mapping,
+                            reducer.aggregates(),
+                            &left_schema,
+                            &right_schema,
+                        )
                     {
-                        if let Some((left_schema, right_schema)) = join.source_schemas_for_cut() {
-                            if let Ok(demand) = crate::ops::join::factorized::demand::compile_demand(
-                                &mapping,
-                                reducer.aggregates(),
-                                &left_schema,
-                                &right_schema,
-                            ) {
-                                join.register_demand(demand.clone())?;
-                                *registered_demand = Some(demand);
-                                let joined_schema = join.joined_schema_for_cut()?;
-                                let projection = outer_project.as_deref().or(project);
-                                let reducer_schema = if let Some(columns) = projection {
-                                    project_batch_schema(&joined_schema, columns)?
-                                } else {
-                                    joined_schema
-                                };
-                                reducer.initialize_cut(reducer_schema)?;
-                                let (Some(left), Some(right)) =
-                                    (join.left_for_cut(), join.right_for_cut())
-                                else {
-                                    return Err(EngineError::Infrastructure(
-                                        "restored join arrangements are missing".into(),
-                                    ));
-                                };
-                                let initialized = if let Some(columns) = projection {
-                                    reducer.initialize_maintained_cut_projected(
-                                        &mapping, left, right, columns,
-                                    )?
-                                } else {
-                                    reducer.initialize_maintained_cut(&mapping, left, right)?
-                                };
-                                if initialized {
-                                    reducer.validate_maintained_history()?;
-                                }
-                            }
+                        join.register_demand(demand.clone())?;
+                        *registered_demand = Some(demand);
+                        let joined_schema = join.joined_schema_for_cut()?;
+                        let projection = outer_project.as_deref().or(project);
+                        let reducer_schema = if let Some(columns) = projection {
+                            project_batch_schema(&joined_schema, columns)?
+                        } else {
+                            joined_schema
+                        };
+                        reducer.initialize_cut(reducer_schema)?;
+                        let (Some(left), Some(right)) = (join.left_for_cut(), join.right_for_cut())
+                        else {
+                            return Err(EngineError::Infrastructure(
+                                "restored join arrangements are missing".into(),
+                            ));
+                        };
+                        let initialized = if let Some(columns) = projection {
+                            reducer.initialize_maintained_cut_projected(
+                                &mapping, left, right, columns,
+                            )?
+                        } else {
+                            reducer.initialize_maintained_cut(&mapping, left, right)?
+                        };
+                        if initialized {
+                            reducer.validate_maintained_history()?;
                         }
                     }
                 }
@@ -131,6 +128,10 @@ impl Node {
             }
             Node::Group { input, reducer, .. } => {
                 report.mark_covered("aggregates");
+                // The reducer now has one stable graph-owned heap allocation;
+                // include its object payload in the structural estimate, but
+                // not allocator bookkeeping or a claim of exact heap bytes.
+                report.add_estimate(std::mem::size_of_val(reducer.as_ref()))?;
                 report.add_group(reducer.memory_usage()?)?;
                 if reducer.has_group_map_storage() {
                     report.mark_unknown("aggregate_hash_map_allocator_overhead");
@@ -358,11 +359,13 @@ fn group_eval(
                             let memo = crate::ops::join::factorized::certified_consume::prepare_dense_metadata_with_sources(
                                 join,
                                 reducer,
-                                mapping,
-                                &left_delta,
-                                &right_delta,
-                                reducer_schema,
-                                projection,
+                                crate::ops::join::factorized::certified_consume::GroupedUpdate {
+                                    mapping,
+                                    left_delta: &left_delta,
+                                    right_delta: &right_delta,
+                                    output_schema: reducer_schema,
+                                    projection,
+                                },
                                 &sources,
                             )?;
                             let joined = join.apply(&left_delta, &right_delta)?;
@@ -381,30 +384,21 @@ fn group_eval(
                             *right_pending = None;
                             return Ok(Some(output));
                         }
-                        let decision = if let Some(projection) =
-                            outer_project.as_deref().or(runtime_project)
-                        {
-                            crate::ops::join::factorized::certified_consume::prepare_grouped_update_projected_with_sources(
-                                join,
-                                reducer,
+                        let update =
+                            crate::ops::join::factorized::certified_consume::GroupedUpdate {
                                 mapping,
-                                &left_delta,
-                                &right_delta,
-                                reducer_schema,
-                                projection,
-                                &sources,
-                            )?
-                        } else {
+                                left_delta: &left_delta,
+                                right_delta: &right_delta,
+                                output_schema: reducer_schema,
+                                projection: outer_project.as_deref().or(runtime_project),
+                            };
+                        let decision =
                             crate::ops::join::factorized::certified_consume::prepare_grouped_update_with_sources(
                                 join,
                                 reducer,
-                                mapping,
-                                &left_delta,
-                                &right_delta,
-                                reducer_schema,
+                                update,
                                 &sources,
-                            )?
-                        };
+                            )?;
                         match decision {
                             crate::ops::join::factorized::certified_consume::CertifiedDecision::Certified(
                                 prepared,

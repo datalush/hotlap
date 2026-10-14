@@ -140,10 +140,13 @@ fn certified_and_flat_consumers_share_one_uncommitted_source_update() {
         crate::ops::join::factorized::certified_consume::prepare_grouped_update_with_sources(
             &mut candidate_join,
             &mut candidate_group,
-            &mapping,
-            &left_delta,
-            &right_delta,
-            output_schema.clone(),
+            crate::ops::join::factorized::certified_consume::GroupedUpdate {
+                mapping: &mapping,
+                left_delta: &left_delta,
+                right_delta: &right_delta,
+                output_schema: output_schema.clone(),
+                projection: None,
+            },
             &sources,
         )
         .unwrap();
@@ -276,10 +279,13 @@ fn flat_prepare_failure_after_aggregate_preparation_publishes_neither_consumer()
         crate::ops::join::factorized::certified_consume::prepare_grouped_update_with_sources(
             &mut join,
             &mut group,
-            &mapping,
-            &left_delta,
-            &right_delta,
-            output_schema.clone(),
+            crate::ops::join::factorized::certified_consume::GroupedUpdate {
+                mapping: &mapping,
+                left_delta: &left_delta,
+                right_delta: &right_delta,
+                output_schema: output_schema.clone(),
+                projection: None,
+            },
             &sources,
         )
         .unwrap();

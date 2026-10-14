@@ -55,6 +55,7 @@ pub struct DeltaPair {
 }
 
 impl DeltaPair {
+    #[cfg(test)]
     pub fn new(epoch: u64, left: Arc<ZSetBatch>, right: Arc<ZSetBatch>) -> Self {
         Self { epoch, left, right }
     }
@@ -355,13 +356,15 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         });
     }
     let state_abs_bounds = match validate_old_group_state(
-        mapping,
-        aggregates,
-        &touched,
-        state.groups,
-        state.left,
-        state.right,
-        &inputs,
+        super::history::OldGroupValidation {
+            mapping,
+            aggs: aggregates,
+            touched: &touched,
+            groups: state.groups,
+            left: state.left,
+            right: state.right,
+            inputs: &inputs,
+        },
         &mut buckets,
     ) {
         Ok(bounds) => bounds,

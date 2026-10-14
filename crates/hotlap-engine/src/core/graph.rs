@@ -28,7 +28,7 @@ enum Node {
     },
     Group {
         input: Box<Node>,
-        reducer: GroupAggregate,
+        reducer: Box<GroupAggregate>,
         cut_plan: Option<Box<Plan>>,
         outer_project: Option<Vec<usize>>,
         registered_demand: Option<crate::ops::join::factorized::demand::Demand>,
@@ -52,7 +52,6 @@ struct EvalCtx<'a> {
     delta: &'a ZSetBatch,
     schemas: &'a HashMap<InputId, SchemaRef>,
     watermark: i64,
-    epoch: u64,
 }
 
 #[cfg(test)]
@@ -104,14 +103,13 @@ impl ViewGraph {
         delta: &ZSetBatch,
         schemas: &HashMap<InputId, SchemaRef>,
         watermark: i64,
-        epoch: u64,
+        _epoch: u64,
     ) -> Result<Option<ZSetBatch>, crate::error::EngineError> {
         let mut ctx = EvalCtx {
             pushed,
             delta,
             schemas,
             watermark,
-            epoch,
         };
         self.root.eval(&mut ctx)
     }
@@ -147,7 +145,7 @@ fn compile(plan: &Plan) -> Node {
         },
         Plan::GroupAggregate { input, key, aggs } => Node::Group {
             input: Box::new(compile(input)),
-            reducer: GroupAggregate::new(key, aggs.clone()),
+            reducer: Box::new(GroupAggregate::new(key, aggs.clone())),
             cut_plan: is_factorized_shape(input).then(|| Box::new(plan.clone())),
             registered_demand: None,
             outer_project: match input.as_ref() {
@@ -196,5 +194,30 @@ fn is_relation_shape(plan: &Plan) -> bool {
         Plan::Source(_) => true,
         Plan::Project { input, .. } => matches!(input.as_ref(), Plan::Source(_)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::Node;
+    use crate::ops::GroupAggregate;
+    use crate::ops::join::factorized::certified_consume::CertifiedDecision;
+
+    #[test]
+    fn graph_node_is_smaller_than_group_reducer() {
+        let node = std::mem::size_of::<Node>();
+        let reducer = std::mem::size_of::<GroupAggregate>();
+        eprintln!("layout baseline/candidate: Node={node}, GroupAggregate={reducer}");
+        assert!(
+            node < reducer,
+            "Node={node} retains GroupAggregate inline ({reducer})"
+        );
+    }
+
+    #[test]
+    fn certified_decision_stays_below_test_owned_payload_budget() {
+        let decision = std::mem::size_of::<CertifiedDecision>();
+        eprintln!("layout baseline/candidate: CertifiedDecision={decision}");
+        assert!(decision <= 192, "CertifiedDecision={decision} bytes");
     }
 }

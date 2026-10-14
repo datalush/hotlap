@@ -17,6 +17,9 @@ pub mod zset;
 
 mod work;
 
+#[cfg(test)]
+mod maintained_canonical_probe;
+
 pub use arrange::KeyedArrangement;
 pub use batch::ZSetBatch;
 pub use core::EngineCore;

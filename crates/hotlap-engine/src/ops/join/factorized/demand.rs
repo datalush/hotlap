@@ -106,25 +106,30 @@ pub(crate) fn compile_demand(
             right_columns.push((local, data_type.clone(), aggregate.func == AggFunc::Sum));
         }
     }
-    let (left_columns, left_column_types, left_column_sums) = sorted_unique_columns(left_columns)?;
-    let (right_columns, right_column_types, right_column_sums) =
-        sorted_unique_columns(right_columns)?;
+    let left = sorted_unique_columns(left_columns)?;
+    let right = sorted_unique_columns(right_columns)?;
     Ok(Demand {
         left_join_key: mapping.left_join_key.clone(),
         right_join_key: mapping.right_join_key.clone(),
         group_key: mapping.group_key.clone(),
-        left_columns,
-        right_columns,
-        left_column_types,
-        right_column_types,
-        left_column_sums,
-        right_column_sums,
+        left_columns: left.columns,
+        right_columns: right.columns,
+        left_column_types: left.types,
+        right_column_types: right.types,
+        left_column_sums: left.sums,
+        right_column_sums: right.sums,
     })
+}
+
+struct SortedColumns {
+    columns: Vec<usize>,
+    types: Vec<DataType>,
+    sums: Vec<bool>,
 }
 
 fn sorted_unique_columns(
     mut selected: Vec<(usize, DataType, bool)>,
-) -> Result<(Vec<usize>, Vec<DataType>, Vec<bool>), DenseReason> {
+) -> Result<SortedColumns, DenseReason> {
     selected.sort_unstable_by_key(|(column, _, _)| *column);
     let mut columns = Vec::with_capacity(selected.len());
     let mut types = Vec::with_capacity(selected.len());
@@ -141,5 +146,9 @@ fn sorted_unique_columns(
         types.push(data_type);
         sums.push(sum);
     }
-    Ok((columns, types, sums))
+    Ok(SortedColumns {
+        columns,
+        types,
+        sums,
+    })
 }

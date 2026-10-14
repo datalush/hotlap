@@ -16,6 +16,14 @@ use super::group_memo::{Contribution, GroupMemoStage};
 use super::prepare::GroupChange;
 use super::raw_bounds::{self, KeyNumericBounds};
 
+pub(crate) struct GroupedUpdate<'a> {
+    pub(crate) mapping: &'a ColumnMapping,
+    pub(crate) left_delta: &'a ZSetBatch,
+    pub(crate) right_delta: &'a ZSetBatch,
+    pub(crate) output_schema: SchemaRef,
+    pub(crate) projection: Option<&'a [usize]>,
+}
+
 pub(crate) enum CertifiedDecision {
     Certified(PreparedCertifiedGroups),
     NeedsRows(Option<GroupMemoStage>),
@@ -26,13 +34,16 @@ pub(crate) enum CertifiedDecision {
 pub(crate) fn prepare_dense_metadata_with_sources(
     join: &mut Join,
     reducer: &mut GroupAggregate,
-    mapping: &ColumnMapping,
-    left_delta: &ZSetBatch,
-    right_delta: &ZSetBatch,
-    output_schema: SchemaRef,
-    projection: Option<&[usize]>,
+    update: GroupedUpdate<'_>,
     sources: &crate::ops::join::PreparedJoinSources,
 ) -> Result<Option<GroupMemoStage>, EngineError> {
+    let GroupedUpdate {
+        mapping,
+        left_delta,
+        right_delta,
+        output_schema,
+        projection,
+    } = update;
     if certificate::compile_metric_bindings(mapping, reducer.aggregates()).is_none() {
         return Ok(None);
     }
@@ -65,7 +76,8 @@ pub(crate) fn prepare_dense_metadata_with_sources(
 }
 
 pub(crate) struct PreparedCertifiedGroups {
-    sources: Option<crate::ops::join::PreparedJoinSources>,
+    #[cfg(test)]
+    sources: Option<Box<crate::ops::join::PreparedJoinSources>>,
     memo: GroupMemoStage,
     groups: Vec<(Vec<u8>, Option<GroupEntry>)>,
     output: ZSetBatch,
@@ -76,12 +88,14 @@ impl PreparedCertifiedGroups {
         &self.output
     }
 
+    #[cfg(test)]
     pub(crate) fn group_changes(&self) -> &[(Vec<u8>, Option<GroupEntry>)] {
         &self.groups
     }
 
     /// All possible failures (including rendering) have completed before this
     /// infallible publication point.
+    #[cfg(test)]
     pub(crate) fn commit(self, join: &mut Join, reducer: &mut GroupAggregate) {
         let Self {
             sources,
@@ -90,7 +104,7 @@ impl PreparedCertifiedGroups {
             output: _,
         } = self;
         if let Some(sources) = sources {
-            join.commit_source_updates(sources);
+            join.commit_source_updates(*sources);
         }
         reducer.commit_maintained_memo(memo);
         reducer.commit_factorized_consumed(groups);
@@ -118,6 +132,7 @@ impl CertifiedDecision {
 /// Prepares a bounded grouped update from maintained source stats, original raw
 /// Arrow prefix bounds, and the authoritative GroupAggregate history. It never
 /// materializes joined pairs or calls the Dense operators.
+#[cfg(test)]
 pub(crate) fn prepare_grouped_update(
     join: &mut Join,
     reducer: &mut GroupAggregate,
@@ -129,11 +144,13 @@ pub(crate) fn prepare_grouped_update(
     prepare_grouped_update_inner(
         join,
         reducer,
-        mapping,
-        left_delta,
-        right_delta,
-        output_schema,
-        None,
+        GroupedUpdate {
+            mapping,
+            left_delta,
+            right_delta,
+            output_schema,
+            projection: None,
+        },
         None,
     )
 }
@@ -144,46 +161,13 @@ pub(crate) fn prepare_grouped_update(
 pub(crate) fn prepare_grouped_update_with_sources(
     join: &mut Join,
     reducer: &mut GroupAggregate,
-    mapping: &ColumnMapping,
-    left_delta: &ZSetBatch,
-    right_delta: &ZSetBatch,
-    output_schema: SchemaRef,
+    update: GroupedUpdate<'_>,
     sources: &crate::ops::join::PreparedJoinSources,
 ) -> Result<CertifiedDecision, EngineError> {
-    prepare_grouped_update_inner(
-        join,
-        reducer,
-        mapping,
-        left_delta,
-        right_delta,
-        output_schema,
-        None,
-        Some(sources),
-    )
+    prepare_grouped_update_inner(join, reducer, update, Some(sources))
 }
 
-pub(crate) fn prepare_grouped_update_projected_with_sources(
-    join: &mut Join,
-    reducer: &mut GroupAggregate,
-    mapping: &ColumnMapping,
-    left_delta: &ZSetBatch,
-    right_delta: &ZSetBatch,
-    output_schema: SchemaRef,
-    projection: &[usize],
-    sources: &crate::ops::join::PreparedJoinSources,
-) -> Result<CertifiedDecision, EngineError> {
-    prepare_grouped_update_inner(
-        join,
-        reducer,
-        mapping,
-        left_delta,
-        right_delta,
-        output_schema,
-        Some(projection),
-        Some(sources),
-    )
-}
-
+#[cfg(test)]
 pub(crate) fn prepare_grouped_update_projected(
     join: &mut Join,
     reducer: &mut GroupAggregate,
@@ -196,11 +180,13 @@ pub(crate) fn prepare_grouped_update_projected(
     prepare_grouped_update_inner(
         join,
         reducer,
-        mapping,
-        left_delta,
-        right_delta,
-        output_schema,
-        Some(projection),
+        GroupedUpdate {
+            mapping,
+            left_delta,
+            right_delta,
+            output_schema,
+            projection: Some(projection),
+        },
         None,
     )
 }
@@ -208,13 +194,16 @@ pub(crate) fn prepare_grouped_update_projected(
 fn prepare_grouped_update_inner(
     join: &mut Join,
     reducer: &mut GroupAggregate,
-    mapping: &ColumnMapping,
-    left_delta: &ZSetBatch,
-    right_delta: &ZSetBatch,
-    output_schema: SchemaRef,
-    projection: Option<&[usize]>,
+    update: GroupedUpdate<'_>,
     preprepared_sources: Option<&crate::ops::join::PreparedJoinSources>,
 ) -> Result<CertifiedDecision, EngineError> {
+    let GroupedUpdate {
+        mapping,
+        left_delta,
+        right_delta,
+        output_schema,
+        projection,
+    } = update;
     // Classify against the actual logical aggregate types before registering
     // source demands or constructing source-derived memo metrics. Valid Dense
     // aggregates outside this integer domain must never be forced through the
@@ -278,14 +267,20 @@ fn prepare_grouped_update_inner(
     };
     // The common arrangement owner stages both row weights and their exact
     // source metadata before any candidate result is made visible.
+    #[cfg(test)]
     let mut owned_sources = None;
     let sources = match preprepared_sources {
         Some(sources) => sources,
         None => {
-            owned_sources = Some(join.prepare_source_updates(left_delta, right_delta)?);
-            owned_sources
-                .as_ref()
-                .expect("the source update was prepared above")
+            #[cfg(test)]
+            {
+                owned_sources = Some(join.prepare_source_updates(left_delta, right_delta)?);
+                owned_sources
+                    .as_ref()
+                    .expect("the source update was prepared above")
+            }
+            #[cfg(not(test))]
+            return Ok(CertifiedDecision::NeedsRows(None));
         }
     };
     let left_raw = match raw_bounds::collect_raw_delta(
@@ -295,7 +290,7 @@ fn prepare_grouped_update_inner(
     ) {
         Ok(raw) => raw,
         Err(_) => {
-            let stage = stage_all_proposed_memo(join, reducer, &sources)?;
+            let stage = stage_all_proposed_memo(join, reducer, sources)?;
             return Ok(CertifiedDecision::NeedsRows(stage));
         }
     };
@@ -306,7 +301,7 @@ fn prepare_grouped_update_inner(
     ) {
         Ok(raw) => raw,
         Err(_) => {
-            let stage = stage_all_proposed_memo(join, reducer, &sources)?;
+            let stage = stage_all_proposed_memo(join, reducer, sources)?;
             return Ok(CertifiedDecision::NeedsRows(stage));
         }
     };
@@ -320,8 +315,8 @@ fn prepare_grouped_update_inner(
     };
     let mut memo_updates = Vec::with_capacity(touched.len());
     for full_key in &touched {
-        let next_left = sources.proposed_left(join, &full_key);
-        let next_right = sources.proposed_right(join, &full_key);
+        let next_left = sources.proposed_left(join, full_key);
+        let next_right = sources.proposed_right(join, full_key);
         let group_key = cut.codec.encode(full_key)?;
         let contribution = match (next_left, next_right) {
             (None, None) => None,
@@ -455,7 +450,8 @@ fn prepare_grouped_update_inner(
         Err(_) => return Ok(CertifiedDecision::NeedsRows(Some(memo_stage))),
     };
     Ok(CertifiedDecision::Certified(PreparedCertifiedGroups {
-        sources: owned_sources,
+        #[cfg(test)]
+        sources: owned_sources.map(Box::new),
         memo: memo_stage,
         groups: consumed.changes,
         output: consumed.output,

@@ -161,6 +161,7 @@ impl GroupAggregate {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) fn maintained_memo(
         &self,
     ) -> Option<&crate::ops::join::factorized::group_memo::GroupMemo> {

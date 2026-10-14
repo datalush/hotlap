@@ -38,6 +38,7 @@ pub(super) struct SideStage {
     pub key_delta_abs_bounds: HashMap<Vec<u8>, u128>,
 }
 
+#[cfg(test)]
 pub(super) fn stage_side(
     batch: &ZSetBatch,
     key_indices: &[usize],

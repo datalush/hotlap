@@ -26,6 +26,7 @@ pub(crate) struct MetricContribution {
 }
 
 impl MetricContribution {
+    #[cfg(test)]
     pub(crate) fn exact(value: i256, abs_value: i256) -> Self {
         Self::exact_with_limit(value, abs_value, i256::from_i128(i128::MAX))
     }
@@ -39,6 +40,7 @@ impl MetricContribution {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn over_limit(sign: i8) -> Self {
         Self::over_limit_with_limit(sign, i256::from_i128(i128::MAX))
     }
@@ -108,6 +110,7 @@ impl Contribution {
 
     /// Construct contribution metadata from the actual proposed canonical
     /// source summaries; callers cannot independently assert the sign flag.
+    #[cfg(test)]
     pub(crate) fn from_source_stats(
         group_key: Vec<u8>,
         left: &SourceStats,
@@ -202,10 +205,12 @@ impl GroupMemo {
         self.by_group_key.get(key)
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.by_join_key.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.by_join_key.is_empty()
     }
@@ -264,6 +269,7 @@ impl GroupMemo {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn remove(&mut self, join_key: &[u8]) -> Result<(), EngineError> {
         let stage = self.stage_updates([(join_key.to_vec(), None)])?;
         self.commit(stage);

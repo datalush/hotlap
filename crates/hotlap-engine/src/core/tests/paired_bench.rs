@@ -74,7 +74,7 @@ impl Fixture {
     }
 
     fn source_value(self, right: bool, key: usize, row: usize) -> Option<i64> {
-        if right && row % 7 == 0 && !self.unsafe_avg_history {
+        if right && row.is_multiple_of(7) && !self.unsafe_avg_history {
             None
         } else if right && row == 1 && key < 2 {
             Some(0)
