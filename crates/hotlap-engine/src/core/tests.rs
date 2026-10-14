@@ -11,6 +11,7 @@ use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
 use super::EngineCore;
 
 mod graph_review;
+mod paired_bench;
 mod recovery;
 
 fn schema() -> Arc<Schema> {
