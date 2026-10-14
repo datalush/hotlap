@@ -30,6 +30,41 @@ pub struct RowState {
     entries: HashMap<Vec<u8>, Bucket>,
 }
 
+impl RowState {
+    pub(super) fn key_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(super) fn iter_buckets(&self) -> impl Iterator<Item = (&[u8], EitherRows<'_>)> {
+        self.entries.iter().map(|(key, bucket)| {
+            let rows = match bucket {
+                Bucket::One(Some(row), weight) => {
+                    EitherRows::One(std::iter::once((row.as_ref(), weight)))
+                }
+                Bucket::One(None, _) => unreachable!("singleton row temporarily moved"),
+                Bucket::Many(rows) => EitherRows::Many(rows.iter()),
+            };
+            (key.as_slice(), rows)
+        })
+    }
+
+    pub(super) fn keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.entries.keys().map(Vec::as_slice)
+    }
+
+    #[cfg(test)]
+    pub(super) fn weight(&self, key: &[u8], payload: &OwnedRow) -> i64 {
+        self.get(key, payload).copied().unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn commit_weights(&mut self, rows: Vec<(OwnedRow, OwnedRow, i64)>) {
+        for (key, payload, weight) in rows {
+            self.set_weight(key, payload, weight);
+        }
+    }
+}
+
 #[cfg(test)]
 impl RowState {
     #[cfg(test)]

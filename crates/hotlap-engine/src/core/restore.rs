@@ -55,6 +55,12 @@ impl EngineCore {
         for view in &snapshot.views {
             core.restore_view(view)?;
         }
+        // Derived source statistics and group memo are rebuilt only after
+        // every logical input, operator, output and pending delta validated.
+        let schemas = &core.schemas;
+        for view in core.views.values_mut() {
+            view.graph.rebuild_derived(schemas)?;
+        }
         // Restored windows carry their dropped-closed counts; seed the publish
         // baseline so the first later push does not re-count them as new.
         core.metrics.late_closed_seen = core.late_closed_total();

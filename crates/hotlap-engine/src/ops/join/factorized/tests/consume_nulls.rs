@@ -50,7 +50,7 @@ fn first_all_null_group_emits_count_star_and_null_sum_avg() {
         state: OldState {
             left: &left,
             right: &right,
-            groups: &[],
+            groups: &empty_groups(),
         },
         consumer: ConsumerCaps::FactorizedAggregates,
     }) {

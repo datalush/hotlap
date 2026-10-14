@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array};
@@ -17,6 +18,7 @@ use crate::keys::KeyConverter;
 
 mod flat_cursor;
 mod flat_prepare;
+mod join_commit;
 
 fn schema(fields: &[(&str, DataType)]) -> SchemaRef {
     Arc::new(Schema::new(
@@ -54,6 +56,48 @@ fn arrangement(initial: &ZSetBatch, key_columns: &[usize]) -> KeyedArrangement {
     result
 }
 
+fn group_map(groups: &[(Vec<u8>, GroupEntry)]) -> HashMap<Vec<u8>, GroupEntry> {
+    groups.iter().cloned().collect()
+}
+
+fn groups_vec(groups: &HashMap<Vec<u8>, GroupEntry>) -> Vec<(Vec<u8>, GroupEntry)> {
+    let mut groups: Vec<_> = groups.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    groups
+}
+
+fn empty_groups() -> HashMap<Vec<u8>, GroupEntry> {
+    HashMap::new()
+}
+
+fn changed_entry<'a>(changes: &'a [GroupChange], key: &[u8]) -> Option<&'a GroupEntry> {
+    changes.iter().find_map(|change| match change {
+        GroupChange::Upsert {
+            key: changed,
+            entry,
+        } if changed == key => Some(entry),
+        _ => None,
+    })
+}
+
+fn apply_changes_for_test(
+    prior: &HashMap<Vec<u8>, GroupEntry>,
+    changes: &[GroupChange],
+) -> HashMap<Vec<u8>, GroupEntry> {
+    let mut candidate = prior.clone();
+    for change in changes {
+        match change {
+            GroupChange::Upsert { key, entry } => {
+                candidate.insert(key.clone(), entry.clone());
+            }
+            GroupChange::Remove { key } => {
+                candidate.remove(key);
+            }
+        }
+    }
+    candidate
+}
+
 fn recognition(aggregate_inputs: Vec<Option<usize>>, types: Vec<Option<DataType>>) -> Recognition {
     Recognition::Eligible(ColumnMapping {
         left_source: InputId(0),
@@ -71,7 +115,7 @@ fn run(
     inputs: DeltaPair,
     left: &KeyedArrangement,
     right: &KeyedArrangement,
-    groups: &[(Vec<u8>, GroupEntry)],
+    groups: &HashMap<Vec<u8>, GroupEntry>,
     recognition: Recognition,
 ) -> CutDecision {
     let aggregates = match &recognition {
@@ -95,7 +139,7 @@ fn run_with_aggs(
     inputs: DeltaPair,
     left: &KeyedArrangement,
     right: &KeyedArrangement,
-    groups: &[(Vec<u8>, GroupEntry)],
+    groups: &HashMap<Vec<u8>, GroupEntry>,
     mapping: Recognition,
     aggregates: &[AggSpec],
 ) -> CutDecision {
@@ -157,6 +201,12 @@ fn typed_rows(z: &ZSetBatch) -> Vec<(Vec<String>, i64)> {
 
 mod aggregates;
 mod avgs;
+use super::history::group_key_covers_join_key;
+mod certified_consume;
+mod certified_consume_support;
+mod certified_domains;
+mod certified_grouped_parity;
+mod certified_projection;
 mod consume;
 mod consume_failures;
 mod consume_nulls;

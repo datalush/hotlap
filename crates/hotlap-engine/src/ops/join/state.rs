@@ -34,7 +34,7 @@ impl Join {
     }
 
     /// Joined output schema (`left || right`), built once from the first apply.
-    pub(super) fn output_schema(&mut self) -> Result<SchemaRef, EngineError> {
+    pub(crate) fn output_schema(&mut self) -> Result<SchemaRef, EngineError> {
         if self.out_schema.is_none() {
             let left = self.left_schema.as_ref().ok_or_else(|| {
                 EngineError::Infrastructure("join left schema uninitialized".to_string())
@@ -55,7 +55,7 @@ impl Join {
     /// only valid for the schema they were built from) and rejects key columns
     /// whose `DataType`s differ across sides (their `arrow::row` encodings would
     /// not be byte-comparable).
-    pub(super) fn ensure_ready(
+    pub(crate) fn ensure_ready(
         &mut self,
         left: &ZSetBatch,
         right: &ZSetBatch,

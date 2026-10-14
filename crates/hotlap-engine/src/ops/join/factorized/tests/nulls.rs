@@ -51,13 +51,13 @@ fn null_only_delta_preserves_typed_aggregates_in_each_order_and_sign() {
     let orders = [[0, 1, 2, 3], [1, 2, 0, 3], [2, 1, 0, 3]];
     for order in orders {
         let aggregates = order.map(|index| base_aggs[index]);
-        let old_groups = [(
+        let old_groups = group_map(&[(
             simple_key(7),
             GroupEntry {
                 rows: 2,
                 values: order.map(|index| base_values[index].clone()).to_vec(),
             },
-        )];
+        )]);
         let groups_before = old_groups.clone();
         let recognition = Recognition::Eligible(ColumnMapping {
             left_source: InputId(0),
@@ -108,11 +108,11 @@ fn null_only_delta_preserves_typed_aggregates_in_each_order_and_sign() {
                 values: order.map(|index| expected[index].clone()).to_vec(),
             };
             assert_eq!(
-                prepared.groups,
+                groups_vec(&apply_changes_for_test(&old_groups, &prepared.groups)),
                 vec![(simple_key(7), expected_entry.clone())]
             );
             assert_eq!(
-                prepared.group_changes,
+                prepared.groups,
                 vec![GroupChange::Upsert {
                     key: simple_key(7),
                     entry: expected_entry
@@ -120,7 +120,7 @@ fn null_only_delta_preserves_typed_aggregates_in_each_order_and_sign() {
             );
             assert!(
                 prepared
-                    .group_changes
+                    .groups
                     .iter()
                     .all(|change| !matches!(change, GroupChange::Remove { .. }))
             );
@@ -132,7 +132,7 @@ fn null_only_delta_preserves_typed_aggregates_in_each_order_and_sign() {
 
     let all_null = nullable_batch(&[None], &[1]);
     let all_null_left = arrangement(&all_null, &[0]);
-    let all_null_groups = [(
+    let all_null_groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
@@ -149,7 +149,7 @@ fn null_only_delta_preserves_typed_aggregates_in_each_order_and_sign() {
                 AggValue::Count(1),
             ],
         },
-    )];
+    )]);
     let order = [0, 1, 2, 3];
     let aggregates = order.map(|index| base_aggs[index]);
     let recognition = Recognition::Eligible(ColumnMapping {
@@ -179,9 +179,16 @@ fn null_only_delta_preserves_typed_aggregates_in_each_order_and_sign() {
     let CutDecision::Eligible(prepared) = result else {
         panic!("all-NULL aggregate group should remain typed and eligible")
     };
-    assert_eq!(prepared.groups[0].1.rows, 2);
     assert_eq!(
-        prepared.groups[0].1.values,
+        changed_entry(&prepared.groups, &simple_key(7))
+            .unwrap()
+            .rows,
+        2
+    );
+    assert_eq!(
+        changed_entry(&prepared.groups, &simple_key(7))
+            .unwrap()
+            .values,
         vec![
             AggValue::Count(0),
             AggValue::SumInteger { sum: 0, count: 0 },
@@ -273,7 +280,7 @@ fn all_null_sum_avg_keep_nonempty_group_with_null_accumulator_counts() {
             input: Some(3),
         },
     ];
-    let old = [(
+    let old = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
@@ -290,7 +297,7 @@ fn all_null_sum_avg_keep_nonempty_group_with_null_accumulator_counts() {
                 },
             ],
         },
-    )];
+    )]);
     let result = run_with_aggs(
         DeltaPair::new(21, Arc::new(left_delta), Arc::new(right_delta)),
         &left,
@@ -303,7 +310,9 @@ fn all_null_sum_avg_keep_nonempty_group_with_null_accumulator_counts() {
         panic!("all-null aggregate inputs should be eligible")
     };
     assert_eq!(
-        prepared.groups[0].1,
+        changed_entry(&prepared.groups, &simple_key(7))
+            .unwrap()
+            .clone(),
         GroupEntry {
             rows: 2,
             values: vec![

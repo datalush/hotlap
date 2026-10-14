@@ -4,10 +4,11 @@ use arrow::row::{RowConverter, SortField};
 use hotlap_core::plan::{AggFunc, AggSpec};
 use hotlap_core::plan_normalize::ColumnMapping;
 
-use crate::arrange::KeyedArrangement;
 use crate::keys::KeyConverter;
 
-use super::prepare::{DeltaPair, DenseReason, bucket_for, combine_bucket, group_key_for};
+use super::prepare::{
+    DeltaPair, DenseReason, OldBuckets, bucket_for, combine_bucket, group_key_for,
+};
 use super::stage::SideStage;
 use super::stats::{
     Stats, delta_bound, delta_product, sum_delta_bound, summarize, validate_i128_abs_bound,
@@ -25,8 +26,7 @@ pub(super) fn compute_key_stats(
     inputs: &DeltaPair,
     _left_stage: &SideStage,
     touched: &HashSet<Vec<u8>>,
-    left_old: &KeyedArrangement,
-    right_old: &KeyedArrangement,
+    buckets: &mut OldBuckets<'_>,
 ) -> Result<KeyStats, DenseReason> {
     let left_keys = KeyConverter::new(inputs.left.schema().as_ref(), &mapping.left_join_key)
         .map_err(|_| DenseReason::InputMapping)?;
@@ -59,12 +59,8 @@ pub(super) fn compute_key_stats(
     let mut groups = HashMap::new();
     let mut row_deltas = HashMap::new();
     for key in touched {
-        let old_left = left_old
-            .to_zset_for_key(key)
-            .map_err(|_| DenseReason::InputMapping)?;
-        let old_right = right_old
-            .to_zset_for_key(key)
-            .map_err(|_| DenseReason::InputMapping)?;
+        let old_left = buckets.left(key).map_err(|_| DenseReason::InputMapping)?;
+        let old_right = buckets.right(key).map_err(|_| DenseReason::InputMapping)?;
         let delta_left =
             bucket_for(&inputs.left, &left_keys, key).map_err(|_| DenseReason::InputMapping)?;
         let delta_right =

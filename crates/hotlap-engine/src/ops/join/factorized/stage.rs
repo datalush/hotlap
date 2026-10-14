@@ -4,12 +4,13 @@ use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, SortField};
-use hotlap_core::snapshot::GroupEntry;
 
 use crate::arrange::KeyedArrangement;
 use crate::batch::ZSetBatch;
 use crate::error::EngineError;
 use crate::keys::KeyConverter;
+
+use super::prepare::OldBuckets;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RowIdentity {
@@ -43,6 +44,17 @@ pub(super) fn stage_side(
     additional_keys: &[Vec<u8>],
     old: &KeyedArrangement,
 ) -> Result<SideStage, EngineError> {
+    let mut buckets = OldBuckets::new(old, old);
+    stage_side_cached(batch, key_indices, additional_keys, old, &mut buckets)
+}
+
+pub(super) fn stage_side_cached(
+    batch: &ZSetBatch,
+    key_indices: &[usize],
+    additional_keys: &[Vec<u8>],
+    old: &KeyedArrangement,
+    buckets: &mut OldBuckets<'_>,
+) -> Result<SideStage, EngineError> {
     let schema = batch.schema();
     let keys = KeyConverter::new(schema.as_ref(), key_indices)?;
     let payload_indices: Vec<usize> = (0..schema.fields().len())
@@ -73,7 +85,11 @@ pub(super) fn stage_side(
     }
     touched_keys.extend(additional_keys.iter().cloned());
     for key in &touched_keys {
-        let bucket = old.to_zset_for_key(key)?;
+        let bucket = if buckets.is_left(old) {
+            buckets.left(key)?
+        } else {
+            buckets.right(key)?
+        };
         let old_keys = keys.convert(bucket.batch.columns())?;
         let old_payload_cols: Vec<ArrayRef> = payload_indices
             .iter()
@@ -250,31 +266,6 @@ pub(super) fn decode_rows(
             .owned();
         output.push((key.as_ref().to_vec(), payload.as_ref().to_vec(), row.new));
     }
-    Ok(output)
-}
-
-pub(super) fn stage_groups(
-    old: &[(Vec<u8>, GroupEntry)],
-    changes: &[super::prepare::GroupChange],
-) -> Result<Vec<(Vec<u8>, GroupEntry)>, EngineError> {
-    let mut staged = HashMap::new();
-    for (key, entry) in old {
-        if staged.insert(key.clone(), entry.clone()).is_some() {
-            return Err(EngineError::Unsupported("duplicate old group key".into()));
-        }
-    }
-    for change in changes {
-        match change {
-            super::prepare::GroupChange::Upsert { key, entry } => {
-                staged.insert(key.clone(), entry.clone());
-            }
-            super::prepare::GroupChange::Remove { key } => {
-                staged.remove(key);
-            }
-        }
-    }
-    let mut output: Vec<_> = staged.into_iter().collect();
-    output.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(output)
 }
 

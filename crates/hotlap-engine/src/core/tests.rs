@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -10,6 +10,7 @@ use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
 
 use super::EngineCore;
 
+mod graph_review;
 mod recovery;
 
 fn schema() -> Arc<Schema> {
@@ -61,6 +62,399 @@ fn aggregate_zset(rows: &[(i64, i64, i64)]) -> ZSetBatch {
     )
     .unwrap();
     ZSetBatch::new(batch, Arc::new(Int64Array::from(diffs))).unwrap()
+}
+
+fn joined_group_plan() -> Plan {
+    Plan::GroupAggregate {
+        input: Box::new(Plan::Join {
+            left: Box::new(Plan::Source(InputId(0))),
+            right: Box::new(Plan::Source(InputId(1))),
+            left_key: vec![0],
+            right_key: vec![0],
+        }),
+        key: vec![0],
+        aggs: vec![AggSpec::count()],
+    }
+}
+
+fn pair_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]))
+}
+
+fn pairs(rows: &[(i64, i64, i64)]) -> ZSetBatch {
+    let batch = RecordBatch::try_new(
+        pair_schema(),
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    ZSetBatch::new(
+        batch,
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+        )),
+    )
+    .unwrap()
+}
+
+#[test]
+fn grouped_join_push_and_checkpoint_continuation_preserve_dense_results() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    core.build_view(ViewId(0), &joined_group_plan()).unwrap();
+    core.push(InputId(0), &pairs(&[(1, 10, 1), (1, 20, 1)]))
+        .unwrap();
+    core.push(InputId(1), &pairs(&[(1, 3, 1), (1, 4, 1)]))
+        .unwrap();
+    let checkpoint = core.checkpoint().unwrap();
+    let mut restored = EngineCore::new();
+    restored.restore(&checkpoint).unwrap();
+    restored.push(InputId(0), &pairs(&[(1, 30, 1)])).unwrap();
+    let actual = crate::zset::consolidate(&restored.snapshot(ViewId(0)).unwrap()).unwrap();
+    let count = actual
+        .batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(count.values(), &[6]);
+}
+
+#[test]
+fn direct_count_sum_group_join_uses_certified_path_for_safe_updates() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    let plan = Plan::GroupAggregate {
+        input: Box::new(Plan::Join {
+            left: Box::new(Plan::Source(InputId(0))),
+            right: Box::new(Plan::Source(InputId(1))),
+            left_key: vec![0],
+            right_key: vec![0],
+        }),
+        key: vec![0],
+        aggs: vec![AggSpec::count(), AggSpec::sum(1)],
+    };
+    core.build_view(ViewId(0), &plan).unwrap();
+    core.push(InputId(0), &pairs(&[(1, 2, 1)])).unwrap();
+    crate::core::graph::FACTORIZED_CUTS.with(|n| n.set(0));
+    crate::core::graph::DENSE_JOIN_MATERIALIZATIONS.with(|n| n.set(0));
+    crate::core::graph::FLAT_ROWS_CUTS.with(|n| n.set(0));
+    core.push(InputId(1), &pairs(&[(1, 3, 1)])).unwrap();
+    crate::core::graph::FACTORIZED_CUTS
+        .with(|n| assert!(n.get() > 0, "certified COUNT/SUM cut is used"));
+    crate::core::graph::DENSE_JOIN_MATERIALIZATIONS
+        .with(|n| assert_eq!(n.get(), 0, "certified cut avoids row materialization"));
+    crate::core::graph::FLAT_ROWS_CUTS.with(|n| assert_eq!(n.get(), 0));
+    let actual = crate::zset::consolidate(&core.snapshot(ViewId(0)).unwrap()).unwrap();
+    assert_eq!(actual.len(), 1);
+    let count = actual
+        .batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sum = actual
+        .batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(count.values(), &[1]);
+    assert_eq!(sum.values(), &[2]);
+    core.push(InputId(0), &pairs(&[(1, 2, -1), (1, 5, 1)]))
+        .unwrap();
+    let checkpoint = core.checkpoint().unwrap();
+    let mut restored = EngineCore::new();
+    restored.restore(&checkpoint).unwrap();
+    restored
+        .push(InputId(1), &pairs(&[(1, 3, -1), (1, 8, 1)]))
+        .unwrap();
+    let continued = crate::zset::consolidate(&restored.snapshot(ViewId(0)).unwrap()).unwrap();
+    let count = continued
+        .batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sum = continued
+        .batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(count.values(), &[1]);
+    assert_eq!(sum.values(), &[5]);
+}
+
+#[test]
+fn projected_avg_group_join_uses_flat_fallback() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    let plan = Plan::GroupAggregate {
+        input: Box::new(Plan::Project {
+            input: Box::new(Plan::Join {
+                left: Box::new(Plan::Project {
+                    input: Box::new(Plan::Source(InputId(0))),
+                    cols: vec![1, 0],
+                }),
+                right: Box::new(Plan::Project {
+                    input: Box::new(Plan::Source(InputId(1))),
+                    cols: vec![1, 0],
+                }),
+                left_key: vec![0],
+                right_key: vec![0],
+            }),
+            cols: vec![3, 0, 1, 2],
+        }),
+        key: vec![1],
+        aggs: vec![AggSpec::count(), AggSpec::sum(2), AggSpec::avg(2)],
+    };
+    core.build_view(ViewId(0), &plan).unwrap();
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, true),
+        Field::new("key", DataType::Int64, false),
+    ]));
+    let source = |rows: &[(Option<i64>, i64, i64)]| {
+        let batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        ZSetBatch::new(
+            batch,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+            )),
+        )
+        .unwrap()
+    };
+    core.push(InputId(0), &source(&[(Some(2), 1, 1), (None, 1, 1)]))
+        .unwrap();
+    core.push(InputId(1), &source(&[(Some(9), 1, 1)])).unwrap();
+    crate::core::graph::FACTORIZED_CUTS.with(|n| assert_eq!(n.get(), 0));
+    crate::core::graph::FLAT_ROWS_CUTS.with(|n| assert!(n.get() > 0));
+    let actual = crate::zset::consolidate(&core.snapshot(ViewId(0)).unwrap()).unwrap();
+    assert_eq!(actual.len(), 1);
+    let count = actual
+        .batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let sum = actual
+        .batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let avg = actual
+        .batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    assert_eq!(count.values(), &[2]);
+    assert_eq!(sum.values(), &[2]);
+    assert_eq!(sum.null_count(), 0);
+    assert_eq!(avg.values(), &[2.0]);
+    assert_eq!(avg.null_count(), 0);
+}
+
+#[test]
+fn flat_avg_and_forced_dense_group_join_match_each_delta_and_pending_restore() {
+    fn core() -> EngineCore {
+        let mut core = EngineCore::new();
+        core.register_input(InputId(0)).unwrap();
+        core.register_input(InputId(1)).unwrap();
+        core.build_view(
+            ViewId(0),
+            &Plan::GroupAggregate {
+                input: Box::new(Plan::Join {
+                    left: Box::new(Plan::Source(InputId(0))),
+                    right: Box::new(Plan::Source(InputId(1))),
+                    left_key: vec![0],
+                    right_key: vec![0],
+                }),
+                key: vec![0],
+                aggs: vec![AggSpec::count(), AggSpec::sum(1), AggSpec::avg(1)],
+            },
+        )
+        .unwrap();
+        core.tap_view(ViewId(0)).unwrap();
+        core
+    }
+    fn same(a: &ZSetBatch, b: &ZSetBatch) {
+        assert_eq!(a.schema(), b.schema());
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.diff().to_data(), b.diff().to_data());
+        for (a, b) in a.batch.columns().iter().zip(b.batch.columns()) {
+            assert_eq!(a.to_data(), b.to_data());
+        }
+    }
+    let mut factor = core();
+    let mut dense = core();
+    crate::core::graph::FACTORIZED_CUTS.with(|n| n.set(0));
+    crate::core::graph::DENSE_JOIN_MATERIALIZATIONS.with(|n| n.set(0));
+    crate::core::graph::FLAT_ROWS_CUTS.with(|n| n.set(0));
+    factor.push(InputId(0), &pairs(&[(1, 2, 1)])).unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(true));
+    dense.push(InputId(0), &pairs(&[(1, 2, 1)])).unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(false));
+    same(
+        &factor.take_changes(ViewId(0)).unwrap(),
+        &dense.take_changes(ViewId(0)).unwrap(),
+    );
+    let checkpoint = factor.checkpoint().unwrap();
+    factor = EngineCore::new();
+    factor.register_input(InputId(0)).unwrap();
+    factor.register_input(InputId(1)).unwrap();
+    factor
+        .build_view(
+            ViewId(0),
+            &Plan::GroupAggregate {
+                input: Box::new(Plan::Join {
+                    left: Box::new(Plan::Source(InputId(0))),
+                    right: Box::new(Plan::Source(InputId(1))),
+                    left_key: vec![0],
+                    right_key: vec![0],
+                }),
+                key: vec![0],
+                aggs: vec![AggSpec::count(), AggSpec::sum(1), AggSpec::avg(1)],
+            },
+        )
+        .unwrap();
+    factor.tap_view(ViewId(0)).unwrap();
+    factor.restore(&checkpoint).unwrap();
+    factor.push(InputId(1), &pairs(&[(1, 3, 1)])).unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(true));
+    dense.push(InputId(1), &pairs(&[(1, 3, 1)])).unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(false));
+    same(
+        &factor.take_changes(ViewId(0)).unwrap(),
+        &dense.take_changes(ViewId(0)).unwrap(),
+    );
+    same(
+        &factor.snapshot(ViewId(0)).unwrap(),
+        &dense.snapshot(ViewId(0)).unwrap(),
+    );
+    factor
+        .push(InputId(0), &pairs(&[(1, 2, -1), (1, 5, 1)]))
+        .unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(true));
+    dense
+        .push(InputId(0), &pairs(&[(1, 2, -1), (1, 5, 1)]))
+        .unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(false));
+    same(
+        &factor.take_changes(ViewId(0)).unwrap(),
+        &dense.take_changes(ViewId(0)).unwrap(),
+    );
+    same(
+        &factor.snapshot(ViewId(0)).unwrap(),
+        &dense.snapshot(ViewId(0)).unwrap(),
+    );
+    crate::core::graph::FACTORIZED_CUTS.with(|n| assert_eq!(n.get(), 0));
+    crate::core::graph::FLAT_ROWS_CUTS.with(|n| assert!(n.get() > 0));
+    crate::core::graph::DENSE_JOIN_MATERIALIZATIONS.with(|n| assert!(n.get() > 0));
+}
+
+#[test]
+fn unsafe_avg_history_stays_on_flat_fallback() {
+    let plan = Plan::GroupAggregate {
+        input: Box::new(Plan::Join {
+            left: Box::new(Plan::Source(InputId(0))),
+            right: Box::new(Plan::Source(InputId(1))),
+            left_key: vec![0],
+            right_key: vec![0],
+        }),
+        key: vec![0],
+        aggs: vec![AggSpec::count(), AggSpec::sum(1), AggSpec::avg(1)],
+    };
+    let make_core = || {
+        let mut c = EngineCore::new();
+        c.register_input(InputId(0)).unwrap();
+        c.register_input(InputId(1)).unwrap();
+        c.build_view(ViewId(0), &plan).unwrap();
+        c.tap_view(ViewId(0)).unwrap();
+        c
+    };
+    let mut factor = make_core();
+    let mut dense = make_core();
+    crate::core::graph::FACTORIZED_CUTS.with(|n| n.set(0));
+    crate::core::graph::DENSE_JOIN_MATERIALIZATIONS.with(|n| n.set(0));
+    crate::core::graph::FLAT_ROWS_CUTS.with(|n| n.set(0));
+    factor
+        .push(InputId(0), &pairs(&[(1, (1_i64 << 53) + 1, 1)]))
+        .unwrap();
+    dense
+        .push(InputId(0), &pairs(&[(1, (1_i64 << 53) + 1, 1)]))
+        .unwrap();
+    factor.push(InputId(1), &pairs(&[(1, 0, 1)])).unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(true));
+    dense.push(InputId(1), &pairs(&[(1, 0, 1)])).unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(false));
+    crate::core::graph::FACTORIZED_CUTS
+        .with(|n| assert_eq!(n.get(), 0, "unsafe AVG history must fallback"));
+    crate::core::graph::DENSE_JOIN_MATERIALIZATIONS.with(|n| assert!(n.get() > 0));
+    same_batches(
+        &factor.take_changes(ViewId(0)).unwrap(),
+        &dense.take_changes(ViewId(0)).unwrap(),
+    );
+    let replacement = pairs(&[(1, (1_i64 << 53) + 1, -1), (1, 4, 1)]);
+    factor.push(InputId(0), &replacement).unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(true));
+    dense.push(InputId(0), &replacement).unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(false));
+    same_batches(
+        &factor.take_changes(ViewId(0)).unwrap(),
+        &dense.take_changes(ViewId(0)).unwrap(),
+    );
+    factor.push(InputId(0), &pairs(&[(1, 2, 1)])).unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(true));
+    dense.push(InputId(0), &pairs(&[(1, 2, 1)])).unwrap();
+    crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(false));
+    same_batches(
+        &factor.take_changes(ViewId(0)).unwrap(),
+        &dense.take_changes(ViewId(0)).unwrap(),
+    );
+    same_batches(
+        &factor.snapshot(ViewId(0)).unwrap(),
+        &dense.snapshot(ViewId(0)).unwrap(),
+    );
+    crate::core::graph::FACTORIZED_CUTS.with(|n| assert_eq!(n.get(), 0));
+    crate::core::graph::FLAT_ROWS_CUTS.with(|n| assert!(n.get() > 0));
+}
+
+fn same_batches(a: &ZSetBatch, b: &ZSetBatch) {
+    if a.is_empty() || b.is_empty() {
+        assert!(a.is_empty() && b.is_empty());
+        return;
+    }
+    assert_eq!(a.schema(), b.schema());
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.diff().to_data(), b.diff().to_data());
+    for (a, b) in a.batch.columns().iter().zip(b.batch.columns()) {
+        assert_eq!(a.to_data(), b.to_data());
+    }
 }
 
 fn group_plan() -> Plan {
@@ -255,6 +649,39 @@ fn memory_report_counts_arrow_buffers_retained_by_pending_taps() {
             .opaque_external_categories
             .contains(&"arrow_external_buffers".to_string())
     );
+}
+
+#[test]
+fn ungrouped_join_view_uses_canonical_flat_materializer() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::Join {
+            left: Box::new(Plan::Source(InputId(0))),
+            right: Box::new(Plan::Source(InputId(1))),
+            left_key: vec![0],
+            right_key: vec![0],
+        },
+    )
+    .unwrap();
+    let left = pairs(&[(1, 10, 2), (1, 11, -1), (2, 20, 1)]);
+    let right = pairs(&[(1, 30, 1), (1, 31, 2), (2, 40, -1)]);
+    crate::core::graph::FLAT_ROWS_CUTS.with(|count| count.set(0));
+    core.push(InputId(0), &left).unwrap();
+    core.push(InputId(1), &right).unwrap();
+
+    let mut dense = crate::ops::join::Join::new(&[0], &[0]);
+    let expected = dense.apply(&left, &right).unwrap();
+    let actual = crate::zset::consolidate(&core.snapshot(ViewId(0)).unwrap()).unwrap();
+    crate::core::graph::FLAT_ROWS_CUTS.with(|count| assert!(count.get() > 0));
+    assert_eq!(actual.schema(), expected.schema());
+    assert_eq!(actual.len(), expected.len());
+    assert_eq!(actual.diff().to_data(), expected.diff().to_data());
+    for (actual, expected) in actual.batch.columns().iter().zip(expected.batch.columns()) {
+        assert_eq!(actual.to_data(), expected.to_data());
+    }
 }
 
 #[test]

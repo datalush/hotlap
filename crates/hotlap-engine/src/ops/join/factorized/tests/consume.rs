@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn staged_group_changes_have_a_production_consumer() {
-    let empty = Vec::<(Vec<u8>, GroupEntry)>::new();
+    let empty = empty_groups();
     let output_schema = schema(&[("k", DataType::Int64), ("v", DataType::Int64)]);
     let left = arrangement(&simple(&[], &[]), &[0]);
     let right = arrangement(&simple(&[], &[]), &[0]);
@@ -36,8 +36,8 @@ fn staged_group_changes_have_a_production_consumer() {
         crate::ops::join::factorized::consume::consume(&prepared, output_schema, &[0], &aggs)
             .unwrap();
     drop(prepared); // Output and snapshot own their data after input Arcs are released.
-    assert_eq!(consumed.groups.len(), 1);
-    assert_eq!(consumed.groups[0].1.rows, 4);
+    assert_eq!(consumed.changes.len(), 1);
+    assert_eq!(consumed.changes[0].1.as_ref().unwrap().rows, 4);
     // Joining left payloads 10 and 20 with two right rows yields these four
     // rows. The join/group key is 7 (simple() fixes it); 10/20 are aggregate
     // payload values, not output group keys.
@@ -107,6 +107,7 @@ fn nullable_updates_match_dense_after_each_insert_retract_remove_and_recreate() 
         (&[Some(9)], &[1]),
     ];
     let mut prior: GroupState = dense.export_state().unwrap();
+    let mut current_groups = group_map(&prior.groups);
     for (epoch, (values, weights)) in transitions.into_iter().enumerate() {
         let delta_left = nullable(values, weights);
         let mut joined_values = Vec::new();
@@ -130,7 +131,7 @@ fn nullable_updates_match_dense_after_each_insert_retract_remove_and_recreate() 
             state: OldState {
                 left: &left,
                 right: &right,
-                groups: &prior.groups,
+                groups: &current_groups,
             },
             consumer: ConsumerCaps::FactorizedAggregates,
         });
@@ -151,13 +152,24 @@ fn nullable_updates_match_dense_after_each_insert_retract_remove_and_recreate() 
         expected_rows.sort();
         assert_eq!(consumed.output.schema(), expected.schema(), "epoch {epoch}");
         assert_eq!(actual_rows, expected_rows, "epoch {epoch}");
-        assert_eq!(consumed.groups, prepared.groups, "epoch {epoch}");
+        assert_eq!(
+            consumed.changes.len(),
+            prepared.groups.len(),
+            "epoch {epoch}"
+        );
 
         let keys = KeyConverter::new(delta_left.schema().as_ref(), &[0]).unwrap();
         left.apply(&delta_left, &keys).unwrap();
+        for (key, value) in consumed.changes {
+            if let Some(value) = value {
+                current_groups.insert(key, value);
+            } else {
+                current_groups.remove(&key);
+            }
+        }
         prior = GroupState {
             schema: None,
-            groups: consumed.groups,
+            groups: groups_vec(&current_groups),
         };
     }
 
@@ -204,7 +216,7 @@ fn simultaneous_side_deltas_match_dense_including_cross_term() {
         state: OldState {
             left: &left,
             right: &right,
-            groups: &prior.groups,
+            groups: &group_map(&prior.groups),
         },
         consumer: ConsumerCaps::FactorizedAggregates,
     }) {
@@ -279,7 +291,7 @@ fn projected_group_subset_keeps_untouched_group_in_snapshot_and_output_keys() {
         state: OldState {
             left: &left,
             right: &right,
-            groups: &prior.groups,
+            groups: &group_map(&prior.groups),
         },
         consumer: ConsumerCaps::FactorizedAggregates,
     }) {
@@ -300,11 +312,15 @@ fn projected_group_subset_keeps_untouched_group_in_snapshot_and_output_keys() {
         "only touched group is retained as prior"
     );
     assert_eq!(prepared.prior_groups[0].0, super::simple_key(7));
-    assert_eq!(consumed.groups, dense.export_state().unwrap().groups);
-    assert_eq!(
-        consumed.groups.len(),
-        2,
-        "untouched group 8 remains in candidate"
-    );
-    assert_eq!(consumed.groups[1].0, super::simple_key(8));
+    let mut candidate = group_map(&prior.groups);
+    for (key, value) in consumed.changes {
+        if let Some(value) = value {
+            candidate.insert(key, value);
+        } else {
+            candidate.remove(&key);
+        }
+    }
+    assert_eq!(groups_vec(&candidate), dense.export_state().unwrap().groups);
+    assert_eq!(candidate.len(), 2, "untouched group 8 remains in candidate");
+    assert!(candidate.contains_key(&super::simple_key(8)));
 }

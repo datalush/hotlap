@@ -14,7 +14,7 @@ fn different_valid_side_schemas_are_accepted_by_per_side_mapping() {
         DeltaPair::new(1, Arc::new(left_delta), Arc::new(right_delta)),
         &left_old,
         &right_old,
-        &[],
+        &empty_groups(),
         recognition(vec![None], vec![None]),
     );
     assert!(!matches!(
@@ -37,7 +37,7 @@ fn flat_rows_consumer_cannot_receive_aggregate_only_prepared_cut() {
         state: OldState {
             left: &left,
             right: &right,
-            groups: &[],
+            groups: &empty_groups(),
         },
         consumer: ConsumerCaps::flat_rows(ConsumerCaps::DEFAULT_FLAT_CHUNK_ROWS),
     });
@@ -88,7 +88,7 @@ fn strict_group_attribution_uses_full_join_keys_then_merges_declared_subset() {
     mapping.group_key = vec![1];
     mapping.join_key_types = vec![DataType::Int64, DataType::Int64];
     let recognition = Recognition::Eligible(mapping);
-    let groups = [
+    let groups = group_map(&[
         (
             simple_key(7),
             GroupEntry {
@@ -103,7 +103,7 @@ fn strict_group_attribution_uses_full_join_keys_then_merges_declared_subset() {
                 values: vec![AggValue::Count(4)],
             },
         ),
-    ];
+    ]);
     let prior = groups.clone();
     let result = run(
         DeltaPair::new(2, Arc::new(delta_left), Arc::new(delta_right)),
@@ -119,7 +119,7 @@ fn strict_group_attribution_uses_full_join_keys_then_merges_declared_subset() {
         }
     };
     assert_eq!(
-        prepared.groups,
+        groups_vec(&apply_changes_for_test(&groups, &prepared.groups)),
         vec![
             (
                 simple_key(7),
@@ -161,13 +161,13 @@ fn absent_identity_retraction_is_dense_even_with_other_positive_delta() {
     let old = simple(&[1], &[1]);
     let left = arrangement(&old, &[0]);
     let right = arrangement(&old, &[0]);
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
             values: vec![AggValue::Count(1)],
         },
-    )];
+    )]);
     let result = run(
         DeltaPair::new(
             3,
@@ -198,7 +198,7 @@ fn zero_aggregate_shape_returns_dense_without_indexing() {
         DeltaPair::new(4, Arc::new(empty.clone()), Arc::new(empty)),
         &left,
         &right,
-        &[],
+        &empty_groups(),
         recognition(vec![], vec![]),
     );
     assert!(matches!(
@@ -212,13 +212,13 @@ fn same_join_key_retraction_and_insert_preserves_old_group_rows() {
     let old = simple(&[1], &[1]);
     let left = arrangement(&old, &[0]);
     let right = arrangement(&old, &[0]);
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
             values: vec![AggValue::Count(1)],
         },
-    )];
+    )]);
     let result = run(
         DeltaPair::new(
             40,
@@ -233,7 +233,12 @@ fn same_join_key_retraction_and_insert_preserves_old_group_rows() {
     let CutDecision::Eligible(prepared) = result else {
         panic!("safe replacement should prepare")
     };
-    assert_eq!(prepared.groups[0].1.rows, 1);
+    assert_eq!(
+        changed_entry(&prepared.groups, &simple_key(7))
+            .unwrap()
+            .rows,
+        1
+    );
 }
 
 #[test]
@@ -241,13 +246,13 @@ fn retracting_last_join_row_removes_group_from_prepared_final_state() {
     let old = simple(&[1], &[1]);
     let left = arrangement(&old, &[0]);
     let right = arrangement(&old, &[0]);
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
             values: vec![AggValue::Count(1)],
         },
-    )];
+    )]);
     let before = groups.clone();
     let result = run(
         DeltaPair::new(
@@ -264,11 +269,13 @@ fn retracting_last_join_row_removes_group_from_prepared_final_state() {
         panic!("valid final retraction should prepare")
     };
     assert!(
-        prepared.groups.is_empty(),
+        !prepared.groups.iter().any(
+            |change| matches!(change, GroupChange::Upsert { key, .. } if *key == simple_key(7))
+        ),
         "zero-row group must be absent from final prepared state"
     );
     assert_eq!(
-        prepared.group_changes,
+        prepared.groups,
         vec![GroupChange::Remove { key: simple_key(7) }]
     );
     assert_eq!(groups, before);

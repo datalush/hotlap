@@ -41,7 +41,7 @@ impl Node {
                 out.push(None);
                 input.export(out)?;
             }
-            Node::Group { input, reducer } => {
+            Node::Group { input, reducer, .. } => {
                 out.push(Some(OperatorState::Group(reducer.export_state()?)));
                 input.export(out)?;
             }
@@ -75,7 +75,7 @@ impl Node {
                 cursor.expect_stateless()?;
                 input.import(cursor)
             }
-            Node::Group { input, reducer } => {
+            Node::Group { input, reducer, .. } => {
                 reducer.import_state(cursor.take_group()?)?;
                 input.import(cursor)
             }

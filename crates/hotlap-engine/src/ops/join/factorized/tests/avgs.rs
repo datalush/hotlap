@@ -7,7 +7,7 @@ fn avg_negative_zero_history_is_rejected_as_non_exact() {
     let old_right_z = simple(&[1], &[1]);
     let left = arrangement(&old_left_z, &[0]);
     let right = arrangement(&old_right_z, &[0]);
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
@@ -19,7 +19,7 @@ fn avg_negative_zero_history_is_rejected_as_non_exact() {
                 neg_inf: 0,
             }],
         },
-    )];
+    )]);
     let mapping = Recognition::Eligible(ColumnMapping {
         left_source: InputId(0),
         right_source: InputId(1),
@@ -94,7 +94,7 @@ fn avg_old_history_includes_untouched_full_keys_collapsed_to_subset_group() {
         func: AggFunc::Avg,
         input: Some(2),
     }];
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 2,
@@ -106,7 +106,7 @@ fn avg_old_history_includes_untouched_full_keys_collapsed_to_subset_group() {
                 neg_inf: 0,
             }],
         },
-    )];
+    )]);
     let result = run_with_aggs(
         DeltaPair::new(24, Arc::new(delta_left), Arc::new(delta_right)),
         &left,
@@ -119,7 +119,9 @@ fn avg_old_history_includes_untouched_full_keys_collapsed_to_subset_group() {
         panic!("old AVG derivation must include untouched same-subset key")
     };
     assert_eq!(
-        prepared.groups[0].1,
+        changed_entry(&prepared.groups, &simple_key(7))
+            .unwrap()
+            .clone(),
         GroupEntry {
             rows: 3,
             values: vec![AggValue::Avg {
@@ -131,6 +133,188 @@ fn avg_old_history_includes_untouched_full_keys_collapsed_to_subset_group() {
             }]
         }
     );
+    crate::ops::join::factorized::OLD_HISTORY_KEYS_CANDIDATE
+        .with(|count| assert_eq!(count.get(), 4));
+}
+
+#[test]
+fn full_group_key_coverage_detects_permuted_duplicate_mapping() {
+    let mut mapping = match recognition(vec![None], vec![None]) {
+        Recognition::Eligible(mapping) => mapping,
+        _ => unreachable!(),
+    };
+    mapping.group_key = vec![0, 1, 0];
+    mapping.join_key_types = vec![DataType::Int64, DataType::Int64];
+    assert!(group_key_covers_join_key(&mapping));
+    mapping.group_key = vec![0, 0];
+    assert!(!group_key_covers_join_key(&mapping));
+}
+
+#[test]
+fn full_group_key_coverage_avoids_arrangement_metadata_scan() {
+    let s = schema(&[
+        ("k1", DataType::Int64),
+        ("k2", DataType::Int64),
+        ("v", DataType::Int64),
+    ]);
+    let make = |keys: &[(i64, i64)], values: &[i64], diffs: &[i64]| {
+        zset(
+            s.clone(),
+            vec![
+                Arc::new(Int64Array::from(
+                    keys.iter().map(|key| key.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    keys.iter().map(|key| key.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(values.to_vec())),
+            ],
+            diffs,
+        )
+    };
+    let old_l = make(&[(1, 1), (2, 2), (3, 3)], &[10, 20, 30], &[1; 3]);
+    let old_r = make(&[(1, 1), (2, 2), (3, 3)], &[2, 3, 4], &[1; 3]);
+    let left = arrangement(&old_l, &[0, 1]);
+    let right = arrangement(&old_r, &[0, 1]);
+    let delta_l = make(&[(1, 1)], &[11], &[1]);
+    let delta_r = make(&[], &[], &[]);
+    let mut mapping = match recognition(vec![None], vec![None]) {
+        Recognition::Eligible(mapping) => mapping,
+        _ => unreachable!(),
+    };
+    mapping.left_join_key = vec![0, 1];
+    mapping.right_join_key = vec![0, 1];
+    mapping.join_key_types = vec![DataType::Int64, DataType::Int64];
+    mapping.group_key = vec![0, 1, 0];
+    mapping.aggregate_inputs = vec![None];
+    mapping.aggregate_input_types = vec![None];
+    let join_conv = arrow::row::RowConverter::new(vec![
+        arrow::row::SortField::new(DataType::Int64),
+        arrow::row::SortField::new(DataType::Int64),
+    ])
+    .unwrap();
+    let group_conv = arrow::row::RowConverter::new(vec![
+        arrow::row::SortField::new(DataType::Int64),
+        arrow::row::SortField::new(DataType::Int64),
+        arrow::row::SortField::new(DataType::Int64),
+    ])
+    .unwrap();
+    let groups = group_map(
+        &[(1, 1), (2, 2), (3, 3)]
+            .iter()
+            .map(|&(a, b)| {
+                let encoded = join_conv
+                    .convert_columns(&[
+                        Arc::new(Int64Array::from(vec![a])),
+                        Arc::new(Int64Array::from(vec![b])),
+                    ])
+                    .unwrap();
+                let key = super::super::prepare::group_key_for(
+                    &join_conv,
+                    &group_conv,
+                    encoded.row(0).as_ref(),
+                    &[0, 1, 0],
+                )
+                .unwrap();
+                (
+                    key,
+                    GroupEntry {
+                        rows: 1,
+                        values: vec![AggValue::Count(1)],
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let touched_encoded = join_conv
+        .convert_columns(&[
+            Arc::new(Int64Array::from(vec![1_i64])),
+            Arc::new(Int64Array::from(vec![1_i64])),
+        ])
+        .unwrap();
+    let touched_group_key = super::super::prepare::group_key_for(
+        &join_conv,
+        &group_conv,
+        touched_encoded.row(0).as_ref(),
+        &[0, 1, 0],
+    )
+    .unwrap();
+    let result = run_with_aggs(
+        DeltaPair::new(1, Arc::new(delta_l), Arc::new(delta_r)),
+        &left,
+        &right,
+        &groups,
+        Recognition::Eligible(mapping),
+        &[AggSpec::count()],
+    );
+    let CutDecision::Eligible(prepared) = result else {
+        panic!("valid full-key state must remain eligible")
+    };
+    assert_eq!(prepared.groups.len(), 1);
+    crate::ops::join::factorized::OLD_HISTORY_KEYS_CANDIDATE
+        .with(|count| assert_eq!(count.get(), 0));
+    crate::ops::join::factorized::OLD_HISTORY_DIRECT_LOOKUPS
+        .with(|count| assert_eq!(count.get(), 2));
+    crate::ops::join::factorized::OLD_BUCKET_DECODES.with(|count| assert_eq!(count.get(), 2));
+    let mut corrupt = groups.clone();
+    corrupt.remove(&touched_group_key);
+    assert!(matches!(
+        run_with_aggs(
+            DeltaPair::new(
+                2,
+                Arc::new(make(&[(1, 1)], &[11], &[1])),
+                Arc::new(make(&[], &[], &[]))
+            ),
+            &left,
+            &right,
+            &corrupt,
+            Recognition::Eligible({
+                let mut mapping = match recognition(vec![None], vec![None]) {
+                    Recognition::Eligible(mapping) => mapping,
+                    _ => unreachable!(),
+                };
+                mapping.left_join_key = vec![0, 1];
+                mapping.right_join_key = vec![0, 1];
+                mapping.join_key_types = vec![DataType::Int64, DataType::Int64];
+                mapping.group_key = vec![0, 1, 0];
+                mapping.aggregate_inputs = vec![None];
+                mapping.aggregate_input_types = vec![None];
+                mapping
+            }),
+            &[AggSpec::count()],
+        ),
+        CutDecision::Dense(DenseReason::StateShape)
+    ));
+    let mut wrong_count = groups.clone();
+    wrong_count.get_mut(&touched_group_key).unwrap().rows = 2;
+    wrong_count.get_mut(&touched_group_key).unwrap().values = vec![AggValue::Count(2)];
+    assert!(matches!(
+        run_with_aggs(
+            DeltaPair::new(
+                3,
+                Arc::new(make(&[(1, 1)], &[11], &[1])),
+                Arc::new(make(&[], &[], &[]))
+            ),
+            &left,
+            &right,
+            &wrong_count,
+            Recognition::Eligible({
+                let mut mapping = match recognition(vec![None], vec![None]) {
+                    Recognition::Eligible(mapping) => mapping,
+                    _ => unreachable!(),
+                };
+                mapping.left_join_key = vec![0, 1];
+                mapping.right_join_key = vec![0, 1];
+                mapping.join_key_types = vec![DataType::Int64, DataType::Int64];
+                mapping.group_key = vec![0, 1, 0];
+                mapping.aggregate_inputs = vec![None];
+                mapping.aggregate_input_types = vec![None];
+                mapping
+            }),
+            &[AggSpec::count()],
+        ),
+        CutDecision::Dense(DenseReason::StateShape)
+    ));
 }
 
 #[test]
@@ -195,7 +379,7 @@ fn avg_proposed_absolute_state_includes_old_cancelled_full_keys() {
         func: AggFunc::Avg,
         input: Some(2),
     }];
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 2,
@@ -207,7 +391,7 @@ fn avg_proposed_absolute_state_includes_old_cancelled_full_keys() {
                 neg_inf: 0,
             }],
         },
-    )];
+    )]);
     let delta_left = left_batch(&[(4, 7)], &[1], &[1]);
     let delta_right = right_batch(&[], &[]);
     let result = run_with_aggs(
@@ -237,7 +421,9 @@ fn avg_proposed_absolute_state_includes_old_cancelled_full_keys() {
         panic!("retraction reducing proposed absolute AVG history should stay eligible")
     };
     assert_eq!(
-        prepared.groups[0].1,
+        changed_entry(&prepared.groups, &simple_key(7))
+            .unwrap()
+            .clone(),
         GroupEntry {
             rows: 1,
             values: vec![AggValue::Avg {
@@ -290,7 +476,7 @@ fn avg_intermediate_absolute_sum_bound_rejects_rounding_path() {
         func: AggFunc::Avg,
         input: Some(2),
     }];
-    let old_groups = [(
+    let old_groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 2,
@@ -302,7 +488,7 @@ fn avg_intermediate_absolute_sum_bound_rejects_rounding_path() {
                 neg_inf: 0,
             }],
         },
-    )];
+    )]);
 
     let mut dense = crate::ops::group_aggregate::GroupAggregate::new(&[0], aggs.to_vec());
     let dense_old_changes = dense
@@ -355,7 +541,7 @@ fn avg_integer_history_over_exact_f64_domain_selects_dense() {
     let right_old = simple(&[1], &[1]);
     let left = arrangement(&old, &[0]);
     let right = arrangement(&right_old, &[0]);
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
@@ -367,7 +553,7 @@ fn avg_integer_history_over_exact_f64_domain_selects_dense() {
                 neg_inf: 0,
             }],
         },
-    )];
+    )]);
     let mapping = Recognition::Eligible(ColumnMapping {
         left_source: InputId(0),
         right_source: InputId(1),
@@ -435,7 +621,7 @@ fn new_avg_rejects_unsafe_cancellation_that_dense_fold_rounds() {
         DeltaPair::new(27, Arc::new(input), Arc::new(simple(&[], &[]))),
         &left,
         &right,
-        &[],
+        &empty_groups(),
         mapping,
         &aggs,
     );
@@ -470,7 +656,7 @@ fn new_avg_exact_small_cancellation_remains_eligible() {
         DeltaPair::new(28, Arc::new(input), Arc::new(simple(&[], &[]))),
         &left,
         &right,
-        &[],
+        &empty_groups(),
         mapping,
         &aggs,
     );
@@ -478,7 +664,9 @@ fn new_avg_exact_small_cancellation_remains_eligible() {
         panic!("exact cancellation within the bound should be eligible")
     };
     assert_eq!(
-        prepared.groups[0].1.values,
+        changed_entry(&prepared.groups, &simple_key(7))
+            .unwrap()
+            .values,
         vec![AggValue::Avg {
             sum: 0.0,
             count: 2,

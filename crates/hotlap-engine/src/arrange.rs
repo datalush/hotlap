@@ -1,4 +1,6 @@
 mod per_key;
+pub(crate) mod source_stats;
+mod source_stats_registration;
 #[doc(hidden)]
 pub mod state;
 
@@ -8,7 +10,9 @@ mod factorized_join_count;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, new_empty_array};
+use arrow::array::{
+    Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, new_empty_array,
+};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, Row, RowConverter};
@@ -17,10 +21,24 @@ use crate::batch::ZSetBatch;
 use crate::error::EngineError;
 use crate::keys::{KeyConverter, converter_for};
 use crate::zset::int64_diffs;
+use source_stats::{SourceColumnDemand, SourceColumnValue, SourceStats};
 use state::RowState;
 
 #[cfg(test)]
 mod numeric_arrangement_tests;
+#[cfg(test)]
+mod source_stats_tests;
+
+thread_local! {
+    #[cfg(test)]
+    static SOURCE_STATS_REBUILD_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static SOURCE_STATS_KEY_DECODE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static SOURCE_STATS_PAYLOAD_ROWS_DECODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static SOURCE_STATS_ORDINARY_VALUES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Incremental keyed state: `key-row -> payload-row -> diff`.
 ///
@@ -35,15 +53,286 @@ pub struct KeyedArrangement {
     key_converter: RowConverter,
     payload_converter: RowConverter,
     state: RowState,
+    source_stats_demand: Option<Vec<SourceColumnDemand>>,
+    source_stats: HashMap<Vec<u8>, SourceStats>,
+}
+
+pub(crate) struct StagedFinalWeights {
+    rows: Vec<(OwnedRow, OwnedRow, i64)>,
+    source_stats: HashMap<Vec<u8>, Option<SourceStats>>,
+}
+
+pub(crate) struct PreparedSourceUpdate {
+    staged: StagedFinalWeights,
+}
+
+impl PreparedSourceUpdate {
+    pub(crate) fn changed_keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.staged.source_stats.keys().map(|key| key.as_slice())
+    }
+
+    pub(crate) fn proposed_stats<'a>(
+        &'a self,
+        owner: &'a KeyedArrangement,
+        key: &[u8],
+    ) -> Option<&'a SourceStats> {
+        match self.staged.source_stats.get(key) {
+            Some(stats) => stats.as_ref(),
+            None => owner.source_stats.get(key),
+        }
+    }
+
+    pub(crate) fn commit(self, owner: &mut KeyedArrangement) {
+        owner.commit_final_weights(self.staged);
+    }
 }
 
 impl KeyedArrangement {
+    pub(crate) fn prepare_source_update(
+        &self,
+        batch: &ZSetBatch,
+        keys: &KeyConverter,
+    ) -> Result<PreparedSourceUpdate, EngineError> {
+        if keys.column_indices() != self.key_indices.as_slice() {
+            return Err(EngineError::Unsupported(
+                "key converter does not match arrangement keys".into(),
+            ));
+        }
+        if batch.schema() != self.schema {
+            return Err(EngineError::Unsupported(
+                "arrangement input schema changed".into(),
+            ));
+        }
+        let key_rows = keys.convert(batch.batch.columns())?;
+        let payload_columns = self
+            .payload_indices
+            .iter()
+            .map(|&i| batch.batch.column(i).clone())
+            .collect::<Vec<_>>();
+        let payload_rows = if payload_columns.is_empty() {
+            None
+        } else {
+            Some(self.payload_converter.convert_columns(&payload_columns)?)
+        };
+        let diffs = int64_diffs(batch.diff())?;
+        let mut staged = HashMap::<(Vec<u8>, OwnedRow), (i64, i64)>::new();
+        for row in 0..batch.len() {
+            let key = key_rows.row(row).as_ref().to_vec();
+            let payload = match &payload_rows {
+                Some(rows) => rows.row(row).owned(),
+                None => self.unit_payload(),
+            };
+            let id = (key, payload);
+            let old = staged.get(&id).map_or_else(
+                || self.state.get(&id.0, &id.1).copied().unwrap_or(0),
+                |pair| pair.1,
+            );
+            let new = old
+                .checked_add(diffs.value(row))
+                .ok_or(EngineError::NumericOverflow(
+                    "arrangement multiplicity addition",
+                ))?;
+            staged
+                .entry(id)
+                .and_modify(|pair| pair.1 = new)
+                .or_insert((old, new));
+        }
+        let rows = staged
+            .into_iter()
+            .map(|((key, payload), (old, new))| (key, payload.as_ref().to_vec(), old, new))
+            .collect::<Vec<_>>();
+        Ok(PreparedSourceUpdate {
+            staged: self.stage_final_weights(&self.schema, &rows)?,
+        })
+    }
+
+    #[allow(dead_code)] // The aggregate consumer is the next approved child slice.
+    pub(crate) fn source_stats(&self, key: &[u8]) -> Option<&SourceStats> {
+        self.source_stats.get(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_stats_rebuild_rows_visited_for_test() -> usize {
+        SOURCE_STATS_REBUILD_ROWS_VISITED.with(std::cell::Cell::get)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_source_stats_rebuild_rows_visited_for_test() {
+        SOURCE_STATS_REBUILD_ROWS_VISITED.with(|visited| visited.set(0));
+        SOURCE_STATS_KEY_DECODE_CALLS.with(|decodes| decodes.set(0));
+        SOURCE_STATS_PAYLOAD_ROWS_DECODED.with(|count| count.set(0));
+        SOURCE_STATS_ORDINARY_VALUES_READ.with(|count| count.set(0));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_stats_key_decode_calls_for_test() -> usize {
+        SOURCE_STATS_KEY_DECODE_CALLS.with(std::cell::Cell::get)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_stats_payload_rows_decoded_for_test() -> usize {
+        SOURCE_STATS_PAYLOAD_ROWS_DECODED.with(std::cell::Cell::get)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_stats_ordinary_values_read_for_test() -> usize {
+        SOURCE_STATS_ORDINARY_VALUES_READ.with(std::cell::Cell::get)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_stats_entries_for_test(&self) -> usize {
+        self.source_stats.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_stats_capacity_for_test(&self) -> usize {
+        self.source_stats.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bucket_kind_for_test(&self, key: &[u8]) -> Option<&'static str> {
+        let key = self.key_converter.parser().parse(key).owned();
+        self.state.bucket_kind(key.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn weight_for_test(&self, key_bytes: &[u8], payload_bytes: &[u8]) -> i64 {
+        let key = self.key_converter.parser().parse(key_bytes).owned();
+        let payload = self.payload_converter.parser().parse(payload_bytes).owned();
+        self.state.weight(key.as_ref(), &payload)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_batch_for_test(
+        &self,
+        batch: &ZSetBatch,
+        keys: &KeyConverter,
+    ) -> Result<(Vec<(OwnedRow, OwnedRow, i64)>, Vec<StagedProbeRow>), EngineError> {
+        if keys.column_indices() != self.key_indices.as_slice() {
+            return Err(EngineError::Unsupported(
+                "key converter does not match arrangement keys".into(),
+            ));
+        }
+        let key_rows = keys.convert(batch.batch.columns())?;
+        let payload_columns = self
+            .payload_indices
+            .iter()
+            .map(|&i| batch.batch.column(i).clone())
+            .collect::<Vec<_>>();
+        let payload_rows = self.payload_converter.convert_columns(&payload_columns)?;
+        let diffs = int64_diffs(batch.diff())?;
+        let mut staged = HashMap::<(Vec<u8>, OwnedRow), i64>::new();
+        let mut decoded = Vec::with_capacity(batch.len());
+        for row in 0..batch.len() {
+            let key = key_rows.row(row).owned();
+            let payload = payload_rows.row(row).owned();
+            let id = (key.as_ref().to_vec(), payload.clone());
+            let old = staged
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| self.state.weight(&id.0, &id.1));
+            let new = old
+                .checked_add(diffs.value(row))
+                .ok_or(EngineError::NumericOverflow(
+                    "arrangement multiplicity addition",
+                ))?;
+            staged.insert(id, new);
+            decoded.push(StagedProbeRow {
+                key: key.as_ref().to_vec(),
+                old_weight: old,
+                new_weight: new,
+            });
+        }
+        Ok((
+            staged
+                .into_iter()
+                .map(|((key, payload), weight)| {
+                    (
+                        self.key_converter.parser().parse(&key).owned(),
+                        payload,
+                        weight,
+                    )
+                })
+                .collect(),
+            decoded,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_batch_for_test(&mut self, rows: Vec<(OwnedRow, OwnedRow, i64)>) {
+        self.state.commit_weights(rows);
+    }
+
+    pub(crate) fn stage_final_weights(
+        &self,
+        schema: &SchemaRef,
+        rows: &[(Vec<u8>, Vec<u8>, i64, i64)],
+    ) -> Result<StagedFinalWeights, EngineError> {
+        if schema != &self.schema {
+            return Err(EngineError::Unsupported(
+                "cut arrangement schema changed".into(),
+            ));
+        }
+        let mut staged = Vec::with_capacity(rows.len());
+        let mut source_stats = HashMap::<Vec<u8>, Option<SourceStats>>::new();
+        source_stats.reserve(rows.len());
+        let source_values = match &self.source_stats_demand {
+            Some(demand) => Some(source_stats_registration::values_for_changed_rows(
+                self, rows, demand,
+            )?),
+            None => None,
+        };
+        for (index, (key_bytes, payload_bytes, old, new)) in rows.iter().enumerate() {
+            let key = self.key_converter.parser().parse(key_bytes).owned();
+            let payload = self.payload_converter.parser().parse(payload_bytes).owned();
+            let actual = self.state.get(key.as_ref(), &payload).copied().unwrap_or(0);
+            if actual != *old {
+                return Err(EngineError::Unsupported(
+                    "cut arrangement old weight changed".into(),
+                ));
+            }
+            if self.source_stats_demand.is_some() {
+                let values = &source_values.as_ref().expect("demand values staged")[index];
+                let current = match source_stats.get(key_bytes.as_slice()) {
+                    Some(Some(stats)) => stats.clone(),
+                    Some(None) => SourceStats::default(),
+                    None => self
+                        .source_stats
+                        .get(key_bytes.as_slice())
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                let next = current.stage_weight_change(*old, *new, values)?;
+                source_stats.insert(key_bytes.clone(), (next.support > 0).then_some(next));
+            }
+            staged.push((key, payload, *new));
+        }
+        Ok(StagedFinalWeights {
+            rows: staged,
+            source_stats,
+        })
+    }
+
+    pub(crate) fn commit_final_weights(&mut self, staged: StagedFinalWeights) {
+        for (key, payload, weight) in staged.rows {
+            self.state.set_weight(key, payload, weight);
+        }
+        for (key, stats) in staged.source_stats {
+            if let Some(stats) = stats {
+                self.source_stats.insert(key, stats);
+            } else {
+                self.source_stats.remove(&key);
+            }
+        }
+    }
+
     pub(crate) fn has_storage(&self) -> bool {
         self.state.has_storage()
     }
 
     pub(crate) fn memory_usage(&self) -> Result<(usize, usize, usize), EngineError> {
-        let (payload, state_capacity, structural) = self.state.memory_usage()?;
+        let (payload, state_capacity, mut structural) = self.state.memory_usage()?;
+        let mut key_capacity = state_capacity;
         let index_capacity = self
             .key_indices
             .capacity()
@@ -52,10 +341,48 @@ impl KeyedArrangement {
             .ok_or_else(|| {
                 EngineError::Infrastructure("arrangement index capacity overflow".into())
             })?;
-        let capacity = state_capacity
+        key_capacity = key_capacity
             .checked_add(index_capacity)
             .ok_or_else(|| EngineError::Infrastructure("arrangement capacity overflow".into()))?;
-        Ok((payload, capacity, structural))
+        structural = structural
+            .checked_add(
+                self.source_stats
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<(Vec<u8>, SourceStats)>())
+                    .ok_or_else(|| {
+                        EngineError::Infrastructure("source stats capacity overflow".into())
+                    })?,
+            )
+            .ok_or_else(|| EngineError::Infrastructure("source stats size overflow".into()))?;
+        for (key, stats) in &self.source_stats {
+            key_capacity = key_capacity
+                .checked_add(key.capacity())
+                .ok_or_else(|| EngineError::Infrastructure("source stats key overflow".into()))?;
+            structural = structural
+                .checked_add(
+                    stats
+                        .columns
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<source_stats::SourceColumnStats>())
+                        .ok_or_else(|| {
+                            EngineError::Infrastructure("source stats columns overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| EngineError::Infrastructure("source stats size overflow".into()))?;
+        }
+        if let Some(demand) = &self.source_stats_demand {
+            structural = structural
+                .checked_add(
+                    demand
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<SourceColumnDemand>())
+                        .ok_or_else(|| {
+                            EngineError::Infrastructure("source demand capacity overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| EngineError::Infrastructure("source demand size overflow".into()))?;
+        }
+        Ok((payload, key_capacity, structural))
     }
 
     /// Builds an arrangement over the key columns named by `key_indices`.
@@ -81,6 +408,8 @@ impl KeyedArrangement {
             key_indices: key_indices.to_vec(),
             payload_indices,
             state: RowState::default(),
+            source_stats_demand: None,
+            source_stats: HashMap::new(),
         })
     }
 
@@ -107,6 +436,10 @@ impl KeyedArrangement {
     /// Returns `true` when no entry survives.
     pub fn is_empty(&self) -> bool {
         self.state.is_empty()
+    }
+
+    pub(crate) fn iter_key_bytes(&self) -> impl Iterator<Item = &[u8]> {
+        self.state.keys()
     }
 
     /// Schema column indices treated as keys by this arrangement.
@@ -168,6 +501,7 @@ impl KeyedArrangement {
             Some(self.payload_converter.convert_columns(&payload_columns)?)
         };
         let diffs = int64_diffs(batch.diff())?;
+        let source_demand = self.source_stats_demand.as_deref();
         let mut staged: HashMap<(Vec<u8>, OwnedRow), i64> = HashMap::new();
         let mut touched = Vec::new();
         for index in 0..batch.len() {
@@ -199,13 +533,41 @@ impl KeyedArrangement {
                     "arrangement multiplicity addition",
                 ))?;
             if !staged.contains_key(&identity) {
-                touched.push((key, payload));
+                let values = if let Some(demand) = source_demand {
+                    batch_values(&batch.batch, index, demand)?
+                } else {
+                    Vec::new()
+                };
+                touched.push((key, payload, old, values));
             }
             staged.insert(identity, next);
         }
-        for (key, payload) in touched {
+        let mut source_updates = HashMap::<Vec<u8>, SourceStats>::new();
+        if source_demand.is_some() {
+            for (key, payload, old, values) in &touched {
+                let identity = (key.as_ref().to_vec(), payload.clone());
+                let new = staged[&identity];
+                let current = source_updates
+                    .get(key.as_ref())
+                    .or_else(|| self.source_stats.get(key.as_ref()))
+                    .cloned()
+                    .unwrap_or_default();
+                source_updates.insert(
+                    key.as_ref().to_vec(),
+                    current.stage_weight_change(*old, new, values)?,
+                );
+            }
+        }
+        for (key, payload, _, _) in touched {
             let weight = staged[&(key.as_ref().to_vec(), payload.clone())];
             self.state.set_weight(key, payload, weight);
+        }
+        for (key, stats) in source_updates {
+            if stats.support == 0 {
+                self.source_stats.remove(&key);
+            } else {
+                self.source_stats.insert(key, stats);
+            }
         }
         Ok(())
     }
@@ -255,9 +617,60 @@ impl KeyedArrangement {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct StagedProbeRow {
+    pub(crate) key: Vec<u8>,
+    pub(crate) old_weight: i64,
+    pub(crate) new_weight: i64,
+}
+
 /// Decodes `arrow::row` bytes back into column arrays for `converter`.
 fn decode(converter: &RowConverter, rows: &[&[u8]]) -> Result<Vec<ArrayRef>, EngineError> {
     let parser = converter.parser();
     let parsed: Vec<Row<'_>> = rows.iter().map(|row| parser.parse(row)).collect();
     Ok(converter.convert_rows(parsed)?)
+}
+
+fn batch_values(
+    batch: &RecordBatch,
+    row: usize,
+    demand: &[SourceColumnDemand],
+) -> Result<Vec<SourceColumnValue>, EngineError> {
+    let values = demand
+        .iter()
+        .map(|column| source_column_value(batch.column(column.index).as_ref(), row, column.sum))
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(test)]
+    SOURCE_STATS_ORDINARY_VALUES_READ.with(|count| count.set(count.get() + values.len()));
+    Ok(values)
+}
+
+pub(super) fn source_column_value(
+    array: &dyn Array,
+    row: usize,
+    sum: bool,
+) -> Result<SourceColumnValue, EngineError> {
+    let is_null = array.is_null(row);
+    let integer = if sum && !is_null {
+        if let Some(values) = array.as_any().downcast_ref::<Int8Array>() {
+            Some(i128::from(values.value(row)))
+        } else if let Some(values) = array.as_any().downcast_ref::<Int16Array>() {
+            Some(i128::from(values.value(row)))
+        } else if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
+            Some(i128::from(values.value(row)))
+        } else if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+            Some(i128::from(values.value(row)))
+        } else {
+            return Err(EngineError::Unsupported(
+                "source SUM stats require signed integer values".into(),
+            ));
+        }
+    } else {
+        None
+    };
+    Ok(SourceColumnValue {
+        is_null,
+        integer,
+        sum,
+    })
 }

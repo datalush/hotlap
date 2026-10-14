@@ -29,6 +29,9 @@ enum Node {
     Group {
         input: Box<Node>,
         reducer: GroupAggregate,
+        cut_plan: Option<Box<Plan>>,
+        outer_project: Option<Vec<usize>>,
+        registered_demand: Option<crate::ops::join::factorized::demand::Demand>,
     },
     Joined {
         left: Box<Node>,
@@ -49,6 +52,17 @@ struct EvalCtx<'a> {
     delta: &'a ZSetBatch,
     schemas: &'a HashMap<InputId, SchemaRef>,
     watermark: i64,
+    epoch: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static FACTORIZED_CUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static FORCE_DENSE_GROUP_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static DENSE_JOIN_MATERIALIZATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static DENSE_JOIN_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static DENSE_JOIN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(super) static FLAT_ROWS_CUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A persistent plan compiled to stateful nodes for one view.
@@ -90,14 +104,23 @@ impl ViewGraph {
         delta: &ZSetBatch,
         schemas: &HashMap<InputId, SchemaRef>,
         watermark: i64,
+        epoch: u64,
     ) -> Result<Option<ZSetBatch>, crate::error::EngineError> {
         let mut ctx = EvalCtx {
             pushed,
             delta,
             schemas,
             watermark,
+            epoch,
         };
         self.root.eval(&mut ctx)
+    }
+
+    pub(super) fn rebuild_derived(
+        &mut self,
+        schemas: &HashMap<InputId, SchemaRef>,
+    ) -> Result<(), crate::error::EngineError> {
+        self.root.rebuild_derived(schemas)
     }
 
     pub(super) fn memory_usage(
@@ -125,6 +148,14 @@ fn compile(plan: &Plan) -> Node {
         Plan::GroupAggregate { input, key, aggs } => Node::Group {
             input: Box::new(compile(input)),
             reducer: GroupAggregate::new(key, aggs.clone()),
+            cut_plan: is_factorized_shape(input).then(|| Box::new(plan.clone())),
+            registered_demand: None,
+            outer_project: match input.as_ref() {
+                Plan::Project { cols, input } if matches!(input.as_ref(), Plan::Join { .. }) => {
+                    Some(cols.clone())
+                }
+                _ => None,
+            },
         },
         Plan::Join {
             left,
@@ -147,5 +178,23 @@ fn compile(plan: &Plan) -> Node {
             input: Box::new(compile(input)),
             reducer: TumbleCount::new(key, *time_col, *size),
         },
+    }
+}
+
+fn is_factorized_shape(plan: &Plan) -> bool {
+    match plan {
+        Plan::Join { left, right, .. } => is_relation_shape(left) && is_relation_shape(right),
+        Plan::Project { input, .. } => {
+            matches!(input.as_ref(), Plan::Join { left, right, .. } if is_relation_shape(left) && is_relation_shape(right))
+        }
+        _ => false,
+    }
+}
+
+fn is_relation_shape(plan: &Plan) -> bool {
+    match plan {
+        Plan::Source(_) => true,
+        Plan::Project { input, .. } => matches!(input.as_ref(), Plan::Source(_)),
+        _ => false,
     }
 }

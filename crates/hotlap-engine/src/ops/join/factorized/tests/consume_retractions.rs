@@ -60,7 +60,7 @@ fn retracting_last_nonnull_value_emits_null_row_while_group_survives() {
         state: OldState {
             left: &left,
             right: &right,
-            groups: &prior.groups,
+            groups: &group_map(&prior.groups),
         },
         consumer: ConsumerCaps::FactorizedAggregates,
     }) {
@@ -85,11 +85,8 @@ fn retracting_last_nonnull_value_emits_null_row_while_group_survives() {
         2,
         "retraction and NULL-valued replacement"
     );
-    assert_eq!(consumed.groups.len(), 1);
-    assert_eq!(consumed.groups[0].1.rows, 2);
-    assert_eq!(consumed.groups[0].1.values[1], AggValue::Count(0));
-    assert_eq!(
-        consumed.groups[0].1.values[2],
-        AggValue::SumInteger { sum: 0, count: 0 }
-    );
+    let entry = consumed.changes[0].1.as_ref().unwrap();
+    assert_eq!(entry.rows, 2);
+    assert_eq!(entry.values[1], AggValue::Count(0));
+    assert_eq!(entry.values[2], AggValue::SumInteger { sum: 0, count: 0 });
 }

@@ -1,8 +1,7 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, UInt32Array, new_empty_array};
-use arrow::compute::{concat, take};
+use arrow::array::{ArrayRef, Int64Array, UInt32Array};
+use arrow::compute::{concat, concat_batches, take};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
@@ -12,8 +11,76 @@ use crate::error::EngineError;
 use crate::keys::{KeyConverter, full_converter};
 use crate::ops::join::delta::delta_buckets;
 use crate::ops::join::helpers::touched_union;
+use crate::ops::join::{Join, PreparedJoinSources};
+
+/// Rows and canonical source replacements prepared together, but not yet
+/// published. Callers may first apply the rows to a downstream reducer.
+pub(crate) struct PreparedFlatJoinUpdate {
+    sources: PreparedJoinSources,
+    output: ZSetBatch,
+}
+
+impl PreparedFlatJoinUpdate {
+    pub(crate) fn output(&self) -> &ZSetBatch {
+        &self.output
+    }
+
+    pub(crate) fn commit(self, join: &mut Join) {
+        join.commit_source_updates(self.sources);
+    }
+}
+
+/// Stages canonical row/stat updates before materializing the delta from the
+/// old arrangements. No source state is published until `commit`.
+pub(crate) fn prepare_flat_join_update(
+    join: &mut Join,
+    left_delta: &ZSetBatch,
+    right_delta: &ZSetBatch,
+    max_rows: usize,
+) -> Result<PreparedFlatJoinUpdate, EngineError> {
+    let schema = join.cut_schema(left_delta, right_delta)?;
+    let sources = join.prepare_source_updates(left_delta, right_delta)?;
+    let output = materialize_flat_delta(join, &sources, left_delta, right_delta, schema, max_rows)?;
+    Ok(PreparedFlatJoinUpdate { sources, output })
+}
+
+/// Materializes only from authoritative old arrangements and the raw Arrow
+/// deltas. `sources` proves both common source updates already validated and
+/// staged; it is deliberately not recomputed here.
+pub(crate) fn materialize_flat_delta(
+    join: &Join,
+    _sources: &PreparedJoinSources,
+    left_delta: &ZSetBatch,
+    right_delta: &ZSetBatch,
+    output_schema: arrow::datatypes::SchemaRef,
+    max_rows: usize,
+) -> Result<ZSetBatch, EngineError> {
+    let left = join.left_for_cut().ok_or_else(|| {
+        EngineError::Infrastructure("flat join left arrangement uninitialized".into())
+    })?;
+    let right = join.right_for_cut().ok_or_else(|| {
+        EngineError::Infrastructure("flat join right arrangement uninitialized".into())
+    })?;
+    let output = FlatRowsCursor::from_join_delta(
+        left,
+        right,
+        left_delta,
+        right_delta,
+        left.key_indices(),
+        right.key_indices(),
+        max_rows,
+    )?
+    .collect()?;
+    if output.schema() != output_schema {
+        return Err(EngineError::Infrastructure(
+            "flat join materializer produced an unexpected schema".into(),
+        ));
+    }
+    Ok(output)
+}
 
 struct PairTerm {
+    key_index: usize,
     left: ZSetBatch,
     right: ZSetBatch,
 }
@@ -39,6 +106,7 @@ impl FlatRowsCursor {
     ) -> Result<Self, EngineError> {
         Self::from_terms(
             vec![PairTerm {
+                key_index: 0,
                 left: left.clone(),
                 right: right.clone(),
             }],
@@ -83,7 +151,7 @@ impl FlatRowsCursor {
         let right_delta = delta_buckets(delta_right, &right_converter)?;
         let keys = touched_union(delta_left, &left_converter, delta_right, &right_converter)?;
         let mut terms = Vec::new();
-        for key in keys {
+        for (key_index, key) in keys.into_iter().enumerate() {
             let old_l = old_left.to_zset_for_key(&key)?;
             let old_r = old_right.to_zset_for_key(&key)?;
             let empty_l = ZSetBatch::empty(delta_left.schema());
@@ -93,6 +161,7 @@ impl FlatRowsCursor {
             for (left, right) in [(dl, &old_r), (&old_l, dr), (dl, dr)] {
                 if !left.is_empty() && !right.is_empty() {
                     terms.push(PairTerm {
+                        key_index,
                         left: left.clone(),
                         right: right.clone(),
                     });
@@ -121,12 +190,16 @@ impl FlatRowsCursor {
         })
     }
 
-    /// Returns at most `max_rows` pairs, potentially spanning term/key borders.
-    /// Keep returned chunks private until `None`: later terms can fail checked
-    /// multiplicity arithmetic, so partial publication would be unsafe.
+    /// Returns at most `max_rows` pairs from one formula term. The collector
+    /// finishes that term's Dense-equivalent consolidation before requesting
+    /// products from the next term or touched key.
     pub(super) fn next_chunk(&mut self) -> Result<Option<ZSetBatch>, EngineError> {
         let mut selected = Vec::with_capacity(self.max_rows);
+        let mut selected_term = None;
         while selected.len() < self.max_rows && self.term < self.terms.len() {
+            if selected_term.is_some_and(|selected| selected != self.term) {
+                break;
+            }
             let term = &self.terms[self.term];
             if self.left_row == term.left.len() || self.right_row == term.right.len() {
                 self.term += 1;
@@ -136,9 +209,12 @@ impl FlatRowsCursor {
             }
             let left_diff = int64_diff(&term.left)?.value(self.left_row);
             let right_diff = int64_diff(&term.right)?.value(self.right_row);
-            let diff = left_diff.checked_mul(right_diff).ok_or_else(|| {
-                EngineError::Infrastructure("join diff product overflowed i64".into())
-            })?;
+            selected_term = Some(self.term);
+            let diff = left_diff
+                .checked_mul(right_diff)
+                .ok_or(EngineError::NumericOverflow("join diff product"))?;
+            #[cfg(test)]
+            super::FLAT_PAIR_PRODUCTS.with(|count| count.set(count.get() + 1));
             selected.push((
                 self.term,
                 u32::try_from(self.left_row).map_err(|_| {
@@ -149,16 +225,15 @@ impl FlatRowsCursor {
                 })?,
                 diff,
             ));
-            self.right_row += 1;
-            if self.right_row == term.right.len() {
-                self.left_row += 1;
-                self.right_row = 0;
+            self.left_row += 1;
+            if self.left_row == term.left.len() {
+                self.right_row += 1;
+                self.left_row = 0;
             }
         }
         if selected.is_empty() {
             return Ok(None);
         }
-
         let mut columns = Vec::with_capacity(self.schema.fields().len());
         for column in 0..self.schema.fields().len() {
             let mut pieces: Vec<ArrayRef> = Vec::with_capacity(selected.len());
@@ -194,59 +269,89 @@ impl FlatRowsCursor {
         )?))
     }
 
-    /// Privately consumes every bounded chunk and returns one consolidated Z-set.
-    /// Errors discard the collector state; no partial output escapes this call.
-    /// Its identity map retains distinct full output rows, so total collector
-    /// memory is O(output); only temporary pair materialization is chunk-bounded.
+    /// Privately consumes bounded pair chunks, retaining the complete current
+    /// term until all its checked products exist. This matches Dense's product
+    /// before consolidation ordering; chunks bound pair workspace only.
     pub(super) fn collect(mut self) -> Result<ZSetBatch, EngineError> {
-        let converter = full_converter(self.schema.as_ref())?;
-        let mut consolidated: BTreeMap<Vec<u8>, (Vec<ArrayRef>, i64)> = BTreeMap::new();
-        while let Some(chunk) = self.next_chunk()? {
-            let rows = converter.convert_columns(chunk.batch.columns())?;
-            let diffs = int64_diff(&chunk)?;
-            for index in 0..chunk.len() {
-                let key = rows.row(index).as_ref().to_vec();
-                if let Some((_, total)) = consolidated.get_mut(&key) {
-                    *total = total.checked_add(diffs.value(index)).ok_or_else(|| {
-                        EngineError::Infrastructure("consolidated diff sum overflowed i64".into())
-                    })?;
-                } else {
-                    let indices = UInt32Array::from(vec![u32::try_from(index).map_err(|_| {
-                        EngineError::Infrastructure("flat chunk index exceeds UInt32".into())
-                    })?]);
-                    let values = chunk
-                        .batch
-                        .columns()
-                        .iter()
-                        .map(|column| take(column.as_ref(), &indices, None))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    consolidated.insert(key, (values, diffs.value(index)));
-                }
+        let mut term_index = None;
+        let mut term_chunks = Vec::new();
+        let mut key_index = None;
+        let mut key_terms = Vec::new();
+        let mut key_outputs = Vec::new();
+        loop {
+            self.advance_finished_terms();
+            if self.term == self.terms.len() {
+                break;
+            }
+            let next_term = self.term;
+            let next_key = self.terms[next_term].key_index;
+            if term_index.is_some_and(|old| old != next_term) {
+                key_terms.push(consolidate_term_chunks(&self.schema, &term_chunks)?);
+                term_chunks.clear();
+            }
+            if key_index.is_some_and(|old| old != next_key) {
+                key_outputs.push(consolidate_join_terms(&self.schema, &key_terms)?);
+                key_terms.clear();
+            }
+            term_index = Some(next_term);
+            key_index = Some(next_key);
+            if let Some(chunk) = self.next_chunk()? {
+                term_chunks.push(chunk);
             }
         }
 
-        let mut columns = Vec::with_capacity(self.schema.fields().len());
-        for column in 0..self.schema.fields().len() {
-            let values = consolidated
-                .values()
-                .filter(|(_, diff)| *diff != 0)
-                .map(|(values, _)| values[column].as_ref())
-                .collect::<Vec<_>>();
-            columns.push(if values.is_empty() {
-                new_empty_array(self.schema.field(column).data_type())
-            } else {
-                concat(&values)?
-            });
+        if !term_chunks.is_empty() {
+            key_terms.push(consolidate_term_chunks(&self.schema, &term_chunks)?);
         }
-        let diffs = consolidated
-            .into_values()
-            .filter_map(|(_, diff)| (diff != 0).then_some(diff))
-            .collect::<Vec<_>>();
-        Ok(ZSetBatch::new(
-            RecordBatch::try_new(self.schema, columns)?,
-            Arc::new(Int64Array::from(diffs)),
-        )?)
+        if !key_terms.is_empty() {
+            key_outputs.push(consolidate_join_terms(&self.schema, &key_terms)?);
+        }
+        consolidate_join_terms(&self.schema, &key_outputs)
     }
+
+    fn advance_finished_terms(&mut self) {
+        while self.term < self.terms.len()
+            && (self.left_row == self.terms[self.term].left.len()
+                || self.right_row == self.terms[self.term].right.len())
+        {
+            self.term += 1;
+            self.left_row = 0;
+            self.right_row = 0;
+        }
+    }
+}
+
+fn consolidate_term_chunks(
+    schema: &SchemaRef,
+    chunks: &[ZSetBatch],
+) -> Result<ZSetBatch, EngineError> {
+    let batches = chunks.iter().map(|chunk| &chunk.batch).collect::<Vec<_>>();
+    let batch = concat_batches(schema, batches)?;
+    let diffs = chunks
+        .iter()
+        .map(|chunk| chunk.diff.as_ref())
+        .collect::<Vec<_>>();
+    let diff = concat(&diffs)?;
+    crate::zset::consolidate(&ZSetBatch::new(batch, diff)?)
+}
+
+fn consolidate_join_terms(
+    schema: &SchemaRef,
+    terms: &[ZSetBatch],
+) -> Result<ZSetBatch, EngineError> {
+    if terms.is_empty() {
+        return Ok(ZSetBatch::empty(schema.clone()));
+    }
+    let batches = terms.iter().map(|term| &term.batch).collect::<Vec<_>>();
+    let batch = concat_batches(schema, batches)?;
+    let diffs = terms
+        .iter()
+        .map(|term| term.diff.as_ref())
+        .collect::<Vec<_>>();
+    let diff = concat(&diffs)?;
+    let joined = ZSetBatch::new(batch, diff)?;
+    let converter = full_converter(schema.as_ref())?;
+    crate::zset::consolidate_with(&converter, &joined)
 }
 
 pub(super) fn validate_chunk_size(max_rows: usize) -> Result<(), EngineError> {

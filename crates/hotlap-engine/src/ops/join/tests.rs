@@ -101,7 +101,112 @@ fn join_rejects_diff_product_overflow() {
     // instead of wrapping or panicking.
     let mut join = Join::new(&[0], &[0]);
     let result = join.apply(&zset(&[(1, "l", i64::MAX)]), &zset(&[(1, "r", 2)]));
-    assert!(matches!(result, Err(EngineError::Infrastructure(_))));
+    assert!(matches!(
+        result,
+        Err(EngineError::NumericOverflow("join diff product"))
+    ));
+}
+
+#[test]
+fn registered_multiple_source_columns_update_on_ordinary_dense_join_apply() {
+    let left_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, true),
+        Field::new("amount", DataType::Int64, true),
+    ]));
+    let right_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("r", DataType::Utf8, true),
+    ]));
+    let left_batch = |labels: Vec<Option<&str>>, amounts: Vec<Option<i64>>, diffs: Vec<i64>| {
+        ZSetBatch::new(
+            RecordBatch::try_new(
+                left_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1; diffs.len()])),
+                    Arc::new(StringArray::from(labels)),
+                    Arc::new(Int64Array::from(amounts)),
+                ],
+            )
+            .unwrap(),
+            Arc::new(Int64Array::from(diffs)),
+        )
+        .unwrap()
+    };
+    let right_batch = |diffs: Vec<i64>| {
+        ZSetBatch::new(
+            RecordBatch::try_new(
+                right_schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1; diffs.len()])),
+                    Arc::new(StringArray::from(vec![Some("r"); diffs.len()])),
+                ],
+            )
+            .unwrap(),
+            Arc::new(Int64Array::from(diffs)),
+        )
+        .unwrap()
+    };
+    let mut join = Join::new(&[0], &[0]);
+    join.apply(
+        &left_batch(vec![Some("old")], vec![Some(5)], vec![2]),
+        &right_batch(vec![1]),
+    )
+    .unwrap();
+    join.register_demand(crate::ops::join::factorized::demand::Demand {
+        left_join_key: vec![0],
+        right_join_key: vec![0],
+        group_key: vec![0],
+        left_columns: vec![1, 2],
+        right_columns: vec![],
+        left_column_types: vec![DataType::Utf8, DataType::Int64],
+        right_column_types: vec![],
+        left_column_sums: vec![false, true],
+        right_column_sums: vec![],
+    })
+    .unwrap();
+    let key = join
+        .left
+        .as_ref()
+        .unwrap()
+        .iter_key_bytes()
+        .next()
+        .unwrap()
+        .to_vec();
+    let initial = join.left.as_ref().unwrap().source_stats(&key).unwrap();
+    assert_eq!(initial.columns[0].nonnull, 2);
+    assert_eq!(
+        initial.columns[1].sum,
+        Some(arrow::datatypes::i256::from_i128(10))
+    );
+
+    crate::arrange::KeyedArrangement::reset_source_stats_rebuild_rows_visited_for_test();
+    join.apply(
+        &left_batch(vec![Some("new")], vec![None], vec![1]),
+        &right_batch(vec![]),
+    )
+    .unwrap();
+    let next = join.left.as_ref().unwrap().source_stats(&key).unwrap();
+    assert_eq!(next.weight, 3);
+    assert_eq!(next.support, 2);
+    assert_eq!(next.columns[0].nonnull, 3);
+    assert_eq!(next.columns[1].nonnull, 2);
+    assert_eq!(
+        next.columns[1].sum,
+        Some(arrow::datatypes::i256::from_i128(10))
+    );
+    assert_eq!(
+        crate::arrange::KeyedArrangement::source_stats_ordinary_values_read_for_test(),
+        2
+    );
+    assert_eq!(
+        crate::arrange::KeyedArrangement::source_stats_key_decode_calls_for_test(),
+        0
+    );
+    assert_eq!(
+        crate::arrange::KeyedArrangement::source_stats_payload_rows_decoded_for_test(),
+        0
+    );
 }
 
 /// Builds a single-column `k` Z-set with the given key element type.

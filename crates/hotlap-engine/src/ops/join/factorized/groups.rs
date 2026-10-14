@@ -10,7 +10,7 @@ use super::stats::Stats;
 pub(super) fn aggregate_groups(
     mapping: &ColumnMapping,
     aggs: &[AggSpec],
-    old: &[(Vec<u8>, GroupEntry)],
+    old: &HashMap<Vec<u8>, GroupEntry>,
     deltas: &HashMap<Vec<u8>, Vec<Stats>>,
     groups: &HashMap<Vec<u8>, Vec<u8>>,
     row_deltas: &HashMap<Vec<u8>, (i128, u128)>,
@@ -33,7 +33,7 @@ pub(super) fn aggregate_groups(
     }
     let mut result = Vec::new();
     for (key, ds) in grouped {
-        let prior = old.iter().find(|(k, _)| *k == key).map(|(_, v)| v);
+        let prior = old.get(&key);
         let (rows_delta, rows_bound) = group_rows.get(&key).copied()?;
         let prior_rows = prior.map_or(0, |v| v.rows);
         if u128::from(prior_rows.unsigned_abs()).checked_add(rows_bound)? > i64::MAX as u128 {

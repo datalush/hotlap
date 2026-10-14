@@ -9,18 +9,28 @@ use crate::arrange::KeyedArrangement;
 use crate::keys::KeyConverter;
 
 use super::groups::{exact_f64_integer, exact_i128_f64};
-use super::prepare::{DeltaPair, DenseReason, bucket_for, combine_bucket, group_key_for};
+use super::prepare::{
+    DeltaPair, DenseReason, OldBuckets, bucket_for, combine_bucket, group_key_for,
+};
 use super::stats::{GroupAbsBounds, Stats, summarize};
+
+pub(super) fn group_key_covers_join_key(mapping: &ColumnMapping) -> bool {
+    (0..mapping.join_key_types.len()).all(|position| mapping.group_key.contains(&position))
+}
 
 pub(super) fn validate_old_group_state(
     mapping: &ColumnMapping,
     aggs: &[AggSpec],
     touched: &HashSet<Vec<u8>>,
-    groups: &[(Vec<u8>, GroupEntry)],
+    groups: &HashMap<Vec<u8>, GroupEntry>,
     left: &KeyedArrangement,
     right: &KeyedArrangement,
     inputs: &DeltaPair,
+    buckets: &mut OldBuckets<'_>,
 ) -> Result<GroupAbsBounds, DenseReason> {
+    if touched.is_empty() && !groups.is_empty() {
+        return Err(DenseReason::StateShape);
+    }
     let join = RowConverter::new(
         mapping
             .join_key_types
@@ -43,6 +53,21 @@ pub(super) fn validate_old_group_state(
         .collect::<Result<Vec<_>, _>>()?;
     let group = RowConverter::new(group_types.into_iter().map(SortField::new).collect())
         .map_err(|_| DenseReason::InputMapping)?;
+    if group_key_covers_join_key(mapping) {
+        #[cfg(test)]
+        super::OLD_HISTORY_DIRECT_LOOKUPS.with(|count| count.set(0));
+        let keys = touched.clone();
+        let affected = keys
+            .iter()
+            .map(|key| {
+                group_key_for(&join, &group, key, &mapping.group_key)
+                    .map_err(|_| DenseReason::InputMapping)
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
+        return validate_old_group_keys(
+            mapping, aggs, &affected, touched, groups, left, inputs, buckets, &join, &group, &keys,
+        );
+    }
     let affected = touched
         .iter()
         .map(|key| {
@@ -50,28 +75,61 @@ pub(super) fn validate_old_group_state(
                 .map_err(|_| DenseReason::InputMapping)
         })
         .collect::<Result<HashSet<_>, _>>()?;
+    let mut keys = HashSet::new();
+    #[cfg(test)]
+    super::OLD_HISTORY_KEYS_CANDIDATE.with(|count| count.set(0));
+    for key in left.iter_key_bytes().chain(right.iter_key_bytes()) {
+        #[cfg(test)]
+        super::OLD_HISTORY_KEYS_CANDIDATE.with(|count| count.set(count.get() + 1));
+        let group_key = group_key_for(&join, &group, key, &mapping.group_key)
+            .map_err(|_| DenseReason::InputMapping)?;
+        if affected.contains(&group_key) {
+            keys.insert(key.to_vec());
+        }
+    }
+    keys.extend(touched.iter().cloned());
+    validate_old_group_keys(
+        mapping, aggs, &affected, touched, groups, left, inputs, buckets, &join, &group, &keys,
+    )
+}
+
+fn validate_old_group_keys(
+    mapping: &ColumnMapping,
+    aggs: &[AggSpec],
+    affected: &HashSet<Vec<u8>>,
+    touched: &HashSet<Vec<u8>>,
+    groups: &HashMap<Vec<u8>, GroupEntry>,
+    left: &KeyedArrangement,
+    inputs: &DeltaPair,
+    buckets: &mut OldBuckets<'_>,
+    join: &RowConverter,
+    group: &RowConverter,
+    keys: &HashSet<Vec<u8>>,
+) -> Result<GroupAbsBounds, DenseReason> {
     let left_keys = KeyConverter::new(inputs.left.schema().as_ref(), &mapping.left_join_key)
         .map_err(|_| DenseReason::InputMapping)?;
     let right_keys = KeyConverter::new(inputs.right.schema().as_ref(), &mapping.right_join_key)
         .map_err(|_| DenseReason::InputMapping)?;
-    let mut keys: HashSet<Vec<u8>> = left.iter().map(|(key, _, _)| key).collect();
-    keys.extend(right.iter().map(|(key, _, _)| key));
-    keys.extend(touched.iter().cloned());
     let width = left.schema().fields().len();
     let mut derived = HashMap::<Vec<u8>, (i128, Vec<Stats>)>::new();
     let mut proposed_abs = HashMap::<Vec<u8>, Vec<(u128, u128)>>::new();
     for key in keys {
-        let l = left
-            .to_zset_for_key(&key)
-            .map_err(|_| DenseReason::InputMapping)?;
-        let r = right
-            .to_zset_for_key(&key)
-            .map_err(|_| DenseReason::InputMapping)?;
+        #[cfg(test)]
+        super::OLD_HISTORY_DIRECT_LOOKUPS.with(|count| count.set(count.get() + 1));
+        let l = buckets.left(&key).map_err(|_| DenseReason::InputMapping)?;
+        let r = buckets.right(&key).map_err(|_| DenseReason::InputMapping)?;
+        #[cfg(test)]
+        super::OLD_HISTORY_DIRECT_LOOKUPS.with(|count| count.set(count.get() + 1));
+        #[cfg(test)]
+        super::OLD_HISTORY_ROWS_SCANNED
+            .with(|count| count.set(count.get().saturating_add(l.len()).saturating_add(r.len())));
+        #[cfg(test)]
+        let summary_started = std::time::Instant::now();
         let ls =
             summarize(&l, 0, aggs, mapping, width).map_err(|_| DenseReason::UnsupportedNumeric)?;
         let rs =
             summarize(&r, 1, aggs, mapping, width).map_err(|_| DenseReason::UnsupportedNumeric)?;
-        let (new_l, new_r) = if touched.contains(&key) {
+        let (new_l, new_r) = if touched.contains(key) {
             let dl = bucket_for(&inputs.left, &left_keys, &key)
                 .map_err(|_| DenseReason::InputMapping)?;
             let dr = bucket_for(&inputs.right, &right_keys, &key)
@@ -87,6 +145,18 @@ pub(super) fn validate_old_group_state(
             .map_err(|_| DenseReason::UnsupportedNumeric)?;
         let new_rs = summarize(&new_r, 1, aggs, mapping, width)
             .map_err(|_| DenseReason::UnsupportedNumeric)?;
+        #[cfg(test)]
+        {
+            super::OLD_HISTORY_SUMMARIZE_NS.with(|value| {
+                value.set(
+                    value
+                        .get()
+                        .saturating_add(summary_started.elapsed().as_nanos()),
+                )
+            });
+            super::OLD_HISTORY_SUMMARIZE_CALLS
+                .with(|value| value.set(value.get().saturating_add(4)));
+        }
         let row_count = ls[0]
             .rows
             .checked_mul(rs[0].rows)
@@ -180,16 +250,10 @@ pub(super) fn validate_old_group_state(
             }
         }
     }
-    let mut validate_keys = affected;
-    validate_keys.extend(groups.iter().map(|(key, _)| key.clone()));
-    validate_keys.extend(derived.keys().cloned());
-    for key in validate_keys {
-        let expected = derived.get(&key);
+    for key in affected {
+        let expected = derived.get(key);
         let rows = expected.map_or(0, |value| value.0);
-        let prior = groups
-            .iter()
-            .find(|(group_key, _)| *group_key == key)
-            .map(|(_, entry)| entry);
+        let prior = groups.get(key);
         if rows == 0 {
             if prior.is_some() {
                 return Err(DenseReason::StateShape);

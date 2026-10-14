@@ -9,7 +9,7 @@ fn integer_sum_render_overflow_selects_dense_without_mutating_old_state() {
     let right = arrangement(&right_oldz, &[0]);
     let before_left = left.iter().collect::<Vec<_>>();
     let before_right = right.iter().collect::<Vec<_>>();
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
@@ -21,7 +21,7 @@ fn integer_sum_render_overflow_selects_dense_without_mutating_old_state() {
                 },
             ],
         },
-    )];
+    )]);
     let before_groups = groups.clone();
     let mapping = Recognition::Eligible(ColumnMapping {
         left_source: InputId(0),
@@ -61,7 +61,7 @@ fn authoritative_integer_sum_near_i128_limit_rejects_delta_bound() {
     let rightz = simple(&[1], &[1]);
     let left = arrangement(&oldz, &[0]);
     let right = arrangement(&rightz, &[0]);
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
@@ -73,7 +73,7 @@ fn authoritative_integer_sum_near_i128_limit_rejects_delta_bound() {
                 },
             ],
         },
-    )];
+    )]);
     let before_groups = groups.clone();
     let mapping = Recognition::Eligible(ColumnMapping {
         left_source: InputId(0),

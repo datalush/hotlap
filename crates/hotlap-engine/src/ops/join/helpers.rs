@@ -154,9 +154,7 @@ fn materialize(
         let product = left_diffs
             .value(left_index)
             .checked_mul(right_diffs.value(right_index))
-            .ok_or_else(|| {
-                EngineError::Infrastructure("join diff product overflowed i64".to_string())
-            })?;
+            .ok_or(EngineError::NumericOverflow("join diff product"))?;
         diffs.push(product);
     }
     consolidate_with(

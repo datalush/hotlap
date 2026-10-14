@@ -32,6 +32,82 @@ pub(crate) fn accumulate(
 }
 
 impl Node {
+    pub(super) fn rebuild_derived(
+        &mut self,
+        schemas: &std::collections::HashMap<hotlap_core::InputId, arrow::datatypes::SchemaRef>,
+    ) -> Result<(), EngineError> {
+        match self {
+            Node::Group {
+                input,
+                reducer,
+                cut_plan: Some(plan),
+                outer_project,
+                registered_demand,
+            } => {
+                let (joined, project) = match input.as_mut() {
+                    Node::Project { input, cols }
+                        if matches!(input.as_ref(), Node::Joined { .. }) =>
+                    {
+                        (input.as_mut(), Some(cols.as_slice()))
+                    }
+                    other => (other, None),
+                };
+                if let Node::Joined { join, .. } = joined {
+                    let recognition = hotlap_core::plan_normalize::recognize(plan, schemas);
+                    if let hotlap_core::plan_normalize::Recognition::Eligible(mapping) = recognition
+                    {
+                        if let Some((left_schema, right_schema)) = join.source_schemas_for_cut() {
+                            if let Ok(demand) = crate::ops::join::factorized::demand::compile_demand(
+                                &mapping,
+                                reducer.aggregates(),
+                                &left_schema,
+                                &right_schema,
+                            ) {
+                                join.register_demand(demand.clone())?;
+                                *registered_demand = Some(demand);
+                                let joined_schema = join.joined_schema_for_cut()?;
+                                let projection = outer_project.as_deref().or(project);
+                                let reducer_schema = if let Some(columns) = projection {
+                                    project_batch_schema(&joined_schema, columns)?
+                                } else {
+                                    joined_schema
+                                };
+                                reducer.initialize_cut(reducer_schema)?;
+                                let (Some(left), Some(right)) =
+                                    (join.left_for_cut(), join.right_for_cut())
+                                else {
+                                    return Err(EngineError::Infrastructure(
+                                        "restored join arrangements are missing".into(),
+                                    ));
+                                };
+                                let initialized = if let Some(columns) = projection {
+                                    reducer.initialize_maintained_cut_projected(
+                                        &mapping, left, right, columns,
+                                    )?
+                                } else {
+                                    reducer.initialize_maintained_cut(&mapping, left, right)?
+                                };
+                                if initialized {
+                                    reducer.validate_maintained_history()?;
+                                }
+                            }
+                        }
+                    }
+                }
+                input.rebuild_derived(schemas)
+            }
+            Node::Group { input, .. }
+            | Node::Filter { input, .. }
+            | Node::Project { input, .. }
+            | Node::Window { input, .. } => input.rebuild_derived(schemas),
+            Node::Joined { left, right, .. } => {
+                left.rebuild_derived(schemas)?;
+                right.rebuild_derived(schemas)
+            }
+            Node::Source(_) => Ok(()),
+        }
+    }
+
     pub(super) fn memory_usage(
         &self,
         report: &mut super::super::memory::MemoryReport,
@@ -53,7 +129,7 @@ impl Node {
                 )?)?;
                 input.memory_usage(report, allocations, external_ranges)?;
             }
-            Node::Group { input, reducer } => {
+            Node::Group { input, reducer, .. } => {
                 report.mark_covered("aggregates");
                 report.add_group(reducer.memory_usage()?)?;
                 if reducer.has_group_map_storage() {
@@ -116,7 +192,20 @@ impl Node {
             Node::Source(id) => source_eval(*id, ctx),
             Node::Filter { input, pred } => filter_eval(input, pred, ctx),
             Node::Project { input, cols } => project_eval(input, cols, ctx),
-            Node::Group { input, reducer } => group_eval(input, reducer, ctx),
+            Node::Group {
+                input,
+                reducer,
+                cut_plan,
+                outer_project,
+                registered_demand,
+            } => group_eval(
+                input,
+                reducer,
+                cut_plan,
+                outer_project,
+                registered_demand,
+                ctx,
+            ),
             Node::Joined {
                 left,
                 right,
@@ -197,12 +286,185 @@ fn project_eval(
     }
 }
 
+fn project_batch_schema(
+    schema: &arrow::datatypes::SchemaRef,
+    columns: &[usize],
+) -> Result<arrow::datatypes::SchemaRef, EngineError> {
+    Ok(project(&ZSetBatch::empty(schema.clone()), columns)?.schema())
+}
+
 /// Feeds the child's delta to the retained, delta-incremental group count.
 fn group_eval(
     input: &mut Node,
     reducer: &mut GroupAggregate,
+    cut_plan: &mut Option<Box<hotlap_core::Plan>>,
+    outer_project: &Option<Vec<usize>>,
+    registered_demand: &mut Option<crate::ops::join::factorized::demand::Demand>,
     ctx: &mut EvalCtx,
 ) -> Result<Option<ZSetBatch>, EngineError> {
+    if cut_plan.is_some() {
+        let (joined_input, runtime_project) = match &mut *input {
+            Node::Project { input, cols } if matches!(input.as_ref(), Node::Joined { .. }) => {
+                (input.as_mut(), Some(cols.as_slice()))
+            }
+            other => (other, None),
+        };
+        if let Node::Joined {
+            left,
+            right,
+            join,
+            left_pending,
+            right_pending,
+        } = joined_input
+        {
+            if let Some((left_delta, right_delta)) = buffer_join_inputs(
+                left.as_mut(),
+                right.as_mut(),
+                left_pending,
+                right_pending,
+                ctx,
+            )? {
+                let Some(plan) = cut_plan.as_deref() else {
+                    unreachable!()
+                };
+                let recognition = hotlap_core::plan_normalize::recognize(plan, ctx.schemas);
+                #[cfg(test)]
+                let force_dense = super::FORCE_DENSE_GROUP_JOIN.with(|flag| flag.get());
+                #[cfg(not(test))]
+                let force_dense = false;
+                if let hotlap_core::plan_normalize::Recognition::Eligible(mapping) = &recognition {
+                    let joined_schema = join.cut_schema(&left_delta, &right_delta)?;
+                    let reducer_schema = if let Some(cols) = outer_project {
+                        project(&ZSetBatch::empty(joined_schema.clone()), cols)?.schema()
+                    } else if let Some(cols) = runtime_project {
+                        project(&ZSetBatch::empty(joined_schema.clone()), cols)?.schema()
+                    } else {
+                        joined_schema.clone()
+                    };
+                    if registered_demand.is_none() {
+                        *registered_demand = crate::ops::join::factorized::demand::compile_demand(
+                            mapping,
+                            reducer.aggregates(),
+                            &left_delta.schema(),
+                            &right_delta.schema(),
+                        )
+                        .ok();
+                    }
+                    if let Some(demand) = registered_demand.as_ref() {
+                        join.register_demand(demand.clone())?;
+                        let sources = join.prepare_source_updates(&left_delta, &right_delta)?;
+                        if force_dense {
+                            let projection = outer_project.as_deref().or(runtime_project);
+                            let memo = crate::ops::join::factorized::certified_consume::prepare_dense_metadata_with_sources(
+                                join,
+                                reducer,
+                                mapping,
+                                &left_delta,
+                                &right_delta,
+                                reducer_schema,
+                                projection,
+                                &sources,
+                            )?;
+                            let joined = join.apply(&left_delta, &right_delta)?;
+                            #[cfg(test)]
+                            record_dense_join_materialization(&joined);
+                            let projected = if let Some(columns) = projection {
+                                project(&joined, columns)?
+                            } else {
+                                joined
+                            };
+                            let output = reducer.apply(&projected)?;
+                            if let Some(memo) = memo {
+                                reducer.commit_maintained_memo(memo);
+                            }
+                            *left_pending = None;
+                            *right_pending = None;
+                            return Ok(Some(output));
+                        }
+                        let decision = if let Some(projection) =
+                            outer_project.as_deref().or(runtime_project)
+                        {
+                            crate::ops::join::factorized::certified_consume::prepare_grouped_update_projected_with_sources(
+                                join,
+                                reducer,
+                                mapping,
+                                &left_delta,
+                                &right_delta,
+                                reducer_schema,
+                                projection,
+                                &sources,
+                            )?
+                        } else {
+                            crate::ops::join::factorized::certified_consume::prepare_grouped_update_with_sources(
+                                join,
+                                reducer,
+                                mapping,
+                                &left_delta,
+                                &right_delta,
+                                reducer_schema,
+                                &sources,
+                            )?
+                        };
+                        match decision {
+                            crate::ops::join::factorized::certified_consume::CertifiedDecision::Certified(
+                                prepared,
+                            ) => {
+                                let output = prepared.output().clone();
+                                prepared.commit_group_state(reducer);
+                                join.commit_source_updates(sources);
+                                *left_pending = None;
+                                *right_pending = None;
+                                #[cfg(test)]
+                                super::FACTORIZED_CUTS.with(|n| n.set(n.get() + 1));
+                                return Ok(Some(output));
+                            }
+                            needs_rows @ crate::ops::join::factorized::certified_consume::CertifiedDecision::NeedsRows(
+                                _,
+                            ) => {
+                                let flat = crate::ops::join::factorized::flat::materialize_flat_delta(
+                                    join,
+                                    &sources,
+                                    &left_delta,
+                                    &right_delta,
+                                    joined_schema,
+                                    crate::ops::join::factorized::ConsumerCaps::DEFAULT_FLAT_CHUNK_ROWS,
+                                )?;
+                                #[cfg(test)]
+                                record_dense_join_materialization(&flat);
+                                let flat = if let Some(columns) =
+                                    outer_project.as_deref().or(runtime_project)
+                                {
+                                    project(&flat, columns)?
+                                } else {
+                                    flat
+                                };
+                                let output = reducer.apply(&flat)?;
+                                needs_rows.commit_dense_metadata(reducer);
+                                join.commit_source_updates(sources);
+                                *left_pending = None;
+                                *right_pending = None;
+                                #[cfg(test)]
+                                super::FLAT_ROWS_CUTS.with(|count| count.set(count.get() + 1));
+                                return Ok(Some(output));
+                            }
+                        }
+                    }
+                }
+                let output = join.apply(&left_delta, &right_delta)?;
+                #[cfg(test)]
+                record_dense_join_materialization(&output);
+                *left_pending = None;
+                *right_pending = None;
+                let output = if let Some(cols) = outer_project.as_deref().or(runtime_project) {
+                    project(&output, cols)?
+                } else {
+                    output
+                };
+                return Ok(Some(reducer.apply(&output)?));
+            }
+            return Ok(None);
+        }
+    }
     match input.eval(ctx)? {
         None => Ok(None),
         Some(z) => Ok(Some(reducer.apply(&z)?)),
@@ -231,6 +493,52 @@ fn join_apply(
     right_pending: &mut Option<ZSetBatch>,
     ctx: &mut EvalCtx,
 ) -> Result<Option<ZSetBatch>, EngineError> {
+    match buffer_join_inputs(left, right, left_pending, right_pending, ctx)? {
+        Some((left, right)) => {
+            let prepared = crate::ops::join::factorized::flat::prepare_flat_join_update(
+                join,
+                &left,
+                &right,
+                crate::ops::join::factorized::ConsumerCaps::DEFAULT_FLAT_CHUNK_ROWS,
+            )?;
+            let output = prepared.output().clone();
+            #[cfg(test)]
+            record_dense_join_materialization(&output);
+            prepared.commit(join);
+            *left_pending = None;
+            *right_pending = None;
+            #[cfg(test)]
+            super::FLAT_ROWS_CUTS.with(|count| count.set(count.get() + 1));
+            Ok(Some(output))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+fn record_dense_join_materialization(output: &ZSetBatch) {
+    use arrow::array::Array;
+
+    let rows = output.len() as u64;
+    let bytes = output
+        .batch
+        .columns()
+        .iter()
+        .map(|column| column.get_array_memory_size())
+        .chain(std::iter::once(output.diff().get_array_memory_size()))
+        .fold(0usize, usize::saturating_add) as u64;
+    super::DENSE_JOIN_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+    super::DENSE_JOIN_ROWS.with(|count| count.set(count.get().saturating_add(rows)));
+    super::DENSE_JOIN_BYTES.with(|count| count.set(count.get().saturating_add(bytes)));
+}
+
+fn buffer_join_inputs(
+    left: &mut Node,
+    right: &mut Node,
+    left_pending: &mut Option<ZSetBatch>,
+    right_pending: &mut Option<ZSetBatch>,
+    ctx: &mut EvalCtx,
+) -> Result<Option<(ZSetBatch, ZSetBatch)>, EngineError> {
     if let Some(z) = left.eval(ctx)? {
         *left_pending = accumulate(left_pending.take(), &z)?;
     }
@@ -238,12 +546,7 @@ fn join_apply(
         *right_pending = accumulate(right_pending.take(), &z)?;
     }
     match (left_pending.as_ref(), right_pending.as_ref()) {
-        (Some(left), Some(right)) => {
-            let output = join.apply(left, right)?;
-            *left_pending = None;
-            *right_pending = None;
-            Ok(Some(output))
-        }
+        (Some(left), Some(right)) => Ok(Some((left.clone(), right.clone()))),
         _ => Ok(None),
     }
 }

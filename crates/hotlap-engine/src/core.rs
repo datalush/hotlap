@@ -132,7 +132,7 @@ impl EngineCore {
             .ok_or_else(|| CoreError::Unsupported(format!("unknown view {id:?}")))?;
         let output = view
             .graph
-            .eval(input, delta, &self.schemas, watermark)
+            .eval(input, delta, &self.schemas, watermark, self.epoch)
             .map_err(CoreError::from)?;
         if let Some(output) = output {
             view.output.update(&output).map_err(CoreError::from)?;

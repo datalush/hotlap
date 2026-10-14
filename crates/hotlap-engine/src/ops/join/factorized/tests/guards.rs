@@ -1,18 +1,63 @@
 use super::*;
 
 #[test]
+fn old_count_max_minus_one_then_positive_two_before_deletion_requires_dense() {
+    let n = (i64::MAX - 1) / 2;
+    let initial_left = simple(&[10], &[n]);
+    let initial_right = simple(&[20], &[2]);
+    let delta_left = simple(&[0], &[2]);
+    let delta_right = simple(&[20], &[-1]);
+    let left = arrangement(&initial_left, &[0]);
+    let right = arrangement(&initial_right, &[0]);
+    let groups = group_map(&[(
+        simple_key(7),
+        GroupEntry {
+            rows: i64::MAX - 1,
+            values: vec![AggValue::Count(i64::MAX - 1)],
+        },
+    )]);
+    let decision = run(
+        DeltaPair::new(
+            47,
+            Arc::new(delta_left.clone()),
+            Arc::new(delta_right.clone()),
+        ),
+        &left,
+        &right,
+        &groups,
+        recognition(vec![None], vec![None]),
+    );
+    assert!(matches!(
+        decision,
+        CutDecision::Dense(DenseReason::NegativeOrOverflow)
+    ));
+
+    let mut dense_join = crate::ops::Join::new(&[0], &[0]);
+    let mut dense_group = crate::ops::GroupAggregate::new(&[0], vec![AggSpec::count()]);
+    // Run the independent Dense oracle over the exact same initial Arrow
+    // batches and incoming deltas used to build the preparation request above.
+    let old_joined = dense_join.apply(&initial_left, &initial_right).unwrap();
+    dense_group.apply(&old_joined).unwrap();
+    let ordered_delta = dense_join.apply(&delta_left, &delta_right).unwrap();
+    assert!(matches!(
+        dense_group.apply(&ordered_delta),
+        Err(crate::error::EngineError::Infrastructure(_))
+    ));
+}
+
+#[test]
 fn old_counter_plus_absolute_delta_bound_selects_dense() {
     let lz = simple(&[1], &[2]);
     let rz = simple(&[1], &[i64::MAX / 3 + 1]);
     let left = arrangement(&lz, &[0]);
     let right = arrangement(&rz, &[0]);
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 7,
             values: vec![AggValue::Count(7)],
         },
-    )];
+    )]);
     let result = run(
         DeltaPair::new(5, Arc::new(simple(&[1], &[1])), Arc::new(simple(&[], &[]))),
         &left,
@@ -32,13 +77,13 @@ fn non_count_cached_state_is_dense_before_group_staging() {
     let old = simple(&[1], &[1]);
     let left = arrangement(&old, &[0]);
     let right = arrangement(&old, &[0]);
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
             values: vec![AggValue::SumInteger { sum: 3, count: 1 }],
         },
-    )];
+    )]);
     let result = run(
         DeltaPair::new(11, Arc::new(simple(&[1], &[1])), Arc::new(simple(&[], &[]))),
         &left,
@@ -57,13 +102,13 @@ fn count_cache_disagreement_with_group_rows_selects_dense() {
     let old = simple(&[1], &[1]);
     let left = arrangement(&old, &[0]);
     let right = arrangement(&old, &[0]);
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 2,
             values: vec![AggValue::Count(2)],
         },
-    )];
+    )]);
     let result = run(
         DeltaPair::new(12, Arc::new(simple(&[], &[])), Arc::new(simple(&[], &[]))),
         &left,
@@ -84,13 +129,13 @@ fn authoritative_old_group_counts_and_sum_must_match_full_keyed_arrangements() {
     let delta = || DeltaPair::new(29, Arc::new(simple(&[2], &[1])), Arc::new(simple(&[], &[])));
 
     let count_mapping = recognition(vec![None], vec![None]);
-    let wrong_count = [(
+    let wrong_count = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
             values: vec![AggValue::Count(2)],
         },
-    )];
+    )]);
     assert!(matches!(
         run(delta(), &left, &right, &wrong_count, count_mapping),
         CutDecision::Dense(_)
@@ -124,13 +169,13 @@ fn authoritative_old_group_counts_and_sum_must_match_full_keyed_arrangements() {
     let nullable_right_z = simple(&[9], &[1]);
     let nullable_left = arrangement(&nullable_left_z, &[0]);
     let nullable_right = arrangement(&nullable_right_z, &[0]);
-    let wrong_nullable = [(
+    let wrong_nullable = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
             values: vec![AggValue::Count(1), AggValue::Count(1)],
         },
-    )];
+    )]);
     assert!(matches!(
         run_with_aggs(
             delta(),
@@ -160,7 +205,7 @@ fn authoritative_old_group_counts_and_sum_must_match_full_keyed_arrangements() {
             input: Some(1),
         },
     ];
-    let wrong_sum = [(
+    let wrong_sum = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
@@ -169,7 +214,7 @@ fn authoritative_old_group_counts_and_sum_must_match_full_keyed_arrangements() {
                 AggValue::SumInteger { sum: 2, count: 1 },
             ],
         },
-    )];
+    )]);
     assert!(matches!(
         run_with_aggs(delta(), &left, &right, &wrong_sum, sum_mapping, &sum_aggs),
         CutDecision::Dense(_)
@@ -184,13 +229,13 @@ fn input_arcs_and_epoch_are_owned_by_prepared_cut() {
     let l = Arc::new(simple(&[2], &[1]));
     let r = Arc::new(simple(&[], &[]));
     let owners = (l.clone(), r.clone());
-    let groups = [(
+    let groups = group_map(&[(
         simple_key(7),
         GroupEntry {
             rows: 1,
             values: vec![AggValue::Count(1)],
         },
-    )];
+    )]);
     let result = run(
         DeltaPair::new(6, l, r),
         &left,
@@ -261,17 +306,21 @@ fn group_subset_conversion_decodes_full_key_selects_ordered_positions() {
         DeltaPair::new(9, Arc::new(dl), Arc::new(dr)),
         &left,
         &right,
-        &[(
+        &group_map(&[(
             simple_key(7),
             GroupEntry {
                 rows: 1,
                 values: vec![AggValue::Count(1)],
             },
-        )],
+        )]),
         Recognition::Eligible(mapping),
     );
     let CutDecision::Eligible(prepared) = result else {
         panic!("subset-key preparation should be eligible")
     };
-    assert_eq!(prepared.groups[0].0, simple_key(7));
+    assert!(
+        prepared.groups.iter().any(
+            |change| matches!(change, GroupChange::Upsert { key, .. } if *key == simple_key(7))
+        )
+    );
 }

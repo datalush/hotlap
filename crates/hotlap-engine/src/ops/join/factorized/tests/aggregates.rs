@@ -84,7 +84,7 @@ fn mixed_count_nullable_sum_avg_uses_typed_keyed_bucket_stats() {
             AggValue::Count(9),
         ],
     };
-    let groups = [(simple_key(7), old_group)];
+    let groups = group_map(&[(simple_key(7), old_group)]);
     let result = run_with_aggs(
         DeltaPair::new(20, Arc::new(delta_left), Arc::new(delta_right)),
         &left,
@@ -98,7 +98,7 @@ fn mixed_count_nullable_sum_avg_uses_typed_keyed_bucket_stats() {
         CutDecision::Dense(reason) => panic!("typed COUNT/SUM/AVG rejected: {reason:?}"),
     };
     assert_eq!(
-        prepared.groups,
+        groups_vec(&apply_changes_for_test(&groups, &prepared.groups)),
         vec![(
             simple_key(7),
             GroupEntry {
@@ -176,13 +176,13 @@ fn joined_row_delta_is_independent_of_aggregate_order() {
             join_key_types: vec![DataType::Int64],
             aggregate_input_types: ordering.map(|index| base_types[index].clone()).to_vec(),
         });
-        let old_group = [(
+        let old_group = group_map(&[(
             simple_key(7),
             GroupEntry {
                 rows: 1,
                 values: old_values.to_vec(),
             },
-        )];
+        )]);
         let result = run_with_aggs(
             DeltaPair::new(31, Arc::new(simple(&[2], &[1])), Arc::new(simple(&[], &[]))),
             &left,
@@ -206,9 +206,16 @@ fn joined_row_delta_is_independent_of_aggregate_order() {
             AggValue::Count(2),
             AggValue::Count(2),
         ];
-        assert_eq!(prepared.groups[0].1.rows, 2);
         assert_eq!(
-            prepared.groups[0].1.values,
+            changed_entry(&prepared.groups, &simple_key(7))
+                .unwrap()
+                .rows,
+            2
+        );
+        assert_eq!(
+            changed_entry(&prepared.groups, &simple_key(7))
+                .unwrap()
+                .values,
             ordering.map(|index| expected[index].clone())
         );
     }

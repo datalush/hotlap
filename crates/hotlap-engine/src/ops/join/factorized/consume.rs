@@ -13,8 +13,8 @@ use super::prepare::{GroupChange, PreparedCut};
 
 #[allow(dead_code)] // Wired by the later graph-cut stage; kept internal meanwhile.
 pub(crate) struct ConsumedGroups {
-    /// Deterministic logical snapshot candidate; caller decides whether to publish.
-    pub groups: Vec<(Vec<u8>, GroupEntry)>,
+    /// Touched-key replacement set; caller publishes only after all output succeeds.
+    pub changes: Vec<(Vec<u8>, Option<GroupEntry>)>,
     pub output: crate::batch::ZSetBatch,
 }
 
@@ -27,10 +27,18 @@ pub(crate) fn consume(
 ) -> Result<ConsumedGroups, EngineError> {
     let prior_groups: std::collections::HashMap<Vec<u8>, GroupEntry> =
         prepared.prior_groups.iter().cloned().collect();
-    let staged_groups: std::collections::HashMap<Vec<u8>, GroupEntry> =
-        prepared.groups.iter().cloned().collect();
-    let mut changes = Vec::with_capacity(prepared.group_changes.len());
-    for change in &prepared.group_changes {
+    consume_changes(&prepared.groups, &prior_groups, schema, group_key, aggs)
+}
+
+pub(crate) fn consume_changes(
+    groups: &[GroupChange],
+    prior_groups: &std::collections::HashMap<Vec<u8>, GroupEntry>,
+    schema: SchemaRef,
+    group_key: &[usize],
+    aggs: &[AggSpec],
+) -> Result<ConsumedGroups, EngineError> {
+    let mut changes = Vec::with_capacity(groups.len());
+    for change in groups {
         match change {
             GroupChange::Remove { key } => {
                 let previous = prior_groups
@@ -62,8 +70,13 @@ pub(crate) fn consume(
         }
     }
     changes.sort_by(|a, b| a.key.cmp(&b.key));
-    let mut snapshot: Vec<_> = staged_groups.into_iter().collect();
-    snapshot.sort_by(|a, b| a.0.cmp(&b.0));
+    let final_changes = groups
+        .iter()
+        .map(|change| match change {
+            GroupChange::Upsert { key, entry } => (key.clone(), Some(entry.clone())),
+            GroupChange::Remove { key } => (key.clone(), None),
+        })
+        .collect();
     let converter = RowConverter::new(
         group_key
             .iter()
@@ -72,7 +85,7 @@ pub(crate) fn consume(
     )?;
     let output = materialize(group_key, aggs, Some(&schema), Some(&converter), &changes)?;
     Ok(ConsumedGroups {
-        groups: snapshot,
+        changes: final_changes,
         output,
     })
 }

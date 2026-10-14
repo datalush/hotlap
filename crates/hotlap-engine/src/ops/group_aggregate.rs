@@ -11,6 +11,7 @@ mod accumulate;
 mod changes;
 pub(crate) mod columns;
 mod fold;
+pub(crate) mod maintained;
 pub(crate) mod materialize;
 pub(crate) mod read;
 mod snapshot;
@@ -41,11 +42,196 @@ pub struct GroupAggregate {
     schema: Option<SchemaRef>,
     converter: Option<RowConverter>,
     groups: HashMap<Vec<u8>, GroupEntry>,
+    /// Query-derived source memo; logical v1 snapshots continue to store only `groups`.
+    maintained_cut: Option<maintained::MaintainedGroupCut>,
     #[cfg(test)]
     work: u64,
 }
 
 impl GroupAggregate {
+    pub(crate) fn maintained_cut(&self) -> Option<&maintained::MaintainedGroupCut> {
+        self.maintained_cut.as_ref()
+    }
+
+    pub(crate) fn empty_cut_entry(&self) -> Result<GroupEntry, EngineError> {
+        let schema = self.schema.as_ref().ok_or_else(|| {
+            EngineError::Infrastructure("group schema missing for certified cut".into())
+        })?;
+        accumulate::empty_entry(&self.aggs, schema)
+    }
+
+    pub(crate) fn initialize_maintained_cut(
+        &mut self,
+        mapping: &hotlap_core::plan_normalize::ColumnMapping,
+        left: &crate::arrange::KeyedArrangement,
+        right: &crate::arrange::KeyedArrangement,
+    ) -> Result<bool, EngineError> {
+        if self.key != mapping.group_key
+            || self.aggs.len() != mapping.aggregate_inputs.len()
+            || self
+                .aggs
+                .iter()
+                .zip(&mapping.aggregate_inputs)
+                .any(|(agg, input)| agg.input != *input)
+        {
+            return Ok(false);
+        }
+        if let Some(existing) = &self.maintained_cut {
+            return Ok(existing.mapping == *mapping);
+        }
+        let Some(cut) = maintained::MaintainedGroupCut::build(mapping, &self.aggs, left, right)?
+        else {
+            return Ok(false);
+        };
+        self.maintained_cut = Some(cut);
+        Ok(true)
+    }
+
+    pub(crate) fn initialize_maintained_cut_projected(
+        &mut self,
+        mapping: &hotlap_core::plan_normalize::ColumnMapping,
+        left: &crate::arrange::KeyedArrangement,
+        right: &crate::arrange::KeyedArrangement,
+        projection: &[usize],
+    ) -> Result<bool, EngineError> {
+        let Some(schema) = &self.schema else {
+            return Ok(false);
+        };
+        if self.key.len() != mapping.group_key.len()
+            || self.aggs.len() != mapping.aggregate_inputs.len()
+            || mapping.aggregate_input_types.len() != self.aggs.len()
+        {
+            return Ok(false);
+        }
+        for (output_key, &join_key_position) in self.key.iter().zip(&mapping.group_key) {
+            let Some(expected_type) = mapping.join_key_types.get(join_key_position) else {
+                return Ok(false);
+            };
+            if schema.fields().get(*output_key).map(|f| f.data_type()) != Some(expected_type) {
+                return Ok(false);
+            }
+            let Some(&projected_column) = projection.get(*output_key) else {
+                return Ok(false);
+            };
+            let Some(&left_column) = mapping.left_join_key.get(join_key_position) else {
+                return Ok(false);
+            };
+            let Some(&right_column) = mapping.right_join_key.get(join_key_position) else {
+                return Ok(false);
+            };
+            let right_column = left
+                .schema()
+                .fields()
+                .len()
+                .checked_add(right_column)
+                .ok_or_else(|| {
+                    EngineError::Infrastructure("projected join column overflow".into())
+                })?;
+            if projected_column != left_column && projected_column != right_column {
+                return Ok(false);
+            }
+        }
+        for ((agg, source_input), source_type) in self
+            .aggs
+            .iter()
+            .zip(&mapping.aggregate_inputs)
+            .zip(&mapping.aggregate_input_types)
+        {
+            match (agg.input, source_input, source_type) {
+                (None, None, None) => {}
+                (Some(output_input), Some(source_input), Some(source_type)) => {
+                    if projection.get(output_input) != Some(source_input)
+                        || schema.fields().get(output_input).map(|f| f.data_type())
+                            != Some(source_type)
+                    {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        if let Some(existing) = &self.maintained_cut {
+            return Ok(existing.mapping == *mapping);
+        }
+        let Some(cut) = maintained::MaintainedGroupCut::build(mapping, &self.aggs, left, right)?
+        else {
+            return Ok(false);
+        };
+        self.maintained_cut = Some(cut);
+        Ok(true)
+    }
+
+    pub(crate) fn maintained_memo(
+        &self,
+    ) -> Option<&crate::ops::join::factorized::group_memo::GroupMemo> {
+        self.maintained_cut.as_ref().map(|cut| &cut.memo)
+    }
+
+    pub(crate) fn validate_maintained_history(&self) -> Result<(), EngineError> {
+        if let Some(cut) = &self.maintained_cut {
+            cut.validate_authoritative_history(&self.aggs, &self.groups)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage_maintained_memo(
+        &self,
+        updates: Vec<(
+            Vec<u8>,
+            Option<crate::ops::join::factorized::group_memo::Contribution>,
+        )>,
+    ) -> Result<Option<crate::ops::join::factorized::group_memo::GroupMemoStage>, EngineError> {
+        self.maintained_cut
+            .as_ref()
+            .map(|cut| cut.stage(updates))
+            .transpose()
+    }
+
+    pub(crate) fn commit_maintained_memo(
+        &mut self,
+        stage: crate::ops::join::factorized::group_memo::GroupMemoStage,
+    ) {
+        if let Some(cut) = &mut self.maintained_cut {
+            cut.commit(stage);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn retained_groups(&self) -> &HashMap<Vec<u8>, GroupEntry> {
+        &self.groups
+    }
+
+    pub(crate) fn aggregates(&self) -> &[AggSpec] {
+        &self.aggs
+    }
+
+    pub(crate) fn group_key(&self) -> &[usize] {
+        &self.key
+    }
+
+    pub(crate) fn schema_for_cut(&self) -> Option<&SchemaRef> {
+        self.schema.as_ref()
+    }
+
+    pub(crate) fn initialize_cut(&mut self, schema: SchemaRef) -> Result<(), EngineError> {
+        let empty = ZSetBatch::empty(schema);
+        self.ensure_schema(&empty)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn commit_factorized_consumed(
+        &mut self,
+        changes: Vec<(Vec<u8>, Option<GroupEntry>)>,
+    ) {
+        for (key, entry) in changes {
+            if let Some(entry) = entry {
+                self.groups.insert(key, entry);
+            } else {
+                self.groups.remove(&key);
+            }
+        }
+    }
+
     pub(crate) fn has_minmax_state(&self) -> bool {
         self.groups.values().any(|entry| {
             entry.values.iter().any(|value| match value {
@@ -123,6 +309,20 @@ impl GroupAggregate {
             )?,
             "aggregate configuration capacity",
         )?;
+        if let Some(cut) = &self.maintained_cut {
+            let (_, memo_capacity) = cut.memo.memory_usage()?;
+            capacity = crate::core::memory::checked_add(
+                capacity,
+                memo_capacity,
+                "maintained group memo capacity",
+            )?;
+            let config = cut.known_capacity_bytes()?;
+            capacity = crate::core::memory::checked_add(
+                capacity,
+                config,
+                "maintained group config capacity",
+            )?;
+        }
         Ok(super::super::core::memory::GroupMemory {
             payload,
             capacity: crate::core::memory::checked_add(
@@ -153,6 +353,7 @@ impl GroupAggregate {
             schema: None,
             converter: None,
             groups: HashMap::new(),
+            maintained_cut: None,
             #[cfg(test)]
             work: 0,
         }

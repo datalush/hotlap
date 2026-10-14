@@ -107,8 +107,8 @@ fn cursor_emits_exact_full_rows_with_signed_checked_products_in_bounded_chunks()
         chunks,
         vec![
             (Some(7), Some(11), Some(7), Some("a".into()), 6),
-            (Some(7), Some(11), None, None, 8),
             (None, None, Some(7), Some("a".into()), -3),
+            (Some(7), Some(11), None, None, 8),
             (None, None, None, None, -4),
         ]
     );
@@ -128,8 +128,9 @@ fn cursor_returns_dense_typed_error_instead_of_wrapping_pair_weight() {
     let mut cursor = FlatRowsCursor::new(&left, &right, 1).unwrap();
     assert!(matches!(
         cursor.next_chunk(),
-        Err(crate::error::EngineError::Infrastructure(message))
-            if message == "join diff product overflowed i64"
+        Err(crate::error::EngineError::NumericOverflow(
+            "join diff product"
+        ))
     ));
 }
 

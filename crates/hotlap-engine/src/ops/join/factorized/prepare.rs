@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array};
@@ -17,7 +17,7 @@ use crate::keys::KeyConverter;
 use super::groups::aggregate_groups;
 use super::history::validate_old_group_state;
 use super::keyed::compute_key_stats;
-use super::stage::{SideStage, TouchedRow, stage_groups, stage_side};
+use super::stage::{SideStage, TouchedRow, stage_side_cached};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -55,7 +55,6 @@ pub struct DeltaPair {
 }
 
 impl DeltaPair {
-    #[cfg(test)]
     pub fn new(epoch: u64, left: Arc<ZSetBatch>, right: Arc<ZSetBatch>) -> Self {
         Self { epoch, left, right }
     }
@@ -68,10 +67,9 @@ pub struct PreparedCut {
     pub mapping: ColumnMapping,
     pub left: Vec<TouchedRow>,
     pub right: Vec<TouchedRow>,
-    pub groups: Vec<(Vec<u8>, GroupEntry)>,
+    pub groups: Vec<GroupChange>,
     /// Prior entries for touched groups, retained for old-row changelog rendering.
     pub prior_groups: Vec<(Vec<u8>, GroupEntry)>,
-    pub group_changes: Vec<GroupChange>,
     pub side_bounds: (u128, u128),
     pub staged_touched: Vec<(Vec<u8>, Vec<u8>, i64)>,
     /// Present only for a guarded flat-row consumer; already fully consolidated.
@@ -104,7 +102,51 @@ impl CutDecision {
 pub struct OldState<'a> {
     pub left: &'a KeyedArrangement,
     pub right: &'a KeyedArrangement,
-    pub groups: &'a [(Vec<u8>, GroupEntry)],
+    pub groups: &'a HashMap<Vec<u8>, GroupEntry>,
+}
+
+pub(super) struct OldBuckets<'a> {
+    left_arrangement: &'a KeyedArrangement,
+    right_arrangement: &'a KeyedArrangement,
+    left: HashMap<Vec<u8>, ZSetBatch>,
+    right: HashMap<Vec<u8>, ZSetBatch>,
+}
+
+impl<'a> OldBuckets<'a> {
+    pub(super) fn new(left: &'a KeyedArrangement, right: &'a KeyedArrangement) -> Self {
+        Self {
+            left_arrangement: left,
+            right_arrangement: right,
+            left: HashMap::new(),
+            right: HashMap::new(),
+        }
+    }
+
+    pub(super) fn is_left(&self, arrangement: &KeyedArrangement) -> bool {
+        std::ptr::eq(self.left_arrangement, arrangement)
+    }
+
+    pub(super) fn left(&mut self, key: &[u8]) -> Result<ZSetBatch, EngineError> {
+        if let Some(batch) = self.left.get(key) {
+            return Ok(batch.clone());
+        }
+        #[cfg(test)]
+        super::OLD_BUCKET_DECODES.with(|count| count.set(count.get() + 1));
+        let batch = self.left_arrangement.to_zset_for_key(key)?;
+        self.left.insert(key.to_vec(), batch.clone());
+        Ok(batch)
+    }
+
+    pub(super) fn right(&mut self, key: &[u8]) -> Result<ZSetBatch, EngineError> {
+        if let Some(batch) = self.right.get(key) {
+            return Ok(batch.clone());
+        }
+        #[cfg(test)]
+        super::OLD_BUCKET_DECODES.with(|count| count.set(count.get() + 1));
+        let batch = self.right_arrangement.to_zset_for_key(key)?;
+        self.right.insert(key.to_vec(), batch.clone());
+        Ok(batch)
+    }
 }
 
 pub struct PrepareInput<'a> {
@@ -116,6 +158,17 @@ pub struct PrepareInput<'a> {
 }
 
 pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
+    #[cfg(test)]
+    let mut phase = std::time::Instant::now();
+    #[cfg(test)]
+    let mut record_phase = |index: usize| {
+        super::PREPARE_STAGE_NS.with(|value| {
+            let mut values = value.get();
+            values[index] = values[index].saturating_add(phase.elapsed().as_nanos());
+            value.set(values);
+        });
+        phase = std::time::Instant::now();
+    };
     let PrepareInput {
         recognition,
         aggregates,
@@ -151,13 +204,13 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         || aggregates.len() != mapping.aggregate_input_types.len()
         || state
             .groups
-            .iter()
-            .any(|(_, entry)| entry.values.len() != aggregates.len())
+            .values()
+            .any(|entry| entry.values.len() != aggregates.len())
     {
         return CutDecision::Dense(DenseReason::StateShape);
     }
     if !flat_rows
-        && state.groups.iter().any(|(_, entry)| {
+        && state.groups.values().any(|entry| {
             entry.rows <= 0
                 || entry.values.len() != aggregates.len()
                 || entry.values.iter().zip(aggregates).any(|(value, agg)| {
@@ -188,6 +241,8 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
     {
         return CutDecision::Dense(DenseReason::InputMapping);
     }
+    #[cfg(test)]
+    record_phase(0);
     if !flat_rows {
         for ((agg, mapped_input), ty) in aggregates
             .iter()
@@ -222,20 +277,23 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         (Ok(left), Ok(right)) => (left, right),
         _ => return CutDecision::Dense(DenseReason::InputMapping),
     };
-    let left = match stage_side(
+    let mut buckets = OldBuckets::new(state.left, state.right);
+    let left = match stage_side_cached(
         &inputs.left,
         &mapping.left_join_key,
         &left_extra,
         state.left,
+        &mut buckets,
     ) {
         Ok(value) => value,
         Err(_) => return CutDecision::Dense(DenseReason::NegativeOrOverflow),
     };
-    let right = match stage_side(
+    let right = match stage_side_cached(
         &inputs.right,
         &mapping.right_join_key,
         &right_extra,
         state.right,
+        &mut buckets,
     ) {
         Ok(value) => value,
         Err(_) => return CutDecision::Dense(DenseReason::NegativeOrOverflow),
@@ -248,6 +306,8 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         Some(value) => value,
         None => return CutDecision::Dense(DenseReason::NegativeOrOverflow),
     };
+    #[cfg(test)]
+    record_phase(1);
     let touched: HashSet<Vec<u8>> = left
         .rows
         .iter()
@@ -264,6 +324,8 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
             Err(_) => return CutDecision::Dense(DenseReason::InputMapping),
         }
     }
+    #[cfg(test)]
+    record_phase(2);
     if flat_rows {
         let flat_rows = match super::flat::FlatRowsCursor::from_join_delta(
             state.left,
@@ -287,7 +349,6 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
             right: right.rows,
             groups: Vec::new(),
             prior_groups: Vec::new(),
-            group_changes: Vec::new(),
             side_bounds: bounds,
             staged_touched,
             flat_rows: Some(flat_rows),
@@ -301,22 +362,20 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         state.left,
         state.right,
         &inputs,
+        &mut buckets,
     ) {
         Ok(bounds) => bounds,
         Err(reason) => return CutDecision::Dense(reason),
     };
-    let key_stats = match compute_key_stats(
-        mapping,
-        aggregates,
-        &inputs,
-        &left,
-        &touched,
-        state.left,
-        state.right,
-    ) {
-        Ok(value) => value,
-        Err(reason) => return CutDecision::Dense(reason),
-    };
+    #[cfg(test)]
+    record_phase(3);
+    let key_stats =
+        match compute_key_stats(mapping, aggregates, &inputs, &left, &touched, &mut buckets) {
+            Ok(value) => value,
+            Err(reason) => return CutDecision::Dense(reason),
+        };
+    #[cfg(test)]
+    record_phase(4);
     let candidates = match aggregate_groups(
         mapping,
         aggregates,
@@ -329,10 +388,8 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
         Some(value) => value,
         None => return CutDecision::Dense(DenseReason::UnsupportedNumeric),
     };
-    let groups = match stage_groups(state.groups, &candidates) {
-        Ok(value) => value,
-        Err(_) => return CutDecision::Dense(DenseReason::StateShape),
-    };
+    #[cfg(test)]
+    record_phase(5);
     let changed_keys: HashSet<Vec<u8>> = candidates
         .iter()
         .map(|change| match change {
@@ -342,18 +399,19 @@ pub fn prepare(request: PrepareInput<'_>) -> CutDecision {
     let prior_groups = state
         .groups
         .iter()
-        .filter(|(key, _)| changed_keys.contains(key))
-        .cloned()
+        .filter(|(key, _)| changed_keys.contains(*key))
+        .map(|(key, entry)| (key.clone(), entry.clone()))
         .collect();
+    #[cfg(test)]
+    record_phase(6);
     CutDecision::Eligible(PreparedCut {
         epoch: inputs.epoch,
         inputs,
         mapping: mapping.clone(),
         left: left.rows,
         right: right.rows,
-        groups,
+        groups: candidates,
         prior_groups,
-        group_changes: candidates,
         side_bounds: bounds,
         staged_touched,
         flat_rows: None,
