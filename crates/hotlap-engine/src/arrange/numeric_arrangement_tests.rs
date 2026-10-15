@@ -95,6 +95,98 @@ fn row_state_promotes_and_demotes_singleton_buckets() {
 }
 
 #[test]
+fn row_state_keeps_owned_identity_after_source_buffer_drop_and_reallocation() {
+    use arrow::array::StringArray;
+
+    let key_bytes = vec![0x31; 4096];
+    let payload_bytes = vec![0x72; 8192];
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+    let converter = converter_for(schema.as_ref(), &[0]).unwrap();
+    let to_owned_row = |bytes: &[u8]| {
+        converter
+            .convert_columns(&[Arc::new(StringArray::from(vec![
+                std::str::from_utf8(bytes).unwrap(),
+            ]))])
+            .unwrap()
+            .row(0)
+            .owned()
+    };
+    let key = to_owned_row(&key_bytes);
+    let payload = to_owned_row(&payload_bytes);
+    let expected_key = key.as_ref().to_vec();
+    let expected_payload = payload.as_ref().to_vec();
+    let mut state = RowState::default();
+
+    state.add(key, payload, 7).unwrap();
+    drop(key_bytes);
+    drop(payload_bytes);
+    let mut replacement_key_buffer = vec![0x31; 4096];
+    let mut replacement_payload_buffer = vec![0x72; 8192];
+    replacement_key_buffer.fill(0xa5);
+    replacement_payload_buffer.fill(0x5a);
+
+    let stored = state.sorted();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].0.as_ref(), expected_key);
+    assert_eq!(stored[0].1.as_ref(), expected_payload);
+    assert_eq!(stored[0].2, 7);
+}
+
+#[test]
+fn row_state_zero_retraction_reclaims_payload_and_overflow_preserves_state() {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let converter = converter_for(schema.as_ref(), &[0]).unwrap();
+    let make = |value| {
+        converter
+            .convert_columns(&[Arc::new(Int64Array::from(vec![value]))])
+            .unwrap()
+            .row(0)
+            .owned()
+    };
+    let (key, first, second, third) = (make(1), make(10), make(20), make(30));
+    let mut state = RowState::default();
+    state.add(key.clone(), first.clone(), 4).unwrap();
+    let outer_capacity = state.outer_capacity_for_test();
+    state.add(key.clone(), second.clone(), 3).unwrap();
+    assert!(state.many_capacity(key.as_ref()).unwrap() > 0);
+    let many_structural = state.memory_usage_for_test().2;
+    assert_eq!(state.len(), 2);
+    state.add(key.clone(), first.clone(), -4).unwrap();
+    assert_eq!(state.bucket_kind(key.as_ref()), Some("one"));
+    assert_eq!(state.len(), 1);
+    assert_eq!(state.get(key.as_ref(), &second), Some(&3));
+    assert_eq!(state.many_capacity(key.as_ref()), None);
+    assert!(state.memory_usage_for_test().2 < many_structural);
+    assert_eq!(state.outer_capacity_for_test(), outer_capacity);
+
+    state.add(key.clone(), third.clone(), 5).unwrap();
+    state.add(key.clone(), second.clone(), -3).unwrap();
+    assert_eq!(state.bucket_kind(key.as_ref()), Some("one"));
+    assert_eq!(state.get(key.as_ref(), &third), Some(&5));
+    state.add(key.clone(), third.clone(), i64::MAX - 5).unwrap();
+    let before_overflow: Vec<_> = state
+        .sorted()
+        .into_iter()
+        .map(|(key, payload, diff)| (key.clone(), payload.clone(), diff))
+        .collect();
+    assert!(matches!(
+        state.add(key.clone(), third.clone(), 1),
+        Err(EngineError::NumericOverflow(_))
+    ));
+    let after_overflow: Vec<_> = state
+        .sorted()
+        .into_iter()
+        .map(|(key, payload, diff)| (key.clone(), payload.clone(), diff))
+        .collect();
+    assert_eq!(after_overflow, before_overflow);
+    state.add(key.clone(), third, -(i64::MAX)).unwrap();
+    assert!(state.is_empty());
+    assert_eq!(state.outer_capacity_for_test(), outer_capacity);
+    state.add(key.clone(), first.clone(), 2).unwrap();
+    assert_eq!(state.get(key.as_ref(), &first), Some(&2));
+}
+
+#[test]
 fn many_bucket_keeps_exact_payload_weights_and_retracts_independently() {
     let row = |value| {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));

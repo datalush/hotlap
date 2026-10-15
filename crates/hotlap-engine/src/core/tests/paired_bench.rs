@@ -896,6 +896,81 @@ mod observer_contract_tests {
             shrink.bytes_allocated as i128 - shrink.bytes_deallocated as i128
         );
     }
+
+    #[cfg(feature = "bench-allocation-observer")]
+    #[test]
+    #[ignore = "process-wide allocator observation; run alone with one test thread"]
+    fn row_state_final_retraction_deallocates_owned_payload_buffer() {
+        use crate::arrange::state::RowState;
+        use arrow::array::{ArrayRef, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["large", "small"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "x".repeat(1 << 20),
+                    "tiny".to_owned(),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let key_converter = crate::keys::KeyConverter::new(schema.as_ref(), &[0]).unwrap();
+        let payload_converter = crate::keys::KeyConverter::new(schema.as_ref(), &[1]).unwrap();
+        let keys = key_converter.convert(batch.columns()).unwrap();
+        let payloads = payload_converter.convert(batch.columns()).unwrap();
+        let large_key = keys.row(0).owned();
+        let large_payload = payloads.row(0).owned();
+        let small_key = keys.row(1).owned();
+        let small_payload = payloads.row(1).owned();
+        let mut state = RowState::default();
+        state
+            .add(large_key.clone(), large_payload.clone(), 2)
+            .unwrap();
+        state
+            .add(small_key.clone(), small_payload.clone(), 1)
+            .unwrap();
+        drop(batch);
+        drop(keys);
+        drop(payloads);
+
+        let first_retract_key = large_key.clone();
+        let first_retract_payload = large_payload.clone();
+        let region = Region::new(TEST_ALLOCATOR);
+        state
+            .add(first_retract_key, first_retract_payload, -1)
+            .unwrap();
+        let non_final_deallocation = region.change();
+
+        let final_retract_key = large_key;
+        let final_retract_payload = large_payload;
+        let region = Region::new(TEST_ALLOCATOR);
+        state
+            .add(final_retract_key, final_retract_payload, -1)
+            .unwrap();
+        let final_deallocation = region.change();
+
+        eprintln!(
+            "non_final_large_retraction_deallocated_bytes={} final_large_retraction_deallocated_bytes={}",
+            non_final_deallocation.bytes_deallocated, final_deallocation.bytes_deallocated
+        );
+        let remaining = state.sorted();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0.as_slice(), small_key.as_ref());
+        assert_eq!(remaining[0].1.as_ref(), small_payload.as_ref());
+        assert_eq!(remaining[0].2, 1);
+        assert!(final_deallocation.bytes_deallocated > non_final_deallocation.bytes_deallocated);
+        assert!(
+            final_deallocation.bytes_deallocated - non_final_deallocation.bytes_deallocated
+                >= (1 << 20)
+        );
+    }
 }
 
 fn run_id() -> String {
