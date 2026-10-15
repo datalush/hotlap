@@ -211,14 +211,6 @@ fn prepare_grouped_update_inner(
     let Some(bindings) = certificate::compile_metric_bindings(mapping, reducer.aggregates()) else {
         return Ok(CertifiedDecision::NeedsRows(None));
     };
-    // The integer AVG certificate is prepared separately from row consumption;
-    // ntf6 will connect it to the renderer after its bitwise-output proof lands.
-    if bindings
-        .iter()
-        .any(|binding| binding.kind == certificate::BoundKind::IntegerAvg)
-    {
-        return Ok(CertifiedDecision::NeedsRows(None));
-    }
     if projection.is_none()
         && (reducer.group_key() != mapping.group_key
             || reducer
@@ -439,7 +431,31 @@ fn prepare_grouped_update_inner(
                     AggValue::SumInteger { sum, count: nn }
                 }
                 BoundKind::IntegerAvg => {
-                    return Ok(CertifiedDecision::NeedsRows(Some(memo_stage)));
+                    let Some(nn_index) = binding.nn_memo_index else {
+                        return Ok(CertifiedDecision::NeedsRows(Some(memo_stage)));
+                    };
+                    let Some(count) = proposed_memo
+                        .metrics
+                        .get(nn_index)
+                        .filter(|metric| {
+                            metric.eligibility
+                                == crate::ops::join::factorized::group_memo::MetricLimit::Exact
+                        })
+                        .and_then(|metric| to_i64(metric.subtotal))
+                        .filter(|count| *count >= 0 && *count <= row_count)
+                    else {
+                        return Ok(CertifiedDecision::NeedsRows(Some(memo_stage)));
+                    };
+                    let Some(integer_sum) = to_i128(metric.subtotal) else {
+                        return Ok(CertifiedDecision::NeedsRows(Some(memo_stage)));
+                    };
+                    AggValue::Avg {
+                        sum: integer_sum as f64,
+                        count,
+                        nan: 0,
+                        pos_inf: 0,
+                        neg_inf: 0,
+                    }
                 }
             };
             entry.values[binding.aggregate_index] = value;

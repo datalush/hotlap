@@ -145,8 +145,7 @@ fn undrained_changes_survive_checkpoint_and_emit_once_after_restore() {
     original.push(InputId(1), &pairs(&[(1, 20, 1)])).unwrap();
     let pending = original.checkpoint().unwrap();
     assert!(!pending.views[0].pending.as_ref().unwrap().diff.is_empty());
-    crate::core::graph::FACTORIZED_CUTS.with(|count| assert_eq!(count.get(), 0));
-    crate::core::graph::FLAT_ROWS_CUTS.with(|count| assert!(count.get() > 0));
+    crate::core::graph::FACTORIZED_CUTS.with(|count| assert!(count.get() > 0));
 
     let mut restored = EngineCore::new();
     restored.register_input(InputId(0)).unwrap();
@@ -743,13 +742,22 @@ fn mixed_factorized_and_flat_views_match_dense_after_each_push_and_restore() {
     let mut dense = core_with_views(true);
     for (step, (input, batch)) in [
         (InputId(0), pairs(&[(1, 4, 1), (1, 7, 1)])),
-        (InputId(1), pairs(&[(1, 9, 1)])),
+        (InputId(1), pairs(&[(1, 9, 1), (1, 12, 1)])),
         (InputId(0), pairs(&[(1, 4, -1), (1, 3, 1)])),
     ]
     .into_iter()
     .enumerate()
     {
+        if step == 1 {
+            crate::core::graph::FACTORIZED_CUTS.with(|count| count.set(0));
+            crate::ops::join::factorized::FLAT_PAIR_PRODUCTS.with(|count| count.set(0));
+        }
         factor.push(input, &batch).unwrap();
+        if step == 1 {
+            crate::core::graph::FACTORIZED_CUTS.with(|count| assert!(count.get() > 0));
+            crate::ops::join::factorized::FLAT_PAIR_PRODUCTS
+                .with(|count| assert_eq!(count.get(), 4));
+        }
         crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|flag| flag.set(true));
         dense.push(input, &batch).unwrap();
         crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|flag| flag.set(false));
@@ -793,10 +801,14 @@ fn typed_join_overflow_after_factorized_history_poison_rejects_checkpoint() {
     core.push(InputId(0), &pairs(&[(1, 1, 1)])).unwrap();
     crate::core::graph::FACTORIZED_CUTS.with(|count| count.set(0));
     core.push(InputId(1), &pairs(&[(1, 1, 2)])).unwrap();
-    crate::core::graph::FACTORIZED_CUTS.with(|count| assert_eq!(count.get(), 0));
-    crate::core::graph::FLAT_ROWS_CUTS.with(|count| assert!(count.get() > 0));
-    crate::ops::join::factorized::FLAT_PAIR_PRODUCTS
-        .with(|count| assert!(count.get() > 0, "explicit flat route evaluates join pairs"));
+    crate::core::graph::FACTORIZED_CUTS.with(|count| assert!(count.get() > 0));
+    crate::ops::join::factorized::FLAT_PAIR_PRODUCTS.with(|count| {
+        assert_eq!(
+            count.get(),
+            0,
+            "certified AVG path avoids join pair products"
+        )
+    });
     core.push(InputId(0), &pairs(&[(1, 1, -1)])).unwrap();
     assert!(core.snapshot(ViewId(0)).unwrap().is_empty());
     let good = core.checkpoint().unwrap();

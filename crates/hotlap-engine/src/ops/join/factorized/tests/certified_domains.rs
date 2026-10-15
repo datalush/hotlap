@@ -2,7 +2,7 @@ use super::certified_consume_support::*;
 use super::*;
 
 #[test]
-fn valid_avg_stays_on_dense_path_without_changing_dense_output() {
+fn valid_integer_avg_certifies_without_changing_dense_output_or_history() {
     let left_schema = rich_left_schema();
     let right_schema = rich_right_schema();
     let left_initial = rich_left(
@@ -56,9 +56,11 @@ fn valid_avg_stays_on_dense_path_without_changing_dense_output() {
         output_schema,
     )
     .unwrap();
-    assert!(matches!(decision, CertifiedDecision::NeedsRows(None)));
-    let candidate_rows = candidate_join.apply(&left_delta, &right_delta).unwrap();
-    let candidate_output = candidate_group.apply(&candidate_rows).unwrap();
+    let CertifiedDecision::Certified(prepared) = decision else {
+        panic!("exact integer AVG history should certify");
+    };
+    let candidate_output = prepared.output().clone();
+    prepared.commit(&mut candidate_join, &mut candidate_group);
     let dense_rows = dense_join.apply(&left_delta, &right_delta).unwrap();
     let dense_output = dense_group.apply(&dense_rows).unwrap();
     assert_eq!(candidate_output.schema(), dense_output.schema());
@@ -75,16 +77,16 @@ fn certified_render_overflow_falls_back_without_publishing_any_cut_state() {
     let right_schema = source_schema("r");
     let left_initial = source_batch(left_schema.clone(), &[(1, 1, Some(i64::MAX - 1))], &[1]);
     let right_initial = source_batch(right_schema.clone(), &[(1, 1, Some(1))], &[1]);
-    let aggs = vec![AggSpec::sum(2)];
+    let aggs = vec![AggSpec::sum(2), AggSpec::avg(2)];
     let mapping = ColumnMapping {
         left_source: InputId(0),
         right_source: InputId(1),
         left_join_key: vec![0, 1],
         right_join_key: vec![0, 1],
         group_key: vec![0],
-        aggregate_inputs: vec![Some(2)],
+        aggregate_inputs: vec![Some(2), Some(2)],
         join_key_types: vec![DataType::Int64, DataType::Int64],
-        aggregate_input_types: vec![Some(DataType::Int64)],
+        aggregate_input_types: vec![Some(DataType::Int64), Some(DataType::Int64)],
     };
     let mut candidate_join = crate::ops::Join::new(&[0, 1], &[0, 1]);
     let initial = candidate_join.apply(&left_initial, &right_initial).unwrap();

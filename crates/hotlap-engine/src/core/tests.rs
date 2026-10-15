@@ -10,6 +10,7 @@ use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
 
 use super::EngineCore;
 
+mod avg_consume;
 mod graph_review;
 mod paired_bench;
 mod recovery;
@@ -199,7 +200,7 @@ fn direct_count_sum_group_join_uses_certified_path_for_safe_updates() {
 }
 
 #[test]
-fn projected_avg_group_join_uses_flat_fallback() {
+fn projected_integer_avg_group_join_certifies_and_preserves_null_keys() {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();
     core.register_input(InputId(1)).unwrap();
@@ -251,8 +252,7 @@ fn projected_avg_group_join_uses_flat_fallback() {
     core.push(InputId(0), &source(&[(Some(2), 1, 1), (None, 1, 1)]))
         .unwrap();
     core.push(InputId(1), &source(&[(Some(9), 1, 1)])).unwrap();
-    crate::core::graph::FACTORIZED_CUTS.with(|n| assert_eq!(n.get(), 0));
-    crate::core::graph::FLAT_ROWS_CUTS.with(|n| assert!(n.get() > 0));
+    crate::core::graph::FACTORIZED_CUTS.with(|n| assert!(n.get() > 0));
     let actual = crate::zset::consolidate(&core.snapshot(ViewId(0)).unwrap()).unwrap();
     assert_eq!(actual.len(), 1);
     let count = actual
@@ -281,7 +281,7 @@ fn projected_avg_group_join_uses_flat_fallback() {
 }
 
 #[test]
-fn flat_avg_and_forced_dense_group_join_match_each_delta_and_pending_restore() {
+fn integer_avg_and_forced_dense_group_join_match_each_delta_and_pending_restore() {
     fn core() -> EngineCore {
         let mut core = EngineCore::new();
         core.register_input(InputId(0)).unwrap();
@@ -373,8 +373,7 @@ fn flat_avg_and_forced_dense_group_join_match_each_delta_and_pending_restore() {
         &factor.snapshot(ViewId(0)).unwrap(),
         &dense.snapshot(ViewId(0)).unwrap(),
     );
-    crate::core::graph::FACTORIZED_CUTS.with(|n| assert_eq!(n.get(), 0));
-    crate::core::graph::FLAT_ROWS_CUTS.with(|n| assert!(n.get() > 0));
+    crate::core::graph::FACTORIZED_CUTS.with(|n| assert!(n.get() > 0));
     crate::core::graph::DENSE_JOIN_MATERIALIZATIONS.with(|n| assert!(n.get() > 0));
 }
 
@@ -420,6 +419,7 @@ fn unsafe_avg_history_stays_on_flat_fallback() {
         &factor.take_changes(ViewId(0)).unwrap(),
         &dense.take_changes(ViewId(0)).unwrap(),
     );
+    same_group_aggregate_state(&factor, &dense);
     let replacement = pairs(&[(1, (1_i64 << 53) + 1, -1), (1, 4, 1)]);
     factor.push(InputId(0), &replacement).unwrap();
     crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(true));
@@ -429,6 +429,8 @@ fn unsafe_avg_history_stays_on_flat_fallback() {
         &factor.take_changes(ViewId(0)).unwrap(),
         &dense.take_changes(ViewId(0)).unwrap(),
     );
+    same_group_aggregate_state(&factor, &dense);
+    crate::core::graph::FACTORIZED_CUTS.with(|n| n.set(0));
     factor.push(InputId(0), &pairs(&[(1, 2, 1)])).unwrap();
     crate::core::graph::FORCE_DENSE_GROUP_JOIN.with(|f| f.set(true));
     dense.push(InputId(0), &pairs(&[(1, 2, 1)])).unwrap();
@@ -437,11 +439,17 @@ fn unsafe_avg_history_stays_on_flat_fallback() {
         &factor.take_changes(ViewId(0)).unwrap(),
         &dense.take_changes(ViewId(0)).unwrap(),
     );
+    same_group_aggregate_state(&factor, &dense);
     same_batches(
         &factor.snapshot(ViewId(0)).unwrap(),
         &dense.snapshot(ViewId(0)).unwrap(),
     );
-    crate::core::graph::FACTORIZED_CUTS.with(|n| assert_eq!(n.get(), 0));
+    crate::core::graph::FACTORIZED_CUTS.with(|n| {
+        assert!(
+            n.get() > 0,
+            "exact history should become eligible after Dense fallback"
+        )
+    });
     crate::core::graph::FLAT_ROWS_CUTS.with(|n| assert!(n.get() > 0));
 }
 
@@ -456,6 +464,25 @@ fn same_batches(a: &ZSetBatch, b: &ZSetBatch) {
     for (a, b) in a.batch.columns().iter().zip(b.batch.columns()) {
         assert_eq!(a.to_data(), b.to_data());
     }
+}
+
+fn same_group_aggregate_state(a: &EngineCore, b: &EngineCore) {
+    fn group(
+        snapshot: &hotlap_core::snapshot::EngineSnapshot,
+    ) -> &hotlap_core::snapshot::GroupState {
+        snapshot.views[0]
+            .operators
+            .iter()
+            .flatten()
+            .find_map(|operator| match operator {
+                hotlap_core::snapshot::OperatorState::Group(state) => Some(state),
+                _ => None,
+            })
+            .expect("view contains GroupAggregate")
+    }
+    let a = a.checkpoint().unwrap();
+    let b = b.checkpoint().unwrap();
+    assert_eq!(group(&a), group(&b));
 }
 
 fn group_plan() -> Plan {

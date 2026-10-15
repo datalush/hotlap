@@ -63,6 +63,38 @@ impl MaintainedGroupCut {
             let mut metric_index = 0usize;
             let entry = groups.get(*group_key);
             for (aggregate_index, aggregate) in aggregates.iter().enumerate() {
+                if aggregate.func == hotlap_core::plan::AggFunc::Avg {
+                    let Some(arrow::datatypes::DataType::Int32 | arrow::datatypes::DataType::Int64) =
+                        self.mapping
+                            .aggregate_input_types
+                            .get(aggregate_index)
+                            .and_then(Option::as_ref)
+                    else {
+                        return Ok(());
+                    };
+                    metric_index += 1;
+                    let Some(nonnull) = summary.metrics.get(metric_index) else {
+                        return Err(history_mismatch("derived AVG non-null metric"));
+                    };
+                    let Some(expected_count) = nonnull.subtotal.to_string().parse::<i64>().ok()
+                    else {
+                        return Ok(());
+                    };
+                    if expected_count < 0 || expected_count > expected_rows {
+                        return Ok(());
+                    }
+                    // Current canonical NN cannot prove historical AVG.count: Dense
+                    // can remove a zero-row group on a signed update, then recreate
+                    // it from different physical source history. v1 has no per-history
+                    // proof. As in the unsupported-aggregate path, stop validating
+                    // later slots too: their endpoint totals do not prove their
+                    // historical GroupAggregate values after that lifecycle.
+                    let _ = (
+                        expected_count,
+                        entry.and_then(|entry| entry.values.get(aggregate_index)),
+                    );
+                    return Ok(());
+                }
                 let Some(metric) = summary.metrics.get(metric_index) else {
                     return Err(history_mismatch("derived metric shape"));
                 };
