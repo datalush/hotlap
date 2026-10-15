@@ -11,6 +11,8 @@ use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
 use super::EngineCore;
 
 mod avg_consume;
+mod filter_project_bench;
+mod filter_project_graph;
 mod graph_review;
 mod paired_bench;
 mod recovery;
@@ -955,4 +957,3 @@ fn push_encodes_only_the_delta() {
         "1-row push re-encoded the resident state"
     );
 }
-mod filter_project_graph;
