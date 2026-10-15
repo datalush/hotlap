@@ -14,6 +14,7 @@ mod avg_consume;
 mod filter_project_bench;
 mod filter_project_graph;
 mod graph_review;
+mod minmax_characterization;
 mod paired_bench;
 mod recovery;
 mod recovery_signed_history;
