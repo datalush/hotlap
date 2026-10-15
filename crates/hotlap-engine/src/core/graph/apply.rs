@@ -192,7 +192,22 @@ impl Node {
         match self {
             Node::Source(id) => source_eval(*id, ctx),
             Node::Filter { input, pred } => filter_eval(input, pred, ctx),
-            Node::Project { input, cols } => project_eval(input, cols, ctx),
+            Node::Project { input, cols } => {
+                let optimized = matches!(
+                    input.as_ref(),
+                    Node::Filter { input, .. } if matches!(input.as_ref(), Node::Source(_))
+                );
+                if optimized && should_fuse_filter_project() {
+                    let Node::Filter { input, pred } = input.as_mut() else {
+                        unreachable!();
+                    };
+                    #[cfg(test)]
+                    super::note_selected_filter_project();
+                    filter_project_eval(input, pred, cols, ctx)
+                } else {
+                    project_eval(input, cols, ctx)
+                }
+            }
             Node::Group {
                 input,
                 reducer,
@@ -247,6 +262,17 @@ impl Node {
     }
 }
 
+fn should_fuse_filter_project() -> bool {
+    #[cfg(test)]
+    {
+        !super::FORCE_DENSE_FILTER_PROJECT.with(|force| force.get())
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
 /// Emits the pushed delta at its source, or an empty delta once its schema is
 /// known; `None` while a sibling source's schema is still unknown.
 fn source_eval(id: InputId, ctx: &mut EvalCtx) -> Result<Option<ZSetBatch>, EngineError> {
@@ -285,6 +311,21 @@ fn project_eval(
         None => Ok(None),
         Some(z) => Ok(Some(project(&z, cols)?)),
     }
+}
+
+fn filter_project_eval(
+    input: &mut Node,
+    pred: &Predicate,
+    cols: &[usize],
+    ctx: &mut EvalCtx,
+) -> Result<Option<ZSetBatch>, EngineError> {
+    let Some(z) = input.eval(ctx)? else {
+        return Ok(None);
+    };
+    let mask = pred.eval(&z.batch)?;
+    Ok(Some(crate::ops::filter_project::filter_project(
+        &z, &mask, cols,
+    )?))
 }
 
 fn project_batch_schema(

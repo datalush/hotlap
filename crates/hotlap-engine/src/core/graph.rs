@@ -59,10 +59,25 @@ struct EvalCtx<'a> {
 thread_local! {
     pub(super) static FACTORIZED_CUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub(super) static FORCE_DENSE_GROUP_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static FORCE_DENSE_FILTER_PROJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static SELECTED_FILTER_PROJECTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub(super) static DENSE_JOIN_MATERIALIZATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub(super) static DENSE_JOIN_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub(super) static DENSE_JOIN_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub(super) static FLAT_ROWS_CUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn note_selected_filter_project() -> bool {
+    SELECTED_FILTER_PROJECTS.with(|count| {
+        count.set(count.get() + 1);
+        true
+    })
+}
+
+#[cfg(test)]
+pub(super) fn selected_filter_project_count() -> u64 {
+    SELECTED_FILTER_PROJECTS.with(std::cell::Cell::get)
 }
 
 /// A persistent plan compiled to stateful nodes for one view.
