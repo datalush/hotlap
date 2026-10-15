@@ -23,6 +23,7 @@ pub(crate) enum BoundKind {
     Count,
     NullableCount,
     IntegerSum,
+    IntegerAvg,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,7 +82,7 @@ pub(crate) fn compile_metric_bindings(
                 });
                 slot += 1;
             }
-            (AggFunc::Sum, Some(_)) => {
+            (AggFunc::Sum | AggFunc::Avg, Some(_)) => {
                 if !matches!(
                     mapping
                         .aggregate_input_types
@@ -92,7 +93,11 @@ pub(crate) fn compile_metric_bindings(
                     return None;
                 }
                 bindings.push(MetricBinding {
-                    kind: BoundKind::IntegerSum,
+                    kind: if aggregate.func == AggFunc::Avg {
+                        BoundKind::IntegerAvg
+                    } else {
+                        BoundKind::IntegerSum
+                    },
                     memo_index: slot,
                     aggregate_index,
                     nn_memo_index: Some(slot + 1),
@@ -220,28 +225,29 @@ pub(crate) fn certify_group(
         ) else {
             return CertificateDecision::NeedsRowEvaluation;
         };
-        let metric_delta_valid = if binding.kind == BoundKind::IntegerSum {
-            let delta_abs = bounds
-                .sum_abs_delta
-                .iter()
-                .find(|(index, _)| *index == binding.memo_index)
-                .map(|(_, value)| *value);
-            match (
-                next.subtotal
-                    .checked_sub(previous.subtotal)
-                    .and_then(abs_i256),
-                delta_abs,
-            ) {
-                (Some(actual), Some(bound)) => actual <= bound,
-                _ => false,
-            }
-        } else {
-            delta_bound
-                .positive
-                .checked_add(previous.subtotal)
-                .and_then(|value| value.checked_sub(delta_bound.negative))
-                == Some(next.subtotal)
-        };
+        let metric_delta_valid =
+            if matches!(binding.kind, BoundKind::IntegerSum | BoundKind::IntegerAvg) {
+                let delta_abs = bounds
+                    .sum_abs_delta
+                    .iter()
+                    .find(|(index, _)| *index == binding.memo_index)
+                    .map(|(_, value)| *value);
+                match (
+                    next.subtotal
+                        .checked_sub(previous.subtotal)
+                        .and_then(abs_i256),
+                    delta_abs,
+                ) {
+                    (Some(actual), Some(bound)) => actual <= bound,
+                    _ => false,
+                }
+            } else {
+                delta_bound
+                    .positive
+                    .checked_add(previous.subtotal)
+                    .and_then(|value| value.checked_sub(delta_bound.negative))
+                    == Some(next.subtotal)
+            };
         if previous.eligibility != MetricLimit::Exact
             || next.eligibility != MetricLimit::Exact
             || !delta_bound.within_prefixes(previous.subtotal, previous.limit)
@@ -323,6 +329,18 @@ pub(crate) fn certify_group(
                     return CertificateDecision::NeedsRowEvaluation;
                 }
             }
+            (BoundKind::IntegerAvg, _) => {
+                if !super::avg_certificate::validate_avg_history(
+                    old,
+                    *binding,
+                    previous,
+                    old_memo,
+                    proposed_memo,
+                    bounds,
+                ) {
+                    return CertificateDecision::NeedsRowEvaluation;
+                }
+            }
             _ => return CertificateDecision::NeedsRowEvaluation,
         }
     }
@@ -399,6 +417,18 @@ fn validate_old_history(
                         .and_then(|(_, delta)| abs_i256(i256::from_i128(*sum))?.checked_add(*delta))
                         .is_some_and(|bound| bound <= i256::from_i128(i128::MAX))
             }
+            (
+                BoundKind::IntegerAvg,
+                AggValue::Avg {
+                    sum,
+                    count,
+                    nan: 0,
+                    pos_inf: 0,
+                    neg_inf: 0,
+                },
+            ) => super::avg_certificate::validate_old_avg_history(
+                old, *binding, metric, memo, bounds, *sum, *count,
+            ),
             _ => false,
         }
     })

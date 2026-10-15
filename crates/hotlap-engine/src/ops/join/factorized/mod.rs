@@ -1,3 +1,4 @@
+mod avg_certificate;
 pub(crate) mod certificate;
 pub(crate) mod certified_consume;
 mod consume;

@@ -211,6 +211,14 @@ fn prepare_grouped_update_inner(
     let Some(bindings) = certificate::compile_metric_bindings(mapping, reducer.aggregates()) else {
         return Ok(CertifiedDecision::NeedsRows(None));
     };
+    // The integer AVG certificate is prepared separately from row consumption;
+    // ntf6 will connect it to the renderer after its bitwise-output proof lands.
+    if bindings
+        .iter()
+        .any(|binding| binding.kind == certificate::BoundKind::IntegerAvg)
+    {
+        return Ok(CertifiedDecision::NeedsRows(None));
+    }
     if projection.is_none()
         && (reducer.group_key() != mapping.group_key
             || reducer
@@ -429,6 +437,9 @@ fn prepare_grouped_update_inner(
                         return Ok(CertifiedDecision::NeedsRows(Some(memo_stage)));
                     };
                     AggValue::SumInteger { sum, count: nn }
+                }
+                BoundKind::IntegerAvg => {
+                    return Ok(CertifiedDecision::NeedsRows(Some(memo_stage)));
                 }
             };
             entry.values[binding.aggregate_index] = value;

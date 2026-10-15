@@ -236,7 +236,7 @@ impl MaintainedGroupCut {
                 row_cardinality_index = Some(metric_index);
             }
             metric_index += match aggregate.func {
-                hotlap_core::plan::AggFunc::Sum => 2,
+                hotlap_core::plan::AggFunc::Sum | hotlap_core::plan::AggFunc::Avg => 2,
                 _ => 1,
             };
         }
@@ -308,14 +308,16 @@ fn raw_columns(
         let Some(input) = input else { continue };
         if (left_side && *input < left_width || !left_side && *input >= left_width)
             && (agg.func == hotlap_core::plan::AggFunc::Count
-                || agg.func == hotlap_core::plan::AggFunc::Sum)
+                || agg.func == hotlap_core::plan::AggFunc::Sum
+                || agg.func == hotlap_core::plan::AggFunc::Avg)
         {
             let index = if left_side {
                 *input
             } else {
                 *input - left_width
             };
-            let sum = agg.func == hotlap_core::plan::AggFunc::Sum;
+            let sum = agg.func == hotlap_core::plan::AggFunc::Sum
+                || agg.func == hotlap_core::plan::AggFunc::Avg;
             if let Some(existing) = columns.iter_mut().find(|column| column.index == index) {
                 existing.sum |= sum;
             } else {

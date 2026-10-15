@@ -17,7 +17,7 @@ pub(crate) struct Demand {
     /// Positions in the complete canonical join key; order and duplicates
     /// preserve the requested projected group-key mapping.
     pub(crate) group_key: Vec<usize>,
-    /// Sorted unique source-local columns required for COUNT(expr)/integer SUM.
+    /// Sorted unique source-local columns required for COUNT(expr)/integer SUM/AVG.
     pub(crate) left_columns: Vec<usize>,
     pub(crate) right_columns: Vec<usize>,
     /// Exact resolved types parallel to the selected source-local columns.
@@ -64,7 +64,7 @@ pub(crate) fn compile_demand(
         .zip(&mapping.aggregate_input_types)
         .zip(aggregates)
     {
-        if !matches!(aggregate.func, AggFunc::Count | AggFunc::Sum) {
+        if !matches!(aggregate.func, AggFunc::Count | AggFunc::Sum | AggFunc::Avg) {
             continue;
         }
         if aggregate.func == AggFunc::Count && aggregate.input.is_none() {
@@ -74,7 +74,8 @@ pub(crate) fn compile_demand(
         let Some(data_type) = data_type else {
             return Err(DenseReason::UnsupportedInputShape);
         };
-        if aggregate.func == AggFunc::Sum && !matches!(data_type, DataType::Int32 | DataType::Int64)
+        if matches!(aggregate.func, AggFunc::Sum | AggFunc::Avg)
+            && !matches!(data_type, DataType::Int32 | DataType::Int64)
         {
             continue;
         }
@@ -90,7 +91,11 @@ pub(crate) fn compile_demand(
                     data_type: actual.clone(),
                 });
             }
-            left_columns.push((*column, data_type.clone(), aggregate.func == AggFunc::Sum));
+            left_columns.push((
+                *column,
+                data_type.clone(),
+                matches!(aggregate.func, AggFunc::Sum | AggFunc::Avg),
+            ));
         } else {
             let local = column - left_width;
             if local >= right_schema.fields().len() {
@@ -103,7 +108,11 @@ pub(crate) fn compile_demand(
                     data_type: actual.clone(),
                 });
             }
-            right_columns.push((local, data_type.clone(), aggregate.func == AggFunc::Sum));
+            right_columns.push((
+                local,
+                data_type.clone(),
+                matches!(aggregate.func, AggFunc::Sum | AggFunc::Avg),
+            ));
         }
     }
     let left = sorted_unique_columns(left_columns)?;

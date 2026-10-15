@@ -89,6 +89,27 @@ impl MetricContribution {
             limit,
         ))
     }
+
+    pub(crate) fn bounded_product_with_absolute(
+        left: i256,
+        right: i256,
+        absolute: i256,
+        limit: i256,
+    ) -> Result<Self, EngineError> {
+        let mut value = Self::bounded_product(left, right, limit)?;
+        if absolute < i256::ZERO || absolute < value.abs_value {
+            return Err(EngineError::Infrastructure(
+                "source absolute metric bound is inconsistent".into(),
+            ));
+        }
+        if absolute > limit {
+            value =
+                Self::over_limit_with_limit(if value.value < i256::ZERO { -1 } else { 1 }, limit);
+        } else {
+            value.abs_value = absolute;
+        }
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

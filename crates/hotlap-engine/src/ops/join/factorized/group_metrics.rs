@@ -10,6 +10,8 @@ use crate::error::EngineError;
 
 use super::group_memo::MetricContribution;
 
+pub(crate) const AVG_EXACT_F64_INTEGER_LIMIT: i128 = 1_i128 << 53;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SourceMeasure {
     Weight,
@@ -64,14 +66,18 @@ pub(crate) fn compile_metric_demands(
                     });
                 }
             }
-            (AggFunc::Sum, Some(column)) => {
+            (AggFunc::Sum | AggFunc::Avg, Some(column)) => {
                 let column = *column;
                 if column < left_width {
                     let slot = left_columns.binary_search(&column).ok()?;
                     result.push(JoinMetricDemand {
                         left: SourceMeasure::Sum(slot),
                         right: SourceMeasure::Weight,
-                        limit: sum_limit,
+                        limit: if agg.func == AggFunc::Avg {
+                            i256::from_i128(AVG_EXACT_F64_INTEGER_LIMIT)
+                        } else {
+                            sum_limit
+                        },
                     });
                     result.push(JoinMetricDemand {
                         left: SourceMeasure::NonNull(slot),
@@ -83,7 +89,11 @@ pub(crate) fn compile_metric_demands(
                     result.push(JoinMetricDemand {
                         left: SourceMeasure::Weight,
                         right: SourceMeasure::Sum(slot),
-                        limit: sum_limit,
+                        limit: if agg.func == AggFunc::Avg {
+                            i256::from_i128(AVG_EXACT_F64_INTEGER_LIMIT)
+                        } else {
+                            sum_limit
+                        },
                     });
                     result.push(JoinMetricDemand {
                         left: SourceMeasure::Weight,
@@ -110,9 +120,44 @@ pub(crate) fn contribution_metrics(
         .map(|demand| {
             let lhs = measure(left, demand.left)?;
             let rhs = measure(right, demand.right)?;
-            MetricContribution::bounded_product(lhs, rhs, demand.limit)
+            if demand.limit == i256::from_i128(AVG_EXACT_F64_INTEGER_LIMIT) {
+                let absolute = match (demand.left, demand.right) {
+                    (SourceMeasure::Sum(index), SourceMeasure::Weight) => {
+                        let sum = left
+                            .and_then(|stats| stats.columns.get(index))
+                            .and_then(|column| column.abs_sum)
+                            .unwrap_or(i256::ZERO);
+                        let weight = absolute_weight(right)?;
+                        sum.checked_mul(weight).ok_or(EngineError::NumericOverflow(
+                            "AVG absolute source contribution",
+                        ))?
+                    }
+                    (SourceMeasure::Weight, SourceMeasure::Sum(index)) => {
+                        let sum = right
+                            .and_then(|stats| stats.columns.get(index))
+                            .and_then(|column| column.abs_sum)
+                            .unwrap_or(i256::ZERO);
+                        let weight = absolute_weight(left)?;
+                        sum.checked_mul(weight).ok_or(EngineError::NumericOverflow(
+                            "AVG absolute source contribution",
+                        ))?
+                    }
+                    _ => return MetricContribution::bounded_product(lhs, rhs, demand.limit),
+                };
+                MetricContribution::bounded_product_with_absolute(lhs, rhs, absolute, demand.limit)
+            } else {
+                MetricContribution::bounded_product(lhs, rhs, demand.limit)
+            }
         })
         .collect()
+}
+
+fn absolute_weight(stats: Option<&SourceStats>) -> Result<i256, EngineError> {
+    let Some(stats) = stats else {
+        return Ok(i256::ZERO);
+    };
+    i256::from_string(&stats.abs_weight.to_string())
+        .ok_or(EngineError::NumericOverflow("AVG absolute source weight"))
 }
 
 fn measure(stats: Option<&SourceStats>, measure: SourceMeasure) -> Result<i256, EngineError> {
