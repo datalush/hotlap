@@ -134,6 +134,31 @@ fn retracting_current_min_recomputes_the_next() {
 }
 
 #[test]
+fn duplicate_extreme_remains_until_its_final_retraction() {
+    let mut reducer = reducer();
+    reducer
+        .apply(&zset(
+            &[1, 1, 1],
+            int64_values(&[Some(10), Some(10), Some(20)]),
+            &[1, 1, 1],
+        ))
+        .unwrap();
+
+    let first = reducer
+        .apply(&zset(&[1], int64_values(&[Some(10)]), &[-1]))
+        .unwrap();
+    assert!(first.is_empty(), "one tied minimum occurrence remains");
+
+    let last = reducer
+        .apply(&zset(&[1], int64_values(&[Some(10)]), &[-1]))
+        .unwrap();
+    assert_eq!(
+        int_rows(&last),
+        vec![(1, Some(10), Some(20), -1), (1, Some(20), Some(20), 1)]
+    );
+}
+
+#[test]
 fn retracting_current_max_recomputes_the_next() {
     let mut reducer = reducer();
     reducer

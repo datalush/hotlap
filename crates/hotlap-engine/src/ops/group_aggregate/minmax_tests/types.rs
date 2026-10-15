@@ -23,6 +23,48 @@ fn float_min_max_preserve_the_input_type() {
 }
 
 #[test]
+fn float_nan_is_ignored_and_signed_zero_uses_total_order() {
+    let mut reducer = reducer();
+    let seeded = reducer
+        .apply(&zset(
+            &[1, 1, 1],
+            float_values(&[Some(f64::NAN), Some(0.0), Some(-0.0)]),
+            &[1, 1, 1],
+        ))
+        .unwrap();
+    let rows = float_rows(&seeded);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.unwrap().to_bits(), (-0.0_f64).to_bits());
+    assert_eq!(rows[0].2.unwrap().to_bits(), 0.0_f64.to_bits());
+
+    let retract_negative_zero = reducer
+        .apply(&zset(&[1], float_values(&[Some(-0.0)]), &[-1]))
+        .unwrap();
+    let rows = float_rows(&retract_negative_zero);
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .any(|row| row.1.is_some_and(|v| v.to_bits() == (-0.0_f64).to_bits()))
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.1.is_some_and(|v| v.to_bits() == 0.0_f64.to_bits()))
+    );
+}
+
+#[test]
+fn all_nan_min_max_renders_null() {
+    let mut reducer = reducer();
+    let out = reducer
+        .apply(&zset(&[1], float_values(&[Some(f64::NAN)]), &[1]))
+        .unwrap();
+    let rows = float_rows(&out);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, None);
+    assert_eq!(rows[0].2, None);
+}
+
+#[test]
 fn int32_min_preserves_the_input_type() {
     let mut reducer = GroupAggregate::new(&[0], vec![AggSpec::min(1)]);
     let out = reducer
