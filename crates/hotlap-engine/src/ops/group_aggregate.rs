@@ -13,6 +13,7 @@ pub(crate) mod columns;
 mod fold;
 pub(crate) mod maintained;
 pub(crate) mod materialize;
+mod persisted;
 pub(crate) mod read;
 mod snapshot;
 mod validate;

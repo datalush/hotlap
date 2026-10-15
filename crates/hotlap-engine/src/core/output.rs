@@ -150,4 +150,19 @@ impl ViewOutput {
         }
         self.snapshot().map(Some)
     }
+
+    /// Compares a persisted root output with rows materialized from its state.
+    /// `None` means neither operator state nor output has initialized its schema.
+    pub(super) fn validate_rows(&self, expected: Option<&ZSetBatch>) -> Result<(), EngineError> {
+        let mut rebuilt = Self::default();
+        if let Some(expected) = expected {
+            rebuilt.update(expected)?;
+        }
+        if self.schema != rebuilt.schema || self.diffs != rebuilt.diffs {
+            return Err(EngineError::Infrastructure(
+                "restored view output disagrees with persisted root aggregate state".into(),
+            ));
+        }
+        Ok(())
+    }
 }

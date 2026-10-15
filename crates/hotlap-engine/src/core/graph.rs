@@ -2,6 +2,7 @@
 //! operators, which retain their state across pushes.
 
 mod apply;
+mod restore_validation;
 mod snapshot;
 
 use std::collections::HashMap;

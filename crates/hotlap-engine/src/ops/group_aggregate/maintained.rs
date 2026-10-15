@@ -32,124 +32,66 @@ impl MaintainedGroupCut {
         aggregates: &[hotlap_core::plan::AggSpec],
         groups: &std::collections::HashMap<Vec<u8>, GroupEntry>,
     ) -> Result<(), EngineError> {
-        let memo_groups = self.memo.groups().collect::<Vec<_>>();
-        // Negative physical source rows and bounded/unsupported summaries can
-        // be valid Dense history. They are not a proof of corruption.
-        if memo_groups.iter().any(|(_, group)| {
-            group.negative_source_keys != 0
-                || group.metrics.iter().any(|metric| {
-                    metric.eligibility
-                        != crate::ops::join::factorized::group_memo::MetricLimit::Exact
-                })
-        }) {
-            return Ok(());
+        for entry in groups.values() {
+            for (index, aggregate) in aggregates.iter().enumerate() {
+                if aggregate.func == hotlap_core::plan::AggFunc::Count
+                    && aggregate.input.is_none()
+                    && entry.values.get(index) != Some(&AggValue::Count(entry.rows))
+                {
+                    return Err(history_mismatch("COUNT(*) slot"));
+                }
+            }
         }
-
+        let memo_groups = self.memo.groups().collect::<Vec<_>>();
         let mut expected_present = std::collections::HashSet::new();
+        let mut unprovable_groups = std::collections::HashSet::new();
         for (group_key, summary) in &memo_groups {
             let Some(row_metric) = summary.metrics.get(self.row_cardinality_index) else {
-                return Err(history_mismatch("derived row-cardinality metric"));
-            };
-            let Some(expected_rows) = row_metric.subtotal.to_string().parse::<i64>().ok() else {
-                // A valid but unprovable wide history remains on Dense.
-                return Ok(());
+                // An incomplete derived summary cannot prove group coverage.
+                unprovable_groups.insert(group_key.to_vec());
+                continue;
             };
             if row_metric.eligibility
                 != crate::ops::join::factorized::group_memo::MetricLimit::Exact
-                || expected_rows < 0
             {
-                return Ok(());
+                // Unknown row bounds cannot prove coverage or cardinality.
+                unprovable_groups.insert(group_key.to_vec());
+                continue;
             }
-            let mut metric_index = 0usize;
+            let Some(expected_rows) = row_metric.subtotal.to_string().parse::<i64>().ok() else {
+                unprovable_groups.insert(group_key.to_vec());
+                continue;
+            };
+            if expected_rows < 0 {
+                unprovable_groups.insert(group_key.to_vec());
+                continue;
+            }
             let entry = groups.get(*group_key);
-            for (aggregate_index, aggregate) in aggregates.iter().enumerate() {
-                if aggregate.func == hotlap_core::plan::AggFunc::Avg {
-                    let Some(arrow::datatypes::DataType::Int32 | arrow::datatypes::DataType::Int64) =
-                        self.mapping
-                            .aggregate_input_types
-                            .get(aggregate_index)
-                            .and_then(Option::as_ref)
-                    else {
-                        return Ok(());
-                    };
-                    metric_index += 1;
-                    let Some(nonnull) = summary.metrics.get(metric_index) else {
-                        return Err(history_mismatch("derived AVG non-null metric"));
-                    };
-                    let Some(expected_count) = nonnull.subtotal.to_string().parse::<i64>().ok()
-                    else {
-                        return Ok(());
-                    };
-                    if expected_count < 0 || expected_count > expected_rows {
-                        return Ok(());
-                    }
-                    // Current canonical NN cannot prove historical AVG.count: Dense
-                    // can remove a zero-row group on a signed update, then recreate
-                    // it from different physical source history. v1 has no per-history
-                    // proof. As in the unsupported-aggregate path, stop validating
-                    // later slots too: their endpoint totals do not prove their
-                    // historical GroupAggregate values after that lifecycle.
-                    let _ = (
-                        expected_count,
-                        entry.and_then(|entry| entry.values.get(aggregate_index)),
-                    );
-                    return Ok(());
-                }
-                let Some(metric) = summary.metrics.get(metric_index) else {
-                    return Err(history_mismatch("derived metric shape"));
-                };
-                let value = match aggregate.func {
-                    hotlap_core::plan::AggFunc::Count => {
-                        metric_index += 1;
-                        let expected = metric.subtotal.to_string().parse::<i64>().ok();
-                        expected.map(AggValue::Count)
-                    }
-                    hotlap_core::plan::AggFunc::Sum => {
-                        let sum = metric.subtotal.to_string().parse::<i128>().ok();
-                        metric_index += 1;
-                        let Some(nonnull) = summary.metrics.get(metric_index) else {
-                            return Err(history_mismatch("derived SUM non-null metric"));
-                        };
-                        let count = nonnull.subtotal.to_string().parse::<i64>().ok();
-                        metric_index += 1;
-                        match (sum, count) {
-                            (Some(sum), Some(count)) => Some(AggValue::SumInteger { sum, count }),
-                            _ => None,
-                        }
-                    }
-                    _ => return Ok(()),
-                };
-                let Some(value) = value else {
-                    // A mathematically exact memo outside the authoritative
-                    // slot's representable domain is ineligible, not proof.
-                    return Ok(());
-                };
-                if let Some(entry) = entry
-                    && entry.values.get(aggregate_index) != Some(&value)
-                {
-                    return Err(history_mismatch("integer aggregate slot"));
-                }
-            }
+            // Current source metrics cannot prove authoritative aggregate slots:
+            // a valid earlier signed update may have removed the last row, erased
+            // GroupEntry, and later recreated the same key with different values.
+            // v1 stores no lifecycle proof; preserve all existing logical slots.
             if expected_rows > 0 {
                 expected_present.insert(group_key.to_vec());
-                let Some(entry) = entry else {
-                    return Err(history_mismatch("missing source-derived group"));
-                };
+            }
+            if let Some(entry) = entry {
                 if entry.rows != expected_rows {
                     return Err(history_mismatch("group row cardinality"));
                 }
-            } else if let Some(entry) = entry {
-                if group_key.is_empty() && entry.rows == 0 {
-                    // Global aggregation may retain its legitimate empty
-                    // group even though no source row contributes.
-                    expected_present.insert(group_key.to_vec());
-                } else {
+                if expected_rows == 0 && !group_key.is_empty() {
                     return Err(history_mismatch("extra zero-row group"));
                 }
+                if expected_rows == 0 && group_key.is_empty() {
+                    expected_present.insert(group_key.to_vec());
+                }
+            } else if expected_rows > 0 {
+                return Err(history_mismatch("missing source-derived group"));
             }
         }
         if groups.iter().any(|(key, entry)| {
-            !expected_present.contains(key) && !(key.is_empty() && entry.rows == 0)
+            !expected_present.contains(key)
+                && !unprovable_groups.contains(key)
+                && !(key.is_empty() && entry.rows == 0)
         }) {
             return Err(history_mismatch(
                 "extra group absent from canonical sources",

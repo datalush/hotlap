@@ -233,7 +233,100 @@ fn restored_group_cut_rebuilds_source_stats_and_memo_before_next_delta() {
 }
 
 #[test]
-fn restore_rejects_count_history_that_disagrees_with_canonical_sources() {
+fn restore_rejects_count_nonnull_history_that_disagrees_with_cached_root_output() {
+    let plan = Plan::GroupAggregate {
+        input: Box::new(Plan::Join {
+            left: Box::new(Plan::Source(InputId(0))),
+            right: Box::new(Plan::Source(InputId(1))),
+            left_key: vec![0],
+            right_key: vec![0],
+        }),
+        key: vec![0],
+        aggs: vec![AggSpec {
+            func: hotlap_core::AggFunc::Count,
+            input: Some(2),
+        }],
+    };
+    let mut source = EngineCore::new();
+    source.register_input(InputId(0)).unwrap();
+    source.register_input(InputId(1)).unwrap();
+    source.build_view(ViewId(0), &plan).unwrap();
+    source.push(InputId(0), &pairs(&[(7, 10, 1)])).unwrap();
+    source.push(InputId(1), &pairs(&[(7, 20, 1)])).unwrap();
+    let mut snapshot = source.checkpoint().unwrap();
+    let group = snapshot.views[0]
+        .operators
+        .iter_mut()
+        .flatten()
+        .find_map(|state| match state {
+            hotlap_core::snapshot::OperatorState::Group(group) => Some(group),
+            _ => None,
+        })
+        .unwrap();
+    group.groups[0].1.values[0] = hotlap_core::snapshot::AggValue::Count(0);
+
+    let mut target = EngineCore::new();
+    target.register_input(InputId(9)).unwrap();
+    target
+        .build_view(ViewId(9), &Plan::Source(InputId(9)))
+        .unwrap();
+    target.tap_view(ViewId(9)).unwrap();
+    target.push(InputId(9), &pairs(&[(99, 1, 1)])).unwrap();
+    let before = target.checkpoint().unwrap();
+    assert!(target.validate_snapshot(&snapshot).is_err());
+    assert!(target.restore(&snapshot).is_err());
+    assert_eq!(target.checkpoint().unwrap(), before);
+}
+
+#[test]
+fn restore_rejects_sum_history_that_disagrees_with_cached_root_output() {
+    let plan = Plan::GroupAggregate {
+        input: Box::new(Plan::Join {
+            left: Box::new(Plan::Source(InputId(0))),
+            right: Box::new(Plan::Source(InputId(1))),
+            left_key: vec![0],
+            right_key: vec![0],
+        }),
+        key: vec![0],
+        aggs: vec![AggSpec::sum(3)],
+    };
+    let mut source = EngineCore::new();
+    source.register_input(InputId(0)).unwrap();
+    source.register_input(InputId(1)).unwrap();
+    source.build_view(ViewId(0), &plan).unwrap();
+    source.push(InputId(0), &pairs(&[(7, 10, 1)])).unwrap();
+    source.push(InputId(1), &pairs(&[(7, 20, 1)])).unwrap();
+    let mut snapshot = source.checkpoint().unwrap();
+    let group = snapshot.views[0]
+        .operators
+        .iter_mut()
+        .flatten()
+        .find_map(|state| match state {
+            hotlap_core::snapshot::OperatorState::Group(group) => Some(group),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        group.groups[0].1.values[0],
+        hotlap_core::snapshot::AggValue::SumInteger { sum: 20, count: 1 }
+    );
+    group.groups[0].1.values[0] = hotlap_core::snapshot::AggValue::SumInteger { sum: 21, count: 1 };
+
+    let mut target = EngineCore::new();
+    target.register_input(InputId(9)).unwrap();
+    target
+        .build_view(ViewId(9), &Plan::Source(InputId(9)))
+        .unwrap();
+    target.tap_view(ViewId(9)).unwrap();
+    target.push(InputId(9), &pairs(&[(99, 1, 1)])).unwrap();
+    let before = target.checkpoint().unwrap();
+    assert!(target.validate_snapshot(&snapshot).is_err());
+    assert!(target.restore(&snapshot).is_err());
+    assert_eq!(target.checkpoint().unwrap(), before);
+}
+
+#[test]
+fn restore_rejects_malformed_scalar_group_key_without_decoding_it() {
     let plan = Plan::GroupAggregate {
         input: Box::new(Plan::Join {
             left: Box::new(Plan::Source(InputId(0))),
@@ -260,14 +353,135 @@ fn restore_rejects_count_history_that_disagrees_with_canonical_sources() {
             _ => None,
         })
         .unwrap();
-    group.groups[0].1.rows = 2;
+    group.groups[0].0 = vec![1];
 
     let mut restored = EngineCore::new();
-    let error = restored.restore(&snapshot).unwrap_err();
     assert!(matches!(
-        error,
-        crate::error::EngineError::Infrastructure(_)
+        restored.restore(&snapshot),
+        Err(crate::error::EngineError::Infrastructure(_))
     ));
+}
+
+#[test]
+fn restore_rejects_malformed_later_group_key_field_after_valid_prefix() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("major", DataType::Int64, false),
+        Field::new("minor", DataType::Int32, true),
+    ]));
+    let make_batch = |rows: &[(i64, Option<i32>, i64)]| {
+        ZSetBatch::new(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(arrow::array::Int32Array::from(
+                        rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap(),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )),
+        )
+        .unwrap()
+    };
+    let plan = Plan::GroupAggregate {
+        input: Box::new(Plan::Join {
+            left: Box::new(Plan::Source(InputId(0))),
+            right: Box::new(Plan::Source(InputId(1))),
+            left_key: vec![0, 1],
+            right_key: vec![0, 1],
+        }),
+        key: vec![0, 1],
+        aggs: vec![AggSpec::count()],
+    };
+    let mut source = EngineCore::new();
+    source.register_input(InputId(0)).unwrap();
+    source.register_input(InputId(1)).unwrap();
+    source.build_view(ViewId(0), &plan).unwrap();
+    source
+        .push(InputId(0), &make_batch(&[(7, Some(3), 1)]))
+        .unwrap();
+    source
+        .push(InputId(1), &make_batch(&[(7, Some(3), 1)]))
+        .unwrap();
+    let mut snapshot = source.checkpoint().unwrap();
+    let group = snapshot.views[0]
+        .operators
+        .iter_mut()
+        .flatten()
+        .find_map(|state| match state {
+            hotlap_core::snapshot::OperatorState::Group(group) => Some(group),
+            _ => None,
+        })
+        .unwrap();
+    group.groups[0].0 = [group.groups[0].0[..9].to_vec(), vec![1]].concat();
+
+    let mut restored = EngineCore::new();
+    assert!(matches!(
+        restored.restore(&snapshot),
+        Err(crate::error::EngineError::Infrastructure(_))
+    ));
+}
+
+#[test]
+fn restore_root_project_validates_consolidated_colliding_group_rows() {
+    let group = Plan::GroupAggregate {
+        input: Box::new(Plan::Join {
+            left: Box::new(Plan::Source(InputId(0))),
+            right: Box::new(Plan::Source(InputId(1))),
+            left_key: vec![0],
+            right_key: vec![0],
+        }),
+        key: vec![0],
+        aggs: vec![AggSpec::count()],
+    };
+    let plan = Plan::Project {
+        input: Box::new(group),
+        cols: vec![1],
+    };
+    let mut source = EngineCore::new();
+    source.register_input(InputId(0)).unwrap();
+    source.register_input(InputId(1)).unwrap();
+    source.build_view(ViewId(0), &plan).unwrap();
+    source
+        .push(InputId(0), &pairs(&[(1, 10, 1), (2, 20, 1)]))
+        .unwrap();
+    source
+        .push(InputId(1), &pairs(&[(1, 11, 1), (2, 21, 1)]))
+        .unwrap();
+    let expected = source.snapshot(ViewId(0)).unwrap();
+    assert_eq!(expected.len(), 1);
+    assert_eq!(
+        expected
+            .diff()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[2]
+    );
+
+    let checkpoint = source.checkpoint().unwrap();
+    let mut restored = EngineCore::new();
+    restored.restore(&checkpoint).unwrap();
+    assert_eq!(restored.checkpoint().unwrap(), checkpoint);
+
+    let mut corrupted = checkpoint.clone();
+    let group = corrupted.views[0]
+        .operators
+        .iter_mut()
+        .flatten()
+        .find_map(|state| match state {
+            hotlap_core::snapshot::OperatorState::Group(group) => Some(group),
+            _ => None,
+        })
+        .unwrap();
+    group.groups[0].1.values[0] = hotlap_core::snapshot::AggValue::Count(2);
+    assert!(EngineCore::new().validate_snapshot(&corrupted).is_err());
 }
 
 #[test]
@@ -399,7 +613,7 @@ fn all_null_sum_keeps_row_cardinality_independent_of_nonnull_count() {
 }
 
 #[test]
-fn restore_checks_count_nonnull_sum_and_group_coverage_when_provable() {
+fn restore_rejects_visible_aggregate_output_and_provable_row_corruption() {
     let plan = Plan::GroupAggregate {
         input: Box::new(Plan::Join {
             left: Box::new(Plan::Source(InputId(0))),
@@ -439,6 +653,7 @@ fn restore_checks_count_nonnull_sum_and_group_coverage_when_provable() {
     source.register_input(InputId(0)).unwrap();
     source.register_input(InputId(1)).unwrap();
     source.build_view(ViewId(0), &plan).unwrap();
+    source.tap_view(ViewId(0)).unwrap();
     source.push(InputId(0), &batch(7, Some(10))).unwrap();
     source.push(InputId(1), &batch(7, None)).unwrap();
     let good = source.checkpoint().unwrap();
@@ -464,7 +679,8 @@ fn restore_checks_count_nonnull_sum_and_group_coverage_when_provable() {
             }
             2 => group.groups.clear(),
             3 => group.groups.push((vec![0xff], group.groups[0].1.clone())),
-            _ => group.groups[0].1.values[1] = hotlap_core::snapshot::AggValue::Count(2),
+            4 => group.groups[0].1.values[1] = hotlap_core::snapshot::AggValue::Count(2),
+            _ => group.groups[0].1.rows = 2,
         }
         let mut restored = EngineCore::new();
         assert!(
@@ -472,7 +688,7 @@ fn restore_checks_count_nonnull_sum_and_group_coverage_when_provable() {
                 restored.restore(&invalid),
                 Err(crate::error::EngineError::Infrastructure(_))
             ),
-            "tampered history case {mutate} should be rejected"
+            "inconsistent cached output or provable corruption case {mutate} should be rejected"
         );
     }
 }

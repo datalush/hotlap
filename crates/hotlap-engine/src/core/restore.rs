@@ -55,6 +55,11 @@ impl EngineCore {
         for view in &snapshot.views {
             core.restore_view(view)?;
         }
+        let schemas = &core.schemas;
+        for view in core.views.values() {
+            view.graph
+                .validate_persisted_root_output(schemas, &view.output)?;
+        }
         // Derived source statistics and group memo are rebuilt only after
         // every logical input, operator, output and pending delta validated.
         let schemas = &core.schemas;

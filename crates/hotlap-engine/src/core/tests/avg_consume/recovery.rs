@@ -284,6 +284,103 @@ fn v1_restore_accepts_live_avg_history_after_signed_zero_row_group_recreation() 
 }
 
 #[test]
+fn v1_restore_accepts_live_integer_history_after_signed_zero_row_group_recreation() {
+    use hotlap_core::snapshot::{AggValue, OperatorState};
+
+    let right = pairs(&[(1, 0, 1)]);
+    let aggregates = vec![
+        AggSpec {
+            func: hotlap_core::plan::AggFunc::Count,
+            input: Some(1),
+        },
+        AggSpec::sum(1),
+    ];
+    let mut live = nullable_value_core(aggregates.clone());
+    live.push(InputId(1), &right).unwrap();
+    live.push(
+        InputId(0),
+        &signed_nullable_pairs(&[(1, Some(7), 1), (1, None, -1)]),
+    )
+    .unwrap();
+    live.push(InputId(0), &signed_nullable_pairs(&[(1, None, 1)]))
+        .unwrap();
+    let checkpoint = live.checkpoint().unwrap();
+    let history = checkpoint.views[0]
+        .operators
+        .iter()
+        .flatten()
+        .find_map(|operator| match operator {
+            OperatorState::Group(state) => state.groups.first().map(|(_, entry)| entry.clone()),
+            _ => None,
+        })
+        .expect("live group entry");
+    assert_eq!(history.values[0], AggValue::Count(0));
+    assert_eq!(history.values[1], AggValue::SumInteger { sum: 0, count: 0 });
+
+    let mut restored = nullable_value_core(aggregates);
+    restored
+        .restore(&checkpoint)
+        .expect("valid live v1 checkpoint");
+    assert_eq!(restored.checkpoint().unwrap(), checkpoint);
+
+    let continuation = signed_nullable_pairs(&[(1, Some(2), 1)]);
+    crate::core::graph::FACTORIZED_CUTS.with(|count| count.set(0));
+    crate::core::graph::FLAT_ROWS_CUTS.with(|count| count.set(0));
+    live.push(InputId(0), &continuation).unwrap();
+    restored.push(InputId(0), &continuation).unwrap();
+    crate::core::graph::FACTORIZED_CUTS.with(|count| assert_eq!(count.get(), 0));
+    crate::core::graph::FLAT_ROWS_CUTS.with(|count| assert_eq!(count.get(), 2));
+    same_batches_bitwise(
+        &live.take_changes(ViewId(0)).unwrap(),
+        &restored.take_changes(ViewId(0)).unwrap(),
+    );
+    same_batches_bitwise(
+        &restored.snapshot(ViewId(0)).unwrap(),
+        &live.snapshot(ViewId(0)).unwrap(),
+    );
+    assert_eq!(restored.checkpoint().unwrap(), live.checkpoint().unwrap());
+
+    let mut resync_live = nullable_value_core(vec![
+        AggSpec {
+            func: hotlap_core::plan::AggFunc::Count,
+            input: Some(1),
+        },
+        AggSpec::sum(1),
+    ]);
+    resync_live.restore(&checkpoint).unwrap();
+    let mut resync_restored = nullable_value_core(vec![
+        AggSpec {
+            func: hotlap_core::plan::AggFunc::Count,
+            input: Some(1),
+        },
+        AggSpec::sum(1),
+    ]);
+    resync_restored.restore(&checkpoint).unwrap();
+    let delete_old_value = signed_nullable_pairs(&[(1, Some(7), -1)]);
+    resync_live.push(InputId(0), &delete_old_value).unwrap();
+    resync_restored.push(InputId(0), &delete_old_value).unwrap();
+    let insert_resynchronized_value = signed_nullable_pairs(&[(1, Some(3), 1)]);
+    crate::core::graph::FACTORIZED_CUTS.with(|count| count.set(0));
+    crate::core::graph::FLAT_ROWS_CUTS.with(|count| count.set(0));
+    resync_live
+        .push(InputId(0), &insert_resynchronized_value)
+        .unwrap();
+    resync_restored
+        .push(InputId(0), &insert_resynchronized_value)
+        .unwrap();
+    crate::core::graph::FACTORIZED_CUTS.with(|count| assert!(count.get() > 0));
+    crate::core::graph::FLAT_ROWS_CUTS.with(|count| assert_eq!(count.get(), 0));
+    same_batches_bitwise(
+        &resync_restored.take_changes(ViewId(0)).unwrap(),
+        &resync_live.take_changes(ViewId(0)).unwrap(),
+    );
+    assert_eq!(
+        resync_restored.checkpoint().unwrap(),
+        resync_live.checkpoint().unwrap()
+    );
+}
+
+#[test]
 fn mixed_avg_first_live_signed_history_restores_and_continues() {
     let aggs = vec![
         AggSpec::avg(1),
@@ -322,7 +419,7 @@ fn mixed_avg_first_live_signed_history_restores_and_continues() {
 }
 
 #[test]
-fn integer_sum_endpoint_history_validation_rejects_same_recreated_group_preexisting() {
+fn integer_sum_endpoint_history_mismatch_is_preserved_and_continues() {
     let mut live = nullable_value_core(vec![AggSpec::sum(1)]);
     live.push(InputId(1), &pairs(&[(1, 0, 1)])).unwrap();
     live.push(
@@ -334,8 +431,16 @@ fn integer_sum_endpoint_history_validation_rejects_same_recreated_group_preexist
         .unwrap();
     let checkpoint = live.checkpoint().unwrap();
     let mut restored = nullable_value_core(vec![AggSpec::sum(1)]);
-    let error = restored.restore(&checkpoint).unwrap_err();
-    assert!(format!("{error:?}").contains("integer aggregate slot"));
+    restored.restore(&checkpoint).unwrap();
+    assert_eq!(restored.checkpoint().unwrap(), checkpoint);
+    let continuation = signed_nullable_pairs(&[(1, Some(2), 1)]);
+    live.push(InputId(0), &continuation).unwrap();
+    restored.push(InputId(0), &continuation).unwrap();
+    same_batches_bitwise(
+        &live.take_changes(ViewId(0)).unwrap(),
+        &restored.take_changes(ViewId(0)).unwrap(),
+    );
+    assert_eq!(restored.checkpoint().unwrap(), live.checkpoint().unwrap());
 }
 
 #[test]
@@ -416,6 +521,7 @@ fn avg_certificate_rejects_old_nn_mismatch_even_when_zero_sum_bits_match() {
 
 #[test]
 fn v1_restore_preserves_signed_zero_avg_history_and_keeps_it_on_dense_fallback() {
+    use arrow::array::Float64Array;
     use hotlap_core::snapshot::{AggValue, OperatorState};
 
     let mut engine = core();
@@ -441,6 +547,19 @@ fn v1_restore_preserves_signed_zero_avg_history_and_keeps_it_on_dense_fallback()
         })
         .unwrap();
     *sum = -0.0;
+    let output =
+        crate::core::ipc::decode_zset(snapshot.views[0].output.as_ref().expect("tapped output"))
+            .unwrap();
+    let mut columns = (0..output.batch.num_columns())
+        .map(|index| output.batch.column(index).clone())
+        .collect::<Vec<_>>();
+    *columns.last_mut().unwrap() = Arc::new(Float64Array::from(vec![-0.0]));
+    let coherent_output = ZSetBatch::new(
+        RecordBatch::try_new(output.schema(), columns).unwrap(),
+        output.diff().clone(),
+    )
+    .unwrap();
+    snapshot.views[0].output = Some(crate::core::ipc::encode_zset(&coherent_output).unwrap());
     let before = snapshot.clone();
     let mut maintained = core();
     maintained.restore(&snapshot).unwrap();

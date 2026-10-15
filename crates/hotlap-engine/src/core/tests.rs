@@ -14,6 +14,7 @@ mod avg_consume;
 mod graph_review;
 mod paired_bench;
 mod recovery;
+mod recovery_signed_history;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
