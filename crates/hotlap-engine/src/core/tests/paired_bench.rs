@@ -1,5 +1,8 @@
 //! Ignored, paired end-to-end benchmark for the direct grouped join cut.
 
+#[path = "paired_bench/avg_bench.rs"]
+mod avg_bench;
+
 use std::collections::HashMap;
 use std::time::Instant;
 use std::{cell::Cell, fs, sync::Arc};
