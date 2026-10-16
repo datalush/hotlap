@@ -532,3 +532,11 @@ fn dense_join_direct_index_public_push_16384_pair_smoke() {
         direct_snapshot.len(),
     );
 }
+
+#[cfg(feature = "bench-allocation-observer")]
+#[path = "borrowed_key_public_push.rs"]
+mod borrowed_key_public_push;
+
+#[cfg(test)]
+#[path = "key_ownership_public_push.rs"]
+mod key_ownership_public_push;
