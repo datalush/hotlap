@@ -98,14 +98,62 @@ pub(super) fn equi_join(
             .or_default()
             .push(index);
     }
-    let mut matches: Vec<(usize, usize)> = Vec::new();
-    for index in 0..right_rows.num_rows() {
-        if let Some(left_indices) = buckets.get(right_rows.row(index).as_ref()) {
-            matches.extend(left_indices.iter().map(|&left_index| (left_index, index)));
+    #[cfg(test)]
+    let force_legacy = super::test_support::force_legacy();
+    #[cfg(not(test))]
+    let force_legacy = false;
+    if !force_legacy
+        && take_indices_fit(left_rows.num_rows())
+        && take_indices_fit(right_rows.num_rows())
+    {
+        let mut left_indices = Vec::new();
+        let mut right_indices = Vec::new();
+        for right_index in 0..right_rows.num_rows() {
+            if let Some(bucket) = buckets.get(right_rows.row(right_index).as_ref()) {
+                for &left_index in bucket {
+                    // The row-count guard above proves these casts are lossless.
+                    left_indices.push(left_index as u32);
+                    right_indices.push(right_index as u32);
+                }
+            }
         }
+        let pairs = left_indices.len();
+        #[cfg(test)]
+        super::test_support::record_direct(pairs);
+        let joined = materialize_indices(
+            left,
+            right,
+            UInt32Array::from(left_indices),
+            UInt32Array::from(right_indices),
+            out_conv,
+            DiffIndices::Narrow,
+        )?;
+        Ok((joined, pairs))
+    } else {
+        let mut matches: Vec<(usize, usize)> = Vec::new();
+        for right_index in 0..right_rows.num_rows() {
+            if let Some(left_indices) = buckets.get(right_rows.row(right_index).as_ref()) {
+                matches.extend(
+                    left_indices
+                        .iter()
+                        .map(|&left_index| (left_index, right_index)),
+                );
+            }
+        }
+        let pairs = matches.len();
+        #[cfg(test)]
+        if force_legacy {
+            super::test_support::record_forced_legacy(pairs);
+        } else {
+            super::test_support::record_wide_fallback(pairs);
+        }
+        Ok((materialize(left, right, &matches, out_conv)?, pairs))
     }
-    let pairs = matches.len();
-    Ok((materialize(left, right, &matches, out_conv)?, pairs))
+}
+
+/// Whether every row position in a side is representable by Arrow's UInt32 take index.
+fn take_indices_fit(rows: usize) -> bool {
+    rows == 0 || u32::try_from(rows - 1).is_ok()
 }
 
 /// Builds the joined Z-set for the `(left index, right index)` match pairs.
@@ -127,6 +175,29 @@ fn materialize(
             .map(|&(_, right_index)| right_index as u32)
             .collect::<Vec<u32>>(),
     );
+    materialize_indices(
+        left,
+        right,
+        left_indices,
+        right_indices,
+        out_conv,
+        DiffIndices::Wide(matches),
+    )
+}
+
+enum DiffIndices<'a> {
+    Wide(&'a [(usize, usize)]),
+    Narrow,
+}
+
+fn materialize_indices(
+    left: &ZSetBatch,
+    right: &ZSetBatch,
+    left_indices: UInt32Array,
+    right_indices: UInt32Array,
+    out_conv: &RowConverter,
+    diff_indices: DiffIndices<'_>,
+) -> Result<ZSetBatch, EngineError> {
     let left_taken = take_batch(&left.batch, &left_indices)?;
     let right_taken = take_batch(&right.batch, &right_indices)?;
 
@@ -149,8 +220,16 @@ fn materialize(
 
     let left_diffs = int64_diffs(&left.diff)?;
     let right_diffs = int64_diffs(&right.diff)?;
-    let mut diffs: Vec<i64> = Vec::with_capacity(matches.len());
-    for &(left_index, right_index) in matches {
+    let pair_count = left_indices.len();
+    let mut diffs: Vec<i64> = Vec::with_capacity(pair_count);
+    for pair_index in 0..pair_count {
+        let (left_index, right_index) = match &diff_indices {
+            DiffIndices::Wide(matches) => matches[pair_index],
+            DiffIndices::Narrow => (
+                left_indices.value(pair_index) as usize,
+                right_indices.value(pair_index) as usize,
+            ),
+        };
         let product = left_diffs
             .value(left_index)
             .checked_mul(right_diffs.value(right_index))

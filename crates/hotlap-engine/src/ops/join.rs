@@ -16,6 +16,94 @@ use factorized::demand::Demand;
 
 use helpers::{concat_zsets, touched_union};
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(crate) struct RouteCounts {
+        pub direct: usize,
+        pub forced_legacy: usize,
+        pub wide_fallback: usize,
+        pub direct_pairs: usize,
+        pub forced_legacy_pairs: usize,
+        pub wide_fallback_pairs: usize,
+    }
+
+    thread_local! {
+        static FORCE_LEGACY: Cell<bool> = const { Cell::new(false) };
+        static DIRECT_CALLS: Cell<usize> = const { Cell::new(0) };
+        static FORCED_LEGACY_CALLS: Cell<usize> = const { Cell::new(0) };
+        static WIDE_FALLBACK_CALLS: Cell<usize> = const { Cell::new(0) };
+        static DIRECT_PAIRS: Cell<usize> = const { Cell::new(0) };
+        static FORCED_LEGACY_PAIRS: Cell<usize> = const { Cell::new(0) };
+        static WIDE_FALLBACK_PAIRS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Test-only route override for reference pushes; restores state during unwind.
+    pub(crate) struct LegacyDenseJoinGuard(bool);
+
+    impl LegacyDenseJoinGuard {
+        pub(crate) fn force() -> Self {
+            Self(FORCE_LEGACY.with(|flag| flag.replace(true)))
+        }
+    }
+
+    impl Drop for LegacyDenseJoinGuard {
+        fn drop(&mut self) {
+            FORCE_LEGACY.with(|flag| flag.set(self.0));
+        }
+    }
+
+    pub(crate) fn force_legacy() -> bool {
+        FORCE_LEGACY.with(Cell::get)
+    }
+
+    pub(crate) fn reset_counts() {
+        DIRECT_CALLS.with(|count| count.set(0));
+        FORCED_LEGACY_CALLS.with(|count| count.set(0));
+        WIDE_FALLBACK_CALLS.with(|count| count.set(0));
+        DIRECT_PAIRS.with(|count| count.set(0));
+        FORCED_LEGACY_PAIRS.with(|count| count.set(0));
+        WIDE_FALLBACK_PAIRS.with(|count| count.set(0));
+    }
+
+    pub(crate) fn reset_direct_count() {
+        DIRECT_CALLS.with(|count| count.set(0));
+        DIRECT_PAIRS.with(|count| count.set(0));
+    }
+
+    pub(crate) fn direct_count() -> usize {
+        DIRECT_CALLS.with(Cell::get)
+    }
+
+    pub(crate) fn counts() -> RouteCounts {
+        RouteCounts {
+            direct: DIRECT_CALLS.with(Cell::get),
+            forced_legacy: FORCED_LEGACY_CALLS.with(Cell::get),
+            wide_fallback: WIDE_FALLBACK_CALLS.with(Cell::get),
+            direct_pairs: DIRECT_PAIRS.with(Cell::get),
+            forced_legacy_pairs: FORCED_LEGACY_PAIRS.with(Cell::get),
+            wide_fallback_pairs: WIDE_FALLBACK_PAIRS.with(Cell::get),
+        }
+    }
+
+    pub(super) fn record_direct(pairs: usize) {
+        DIRECT_CALLS.with(|count| count.set(count.get() + 1));
+        DIRECT_PAIRS.with(|count| count.set(count.get().saturating_add(pairs)));
+    }
+
+    pub(super) fn record_forced_legacy(pairs: usize) {
+        FORCED_LEGACY_CALLS.with(|count| count.set(count.get() + 1));
+        FORCED_LEGACY_PAIRS.with(|count| count.set(count.get().saturating_add(pairs)));
+    }
+
+    pub(super) fn record_wide_fallback(pairs: usize) {
+        WIDE_FALLBACK_CALLS.with(|count| count.set(count.get() + 1));
+        WIDE_FALLBACK_PAIRS.with(|count| count.set(count.get().saturating_add(pairs)));
+    }
+}
+
 /// Stateful delta-incremental inner equi-join of two keyed streams.
 ///
 /// Both sides accumulate in [`KeyedArrangement`]s keyed by their join columns.

@@ -229,6 +229,7 @@ fn same_batches_bitwise(left: &ZSetBatch, right: &ZSetBatch) {
     }
 }
 
+mod direct_join_parity;
 mod eligible;
 mod nulls;
 mod projections;
