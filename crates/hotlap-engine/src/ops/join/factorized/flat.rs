@@ -21,10 +21,19 @@ pub(crate) struct PreparedFlatJoinUpdate {
 }
 
 impl PreparedFlatJoinUpdate {
+    #[cfg(test)]
     pub(crate) fn output(&self) -> &ZSetBatch {
         &self.output
     }
 
+    /// Separates the PRE-state result from its staged owner update so
+    /// independent readers can all consume the same old arrangements before
+    /// the owner publishes the update.
+    pub(crate) fn into_parts(self) -> (ZSetBatch, PreparedJoinSources) {
+        (self.output, self.sources)
+    }
+
+    #[cfg(test)]
     pub(crate) fn commit(self, join: &mut Join) {
         join.commit_source_updates(self.sources);
     }

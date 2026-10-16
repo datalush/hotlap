@@ -536,10 +536,10 @@ fn join_apply(
                 &right,
                 crate::ops::join::factorized::ConsumerCaps::DEFAULT_FLAT_CHUNK_ROWS,
             )?;
-            let output = prepared.output().clone();
+            let (output, sources) = prepared.into_parts();
             #[cfg(test)]
             record_dense_join_materialization(&output);
-            prepared.commit(join);
+            join.commit_source_updates(sources);
             *left_pending = None;
             *right_pending = None;
             #[cfg(test)]
