@@ -271,6 +271,7 @@ impl super::EngineCore {
         report.mark_unknown("core_metrics_handles_and_registry");
         self.retention
             .memory_usage(&mut report, &mut allocations, &mut external_ranges)?;
+        self.shared_arrangements.memory_usage(&mut report)?;
         for view in self.views.values() {
             view.graph
                 .memory_usage(&mut report, &mut allocations, &mut external_ranges)?;

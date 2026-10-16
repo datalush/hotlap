@@ -32,6 +32,32 @@ pub(crate) fn accumulate(
 }
 
 impl Node {
+    pub(super) fn release_shared(
+        &mut self,
+        arena: &mut crate::arrange::ArrangementArena,
+    ) -> Result<(), EngineError> {
+        match self {
+            Node::Joined {
+                left,
+                right,
+                shared,
+                ..
+            } => {
+                if let Some(binding) = shared.take() {
+                    arena.release(binding.left)?;
+                    arena.release(binding.right)?;
+                }
+                left.release_shared(arena)?;
+                right.release_shared(arena)
+            }
+            Node::Group { input, .. }
+            | Node::Filter { input, .. }
+            | Node::Project { input, .. }
+            | Node::Window { input, .. } => input.release_shared(arena),
+            Node::Source(_) => Ok(()),
+        }
+    }
+
     pub(super) fn rebuild_derived(
         &mut self,
         schemas: &std::collections::HashMap<hotlap_core::InputId, arrow::datatypes::SchemaRef>,
@@ -147,11 +173,13 @@ impl Node {
                 join,
                 left_pending,
                 right_pending,
+                shared,
+                ..
             } => {
                 report.mark_covered("joins");
                 let (payload, capacity, estimate) = join.memory_usage()?;
                 report.add_join(payload, capacity, estimate)?;
-                if join.is_initialized() {
+                if join.is_initialized() || shared.is_some() {
                     report.mark_unknown("join_converter_and_schema_metadata");
                 }
                 if join.has_retained_rows() {
@@ -228,7 +256,20 @@ impl Node {
                 join,
                 left_pending,
                 right_pending,
-            } => join_apply(left, right, join.as_mut(), left_pending, right_pending, ctx),
+                left_pending_revision,
+                right_pending_revision,
+                shared,
+            } => join_apply(
+                left,
+                right,
+                join.as_mut(),
+                left_pending,
+                right_pending,
+                left_pending_revision,
+                right_pending_revision,
+                shared,
+                ctx,
+            ),
             Node::Window { input, reducer } => window_eval(input, reducer, ctx),
         }
     }
@@ -357,6 +398,9 @@ fn group_eval(
             join,
             left_pending,
             right_pending,
+            left_pending_revision,
+            right_pending_revision,
+            ..
         } = joined_input
         {
             if let Some((left_delta, right_delta)) = buffer_join_inputs(
@@ -364,6 +408,8 @@ fn group_eval(
                 right.as_mut(),
                 left_pending,
                 right_pending,
+                left_pending_revision,
+                right_pending_revision,
                 ctx,
             )? {
                 let Some(plan) = cut_plan.as_deref() else {
@@ -423,6 +469,8 @@ fn group_eval(
                             }
                             *left_pending = None;
                             *right_pending = None;
+                            *left_pending_revision = None;
+                            *right_pending_revision = None;
                             return Ok(Some(output));
                         }
                         let update =
@@ -449,6 +497,8 @@ fn group_eval(
                                 join.commit_source_updates(sources);
                                 *left_pending = None;
                                 *right_pending = None;
+                                *left_pending_revision = None;
+                                *right_pending_revision = None;
                                 #[cfg(test)]
                                 super::FACTORIZED_CUTS.with(|n| n.set(n.get() + 1));
                                 return Ok(Some(output));
@@ -478,6 +528,8 @@ fn group_eval(
                                 join.commit_source_updates(sources);
                                 *left_pending = None;
                                 *right_pending = None;
+                                *left_pending_revision = None;
+                                *right_pending_revision = None;
                                 #[cfg(test)]
                                 super::FLAT_ROWS_CUTS.with(|count| count.set(count.get() + 1));
                                 return Ok(Some(output));
@@ -490,6 +542,8 @@ fn group_eval(
                 record_dense_join_materialization(&output);
                 *left_pending = None;
                 *right_pending = None;
+                *left_pending_revision = None;
+                *right_pending_revision = None;
                 let output = if let Some(cols) = outer_project.as_deref().or(runtime_project) {
                     project(&output, cols)?
                 } else {
@@ -520,16 +574,120 @@ fn window_eval(
 
 /// Applies both sides' deltas to the retained join, buffering a side whose
 /// sibling schema is still unknown until the join can be initialized.
+#[allow(clippy::too_many_arguments)]
 fn join_apply(
     left: &mut Node,
     right: &mut Node,
     join: &mut Join,
     left_pending: &mut Option<ZSetBatch>,
     right_pending: &mut Option<ZSetBatch>,
+    left_pending_revision: &mut Option<(u64, u64)>,
+    right_pending_revision: &mut Option<(u64, u64)>,
+    shared: &mut Option<super::SharedBinding>,
     ctx: &mut EvalCtx,
 ) -> Result<Option<ZSetBatch>, EngineError> {
-    match buffer_join_inputs(left, right, left_pending, right_pending, ctx)? {
+    let source_ids = (direct_source(left), direct_source(right));
+    match buffer_join_inputs(
+        left,
+        right,
+        left_pending,
+        right_pending,
+        left_pending_revision,
+        right_pending_revision,
+        ctx,
+    )? {
         Some((left, right)) => {
+            if shared.is_some() || ctx.share_candidate {
+                let Some(frame) = ctx.shared_frame.as_deref_mut() else {
+                    return Err(EngineError::Infrastructure(
+                        "eligible shared join has no arrangement frame".into(),
+                    ));
+                };
+                let output_schema = join.cut_schema(&left, &right)?;
+                let binding = match *shared {
+                    Some(binding) => binding,
+                    None => {
+                        let (Some(left_source), Some(right_source)) = source_ids else {
+                            return Err(EngineError::Infrastructure(
+                                "shared root join has transformed children".into(),
+                            ));
+                        };
+                        let (left_schema, right_schema) =
+                            join.source_schemas_for_cut().ok_or_else(|| {
+                                EngineError::Infrastructure(
+                                    "shared join schemas did not initialize".into(),
+                                )
+                            })?;
+                        let (left_keys, right_keys) = join.source_keys_for_cut();
+                        let alias_source = left_source == right_source && left_keys == right_keys;
+                        let (left_arrangement, right_arrangement) =
+                            join.take_empty_source_arrangements(alias_source)?;
+                        let left_descriptor = shared_descriptor(
+                            left_source,
+                            right_source,
+                            &left_keys,
+                            &right_keys,
+                            left_schema.clone(),
+                            right_schema.clone(),
+                            left_source,
+                            right_source,
+                            &left_keys,
+                            &right_keys,
+                            left_schema.clone(),
+                        );
+                        let left_handle =
+                            frame.lease_arrangement(left_descriptor.clone(), left_arrangement)?;
+                        let right_handle = match right_arrangement {
+                            Some(arrangement) => frame.lease_arrangement(
+                                shared_descriptor(
+                                    left_source,
+                                    right_source,
+                                    &left_keys,
+                                    &right_keys,
+                                    left_schema.clone(),
+                                    right_schema.clone(),
+                                    right_source,
+                                    left_source,
+                                    &right_keys,
+                                    &left_keys,
+                                    right_schema,
+                                ),
+                                arrangement,
+                            )?,
+                            None => frame.lease(left_descriptor)?,
+                        };
+                        super::SharedBinding {
+                            left: left_handle,
+                            right: right_handle,
+                        }
+                    }
+                };
+                *shared = Some(binding);
+                if let Some((start, end)) = *left_pending_revision {
+                    frame.stage_range(binding.left, start, end, &left)?;
+                }
+                if let Some((start, end)) = *right_pending_revision {
+                    frame.stage_range(binding.right, start, end, &right)?;
+                }
+                let (left_keys, right_keys) = join.source_keys_for_cut();
+                let output = crate::ops::join::factorized::flat::materialize_shared_flat_delta(
+                    frame.owner(binding.left)?,
+                    frame.owner(binding.right)?,
+                    &left,
+                    &right,
+                    &left_keys,
+                    &right_keys,
+                    output_schema,
+                    crate::ops::join::factorized::ConsumerCaps::DEFAULT_FLAT_CHUNK_ROWS,
+                )?;
+                *left_pending = None;
+                *right_pending = None;
+                *left_pending_revision = None;
+                *right_pending_revision = None;
+                #[cfg(test)]
+                super::FLAT_ROWS_CUTS.with(|count| count.set(count.get() + 1));
+                return Ok(Some(output));
+            }
             let prepared = crate::ops::join::factorized::flat::prepare_flat_join_update(
                 join,
                 &left,
@@ -542,6 +700,8 @@ fn join_apply(
             join.commit_source_updates(sources);
             *left_pending = None;
             *right_pending = None;
+            *left_pending_revision = None;
+            *right_pending_revision = None;
             #[cfg(test)]
             super::FLAT_ROWS_CUTS.with(|count| count.set(count.get() + 1));
             Ok(Some(output))
@@ -572,16 +732,75 @@ fn buffer_join_inputs(
     right: &mut Node,
     left_pending: &mut Option<ZSetBatch>,
     right_pending: &mut Option<ZSetBatch>,
+    left_pending_revision: &mut Option<(u64, u64)>,
+    right_pending_revision: &mut Option<(u64, u64)>,
     ctx: &mut EvalCtx,
 ) -> Result<Option<(ZSetBatch, ZSetBatch)>, EngineError> {
     if let Some(z) = left.eval(ctx)? {
         *left_pending = accumulate(left_pending.take(), &z)?;
+        if direct_source(left) == Some(ctx.pushed) {
+            *left_pending_revision =
+                Some(extend_revision(*left_pending_revision, ctx.source_revision));
+        }
     }
     if let Some(z) = right.eval(ctx)? {
         *right_pending = accumulate(right_pending.take(), &z)?;
+        if direct_source(right) == Some(ctx.pushed) {
+            *right_pending_revision = Some(extend_revision(
+                *right_pending_revision,
+                ctx.source_revision,
+            ));
+        }
     }
     match (left_pending.as_ref(), right_pending.as_ref()) {
         (Some(left), Some(right)) => Ok(Some((left.clone(), right.clone()))),
         _ => Ok(None),
+    }
+}
+
+fn extend_revision(previous: Option<(u64, u64)>, revision: u64) -> (u64, u64) {
+    match previous {
+        Some((start, _)) => (start, revision),
+        None => (revision, revision),
+    }
+}
+
+fn direct_source(node: &Node) -> Option<hotlap_core::InputId> {
+    match node {
+        Node::Source(source) => Some(*source),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shared_descriptor(
+    root_left_source: hotlap_core::InputId,
+    root_right_source: hotlap_core::InputId,
+    root_left_keys: &[usize],
+    root_right_keys: &[usize],
+    root_left_schema: arrow::datatypes::SchemaRef,
+    root_right_schema: arrow::datatypes::SchemaRef,
+    source: hotlap_core::InputId,
+    partner: hotlap_core::InputId,
+    key_indices: &[usize],
+    partner_key_indices: &[usize],
+    schema: arrow::datatypes::SchemaRef,
+) -> crate::arrange::ArrangementDescriptor {
+    crate::arrange::ArrangementDescriptor {
+        root_left_source: u64::from(root_left_source.0),
+        root_right_source: u64::from(root_right_source.0),
+        root_left_keys: root_left_keys.to_vec(),
+        root_right_keys: root_right_keys.to_vec(),
+        root_left_schema,
+        root_right_schema,
+        source: u64::from(source.0),
+        partner: u64::from(partner.0),
+        key_indices: key_indices.to_vec(),
+        partner_key_indices: partner_key_indices.to_vec(),
+        schema,
+        cohort: 0,
+        consumed_revision_start: 0,
+        consumed_revision_end: 0,
+        demand_none: true,
     }
 }

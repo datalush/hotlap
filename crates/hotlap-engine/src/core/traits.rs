@@ -40,8 +40,20 @@ impl IncrementalCore for EngineCore {
             }
         }
         let output = self.replay_or_empty(&mut graph)?;
-        self.views
-            .insert(view, ViewState::new(graph, plan.clone(), output));
+        let share_candidate = !self.frozen
+            && matches!(
+                plan,
+                Plan::Join { left, right, .. }
+                    if matches!(left.as_ref(), Plan::Source(_))
+                        && matches!(right.as_ref(), Plan::Source(_))
+            );
+        #[cfg(test)]
+        let share_candidate = share_candidate
+            && !super::graph::FORCE_PRIVATE_SHARED_ARRANGEMENTS.with(std::cell::Cell::get);
+        self.views.insert(
+            view,
+            ViewState::new(graph, plan.clone(), output, share_candidate),
+        );
         self.refresh_windows_open();
         Ok(())
     }
@@ -112,6 +124,13 @@ impl IncrementalCore for EngineCore {
         if !self.frozen {
             self.freeze()?;
         }
+        let source_revision = self
+            .source_revisions
+            .get(&input)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(CoreError::NumericOverflow("input source revision"))?;
         self.count_ingested(batch.len());
         self.schemas.insert(input, batch.schema());
         let kept = self
@@ -125,14 +144,13 @@ impl IncrementalCore for EngineCore {
             .filter(|(_, view)| view.graph.sources().contains(&input))
             .map(|(id, _)| *id)
             .collect();
-        for id in targets {
-            // A failure may leave earlier views applied; poison the core
-            // instead of serving that partial state.
-            if let Err(error) = self.push_view(id, input, &kept) {
-                self.fail();
-                return Err(error);
-            }
+        // A failure may leave earlier private views or outputs applied; poison
+        // the core and discard all uncommitted shared-owner deltas.
+        if let Err(error) = self.push_targets(&targets, input, &kept, source_revision) {
+            self.fail();
+            return Err(error);
         }
+        self.source_revisions.insert(input, source_revision);
         self.refresh_late_closed();
         self.refresh_windows_open();
         self.epoch = self.epoch.wrapping_add(1);

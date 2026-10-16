@@ -140,6 +140,7 @@ impl EngineCore {
                 tapped: view.tapped,
                 output,
                 pending,
+                share_candidate: false,
             },
         );
         Ok(())

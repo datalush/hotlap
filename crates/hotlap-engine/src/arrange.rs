@@ -1,4 +1,8 @@
 mod per_key;
+mod shared_arena;
+pub(crate) use shared_arena::{
+    ArrangementArena, ArrangementDescriptor, ArrangementFrame, ArrangementHandle,
+};
 pub(crate) mod source_stats;
 mod source_stats_registration;
 #[doc(hidden)]

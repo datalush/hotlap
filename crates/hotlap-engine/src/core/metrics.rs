@@ -54,6 +54,8 @@ impl EngineCore {
     pub(super) fn with_registry(metrics: Arc<MetricsRegistry>) -> Self {
         Self {
             views: HashMap::new(),
+            shared_arrangements: crate::arrange::ArrangementArena::default(),
+            source_revisions: HashMap::new(),
             registered: HashSet::new(),
             specs: HashMap::new(),
             watermarks: HashMap::new(),

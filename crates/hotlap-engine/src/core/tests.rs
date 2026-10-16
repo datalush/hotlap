@@ -10,6 +10,22 @@ use hotlap_core::{AggSpec, IncrementalCore, InputId, Plan, ViewId, ZSetBatch};
 
 use super::EngineCore;
 
+struct ForcePrivateSharedArrangements(bool);
+
+impl ForcePrivateSharedArrangements {
+    fn new() -> Self {
+        let previous =
+            super::graph::FORCE_PRIVATE_SHARED_ARRANGEMENTS.with(|flag| flag.replace(true));
+        Self(previous)
+    }
+}
+
+impl Drop for ForcePrivateSharedArrangements {
+    fn drop(&mut self) {
+        super::graph::FORCE_PRIVATE_SHARED_ARRANGEMENTS.with(|flag| flag.set(self.0));
+    }
+}
+
 mod avg_consume;
 mod filter_project_bench;
 mod filter_project_graph;
@@ -81,6 +97,613 @@ fn joined_group_plan() -> Plan {
         key: vec![0],
         aggs: vec![AggSpec::count()],
     }
+}
+
+#[test]
+fn drop_view_rejects_unknown_and_removes_existing_view() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.build_view(ViewId(7), &Plan::Source(InputId(0)))
+        .unwrap();
+    assert!(core.drop_view(ViewId(8)).is_err());
+    core.drop_view(ViewId(7)).unwrap();
+    assert!(core.snapshot(ViewId(7)).is_err());
+}
+
+#[test]
+fn duplicate_root_joins_share_the_same_physical_source_arrangements() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    let plan = Plan::Join {
+        left: Box::new(Plan::Source(InputId(0))),
+        right: Box::new(Plan::Source(InputId(1))),
+        left_key: vec![0],
+        right_key: vec![0],
+    };
+    core.build_view(ViewId(10), &plan).unwrap();
+    core.build_view(ViewId(11), &plan).unwrap();
+    core.push(InputId(0), &pairs(&[(7, 20, 1)])).unwrap();
+    core.push(InputId(0), &pairs(&[(7, 21, 1)])).unwrap();
+    core.push(InputId(1), &pairs(&[(7, 30, 1)])).unwrap();
+
+    let first = core.views[&ViewId(10)]
+        .graph
+        .root_shared_handles_for_test()
+        .unwrap();
+    let second = core.views[&ViewId(11)]
+        .graph
+        .root_shared_handles_for_test()
+        .unwrap();
+    assert_eq!(
+        first, second,
+        "eligible root joins should use shared owners"
+    );
+    assert_eq!(core.shared_arrangements.owner_count(), 2);
+    assert_eq!(
+        core.shared_arrangements
+            .owner_commit_count(first.0)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        core.shared_arrangements
+            .owner_commit_count(first.1)
+            .unwrap(),
+        1
+    );
+    let expected_shared_payload = core
+        .shared_arrangements
+        .owner(first.0)
+        .unwrap()
+        .memory_usage()
+        .unwrap()
+        .0
+        + core
+            .shared_arrangements
+            .owner(first.1)
+            .unwrap()
+            .memory_usage()
+            .unwrap()
+            .0;
+    let memory = core.memory_report().unwrap();
+    assert!(
+        memory
+            .covered_categories
+            .contains(&"shared_join_arrangements".into())
+    );
+    assert_eq!(memory.join_logical_payload_bytes, expected_shared_payload);
+    assert_eq!(core.snapshot(ViewId(10)).unwrap().len(), 2);
+    assert_eq!(core.snapshot(ViewId(11)).unwrap().len(), 2);
+    assert_eq!(
+        core.snapshot(ViewId(10))
+            .unwrap()
+            .diff()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .sum::<i64>(),
+        2
+    );
+}
+
+#[test]
+fn shared_join_tracks_only_each_sources_own_revision_across_interleaved_pushes() {
+    let mut core = EngineCore::new();
+    for input in 0..3 {
+        core.register_input(InputId(input)).unwrap();
+    }
+    let plan = Plan::Join {
+        left: Box::new(Plan::Source(InputId(0))),
+        right: Box::new(Plan::Source(InputId(1))),
+        left_key: vec![0],
+        right_key: vec![0],
+    };
+    core.build_view(ViewId(100), &plan).unwrap();
+    core.build_view(ViewId(101), &plan).unwrap();
+    core.build_view(ViewId(102), &Plan::Source(InputId(2)))
+        .unwrap();
+
+    let pushes = [
+        (InputId(0), pairs(&[(7, 10, 1)]), 0),
+        (InputId(1), pairs(&[(7, 20, 1)]), 1),
+        (InputId(0), pairs(&[]), 1),
+        (InputId(0), pairs(&[(7, 11, 1)]), 2),
+        (InputId(1), pairs(&[(7, 21, 1)]), 4),
+        (InputId(0), pairs(&[(7, 12, 1)]), 6),
+        (InputId(2), pairs(&[(9, 90, 1)]), 6),
+        (InputId(1), pairs(&[(7, 22, 1)]), 9),
+    ];
+    let expected_commits = [
+        (0, 0),
+        (1, 1),
+        (2, 1),
+        (3, 1),
+        (3, 2),
+        (4, 2),
+        (4, 2),
+        (4, 3),
+    ];
+    for (index, (source, batch, expected_weight)) in pushes.into_iter().enumerate() {
+        core.push(source, &batch).unwrap();
+        for view in [ViewId(100), ViewId(101)] {
+            let output = core.snapshot(view).unwrap();
+            let diff = output.diff().as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(diff.values().iter().sum::<i64>(), expected_weight);
+        }
+        let first_output = core.snapshot(ViewId(100)).unwrap();
+        let second_output = core.snapshot(ViewId(101)).unwrap();
+        assert_eq!(first_output.batch, second_output.batch);
+        assert_eq!(diff_values(&first_output), diff_values(&second_output));
+        if let Some(handles) = core.views[&ViewId(100)]
+            .graph
+            .root_shared_handles_for_test()
+        {
+            assert_eq!(
+                core.shared_arrangements
+                    .owner_commit_count(handles.0)
+                    .unwrap(),
+                expected_commits[index].0
+            );
+            assert_eq!(
+                core.shared_arrangements
+                    .owner_commit_count(handles.1)
+                    .unwrap(),
+                expected_commits[index].1
+            );
+        }
+    }
+    let handles = core.views[&ViewId(100)]
+        .graph
+        .root_shared_handles_for_test()
+        .unwrap();
+    assert_eq!(core.shared_arrangements.owner_count(), 2);
+    assert_eq!(
+        core.shared_arrangements
+            .owner_commit_count(handles.0)
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        core.shared_arrangements
+            .owner_commit_count(handles.1)
+            .unwrap(),
+        3
+    );
+    assert_eq!(core.snapshot(ViewId(102)).unwrap().len(), 1);
+}
+
+#[test]
+fn reversed_root_plans_have_separate_shared_arrangement_cohorts() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    let join = |left, right| Plan::Join {
+        left: Box::new(Plan::Source(InputId(left))),
+        right: Box::new(Plan::Source(InputId(right))),
+        left_key: vec![0],
+        right_key: vec![0],
+    };
+    let ab = join(0, 1);
+    let ba = join(1, 0);
+    for (view, plan) in [(110, &ab), (111, &ab), (112, &ba), (113, &ba)] {
+        core.build_view(ViewId(view), plan).unwrap();
+    }
+    core.push(InputId(0), &pairs(&[(7, 10, 1)])).unwrap();
+    core.push(InputId(1), &pairs(&[(7, 20, 1)])).unwrap();
+    assert_eq!(core.shared_arrangements.owner_count(), 4);
+    for view in 110..114 {
+        assert_eq!(core.snapshot(ViewId(view)).unwrap().len(), 1);
+    }
+    let handles = (110..114)
+        .map(|view| {
+            core.views[&ViewId(view)]
+                .graph
+                .root_shared_handles_for_test()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(handles[0], handles[1]);
+    assert_eq!(handles[2], handles[3]);
+    assert_ne!(handles[0], handles[2]);
+    assert_ne!(handles[0].0, handles[2].1);
+    assert_ne!(handles[0].1, handles[2].0);
+}
+
+#[test]
+fn eight_duplicate_roots_use_two_canonical_owners_and_apply_each_once() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    let plan = Plan::Join {
+        left: Box::new(Plan::Source(InputId(0))),
+        right: Box::new(Plan::Source(InputId(1))),
+        left_key: vec![0],
+        right_key: vec![0],
+    };
+    for id in 20..28 {
+        core.build_view(ViewId(id), &plan).unwrap();
+    }
+    core.push(InputId(0), &pairs(&[(7, 20, 1)])).unwrap();
+    core.push(InputId(1), &pairs(&[(7, 30, 1)])).unwrap();
+    let handles = core.views[&ViewId(20)]
+        .graph
+        .root_shared_handles_for_test()
+        .unwrap();
+    for id in 21..28 {
+        assert_eq!(
+            core.views[&ViewId(id)].graph.root_shared_handles_for_test(),
+            Some(handles)
+        );
+        assert_eq!(core.snapshot(ViewId(id)).unwrap().len(), 1);
+    }
+    assert_eq!(core.shared_arrangements.owner_count(), 2);
+    assert_eq!(
+        core.shared_arrangements
+            .owner_commit_count(handles.0)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        core.shared_arrangements
+            .owner_commit_count(handles.1)
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn different_key_and_transformed_join_roots_remain_private() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.register_input(InputId(1)).unwrap();
+    let root = |left_key, right_key| Plan::Join {
+        left: Box::new(Plan::Source(InputId(0))),
+        right: Box::new(Plan::Source(InputId(1))),
+        left_key: vec![left_key],
+        right_key: vec![right_key],
+    };
+    let first = root(0, 0);
+    let different_key = root(1, 1);
+    let transformed = Plan::Project {
+        input: Box::new(first.clone()),
+        cols: vec![0, 1, 2, 3],
+    };
+    for (id, plan) in [
+        (50, first.clone()),
+        (51, different_key),
+        (52, transformed.clone()),
+        (53, transformed),
+    ] {
+        core.build_view(ViewId(id), &plan).unwrap();
+    }
+    core.push(InputId(0), &pairs(&[(7, 20, 1)])).unwrap();
+    core.push(InputId(1), &pairs(&[(7, 30, 1)])).unwrap();
+    assert_eq!(core.shared_arrangements.owner_count(), 0);
+    for id in 50..54 {
+        assert!(
+            core.views[&ViewId(id)]
+                .graph
+                .root_shared_handles_for_test()
+                .is_none()
+        );
+    }
+    assert_eq!(core.snapshot(ViewId(50)).unwrap().len(), 1);
+    assert_eq!(core.snapshot(ViewId(51)).unwrap().len(), 0);
+    assert_eq!(core.snapshot(ViewId(52)).unwrap().len(), 1);
+    assert_eq!(core.snapshot(ViewId(53)).unwrap().len(), 1);
+}
+
+#[test]
+fn self_join_owner_commits_once_and_final_drop_retains_ordered_replay_history() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.set_input_retention(8).unwrap();
+    let plan = Plan::Join {
+        left: Box::new(Plan::Source(InputId(0))),
+        right: Box::new(Plan::Source(InputId(0))),
+        left_key: vec![0],
+        right_key: vec![0],
+    };
+    core.build_view(ViewId(30), &plan).unwrap();
+    core.build_view(ViewId(31), &plan).unwrap();
+    core.tap_view(ViewId(30)).unwrap();
+    core.push(InputId(0), &pairs(&[(7, 20, 1)])).unwrap();
+    let handles = core.views[&ViewId(30)]
+        .graph
+        .root_shared_handles_for_test()
+        .unwrap();
+    assert_eq!(handles.0, handles.1);
+    assert_eq!(core.shared_arrangements.owner_count(), 1);
+    assert_eq!(
+        core.shared_arrangements
+            .owner_lease_count(handles.0)
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        core.shared_arrangements
+            .owner_commit_count(handles.0)
+            .unwrap(),
+        1
+    );
+
+    core.push(InputId(0), &pairs(&[(7, 20, 1)])).unwrap();
+    assert_eq!(
+        core.take_changes(ViewId(30))
+            .unwrap()
+            .diff()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        4
+    );
+    assert_eq!(
+        core.shared_arrangements
+            .owner_commit_count(handles.0)
+            .unwrap(),
+        2
+    );
+    core.drop_view(ViewId(30)).unwrap();
+    assert_eq!(
+        core.shared_arrangements
+            .owner_lease_count(handles.0)
+            .unwrap(),
+        2
+    );
+    core.drop_view(ViewId(31)).unwrap();
+    assert_eq!(core.shared_arrangements.owner_count(), 0);
+
+    core.build_view(ViewId(32), &plan).unwrap();
+    assert_eq!(core.shared_arrangements.owner_count(), 0);
+    assert_eq!(core.snapshot(ViewId(32)).unwrap().len(), 1);
+    assert_eq!(
+        core.snapshot(ViewId(32))
+            .unwrap()
+            .diff()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        4
+    );
+}
+
+#[test]
+fn shared_checkpoint_exports_each_logical_join_and_restore_is_private_and_atomic() {
+    use hotlap_core::snapshot::OperatorState;
+
+    let plan = Plan::Join {
+        left: Box::new(Plan::Source(InputId(0))),
+        right: Box::new(Plan::Source(InputId(1))),
+        left_key: vec![0],
+        right_key: vec![0],
+    };
+    let mut live = EngineCore::new();
+    live.register_input(InputId(0)).unwrap();
+    live.register_input(InputId(1)).unwrap();
+    live.build_view(ViewId(40), &plan).unwrap();
+    live.build_view(ViewId(41), &plan).unwrap();
+    live.tap_view(ViewId(40)).unwrap();
+    live.push(InputId(0), &pairs(&[(7, 20, 1)])).unwrap();
+    live.push(InputId(1), &pairs(&[(7, 30, 1)])).unwrap();
+    let shared_handles = live.views[&ViewId(40)]
+        .graph
+        .root_shared_handles_for_test()
+        .unwrap();
+    let snapshot = live.checkpoint().unwrap();
+    let view0 = snapshot
+        .views
+        .iter()
+        .find(|view| view.id == ViewId(40))
+        .unwrap();
+    let view1 = snapshot
+        .views
+        .iter()
+        .find(|view| view.id == ViewId(41))
+        .unwrap();
+    let (Some(OperatorState::Join(join0)), Some(OperatorState::Join(join1))) =
+        (&view0.operators[0], &view1.operators[0])
+    else {
+        panic!("root join state missing from v1 checkpoint");
+    };
+    assert_eq!(join0.left, join1.left);
+    assert_eq!(join0.right, join1.right);
+    assert!(view0.tapped);
+
+    let before = live.snapshot(ViewId(40)).unwrap();
+    let mut malformed = snapshot.clone();
+    malformed.format_version += 1;
+    assert!(live.restore(&malformed).is_err());
+    assert_eq!(live.shared_arrangements.owner_count(), 2);
+    let after_failed_restore = live.snapshot(ViewId(40)).unwrap();
+    assert_eq!(before.batch, after_failed_restore.batch);
+    assert_eq!(
+        before
+            .diff()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        after_failed_restore
+            .diff()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+    );
+
+    let mut restored = EngineCore::new();
+    restored.restore(&snapshot).unwrap();
+    assert_eq!(restored.shared_arrangements.owner_count(), 0);
+    assert!(
+        restored.views[&ViewId(40)]
+            .graph
+            .root_shared_handles_for_test()
+            .is_none()
+    );
+    assert_eq!(restored.snapshot(ViewId(40)).unwrap().batch, before.batch);
+    let live_pending = live.take_changes(ViewId(40)).unwrap();
+    let restored_pending = restored.take_changes(ViewId(40)).unwrap();
+    assert_eq!(live_pending.batch, restored_pending.batch);
+    assert_eq!(
+        live_pending
+            .diff()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        restored_pending
+            .diff()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+    );
+    let next_left = pairs(&[(8, 21, 1)]);
+    live.push(InputId(0), &next_left).unwrap();
+    restored.push(InputId(0), &next_left).unwrap();
+    let live_after = live.snapshot(ViewId(40)).unwrap();
+    let restored_after = restored.snapshot(ViewId(40)).unwrap();
+    assert_eq!(live_after.batch, restored_after.batch);
+    assert_eq!(
+        live_after
+            .diff()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        restored_after
+            .diff()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+    );
+    assert_eq!(live.shared_arrangements.owner_count(), 2);
+    assert!(
+        live.shared_arrangements
+            .owner_commit_count(shared_handles.0)
+            .unwrap()
+            >= 2
+    );
+}
+
+#[test]
+fn shared_checkpoint_matching_key_continuation_matches_private_and_restored_cores() {
+    let plan = Plan::Join {
+        left: Box::new(Plan::Source(InputId(0))),
+        right: Box::new(Plan::Source(InputId(1))),
+        left_key: vec![0],
+        right_key: vec![0],
+    };
+    let initialize = |core: &mut EngineCore| {
+        core.register_input(InputId(0)).unwrap();
+        core.register_input(InputId(1)).unwrap();
+        for view in [ViewId(120), ViewId(121)] {
+            core.build_view(view, &plan).unwrap();
+            core.tap_view(view).unwrap();
+        }
+        core.push(InputId(0), &pairs(&[(7, 10, 1)])).unwrap();
+        core.push(InputId(1), &pairs(&[(7, 20, 1)])).unwrap();
+    };
+
+    let mut shared = EngineCore::new();
+    initialize(&mut shared);
+    assert_eq!(shared.shared_arrangements.owner_count(), 2);
+    let checkpoint = shared.checkpoint().unwrap();
+    let mut restored = EngineCore::new();
+    restored.restore(&checkpoint).unwrap();
+    assert_eq!(restored.shared_arrangements.owner_count(), 0);
+    for view in [ViewId(120), ViewId(121)] {
+        assert!(
+            restored.views[&view]
+                .graph
+                .root_shared_handles_for_test()
+                .is_none()
+        );
+    }
+
+    let mut private = EngineCore::new();
+    {
+        let _force_private = ForcePrivateSharedArrangements::new();
+        initialize(&mut private);
+    }
+    assert_eq!(private.shared_arrangements.owner_count(), 0);
+
+    let compare_tapped = |cores: &mut [&mut EngineCore], expected_weight: i64| {
+        for view in [ViewId(120), ViewId(121)] {
+            let batches = cores
+                .iter_mut()
+                .map(|core| core.take_changes(view).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(diff_values(&batches[0]), vec![expected_weight]);
+            for batch in &batches[1..] {
+                assert_eq!(batch.batch, batches[0].batch);
+                assert_eq!(diff_values(batch), diff_values(&batches[0]));
+            }
+        }
+    };
+    compare_tapped(&mut [&mut shared, &mut restored, &mut private], 1);
+    for view in [ViewId(120), ViewId(121)] {
+        let output = shared.snapshot(view).unwrap();
+        assert_eq!(output.len(), 1);
+        for (column, expected) in [7, 10, 7, 20].into_iter().enumerate() {
+            let values = output
+                .batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(values.values(), &[expected]);
+        }
+    }
+
+    for core in [&mut shared, &mut restored, &mut private] {
+        core.push(InputId(0), &pairs(&[(7, 10, 1)])).unwrap();
+    }
+    compare_tapped(&mut [&mut shared, &mut restored, &mut private], 1);
+    for core in [&mut shared, &mut restored, &mut private] {
+        core.push(InputId(1), &pairs(&[(7, 20, -1)])).unwrap();
+    }
+    compare_tapped(&mut [&mut shared, &mut restored, &mut private], -2);
+
+    for view in [ViewId(120), ViewId(121)] {
+        let shared_snapshot = shared.snapshot(view).unwrap();
+        let restored_snapshot = restored.snapshot(view).unwrap();
+        let private_snapshot = private.snapshot(view).unwrap();
+        assert_eq!(shared_snapshot.batch, restored_snapshot.batch);
+        assert_eq!(shared_snapshot.batch, private_snapshot.batch);
+        assert_eq!(
+            diff_values(&shared_snapshot),
+            diff_values(&restored_snapshot)
+        );
+        assert_eq!(
+            diff_values(&shared_snapshot),
+            diff_values(&private_snapshot)
+        );
+        assert_eq!(diff_sum(&shared_snapshot), 0);
+    }
+    assert_eq!(shared.shared_arrangements.owner_count(), 2);
+    assert_eq!(restored.shared_arrangements.owner_count(), 0);
+    assert_eq!(private.shared_arrangements.owner_count(), 0);
+}
+
+fn diff_values(batch: &ZSetBatch) -> Vec<i64> {
+    batch
+        .diff()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec()
+}
+
+fn diff_sum(batch: &ZSetBatch) -> i64 {
+    diff_values(batch).into_iter().sum()
 }
 
 fn pair_schema() -> Arc<Schema> {

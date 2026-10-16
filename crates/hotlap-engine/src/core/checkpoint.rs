@@ -76,7 +76,7 @@ impl EngineCore {
                 tapped: state.tapped,
                 output: encode_optional(state.output.to_snapshot()?)?,
                 pending: state.pending.as_ref().map(encode_zset).transpose()?,
-                operators: state.graph.export_states()?,
+                operators: state.graph.export_states(&self.shared_arrangements)?,
             });
         }
         Ok(out)

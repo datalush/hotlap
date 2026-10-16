@@ -208,8 +208,63 @@ impl PreparedJoinSources {
 }
 
 impl Join {
+    /// Moves initialized, empty source tables out of a root join for canonical
+    /// external ownership. A self-join can discard its duplicate empty right
+    /// table only when its schemas and ordered keys match exactly.
+    #[allow(dead_code)] // EngineCore's conservative binding path is added next.
+    pub(crate) fn take_empty_source_arrangements(
+        &mut self,
+        self_join: bool,
+    ) -> Result<(KeyedArrangement, Option<KeyedArrangement>), EngineError> {
+        if self.demand.is_some() {
+            return Err(EngineError::Unsupported(
+                "join with registered demand cannot bind external sources".into(),
+            ));
+        }
+        let left = self.left.as_ref().ok_or_else(|| {
+            EngineError::Unsupported("join left source is not initialized".into())
+        })?;
+        let right = self.right.as_ref().ok_or_else(|| {
+            EngineError::Unsupported("join right source is not initialized".into())
+        })?;
+        if self.left_schema.is_none() || self.right_schema.is_none() {
+            return Err(EngineError::Unsupported(
+                "join source schemas are not both ready".into(),
+            ));
+        }
+        if !left.is_empty() || !right.is_empty() {
+            return Err(EngineError::Unsupported(
+                "non-empty join source tables cannot be externally rebound".into(),
+            ));
+        }
+        if self_join
+            && (self.left_keys != self.right_keys
+                || self.left_schema != self.right_schema
+                || left.schema() != right.schema()
+                || left.key_indices() != right.key_indices())
+        {
+            return Err(EngineError::Unsupported(
+                "self-join external source tables have different schemas or keys".into(),
+            ));
+        }
+        let left = self.left.take().expect("validated initialized left source");
+        let right = self
+            .right
+            .take()
+            .expect("validated initialized right source");
+        if self_join {
+            Ok((left, None))
+        } else {
+            Ok((left, Some(right)))
+        }
+    }
+
     pub(crate) fn source_schemas_for_cut(&self) -> Option<(SchemaRef, SchemaRef)> {
         Some((self.left_schema.clone()?, self.right_schema.clone()?))
+    }
+
+    pub(crate) fn source_keys_for_cut(&self) -> (Vec<usize>, Vec<usize>) {
+        (self.left_keys.clone(), self.right_keys.clone())
     }
 
     pub(crate) fn joined_schema_for_cut(&mut self) -> Result<SchemaRef, EngineError> {

@@ -19,11 +19,19 @@ pub(crate) struct ViewState {
     ///
     /// [`take_changes`]: crate::IncrementalCore::take_changes
     pub(super) pending: Option<ZSetBatch>,
+    /// Root flat joins created before the first input may join an exact plan
+    /// cohort; restored and late-created graphs never enter a cohort.
+    pub(super) share_candidate: bool,
 }
 
 impl ViewState {
     /// Builds a view's state from its graph, plan and initial output.
-    pub(in crate::core) fn new(graph: ViewGraph, plan: Plan, output: ViewOutput) -> Self {
+    pub(in crate::core) fn new(
+        graph: ViewGraph,
+        plan: Plan,
+        output: ViewOutput,
+        share_candidate: bool,
+    ) -> Self {
         Self {
             windowed: has_window(&plan),
             graph,
@@ -31,6 +39,7 @@ impl ViewState {
             tapped: false,
             output,
             pending: None,
+            share_candidate,
         }
     }
 }

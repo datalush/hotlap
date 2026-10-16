@@ -2,15 +2,19 @@
 
 use hotlap_core::snapshot::{GroupState, JoinState, OperatorState, WindowState};
 
-use super::{Node, ViewGraph};
+use super::{Join, Node, ViewGraph};
+use crate::arrange::ArrangementArena;
 use crate::core::ipc::{decode_zset, encode_zset};
 use crate::error::EngineError;
 
 impl ViewGraph {
     /// Exports one entry per node in plan pre-order (`None` when stateless).
-    pub(crate) fn export_states(&self) -> Result<Vec<Option<OperatorState>>, EngineError> {
+    pub(crate) fn export_states(
+        &self,
+        arena: &ArrangementArena,
+    ) -> Result<Vec<Option<OperatorState>>, EngineError> {
         let mut out = Vec::new();
-        self.root.export(&mut out)?;
+        self.root.export(&mut out, arena)?;
         Ok(out)
     }
 
@@ -34,20 +38,24 @@ impl ViewGraph {
 
 impl Node {
     /// Appends this subtree's state in pre-order.
-    fn export(&self, out: &mut Vec<Option<OperatorState>>) -> Result<(), EngineError> {
+    fn export(
+        &self,
+        out: &mut Vec<Option<OperatorState>>,
+        arena: &ArrangementArena,
+    ) -> Result<(), EngineError> {
         match self {
             Node::Source(_) => out.push(None),
             Node::Filter { input, .. } | Node::Project { input, .. } => {
                 out.push(None);
-                input.export(out)?;
+                input.export(out, arena)?;
             }
             Node::Group { input, reducer, .. } => {
                 out.push(Some(OperatorState::Group(reducer.export_state()?)));
-                input.export(out)?;
+                input.export(out, arena)?;
             }
             Node::Window { input, reducer } => {
                 out.push(Some(OperatorState::Window(reducer.export_state()?)));
-                input.export(out)?;
+                input.export(out, arena)?;
             }
             Node::Joined {
                 left,
@@ -55,13 +63,27 @@ impl Node {
                 join,
                 left_pending,
                 right_pending,
+                shared,
+                ..
             } => {
-                let mut state = join.export_state()?;
-                state.left_pending = left_pending.as_ref().map(encode_zset).transpose()?;
-                state.right_pending = right_pending.as_ref().map(encode_zset).transpose()?;
+                let state = match shared {
+                    Some(binding) => Join::export_external_state(
+                        Some(arena.owner(binding.left)?),
+                        Some(arena.owner(binding.right)?),
+                        left_pending.as_ref(),
+                        right_pending.as_ref(),
+                    )?,
+                    None => {
+                        let mut state = join.export_state()?;
+                        state.left_pending = left_pending.as_ref().map(encode_zset).transpose()?;
+                        state.right_pending =
+                            right_pending.as_ref().map(encode_zset).transpose()?;
+                        state
+                    }
+                };
                 out.push(Some(OperatorState::Join(state)));
-                left.export(out)?;
-                right.export(out)?;
+                left.export(out, arena)?;
+                right.export(out, arena)?;
             }
         }
         Ok(())
@@ -89,10 +111,17 @@ impl Node {
                 join,
                 left_pending,
                 right_pending,
+                left_pending_revision,
+                right_pending_revision,
+                shared,
+                ..
             } => {
                 let state = cursor.take_join()?;
                 *left_pending = state.left_pending.as_ref().map(decode_zset).transpose()?;
                 *right_pending = state.right_pending.as_ref().map(decode_zset).transpose()?;
+                *left_pending_revision = None;
+                *right_pending_revision = None;
+                *shared = None;
                 join.import_state(state)?;
                 left.import(cursor)?;
                 right.import(cursor)

@@ -144,7 +144,16 @@ impl InputRetention {
         for event in &self.events {
             watermarks.insert(event.input, event.watermark);
             let watermark = watermark_for(sources, &watermarks);
-            if let Some(delta) = graph.eval(event.input, &event.batch, schemas, watermark, 0)? {
+            if let Some(delta) = graph.eval(
+                event.input,
+                &event.batch,
+                schemas,
+                watermark,
+                0,
+                0,
+                false,
+                None,
+            )? {
                 output.update(&delta)?;
             }
         }

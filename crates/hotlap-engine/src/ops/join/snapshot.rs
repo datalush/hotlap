@@ -7,6 +7,7 @@ use hotlap_core::snapshot::JoinState;
 
 use super::Join;
 use crate::arrange::KeyedArrangement;
+use crate::batch::ZSetBatch;
 use crate::core::ipc::{decode_zset, encode_zset};
 use crate::error::EngineError;
 use crate::keys::KeyConverter;
@@ -17,19 +18,28 @@ impl Join {
     /// Buffered side deltas live on the enclosing graph node and are filled in
     /// by the graph's export; this method leaves them `None`.
     pub(crate) fn export_state(&self) -> Result<JoinState, EngineError> {
-        let left = match &self.left {
-            Some(arrangement) => Some(encode_zset(&arrangement.to_zset()?)?),
-            None => None,
-        };
-        let right = match &self.right {
-            Some(arrangement) => Some(encode_zset(&arrangement.to_zset()?)?),
-            None => None,
-        };
+        Self::export_external_state(self.left.as_ref(), self.right.as_ref(), None, None)
+    }
+
+    /// Serializes canonical external arrangements into this view's unchanged
+    /// logical v1 join slots, including its independent pending side batches.
+    pub(crate) fn export_external_state(
+        left: Option<&KeyedArrangement>,
+        right: Option<&KeyedArrangement>,
+        left_pending: Option<&ZSetBatch>,
+        right_pending: Option<&ZSetBatch>,
+    ) -> Result<JoinState, EngineError> {
+        let left = left
+            .map(|arrangement| arrangement.to_zset().and_then(|zset| encode_zset(&zset)))
+            .transpose()?;
+        let right = right
+            .map(|arrangement| arrangement.to_zset().and_then(|zset| encode_zset(&zset)))
+            .transpose()?;
         Ok(JoinState {
             left,
             right,
-            left_pending: None,
-            right_pending: None,
+            left_pending: left_pending.map(encode_zset).transpose()?,
+            right_pending: right_pending.map(encode_zset).transpose()?,
         })
     }
 

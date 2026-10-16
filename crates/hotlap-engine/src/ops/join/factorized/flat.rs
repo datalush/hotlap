@@ -70,13 +70,39 @@ pub(crate) fn materialize_flat_delta(
     let right = join.right_for_cut().ok_or_else(|| {
         EngineError::Infrastructure("flat join right arrangement uninitialized".into())
     })?;
-    let output = FlatRowsCursor::from_join_delta(
+    materialize_shared_flat_delta(
         left,
         right,
         left_delta,
         right_delta,
         left.key_indices(),
         right.key_indices(),
+        output_schema,
+        max_rows,
+    )
+}
+
+/// Materializes the canonical flat delta from externally owned PRE-state
+/// arrangements. The caller must stage source updates before calling, then
+/// delay their commit until every consumer has read these arrangements.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn materialize_shared_flat_delta(
+    old_left: &KeyedArrangement,
+    old_right: &KeyedArrangement,
+    left_delta: &ZSetBatch,
+    right_delta: &ZSetBatch,
+    left_keys: &[usize],
+    right_keys: &[usize],
+    output_schema: arrow::datatypes::SchemaRef,
+    max_rows: usize,
+) -> Result<ZSetBatch, EngineError> {
+    let output = FlatRowsCursor::from_join_delta(
+        old_left,
+        old_right,
+        left_delta,
+        right_delta,
+        left_keys,
+        right_keys,
         max_rows,
     )?
     .collect()?;

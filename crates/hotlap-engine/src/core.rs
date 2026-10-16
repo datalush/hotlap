@@ -23,6 +23,7 @@ use arrow::datatypes::SchemaRef;
 
 use hotlap_core::{CoreError, InputId, MetricsRegistry, SplitId, ViewId, WatermarkSpec, ZSetBatch};
 
+use crate::arrange::ArrangementArena;
 use metrics::MetricHandles;
 use retention::InputRetention;
 use view_state::ViewState;
@@ -41,6 +42,11 @@ use view_state::ViewState;
 /// `ensure_healthy`.
 pub struct EngineCore {
     pub(super) views: HashMap<ViewId, ViewState>,
+    /// Derived canonical source arrangements; never serialized and always
+    /// rebuilt empty on restore.
+    pub(super) shared_arrangements: ArrangementArena,
+    /// Per-source runtime revisions used only by live pre-start cohorts.
+    pub(super) source_revisions: HashMap<InputId, u64>,
     pub(super) registered: HashSet<InputId>,
     pub(super) specs: HashMap<InputId, WatermarkSpec>,
     /// Effective input watermark: the minimum across each input's splits.
@@ -75,6 +81,20 @@ impl EngineCore {
     /// Creates an empty core with no inputs, views or watermarks.
     pub fn new() -> Self {
         Self::with_registry(Arc::new(MetricsRegistry::new()))
+    }
+
+    /// Removes a view and all state owned by its graph, retaining source
+    /// history so a later view can still replay the inputs.
+    pub fn drop_view(&mut self, view: ViewId) -> Result<(), CoreError> {
+        self.ensure_healthy()?;
+        if let Some(state) = self.views.get_mut(&view) {
+            state.graph.release_shared(&mut self.shared_arrangements)?;
+        }
+        if self.views.remove(&view).is_none() {
+            return Err(CoreError::Unsupported(format!("unknown view {view:?}")));
+        }
+        self.refresh_windows_open();
+        Ok(())
     }
 
     /// Marks the core failed after a push that may have applied partially.
@@ -118,44 +138,65 @@ impl EngineCore {
         Ok(())
     }
 
-    /// Propagates one input's delta through the graph of view `id`.
-    pub(super) fn push_view(
+    /// Evaluates every consumer against the same arena PRE-state, then commits
+    /// each prepared canonical source owner once after all views succeed.
+    pub(super) fn push_targets(
         &mut self,
-        id: ViewId,
+        targets: &[ViewId],
         input: InputId,
         delta: &ZSetBatch,
+        source_revision: u64,
     ) -> Result<(), CoreError> {
-        let watermark = self.view_watermark(id);
-        let view = self
-            .views
-            .get_mut(&id)
-            .ok_or_else(|| CoreError::Unsupported(format!("unknown view {id:?}")))?;
-        let output = view
-            .graph
-            .eval(input, delta, &self.schemas, watermark, self.epoch)
-            .map_err(CoreError::from)?;
-        if let Some(output) = output {
-            view.output.update(&output).map_err(CoreError::from)?;
-            self.metrics.rows_emitted.add(output.len() as u64);
-            if view.tapped {
-                view.pending =
-                    graph::accumulate(view.pending.take(), &output).map_err(CoreError::from)?;
+        let mut frame = self.shared_arrangements.frame();
+        for &id in targets {
+            let share_candidate = self.views.get(&id).is_some_and(|view| {
+                view.share_candidate
+                    && self
+                        .views
+                        .values()
+                        .filter(|other| other.share_candidate && other.plan == view.plan)
+                        .count()
+                        >= 2
+            });
+            #[cfg(test)]
+            let share_candidate = share_candidate
+                && !graph::FORCE_PRIVATE_SHARED_ARRANGEMENTS.with(std::cell::Cell::get);
+            let watermark = self.views.get(&id).map_or(0, |view| {
+                view.graph
+                    .sources()
+                    .iter()
+                    .map(|source| self.watermarks.get(source).copied().unwrap_or(0))
+                    .min()
+                    .unwrap_or(0)
+            });
+            let view = self
+                .views
+                .get_mut(&id)
+                .ok_or_else(|| CoreError::Unsupported(format!("unknown view {id:?}")))?;
+            let output = view
+                .graph
+                .eval(
+                    input,
+                    delta,
+                    &self.schemas,
+                    watermark,
+                    self.epoch,
+                    source_revision,
+                    share_candidate,
+                    Some(&mut frame),
+                )
+                .map_err(CoreError::from)?;
+            if let Some(output) = output {
+                view.output.update(&output).map_err(CoreError::from)?;
+                self.metrics.rows_emitted.add(output.len() as u64);
+                if view.tapped {
+                    view.pending =
+                        graph::accumulate(view.pending.take(), &output).map_err(CoreError::from)?;
+                }
             }
         }
+        frame.commit().map_err(CoreError::from)?;
         Ok(())
-    }
-
-    /// Watermark a view's window closes against: the minimum of its sources'.
-    fn view_watermark(&self, id: ViewId) -> i64 {
-        let Some(view) = self.views.get(&id) else {
-            return 0;
-        };
-        view.graph
-            .sources()
-            .iter()
-            .map(|source| self.watermarks.get(source).copied().unwrap_or(0))
-            .min()
-            .unwrap_or(0)
     }
 }
 
