@@ -55,6 +55,7 @@ enum Update {
     DeleteLeft,
     AppendRight,
     DeleteRight,
+    NoMatchLeft,
 }
 
 impl Fixture {
@@ -144,6 +145,7 @@ impl Fixture {
             Update::AppendRight => (InputId(1), 0, 0, 1_000_033, vec![1]),
             Update::DeleteLeft => (InputId(0), 2, 2, self.payload(2, 2), vec![-1]),
             Update::DeleteRight => (InputId(1), 2, 2, self.payload(2, 2), vec![-1]),
+            Update::NoMatchLeft => (InputId(0), self.keys as i64 + 9, 0, 1_000_037, vec![1]),
         };
         let is_right = input == InputId(1);
         let (keys, values) = match update {
@@ -158,6 +160,7 @@ impl Fixture {
                 vec![key],
                 vec![self.source_value(is_right, key as usize, old_row)],
             ),
+            Update::NoMatchLeft => (vec![key], vec![Some(row)]),
             _ => (vec![key], vec![Some(row)]),
         };
         (input, zset(keys, values, diffs))
@@ -446,6 +449,7 @@ fn paired_updates_replace_append_and_delete_nonnull_sum_inputs_on_both_sides() {
         Update::AppendRight,
         Update::DeleteLeft,
         Update::DeleteRight,
+        Update::NoMatchLeft,
     ] {
         let (input, batch) = fixture.update_with(update);
         let value = batch
@@ -471,7 +475,7 @@ fn paired_updates_replace_append_and_delete_nonnull_sum_inputs_on_both_sides() {
                 assert!(value.value(1) > 0);
                 assert!(!value.is_null(1));
             }
-            Update::AppendLeft | Update::AppendRight => {
+            Update::AppendLeft | Update::AppendRight | Update::NoMatchLeft => {
                 assert_eq!(batch.len(), 1);
                 assert_eq!(diffs.value(0), 1);
                 assert!(value.value(0) > 0);
@@ -597,6 +601,7 @@ fn sample(fixture: Fixture, force_dense: bool) -> (Sample, Vec<ZSetBatch>, Vec<Z
     let (input, update) = fixture.update();
     let before_report = core.memory_report().unwrap();
     reset_path_counters();
+    crate::ops::join::test_support::reset_counts();
     let rss_before = resident_pages();
     #[cfg(feature = "bench-allocation-observer")]
     let allocation_region = Region::new(TEST_ALLOCATOR);
@@ -836,6 +841,119 @@ fn allocator_observation_scope() -> &'static str {
 #[cfg(test)]
 mod observer_contract_tests {
     use super::*;
+
+    #[cfg(feature = "bench-allocation-observer")]
+    #[test]
+    #[ignore = "isolated full EngineCore Dense join allocation comparison; run with one test thread"]
+    fn dense_join_direct_index_allocation_regression() {
+        let fixture = Fixture {
+            name: "direct-index-allocation-1x256",
+            keys: 1,
+            fanout: 256,
+            duplicate_payloads: false,
+            skewed: false,
+            mixed_flat_view: false,
+            unsafe_avg_history: false,
+            subset_group: false,
+            update: Update::AppendLeft,
+        };
+        let mut direct = build_seeded(fixture, true);
+        let (input, update) = fixture.update();
+        let _mode = ModeGuard::new(true);
+        reset_path_counters();
+        crate::ops::join::test_support::reset_counts();
+        let direct_region = Region::new(TEST_ALLOCATOR);
+        direct.push(input, &update).unwrap();
+        let direct_stats = direct_region.change();
+        let direct_routes = crate::ops::join::test_support::counts();
+        let direct_dense_calls = crate::core::graph::DENSE_JOIN_MATERIALIZATIONS.with(Cell::get);
+        let direct_dense_rows = crate::core::graph::DENSE_JOIN_ROWS.with(Cell::get);
+        drop(_mode);
+        let direct_changes = vec![direct.take_changes(ViewId(0)).unwrap()];
+        let direct_snapshots = vec![direct.snapshot(ViewId(0)).unwrap()];
+        let (mut legacy, legacy_stats, legacy_routes, legacy_dense_calls, legacy_dense_rows) = {
+            let _mode = ModeGuard::new(true);
+            let _legacy = crate::ops::join::test_support::LegacyDenseJoinGuard::force();
+            let mut legacy = build_seeded(fixture, true);
+            reset_path_counters();
+            crate::ops::join::test_support::reset_counts();
+            let legacy_region = Region::new(TEST_ALLOCATOR);
+            legacy.push(input, &update).unwrap();
+            let stats = legacy_region.change();
+            let routes = crate::ops::join::test_support::counts();
+            let calls = crate::core::graph::DENSE_JOIN_MATERIALIZATIONS.with(Cell::get);
+            let rows = crate::core::graph::DENSE_JOIN_ROWS.with(Cell::get);
+            (legacy, stats, routes, calls, rows)
+        };
+        let legacy_changes = vec![legacy.take_changes(ViewId(0)).unwrap()];
+        let legacy_snapshots = vec![legacy.snapshot(ViewId(0)).unwrap()];
+
+        assert!(direct_dense_calls > 0 && direct_dense_rows > 0);
+        assert!(direct_routes.direct > 0);
+        assert_eq!(direct_routes.forced_legacy, 0);
+        assert!(legacy_routes.forced_legacy > 0);
+        assert!(legacy_dense_calls > 0 && legacy_dense_rows > 0);
+        assert_eq!(legacy_routes.direct, 0);
+        assert!(legacy_routes.forced_legacy > 0);
+        assert!(legacy_dense_calls > 0 && legacy_dense_rows > 0);
+        assert_same_views(&direct_changes, &legacy_changes);
+        assert_same_views(&direct_snapshots, &legacy_snapshots);
+
+        let direct_bytes = direct_stats.bytes_allocated;
+        let legacy_bytes = legacy_stats.bytes_allocated;
+        let expected_pairs = fixture.fanout;
+        let tuple_payload = expected_pairs * std::mem::size_of::<(usize, usize)>();
+        assert!(
+            direct_bytes < legacy_bytes,
+            "same public-push fixture should allocate fewer bytes on direct path: legacy={legacy_bytes}, direct={direct_bytes}"
+        );
+        println!(
+            "dense_engine_push_allocations pairs={expected_pairs} direct_bytes={direct_bytes} legacy_bytes={legacy_bytes} net_difference_bytes={} operator_tuple_payload_bytes={tuple_payload} direct_calls={} legacy_calls={} dense_rows={}",
+            legacy_bytes - direct_bytes,
+            direct_routes.direct,
+            legacy_routes.forced_legacy,
+            direct_dense_rows,
+        );
+    }
+
+    #[cfg(feature = "bench-allocation-observer")]
+    #[test]
+    #[ignore = "negative control: forced legacy public-push path must violate direct allocation assertion"]
+    fn dense_join_direct_index_allocation_legacy_negative_control() {
+        let fixture = Fixture {
+            name: "direct-index-allocation-1x256",
+            keys: 1,
+            fanout: 256,
+            duplicate_payloads: false,
+            skewed: false,
+            mixed_flat_view: false,
+            unsafe_avg_history: false,
+            subset_group: false,
+            update: Update::AppendLeft,
+        };
+        let (input, update) = fixture.update();
+        let (bytes, routes) = {
+            let _mode = ModeGuard::new(true);
+            let _legacy = crate::ops::join::test_support::LegacyDenseJoinGuard::force();
+            let mut core = build_seeded(fixture, true);
+            crate::ops::join::test_support::reset_counts();
+            let region = Region::new(TEST_ALLOCATOR);
+            core.push(input, &update).unwrap();
+            (
+                region.change().bytes_allocated,
+                crate::ops::join::test_support::counts(),
+            )
+        };
+        assert!(routes.forced_legacy > 0);
+        let direct_budget = 353_999usize;
+        assert!(
+            bytes < direct_budget,
+            "negative control expects forced legacy route to exceed direct budget {direct_budget}; observed={bytes}"
+        );
+    }
+
+    #[path = "public_push_fixture.rs"]
+    mod public_push_fixture;
 
     #[test]
     fn signed_allocator_delta_excludes_reallocation_adjustment() {

@@ -250,3 +250,192 @@ fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch,
     }
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
+
+#[cfg(test)]
+mod index_width_tests {
+    use super::take_indices_fit;
+
+    #[test]
+    fn take_index_eligibility_includes_u32_max_without_wrapping() {
+        let max_index = usize::try_from(u32::MAX).unwrap();
+        assert!(take_indices_fit(0));
+        assert!(take_indices_fit(max_index));
+        if let Some(rows) = max_index.checked_add(1) {
+            assert!(take_indices_fit(rows));
+            if let Some(rows) = rows.checked_add(1) {
+                assert!(!take_indices_fit(rows));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_order_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Float64Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::*;
+    use crate::keys::full_converter;
+    use crate::ops::join::test_support::LegacyDenseJoinGuard;
+
+    fn side(name: &str, diff: ArrayRef) -> ZSetBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef],
+        )
+        .unwrap();
+        let _ = name;
+        ZSetBatch::new(batch, diff).unwrap()
+    }
+
+    fn materialize_error(left: &ZSetBatch, right: &ZSetBatch) -> String {
+        let left_conv = KeyConverter::new(left.schema().as_ref(), &[0]).unwrap();
+        let right_conv = KeyConverter::new(right.schema().as_ref(), &[0]).unwrap();
+        let out = joined_schema(&left.schema(), &right.schema());
+        let out_conv = full_converter(out.as_ref()).unwrap();
+        match equi_join(left, &left_conv, right, &right_conv, &out_conv) {
+            Ok(_) => panic!("expected malformed diff dtype to fail"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn both_routes_validate_left_diff_dtype_before_right_diff_dtype() {
+        let bad_left = side("left", Arc::new(Float64Array::from(vec![1.0])));
+        let bad_right = side("right", Arc::new(Float64Array::from(vec![2.0])));
+        let good = side("good", Arc::new(Int64Array::from(vec![1_i64])));
+        let left_first = materialize_error(&bad_left, &good);
+        let right_only = materialize_error(&good, &bad_right);
+        assert!(left_first.contains("diff column must be integer"));
+        assert!(right_only.contains("diff column must be integer"));
+
+        let _legacy = LegacyDenseJoinGuard::force();
+        assert_eq!(materialize_error(&bad_left, &good), left_first);
+        assert_eq!(materialize_error(&good, &bad_right), right_only);
+        assert_eq!(materialize_error(&bad_left, &bad_right), left_first);
+    }
+
+    #[test]
+    fn both_routes_keep_empty_no_pair_diff_validation() {
+        let invalid = side("invalid", Arc::new(Float64Array::from(vec![1.0])));
+        let empty = ZSetBatch::empty(invalid.schema());
+        let direct = materialize_error(&invalid, &empty);
+        let _legacy = LegacyDenseJoinGuard::force();
+        assert_eq!(materialize_error(&invalid, &empty), direct);
+        assert!(direct.contains("diff column must be integer"));
+    }
+}
+
+#[cfg(test)]
+mod operator_diagnostic_tests {
+    use std::hint::black_box;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use arrow::array::{ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::*;
+    use crate::keys::full_converter;
+    use crate::ops::join::test_support::{self, LegacyDenseJoinGuard};
+
+    const SIDE_ROWS: usize = 128;
+    const ITERATIONS: usize = 16;
+
+    fn side(name: &str, offset: i64) -> ZSetBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new(name, DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64; SIDE_ROWS])) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(
+                    (0..SIDE_ROWS).map(|row| offset + row as i64),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        ZSetBatch::new(batch, Arc::new(Int64Array::from(vec![1_i64; SIDE_ROWS]))).unwrap()
+    }
+
+    fn assert_output(output: &ZSetBatch) {
+        assert_eq!(output.len(), SIDE_ROWS * SIDE_ROWS);
+        assert_eq!(output.schema().fields().len(), 4);
+        for field in output.schema().fields() {
+            assert_eq!(field.data_type(), &DataType::Int64);
+        }
+        let diffs = output.diff().as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(diffs.null_count(), 0);
+        assert!(diffs.values().iter().all(|&diff| diff == 1));
+    }
+
+    #[test]
+    #[ignore = "operator-only 16,384-pair diagnostic; one-shot smoke, not a performance acceptance test"]
+    fn high_fanout_equi_join_clock_smoke() {
+        let left = side("left_payload", 0);
+        let right = side("right_payload", 10_000);
+        let left_conv = KeyConverter::new(left.schema().as_ref(), &[0]).unwrap();
+        let right_conv = KeyConverter::new(right.schema().as_ref(), &[0]).unwrap();
+        let output_schema = joined_schema(&left.schema(), &right.schema());
+        let output_conv = full_converter(output_schema.as_ref()).unwrap();
+
+        let run = |legacy: bool| {
+            let _legacy = legacy.then(LegacyDenseJoinGuard::force);
+            let warmup = equi_join(&left, &left_conv, &right, &right_conv, &output_conv).unwrap();
+            assert_eq!(warmup.1, SIDE_ROWS * SIDE_ROWS);
+            assert_output(&warmup.0);
+            drop(warmup);
+            test_support::reset_counts();
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let (output, _) =
+                    equi_join(&left, &left_conv, &right, &right_conv, &output_conv).unwrap();
+                black_box(output);
+            }
+            let elapsed = started.elapsed().as_nanos();
+            (elapsed, test_support::counts())
+        };
+        let legacy_first = std::env::var_os("W3HW_LEGACY_FIRST").is_some();
+        let (direct_result, legacy_result) = if legacy_first {
+            let legacy = run(true);
+            let direct = run(false);
+            (direct, legacy)
+        } else {
+            (run(false), run(true))
+        };
+        let (direct_ns, direct_routes) = direct_result;
+        let (legacy_ns, legacy_routes) = legacy_result;
+        assert_eq!(direct_routes.direct, ITERATIONS);
+        assert_eq!(direct_routes.forced_legacy, 0);
+        assert_eq!(
+            direct_routes.direct_pairs,
+            ITERATIONS * SIDE_ROWS * SIDE_ROWS
+        );
+
+        assert_eq!(legacy_routes.forced_legacy, ITERATIONS);
+        assert_eq!(legacy_routes.direct, 0);
+        assert_eq!(
+            legacy_routes.forced_legacy_pairs,
+            ITERATIONS * SIDE_ROWS * SIDE_ROWS
+        );
+        println!(
+            "operator_high_fanout legacy_first={} pairs_per_call={} iterations={} direct_total_ns={} direct_ns_per_call={} legacy_total_ns={} legacy_ns_per_call={} direct_actual_pairs={} legacy_actual_pairs={}",
+            legacy_first,
+            SIDE_ROWS * SIDE_ROWS,
+            ITERATIONS,
+            direct_ns,
+            direct_ns / ITERATIONS as u128,
+            legacy_ns,
+            legacy_ns / ITERATIONS as u128,
+            direct_routes.direct_pairs,
+            legacy_routes.forced_legacy_pairs,
+        );
+    }
+}
