@@ -131,6 +131,30 @@ impl ViewGraph {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn root_join_sources_for_test(&self) -> Option<(InputId, InputId)> {
+        match &self.root {
+            Node::Joined { left, right, .. } => match (left.as_ref(), right.as_ref()) {
+                (Node::Source(left), Node::Source(right)) => Some((*left, *right)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn root_private_arrangement_rows_for_test(&self) -> Option<(usize, usize)> {
+        match &self.root {
+            Node::Joined { join, shared, .. } if shared.is_none() => {
+                join.arrangement_row_counts_for_test()
+            }
+            Node::Joined {
+                shared: Some(_), ..
+            } => Some((0, 0)),
+            _ => None,
+        }
+    }
+
     /// Total deltas dropped by this graph's window operators because their
     /// window had already closed.
     pub(super) fn window_late_closed_dropped(&self) -> u64 {

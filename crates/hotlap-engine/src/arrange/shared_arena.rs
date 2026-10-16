@@ -294,6 +294,59 @@ impl ArrangementArena {
             .count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn owner_distinct_row_count(
+        &self,
+        handle: ArrangementHandle,
+    ) -> Result<usize, EngineError> {
+        Ok(self.owner(handle)?.distinct_row_count_for_test())
+    }
+
+    /// Capacity lower bound for arena slots, free-list indices, and live
+    /// descriptor key-index vectors. Excludes allocator and Arc/schema/converter
+    /// backing overhead; slot capacity includes inline owner/lease metadata.
+    #[cfg(test)]
+    pub(crate) fn container_capacity_lower_bound_for_test(&self) -> Result<usize, EngineError> {
+        let mut bytes = self
+            .slots
+            .capacity()
+            .checked_mul(std::mem::size_of::<ArenaSlot>())
+            .ok_or_else(|| EngineError::Infrastructure("arena slot capacity overflow".into()))?;
+        bytes = bytes
+            .checked_add(
+                self.free
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .ok_or_else(|| {
+                        EngineError::Infrastructure("arena free-list capacity overflow".into())
+                    })?,
+            )
+            .ok_or_else(|| EngineError::Infrastructure("arena capacity sum overflow".into()))?;
+        for owner in self.slots.iter().filter_map(|slot| slot.owner.as_ref()) {
+            let indices = [
+                owner.descriptor.root_left_keys.capacity(),
+                owner.descriptor.root_right_keys.capacity(),
+                owner.descriptor.key_indices.capacity(),
+                owner.descriptor.partner_key_indices.capacity(),
+            ]
+            .into_iter()
+            .try_fold(0usize, |sum, capacity| sum.checked_add(capacity))
+            .ok_or_else(|| {
+                EngineError::Infrastructure("descriptor index capacity overflow".into())
+            })?;
+            bytes = bytes
+                .checked_add(
+                    indices
+                        .checked_mul(std::mem::size_of::<usize>())
+                        .ok_or_else(|| {
+                            EngineError::Infrastructure("descriptor byte capacity overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| EngineError::Infrastructure("arena capacity sum overflow".into()))?;
+        }
+        Ok(bytes)
+    }
+
     fn slot(&self, handle: ArrangementHandle) -> Result<&ArenaSlot, EngineError> {
         let slot = self
             .slots

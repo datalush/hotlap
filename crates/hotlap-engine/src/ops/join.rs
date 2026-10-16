@@ -279,6 +279,14 @@ impl Join {
         self.right.as_ref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn arrangement_row_counts_for_test(&self) -> Option<(usize, usize)> {
+        Some((
+            self.left.as_ref()?.distinct_row_count_for_test(),
+            self.right.as_ref()?.distinct_row_count_for_test(),
+        ))
+    }
+
     pub(crate) fn prepare_source_updates(
         &self,
         left: &ZSetBatch,

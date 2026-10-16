@@ -95,6 +95,11 @@ impl PreparedSourceUpdate {
 }
 
 impl KeyedArrangement {
+    #[cfg(test)]
+    pub(crate) fn distinct_row_count_for_test(&self) -> usize {
+        self.state.len()
+    }
+
     pub(crate) fn prepare_source_update(
         &self,
         batch: &ZSetBatch,

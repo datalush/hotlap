@@ -2,6 +2,8 @@
 
 #[path = "paired_bench/avg_bench.rs"]
 mod avg_bench;
+#[path = "paired_bench/shared_arena_bench.rs"]
+mod shared_arena_bench;
 
 use std::collections::HashMap;
 use std::time::Instant;
