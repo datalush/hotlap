@@ -194,3 +194,203 @@ fn restore_then_continue_matches_no_restart() {
         );
     }
 }
+
+#[test]
+fn window_checkpoint_without_schema_but_with_open_bucket_is_rejected() {
+    let mut original = EngineCore::new();
+    original.register_input(InputId(0)).unwrap();
+    original
+        .declare_watermark(
+            InputId(0),
+            WatermarkSpec {
+                time_col: 2,
+                lag: 0,
+            },
+        )
+        .unwrap();
+    original
+        .build_view(
+            ViewId(0),
+            &Plan::TumbleCount {
+                input: Box::new(Plan::Source(InputId(0))),
+                key: vec![0],
+                time_col: 2,
+                size: 10,
+            },
+        )
+        .unwrap();
+    original.push(InputId(0), &input0(&[(1, 2, 1, 1)])).unwrap();
+    let mut corrupted = original.checkpoint().unwrap();
+    let window = match corrupted.views[0].operators[0].as_mut().unwrap() {
+        hotlap_core::snapshot::OperatorState::Window(state) => state,
+        other => panic!("expected window state, got {other:?}"),
+    };
+    window.schema = None;
+    let bytes = encode_snapshot(&corrupted).unwrap();
+    let decoded = decode_snapshot(&bytes).unwrap();
+    assert_rejected_restore_preserves_window_engine(decoded);
+}
+
+#[test]
+fn window_checkpoint_duplicate_open_bucket_is_rejected() {
+    let mut original = EngineCore::new();
+    original.register_input(InputId(0)).unwrap();
+    original
+        .declare_watermark(
+            InputId(0),
+            WatermarkSpec {
+                time_col: 2,
+                lag: 0,
+            },
+        )
+        .unwrap();
+    original
+        .build_view(
+            ViewId(0),
+            &Plan::TumbleCount {
+                input: Box::new(Plan::Source(InputId(0))),
+                key: vec![0],
+                time_col: 2,
+                size: 10,
+            },
+        )
+        .unwrap();
+    original.push(InputId(0), &input0(&[(1, 2, 1, 1)])).unwrap();
+    let mut corrupted = original.checkpoint().unwrap();
+    let state = match corrupted.views[0].operators[0].as_mut().unwrap() {
+        hotlap_core::snapshot::OperatorState::Window(state) => state,
+        other => panic!("expected window state, got {other:?}"),
+    };
+    state.open.push(state.open[0].clone());
+    let decoded = decode_snapshot(&encode_snapshot(&corrupted).unwrap()).unwrap();
+    assert_rejected_restore_preserves_window_engine(decoded);
+}
+
+#[test]
+fn empty_uninitialized_window_checkpoint_restores() {
+    let original = window_engine();
+    let snapshot = original.checkpoint().unwrap();
+    let mut restored = EngineCore::new();
+    restored.restore(&snapshot).unwrap();
+    assert_eq!(restored.checkpoint().unwrap(), snapshot);
+}
+
+#[test]
+fn restore_preserves_negative_and_zero_open_window_counts() {
+    let mut original = window_engine();
+    original
+        .push(InputId(0), &input0(&[(1, 0, 1, -2), (2, 0, 2, 0)]))
+        .unwrap();
+    let checkpoint = original.checkpoint().unwrap();
+    let state = match checkpoint.views[0].operators[0].as_ref().unwrap() {
+        hotlap_core::snapshot::OperatorState::Window(state) => state,
+        other => panic!("expected window state, got {other:?}"),
+    };
+    let mut counts = state
+        .open
+        .iter()
+        .map(|bucket| bucket.count)
+        .collect::<Vec<_>>();
+    counts.sort();
+    assert_eq!(counts, vec![-2, 0]);
+
+    let mut restored = EngineCore::new();
+    restored.restore(&checkpoint).unwrap();
+    restored
+        .push(InputId(0), &input0(&[(3, 0, 10, 1)]))
+        .unwrap();
+    assert_eq!(
+        rows(&restored.snapshot(ViewId(0)).unwrap()),
+        vec![(vec![1, 0, -2], 1)]
+    );
+}
+
+#[test]
+#[ignore = "known current-v1 recovery defect; tracked by hotlap#qs79; this test must fail when run"]
+fn window_checkpoint_truncated_key_parser_behavior_probe() {
+    let mut original = window_engine();
+    original.push(InputId(0), &input0(&[(1, 2, 1, 1)])).unwrap();
+    let mut corrupted = original.checkpoint().unwrap();
+    let state = match corrupted.views[0].operators[0].as_mut().unwrap() {
+        hotlap_core::snapshot::OperatorState::Window(state) => state,
+        other => panic!("expected window state, got {other:?}"),
+    };
+    state.open[0].key.truncate(1);
+    let decoded = decode_snapshot(&encode_snapshot(&corrupted).unwrap()).unwrap();
+    let mut target = EngineCore::new();
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| target.restore(&decoded)));
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "malformed key was not rejected with a typed error: {result:?}"
+    );
+}
+
+fn window_engine() -> EngineCore {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.declare_watermark(
+        InputId(0),
+        WatermarkSpec {
+            time_col: 2,
+            lag: 0,
+        },
+    )
+    .unwrap();
+    core.build_view(
+        ViewId(0),
+        &Plan::TumbleCount {
+            input: Box::new(Plan::Source(InputId(0))),
+            key: vec![0],
+            time_col: 2,
+            size: 10,
+        },
+    )
+    .unwrap();
+    core.tap_view(ViewId(0)).unwrap();
+    core
+}
+
+fn assert_rejected_restore_preserves_window_engine(snapshot: EngineSnapshot) {
+    let mut target = window_engine();
+    target.push(InputId(0), &input0(&[(7, 0, 1, 1)])).unwrap();
+    target.push(InputId(0), &input0(&[(7, 0, 10, 1)])).unwrap();
+    assert_eq!(
+        rows(&target.snapshot(ViewId(0)).unwrap()),
+        vec![(vec![7, 0, 1], 1)]
+    );
+    target.take_changes(ViewId(0)).unwrap();
+
+    let before = target.checkpoint().unwrap();
+    let mut reference = EngineCore::new();
+    reference.restore(&before).unwrap();
+    assert!(
+        matches!(
+            target.restore(&snapshot),
+            Err(hotlap_engine::EngineError::Infrastructure(_))
+        ),
+        "corrupt window state did not return typed Infrastructure error"
+    );
+    assert_eq!(
+        target.checkpoint().unwrap(),
+        before,
+        "failed restore mutated target"
+    );
+
+    for batch in [input0(&[(8, 0, 12, 1)]), input0(&[(8, 0, 20, 1)])] {
+        target.push(InputId(0), &batch).unwrap();
+        reference.push(InputId(0), &batch).unwrap();
+    }
+    assert_eq!(
+        rows(&target.snapshot(ViewId(0)).unwrap()),
+        vec![(vec![7, 0, 1], 1), (vec![7, 10, 1], 1), (vec![8, 10, 1], 1),]
+    );
+    assert_eq!(
+        rows(&target.snapshot(ViewId(0)).unwrap()),
+        rows(&reference.snapshot(ViewId(0)).unwrap())
+    );
+    assert_eq!(
+        rows(&target.take_changes(ViewId(0)).unwrap()),
+        rows(&reference.take_changes(ViewId(0)).unwrap())
+    );
+}

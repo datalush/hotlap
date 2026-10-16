@@ -35,22 +35,39 @@ impl TumbleCount {
 
     /// Restores the schema, counters and open buckets.
     pub(crate) fn import_state(&mut self, state: &WindowState) -> Result<(), EngineError> {
-        self.windows.clear();
-        self.watermark = state.watermark;
-        self.dropped_late = state.dropped_late;
-        self.dropped_closed = state.dropped_closed;
         let Some(bytes) = &state.schema else {
+            if !state.open.is_empty() {
+                return Err(EngineError::Infrastructure(
+                    "restored window buckets exist without their schema".into(),
+                ));
+            }
+            self.windows.clear();
+            self.watermark = state.watermark;
+            self.dropped_late = state.dropped_late;
+            self.dropped_closed = state.dropped_closed;
             self.converter = None;
             self.schema = None;
             return Ok(());
         };
         let schema = decode_schema(bytes)?;
         let converter = converter_for(&schema, &self.key)?;
+        let mut windows = super::helpers::Windows::new();
         for bucket in &state.open {
             let key = converter.parser().parse(&bucket.key).owned();
-            let entry = self.windows.entry(bucket.start).or_default();
-            entry.insert(bucket.key.clone(), (key, bucket.count));
+            let entry = windows.entry(bucket.start).or_default();
+            if entry
+                .insert(bucket.key.clone(), (key, bucket.count))
+                .is_some()
+            {
+                return Err(EngineError::Infrastructure(
+                    "duplicate restored window bucket".into(),
+                ));
+            }
         }
+        self.windows = windows;
+        self.watermark = state.watermark;
+        self.dropped_late = state.dropped_late;
+        self.dropped_closed = state.dropped_closed;
         self.converter = Some(converter);
         self.schema = Some(schema);
         Ok(())
