@@ -34,6 +34,7 @@ mod minmax_characterization;
 mod paired_bench;
 mod recovery;
 mod recovery_signed_history;
+mod shared_qualification;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
