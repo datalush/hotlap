@@ -21,6 +21,7 @@ fn engine_with_source_taps() -> EngineCore {
 enum Route {
     Direct,
     Legacy,
+    OwnedKeys,
 }
 
 fn push_on_route(
@@ -30,13 +31,14 @@ fn push_on_route(
     route: Route,
     expect_dense_materialization: bool,
 ) {
-    use crate::ops::join::test_support::{self, LegacyDenseJoinGuard};
+    use crate::ops::join::test_support::{self, LegacyDenseJoinGuard, OwnedDenseJoinKeyGuard};
 
     test_support::reset_counts();
     crate::core::graph::DENSE_JOIN_MATERIALIZATIONS.with(|count| count.set(0));
     crate::core::graph::FACTORIZED_CUTS.with(|count| count.set(0));
+    let _owned_keys = matches!(route, Route::OwnedKeys).then(OwnedDenseJoinKeyGuard::force);
     match route {
-        Route::Direct => engine.push(input, delta).unwrap(),
+        Route::Direct | Route::OwnedKeys => engine.push(input, delta).unwrap(),
         Route::Legacy => {
             let _legacy = LegacyDenseJoinGuard::force();
             engine.push(input, delta).unwrap();
@@ -56,10 +58,22 @@ fn push_on_route(
                 assert_eq!(calls.direct, 0);
                 assert!(calls.forced_legacy > 0, "reference must use legacy tuples");
             }
+            Route::OwnedKeys => {
+                assert!(calls.direct > 0, "owned-key reference uses direct indices");
+                assert_eq!(calls.forced_legacy, 0);
+                assert_eq!(calls.owned_key_buckets, calls.direct);
+                assert_eq!(calls.borrowed_key_buckets, 0);
+            }
+        }
+        if matches!(route, Route::Direct) {
+            assert_eq!(calls.borrowed_key_buckets, calls.direct);
+            assert_eq!(calls.owned_key_buckets, 0);
         }
     } else {
         assert_eq!(calls.direct, 0);
         assert_eq!(calls.forced_legacy, 0);
+        assert_eq!(calls.borrowed_key_buckets, 0);
+        assert_eq!(calls.owned_key_buckets, 0);
     }
     assert_eq!(calls.wide_fallback, 0, "fixture indices fit u32");
     crate::core::graph::FACTORIZED_CUTS.with(|count| assert_eq!(count.get(), 0));
@@ -257,8 +271,7 @@ fn assert_direct_reference(
     }
 }
 
-#[test]
-fn direct_dense_indices_match_legacy_float_history_through_restore_and_retractions() {
+fn assert_float_history_matches_reference(reference_route: Route) {
     let mut direct = engine_with_source_taps();
     let mut legacy = engine_with_source_taps();
     let mut expected_left = BTreeMap::new();
@@ -266,7 +279,7 @@ fn direct_dense_indices_match_legacy_float_history_through_restore_and_retractio
 
     let right_seed = float_pairs(&[(1, 9.0, 1)]);
     push_on_route(&mut direct, InputId(1), &right_seed, Route::Direct, false);
-    push_on_route(&mut legacy, InputId(1), &right_seed, Route::Legacy, false);
+    push_on_route(&mut legacy, InputId(1), &right_seed, reference_route, false);
     expected_right.insert((1, 9.0_f64.to_bits()), 1);
     assert_direct_reference(
         &mut direct,
@@ -292,7 +305,7 @@ fn direct_dense_indices_match_legacy_float_history_through_restore_and_retractio
     ] {
         let delta = float_pairs(&[(1, value, 1)]);
         push_on_route(&mut direct, InputId(0), &delta, Route::Direct, true);
-        push_on_route(&mut legacy, InputId(0), &delta, Route::Legacy, true);
+        push_on_route(&mut legacy, InputId(0), &delta, reference_route, true);
         *expected_left.entry((1, value.to_bits())).or_insert(0) += 1;
 
         let current = (
@@ -380,7 +393,7 @@ fn direct_dense_indices_match_legacy_float_history_through_restore_and_retractio
         ),
     ] {
         push_on_route(&mut direct, InputId(0), &delta, Route::Direct, true);
-        push_on_route(&mut legacy, InputId(0), &delta, Route::Legacy, true);
+        push_on_route(&mut legacy, InputId(0), &delta, reference_route, true);
         push_on_route(
             &mut direct_restored,
             InputId(0),
@@ -392,7 +405,7 @@ fn direct_dense_indices_match_legacy_float_history_through_restore_and_retractio
             &mut legacy_restored,
             InputId(0),
             &delta,
-            Route::Legacy,
+            reference_route,
             true,
         );
         let weight = expected_left
@@ -447,6 +460,16 @@ fn direct_dense_indices_match_legacy_float_history_through_restore_and_retractio
             },
         );
     }
+}
+
+#[test]
+fn direct_dense_indices_match_legacy_float_history_through_restore_and_retractions() {
+    assert_float_history_matches_reference(Route::Legacy);
+}
+
+#[test]
+fn borrowed_keys_match_owned_key_direct_indices_through_float_restore_and_retractions() {
+    assert_float_history_matches_reference(Route::OwnedKeys);
 }
 
 #[test]

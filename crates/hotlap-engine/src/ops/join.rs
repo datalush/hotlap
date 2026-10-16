@@ -28,16 +28,21 @@ pub(crate) mod test_support {
         pub direct_pairs: usize,
         pub forced_legacy_pairs: usize,
         pub wide_fallback_pairs: usize,
+        pub borrowed_key_buckets: usize,
+        pub owned_key_buckets: usize,
     }
 
     thread_local! {
         static FORCE_LEGACY: Cell<bool> = const { Cell::new(false) };
+        static FORCE_OWNED_KEYS: Cell<bool> = const { Cell::new(false) };
         static DIRECT_CALLS: Cell<usize> = const { Cell::new(0) };
         static FORCED_LEGACY_CALLS: Cell<usize> = const { Cell::new(0) };
         static WIDE_FALLBACK_CALLS: Cell<usize> = const { Cell::new(0) };
         static DIRECT_PAIRS: Cell<usize> = const { Cell::new(0) };
         static FORCED_LEGACY_PAIRS: Cell<usize> = const { Cell::new(0) };
         static WIDE_FALLBACK_PAIRS: Cell<usize> = const { Cell::new(0) };
+        static BORROWED_KEY_BUCKETS: Cell<usize> = const { Cell::new(0) };
+        static OWNED_KEY_BUCKETS: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Test-only route override for reference pushes; restores state during unwind.
@@ -46,6 +51,22 @@ pub(crate) mod test_support {
     impl LegacyDenseJoinGuard {
         pub(crate) fn force() -> Self {
             Self(FORCE_LEGACY.with(|flag| flag.replace(true)))
+        }
+    }
+
+    /// Test-only switch that restores the prior owned-byte-key bucket as the
+    /// reference while retaining the committed direct-index pair path.
+    pub(crate) struct OwnedDenseJoinKeyGuard(bool);
+
+    impl OwnedDenseJoinKeyGuard {
+        pub(crate) fn force() -> Self {
+            Self(FORCE_OWNED_KEYS.with(|flag| flag.replace(true)))
+        }
+    }
+
+    impl Drop for OwnedDenseJoinKeyGuard {
+        fn drop(&mut self) {
+            FORCE_OWNED_KEYS.with(|flag| flag.set(self.0));
         }
     }
 
@@ -59,6 +80,10 @@ pub(crate) mod test_support {
         FORCE_LEGACY.with(Cell::get)
     }
 
+    pub(crate) fn force_owned_keys() -> bool {
+        FORCE_OWNED_KEYS.with(Cell::get)
+    }
+
     pub(crate) fn reset_counts() {
         DIRECT_CALLS.with(|count| count.set(0));
         FORCED_LEGACY_CALLS.with(|count| count.set(0));
@@ -66,6 +91,8 @@ pub(crate) mod test_support {
         DIRECT_PAIRS.with(|count| count.set(0));
         FORCED_LEGACY_PAIRS.with(|count| count.set(0));
         WIDE_FALLBACK_PAIRS.with(|count| count.set(0));
+        BORROWED_KEY_BUCKETS.with(|count| count.set(0));
+        OWNED_KEY_BUCKETS.with(|count| count.set(0));
     }
 
     pub(crate) fn reset_direct_count() {
@@ -85,6 +112,8 @@ pub(crate) mod test_support {
             direct_pairs: DIRECT_PAIRS.with(Cell::get),
             forced_legacy_pairs: FORCED_LEGACY_PAIRS.with(Cell::get),
             wide_fallback_pairs: WIDE_FALLBACK_PAIRS.with(Cell::get),
+            borrowed_key_buckets: BORROWED_KEY_BUCKETS.with(Cell::get),
+            owned_key_buckets: OWNED_KEY_BUCKETS.with(Cell::get),
         }
     }
 
@@ -101,6 +130,14 @@ pub(crate) mod test_support {
     pub(super) fn record_wide_fallback(pairs: usize) {
         WIDE_FALLBACK_CALLS.with(|count| count.set(count.get() + 1));
         WIDE_FALLBACK_PAIRS.with(|count| count.set(count.get().saturating_add(pairs)));
+    }
+
+    pub(super) fn record_borrowed_key_bucket() {
+        BORROWED_KEY_BUCKETS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn record_owned_key_bucket() {
+        OWNED_KEY_BUCKETS.with(|count| count.set(count.get() + 1));
     }
 }
 

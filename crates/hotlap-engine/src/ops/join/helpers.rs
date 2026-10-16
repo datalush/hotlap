@@ -1,4 +1,6 @@
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int64Array, UInt32Array};
@@ -91,32 +93,89 @@ pub(super) fn equi_join(
     let left_rows = left_conv.convert(left.batch.columns())?;
     let right_rows = right_conv.convert(right.batch.columns())?;
 
-    let mut buckets: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-    for index in 0..left_rows.num_rows() {
-        buckets
-            .entry(left_rows.row(index).as_ref().to_vec())
-            .or_default()
-            .push(index);
-    }
     #[cfg(test)]
     let force_legacy = super::test_support::force_legacy();
     #[cfg(not(test))]
     let force_legacy = false;
-    if !force_legacy
+    let direct_eligible = !force_legacy
         && take_indices_fit(left_rows.num_rows())
-        && take_indices_fit(right_rows.num_rows())
-    {
-        let mut left_indices = Vec::new();
-        let mut right_indices = Vec::new();
-        for right_index in 0..right_rows.num_rows() {
-            if let Some(bucket) = buckets.get(right_rows.row(right_index).as_ref()) {
-                for &left_index in bucket {
-                    // The row-count guard above proves these casts are lossless.
-                    left_indices.push(left_index as u32);
-                    right_indices.push(right_index as u32);
-                }
-            }
+        && take_indices_fit(right_rows.num_rows());
+    #[cfg(test)]
+    if super::test_support::force_owned_keys() {
+        let mut buckets: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        for index in 0..left_rows.num_rows() {
+            buckets
+                .entry(left_rows.row(index).as_ref().to_vec())
+                .or_default()
+                .push(index);
         }
+        #[cfg(test)]
+        super::test_support::record_owned_key_bucket();
+        evaluate_dense_buckets(
+            left,
+            right,
+            &buckets,
+            &right_rows,
+            out_conv,
+            direct_eligible,
+            force_legacy,
+        )
+    } else {
+        let buckets = borrowed_key_buckets(&left_rows);
+        #[cfg(test)]
+        super::test_support::record_borrowed_key_bucket();
+        evaluate_dense_buckets(
+            left,
+            right,
+            &buckets,
+            &right_rows,
+            out_conv,
+            direct_eligible,
+            force_legacy,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        let buckets = borrowed_key_buckets(&left_rows);
+        evaluate_dense_buckets(
+            left,
+            right,
+            &buckets,
+            &right_rows,
+            out_conv,
+            direct_eligible,
+            force_legacy,
+        )
+    }
+}
+
+fn borrowed_key_buckets(rows: &arrow::row::Rows) -> HashMap<&[u8], Vec<usize>> {
+    let mut buckets = HashMap::new();
+    for index in 0..rows.num_rows() {
+        buckets
+            .entry(rows.row(index).data())
+            .or_insert_with(Vec::new)
+            .push(index);
+    }
+    buckets
+}
+
+fn evaluate_dense_buckets<K>(
+    left: &ZSetBatch,
+    right: &ZSetBatch,
+    buckets: &HashMap<K, Vec<usize>>,
+    right_rows: &arrow::row::Rows,
+    out_conv: &RowConverter,
+    direct_eligible: bool,
+    force_legacy: bool,
+) -> Result<(ZSetBatch, usize), EngineError>
+where
+    K: Borrow<[u8]> + Eq + Hash,
+{
+    #[cfg(not(test))]
+    let _ = force_legacy;
+    if direct_eligible {
+        let (left_indices, right_indices) = direct_pair_indices(buckets, right_rows);
         let pairs = left_indices.len();
         #[cfg(test)]
         super::test_support::record_direct(pairs);
@@ -132,7 +191,7 @@ pub(super) fn equi_join(
     } else {
         let mut matches: Vec<(usize, usize)> = Vec::new();
         for right_index in 0..right_rows.num_rows() {
-            if let Some(left_indices) = buckets.get(right_rows.row(right_index).as_ref()) {
+            if let Some(left_indices) = buckets.get(right_rows.row(right_index).data()) {
                 matches.extend(
                     left_indices
                         .iter()
@@ -149,6 +208,27 @@ pub(super) fn equi_join(
         }
         Ok((materialize(left, right, &matches, out_conv)?, pairs))
     }
+}
+
+fn direct_pair_indices<K>(
+    buckets: &HashMap<K, Vec<usize>>,
+    right_rows: &arrow::row::Rows,
+) -> (Vec<u32>, Vec<u32>)
+where
+    K: Borrow<[u8]> + Eq + Hash,
+{
+    let mut left_indices = Vec::new();
+    let mut right_indices = Vec::new();
+    for right_index in 0..right_rows.num_rows() {
+        if let Some(bucket) = buckets.get(right_rows.row(right_index).data()) {
+            for &left_index in bucket {
+                // The caller's row-count guard proves these casts are lossless.
+                left_indices.push(left_index as u32);
+                right_indices.push(right_index as u32);
+            }
+        }
+    }
+    (left_indices, right_indices)
 }
 
 /// Whether every row position in a side is representable by Arrow's UInt32 take index.
@@ -331,111 +411,9 @@ mod error_order_tests {
 }
 
 #[cfg(test)]
-mod operator_diagnostic_tests {
-    use std::hint::black_box;
-    use std::sync::Arc;
-    use std::time::Instant;
+#[path = "borrowed_key_tests.rs"]
+mod borrowed_key_tests;
 
-    use arrow::array::{ArrayRef, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-
-    use super::*;
-    use crate::keys::full_converter;
-    use crate::ops::join::test_support::{self, LegacyDenseJoinGuard};
-
-    const SIDE_ROWS: usize = 128;
-    const ITERATIONS: usize = 16;
-
-    fn side(name: &str, offset: i64) -> ZSetBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Int64, false),
-            Field::new(name, DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64; SIDE_ROWS])) as ArrayRef,
-                Arc::new(Int64Array::from_iter_values(
-                    (0..SIDE_ROWS).map(|row| offset + row as i64),
-                )) as ArrayRef,
-            ],
-        )
-        .unwrap();
-        ZSetBatch::new(batch, Arc::new(Int64Array::from(vec![1_i64; SIDE_ROWS]))).unwrap()
-    }
-
-    fn assert_output(output: &ZSetBatch) {
-        assert_eq!(output.len(), SIDE_ROWS * SIDE_ROWS);
-        assert_eq!(output.schema().fields().len(), 4);
-        for field in output.schema().fields() {
-            assert_eq!(field.data_type(), &DataType::Int64);
-        }
-        let diffs = output.diff().as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(diffs.null_count(), 0);
-        assert!(diffs.values().iter().all(|&diff| diff == 1));
-    }
-
-    #[test]
-    #[ignore = "operator-only 16,384-pair diagnostic; one-shot smoke, not a performance acceptance test"]
-    fn high_fanout_equi_join_clock_smoke() {
-        let left = side("left_payload", 0);
-        let right = side("right_payload", 10_000);
-        let left_conv = KeyConverter::new(left.schema().as_ref(), &[0]).unwrap();
-        let right_conv = KeyConverter::new(right.schema().as_ref(), &[0]).unwrap();
-        let output_schema = joined_schema(&left.schema(), &right.schema());
-        let output_conv = full_converter(output_schema.as_ref()).unwrap();
-
-        let run = |legacy: bool| {
-            let _legacy = legacy.then(LegacyDenseJoinGuard::force);
-            let warmup = equi_join(&left, &left_conv, &right, &right_conv, &output_conv).unwrap();
-            assert_eq!(warmup.1, SIDE_ROWS * SIDE_ROWS);
-            assert_output(&warmup.0);
-            drop(warmup);
-            test_support::reset_counts();
-            let started = Instant::now();
-            for _ in 0..ITERATIONS {
-                let (output, _) =
-                    equi_join(&left, &left_conv, &right, &right_conv, &output_conv).unwrap();
-                black_box(output);
-            }
-            let elapsed = started.elapsed().as_nanos();
-            (elapsed, test_support::counts())
-        };
-        let legacy_first = std::env::var_os("W3HW_LEGACY_FIRST").is_some();
-        let (direct_result, legacy_result) = if legacy_first {
-            let legacy = run(true);
-            let direct = run(false);
-            (direct, legacy)
-        } else {
-            (run(false), run(true))
-        };
-        let (direct_ns, direct_routes) = direct_result;
-        let (legacy_ns, legacy_routes) = legacy_result;
-        assert_eq!(direct_routes.direct, ITERATIONS);
-        assert_eq!(direct_routes.forced_legacy, 0);
-        assert_eq!(
-            direct_routes.direct_pairs,
-            ITERATIONS * SIDE_ROWS * SIDE_ROWS
-        );
-
-        assert_eq!(legacy_routes.forced_legacy, ITERATIONS);
-        assert_eq!(legacy_routes.direct, 0);
-        assert_eq!(
-            legacy_routes.forced_legacy_pairs,
-            ITERATIONS * SIDE_ROWS * SIDE_ROWS
-        );
-        println!(
-            "operator_high_fanout legacy_first={} pairs_per_call={} iterations={} direct_total_ns={} direct_ns_per_call={} legacy_total_ns={} legacy_ns_per_call={} direct_actual_pairs={} legacy_actual_pairs={}",
-            legacy_first,
-            SIDE_ROWS * SIDE_ROWS,
-            ITERATIONS,
-            direct_ns,
-            direct_ns / ITERATIONS as u128,
-            legacy_ns,
-            legacy_ns / ITERATIONS as u128,
-            direct_routes.direct_pairs,
-            legacy_routes.forced_legacy_pairs,
-        );
-    }
-}
+#[cfg(test)]
+#[path = "operator_diagnostic_tests.rs"]
+mod operator_diagnostic_tests;
