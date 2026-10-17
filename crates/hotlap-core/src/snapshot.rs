@@ -2,8 +2,8 @@
 //!
 //! The snapshot is a plain serde container so any format (JSON, binary) can
 //! carry it. Rectangular tables are stored as Arrow IPC bytes plus a signed
-//! multiplicity column; keyed operator state is stored as ordered
-//! `(bytes, value)` maps. The engine encodes and decodes its internals into
+//! multiplicity column; keyed operator state pairs typed IPC key columns with
+//! ordered authoritative values. The engine encodes and decodes its internals into
 //! this representation; [`ENGINE_SNAPSHOT_FORMAT_VERSION`] guards against
 //! reading bytes produced by an incompatible layout.
 
@@ -20,7 +20,8 @@ pub use minmax::{ExtremeValue, OrderedMultiset};
 #[cfg(feature = "test-instrumentation")]
 pub use minmax::{copied_entries, reset_copied_entries};
 pub use operator::{
-    AggValue, GroupEntry, GroupState, JoinState, OperatorState, WindowBucket, WindowState,
+    AggValue, GroupEntry, GroupState, JoinState, OperatorState, TypedKeyPayload, WindowBucket,
+    WindowState,
 };
 
 /// Current at-rest layout version of [`EngineSnapshot`].

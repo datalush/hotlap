@@ -100,6 +100,10 @@ fn avg_core(case: AvgCase) -> EngineCore {
 }
 
 fn history_signature(core: &EngineCore) -> AvgHistory {
+    use std::io::Cursor;
+
+    use arrow::ipc::reader::StreamReader;
+    use arrow::row::{RowConverter, SortField};
     use hotlap_core::snapshot::{AggValue, OperatorState};
     let checkpoint = core.checkpoint().unwrap();
     let state = checkpoint.views[0]
@@ -111,10 +115,31 @@ fn history_signature(core: &EngineCore) -> AvgHistory {
             _ => None,
         })
         .unwrap();
+    let hotlap_core::snapshot::TypedKeyPayload::Ipc(bytes) = &state.typed_keys else {
+        return Vec::new();
+    };
+    let key_schema = StreamReader::try_new(Cursor::new(bytes), None)
+        .unwrap()
+        .schema();
+    let (batches, _) = crate::core::ipc::typed_keys::decode(bytes, &key_schema).unwrap();
+    let converter = RowConverter::new(
+        key_schema
+            .fields()
+            .iter()
+            .map(|field| SortField::new(field.data_type().clone()))
+            .collect(),
+    )
+    .unwrap();
+    let mut keys = Vec::new();
+    for batch in batches {
+        let rows = converter.convert_columns(batch.columns()).unwrap();
+        keys.extend((0..rows.num_rows()).map(|row| rows.row(row).as_ref().to_vec()));
+    }
     state
         .groups
         .iter()
-        .map(|(key, entry)| {
+        .zip(keys)
+        .map(|(entry, key)| {
             let values = entry
                 .values
                 .iter()
@@ -129,7 +154,7 @@ fn history_signature(core: &EngineCore) -> AvgHistory {
                     _ => None,
                 })
                 .collect();
-            (key.clone(), values)
+            (key, values)
         })
         .collect()
 }

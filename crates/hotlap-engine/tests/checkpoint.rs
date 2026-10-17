@@ -3,10 +3,13 @@
 //! Continuing after `restore` must match continuing without a restart, across
 //! several epochs, retractions and a tumbling window.
 
+use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
 use hotlap_core::{
@@ -262,6 +265,32 @@ fn window_checkpoint_duplicate_open_bucket_is_rejected() {
         other => panic!("expected window state, got {other:?}"),
     };
     state.open.push(state.open[0].clone());
+    let hotlap_core::snapshot::TypedKeyPayload::Ipc(key_bytes) = &state.typed_keys else {
+        panic!("expected typed key stream");
+    };
+    let mut reader = StreamReader::try_new(Cursor::new(key_bytes), None).unwrap();
+    let keys = reader.next().unwrap().unwrap();
+    let repeated = RecordBatch::try_new(
+        keys.schema(),
+        keys.columns()
+            .iter()
+            .map(|column| {
+                arrow::compute::take(
+                    column.as_ref(),
+                    &arrow::array::UInt32Array::from(vec![0, 0]),
+                    None,
+                )
+                .unwrap()
+            })
+            .collect(),
+    )
+    .unwrap();
+    let mut duplicate_key_bytes = Vec::new();
+    let mut writer =
+        StreamWriter::try_new(&mut duplicate_key_bytes, repeated.schema().as_ref()).unwrap();
+    writer.write(&repeated).unwrap();
+    writer.finish().unwrap();
+    state.typed_keys = hotlap_core::snapshot::TypedKeyPayload::Ipc(duplicate_key_bytes);
     let decoded = decode_snapshot(&encode_snapshot(&corrupted).unwrap()).unwrap();
     assert_rejected_restore_preserves_window_engine(decoded);
 }
@@ -306,7 +335,6 @@ fn restore_preserves_negative_and_zero_open_window_counts() {
 }
 
 #[test]
-#[ignore = "known current-v1 recovery defect; tracked by hotlap#qs79; this test must fail when run"]
 fn window_checkpoint_truncated_key_parser_behavior_probe() {
     let mut original = window_engine();
     original.push(InputId(0), &input0(&[(1, 2, 1, 1)])).unwrap();
@@ -315,15 +343,31 @@ fn window_checkpoint_truncated_key_parser_behavior_probe() {
         hotlap_core::snapshot::OperatorState::Window(state) => state,
         other => panic!("expected window state, got {other:?}"),
     };
-    state.open[0].key.truncate(1);
-    let decoded = decode_snapshot(&encode_snapshot(&corrupted).unwrap()).unwrap();
-    let mut target = EngineCore::new();
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| target.restore(&decoded)));
-    assert!(
-        matches!(result, Ok(Err(_))),
-        "malformed key was not rejected with a typed error: {result:?}"
-    );
+    let original_bytes = match &state.typed_keys {
+        hotlap_core::snapshot::TypedKeyPayload::Ipc(bytes) => bytes.clone(),
+        _ => panic!("expected typed key stream"),
+    };
+    for removed in [1, 8] {
+        let mut damaged = corrupted.clone();
+        let state = match damaged.views[0].operators[0].as_mut().unwrap() {
+            hotlap_core::snapshot::OperatorState::Window(state) => state,
+            other => panic!("expected window state, got {other:?}"),
+        };
+        match &mut state.typed_keys {
+            hotlap_core::snapshot::TypedKeyPayload::Ipc(bytes) => {
+                bytes.truncate(original_bytes.len() - removed);
+            }
+            _ => panic!("expected typed key stream"),
+        }
+        let decoded = decode_snapshot(&encode_snapshot(&damaged).unwrap()).unwrap();
+        let mut target = EngineCore::new();
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| target.restore(&decoded)));
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "malformed key with {removed} bytes removed was not rejected: {result:?}"
+        );
+    }
 }
 
 fn window_engine() -> EngineCore {

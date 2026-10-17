@@ -1,13 +1,16 @@
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
+use arrow::row::{RowConverter, SortField};
 use hotlap_core::InputId;
 use hotlap_core::plan::AggSpec;
 use hotlap_core::plan_normalize::{ColumnMapping, Recognition};
-use hotlap_core::snapshot::{AggValue, GroupEntry};
+use hotlap_core::snapshot::{AggValue, GroupEntry, GroupState, TypedKeyPayload};
 
 use super::{
     ConsumerCaps, CutDecision, DeltaPair, DenseReason, GroupChange, OldState, PrepareInput, prepare,
@@ -61,6 +64,40 @@ fn arrangement(initial: &ZSetBatch, key_columns: &[usize]) -> KeyedArrangement {
 
 fn group_map(groups: &[(Vec<u8>, GroupEntry)]) -> HashMap<Vec<u8>, GroupEntry> {
     groups.iter().cloned().collect()
+}
+
+fn group_map_from_state(state: &GroupState) -> HashMap<Vec<u8>, GroupEntry> {
+    let TypedKeyPayload::Ipc(bytes) = &state.typed_keys else {
+        assert!(state.groups.is_empty());
+        return HashMap::new();
+    };
+    let schema = StreamReader::try_new(Cursor::new(bytes), None)
+        .unwrap()
+        .schema();
+    let (batches, rows) = crate::core::ipc::typed_keys::decode(bytes, &schema).unwrap();
+    assert_eq!(rows, state.groups.len());
+    let converter = RowConverter::new(
+        schema
+            .fields()
+            .iter()
+            .map(|field| SortField::new(field.data_type().clone()))
+            .collect(),
+    )
+    .unwrap();
+    let mut groups = HashMap::new();
+    let mut index = 0;
+    for batch in batches {
+        let keys = converter.convert_columns(batch.columns()).unwrap();
+        for row in 0..batch.num_rows() {
+            assert!(
+                groups
+                    .insert(keys.row(row).as_ref().to_vec(), state.groups[index].clone())
+                    .is_none()
+            );
+            index += 1;
+        }
+    }
+    groups
 }
 
 fn groups_vec(groups: &HashMap<Vec<u8>, GroupEntry>) -> Vec<(Vec<u8>, GroupEntry)> {

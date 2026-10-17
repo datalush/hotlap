@@ -76,7 +76,7 @@ fn count_star_remains_provable_when_nullable_count_and_sum_history_drift() {
         .iter()
         .flatten()
         .find_map(|state| match state {
-            OperatorState::Group(group) => group.groups.first().map(|(_, entry)| entry),
+            OperatorState::Group(group) => group.groups.first(),
             _ => None,
         })
         .unwrap();
@@ -137,10 +137,10 @@ fn hidden_sum_count_mismatch_with_matching_root_output_falls_back_without_repair
         })
         .unwrap();
     assert_eq!(
-        group.groups[0].1.values[0],
+        group.groups[0].values[0],
         hotlap_core::snapshot::AggValue::SumInteger { sum: 20, count: 1 }
     );
-    group.groups[0].1.values[0] = hotlap_core::snapshot::AggValue::SumInteger { sum: 20, count: 2 };
+    group.groups[0].values[0] = hotlap_core::snapshot::AggValue::SumInteger { sum: 20, count: 2 };
 
     let mut restored = EngineCore::new();
     restored.restore(&checkpoint).unwrap();
@@ -150,7 +150,7 @@ fn hidden_sum_count_mismatch_with_matching_root_output_falls_back_without_repair
         .iter()
         .flatten()
         .find_map(|state| match state {
-            OperatorState::Group(group) => Some(&group.groups[0].1.values[0]),
+            OperatorState::Group(group) => Some(&group.groups[0].values[0]),
             _ => None,
         })
         .unwrap();

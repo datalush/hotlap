@@ -60,7 +60,7 @@ fn retracting_last_nonnull_value_emits_null_row_while_group_survives() {
         state: OldState {
             left: &left,
             right: &right,
-            groups: &group_map(&prior.groups),
+            groups: &group_map_from_state(&prior),
         },
         consumer: ConsumerCaps::FactorizedAggregates,
     }) {

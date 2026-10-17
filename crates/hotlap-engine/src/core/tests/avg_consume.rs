@@ -130,10 +130,7 @@ fn same_avg_history(left: &EngineCore, right: &EngineCore) {
     let left_state = group_state(&left);
     let right_state = group_state(&right);
     assert_eq!(left_state.groups.len(), right_state.groups.len());
-    for ((left_key, left_entry), (right_key, right_entry)) in
-        left_state.groups.iter().zip(&right_state.groups)
-    {
-        assert_eq!(left_key, right_key);
+    for (left_entry, right_entry) in left_state.groups.iter().zip(&right_state.groups) {
         assert_eq!(left_entry.rows, right_entry.rows);
         assert_eq!(left_entry.values.len(), right_entry.values.len());
         for (left_value, right_value) in left_entry.values.iter().zip(&right_entry.values) {
@@ -177,7 +174,7 @@ fn avg_sum_bits(core: &EngineCore) -> Vec<u64> {
                 state
                     .groups
                     .iter()
-                    .flat_map(|(_, entry)| entry.values.iter())
+                    .flat_map(|entry| entry.values.iter())
                     .filter_map(|value| match value {
                         AggValue::Avg { sum, .. } => Some(sum.to_bits()),
                         _ => None,

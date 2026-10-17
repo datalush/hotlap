@@ -87,7 +87,7 @@ fn consumer_matches_dense_with_unequal_side_schemas() {
         state: OldState {
             left: &left,
             right: &right,
-            groups: &group_map(&prior.groups),
+            groups: &group_map_from_state(&prior),
         },
         consumer: ConsumerCaps::FactorizedAggregates,
     }) {

@@ -259,7 +259,7 @@ fn assert_group_state(snapshot: &EngineSnapshot, expected: &BTreeMap<i64, i64>) 
         })
         .unwrap();
     assert_eq!(group.groups.len(), 1, "one source group expected");
-    let entry = &group.groups[0].1;
+    let entry = &group.groups[0];
     assert_eq!(entry.rows, expected.values().sum::<i64>());
     let min = match &entry.values[0] {
         AggValue::Min(values) => values,

@@ -120,13 +120,15 @@ pub struct GroupEntry {
     pub values: Vec<AggValue>,
 }
 
-/// `groupaggregate` retained state: encoded key bytes to accumulator values.
+/// `groupaggregate` retained state: typed key rows paired positionally with entries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupState {
+    /// Required typed Arrow IPC payload for keys, or uninitialized before use.
+    pub typed_keys: TypedKeyPayload,
     /// Arrow IPC schema bytes of the reducer's input, or `None` before use.
     pub schema: Option<Vec<u8>>,
-    /// Live `key bytes -> entry` groups, ordered by key bytes.
-    pub groups: Vec<(Vec<u8>, GroupEntry)>,
+    /// Authoritative aggregate histories, positionally paired with typed key rows.
+    pub groups: Vec<GroupEntry>,
 }
 
 /// A single open window bucket.
@@ -134,15 +136,24 @@ pub struct GroupState {
 pub struct WindowBucket {
     /// Inclusive window start.
     pub start: i64,
-    /// Encoded key bytes.
-    pub key: Vec<u8>,
     /// Accumulated count for the bucket.
     pub count: i64,
+}
+
+/// Required typed Arrow IPC payload for operator keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TypedKeyPayload {
+    /// The operator has not learned an input schema yet.
+    Uninitialized,
+    /// One Arrow IPC stream containing all key rows.
+    Ipc(Vec<u8>),
 }
 
 /// Tumbling-window retained state: open buckets plus progress counters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowState {
+    /// Typed key rows corresponding positionally to `open`.
+    pub typed_keys: TypedKeyPayload,
     /// Arrow IPC schema bytes of the reducer's input, or `None` before use.
     pub schema: Option<Vec<u8>>,
     /// Reducer watermark.

@@ -4,6 +4,8 @@
 mod avg_bench;
 #[path = "paired_bench/shared_arena_bench.rs"]
 mod shared_arena_bench;
+#[path = "paired_bench/typed_key_cost.rs"]
+mod typed_key_cost;
 
 use std::collections::HashMap;
 use std::time::Instant;

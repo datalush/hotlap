@@ -58,7 +58,7 @@ fn avg_counts_and_sum_bits(core: &EngineCore) -> Vec<(i64, u64)> {
                 state
                     .groups
                     .iter()
-                    .flat_map(|(_, entry)| entry.values.iter())
+                    .flat_map(|entry| entry.values.iter())
                     .filter_map(|value| match value {
                         AggValue::Avg { sum, count, .. } => Some((*count, sum.to_bits())),
                         _ => None,
@@ -310,7 +310,7 @@ fn v1_restore_accepts_live_integer_history_after_signed_zero_row_group_recreatio
         .iter()
         .flatten()
         .find_map(|operator| match operator {
-            OperatorState::Group(state) => state.groups.first().map(|(_, entry)| entry.clone()),
+            OperatorState::Group(state) => state.groups.first().cloned(),
             _ => None,
         })
         .expect("live group entry");
@@ -538,7 +538,6 @@ fn v1_restore_preserves_signed_zero_avg_history_and_keeps_it_on_dense_fallback()
         })
         .unwrap();
     let sum = group.groups[0]
-        .1
         .values
         .iter_mut()
         .find_map(|value| match value {

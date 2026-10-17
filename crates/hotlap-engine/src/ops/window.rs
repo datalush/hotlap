@@ -11,11 +11,15 @@ use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter};
 
 use crate::batch::ZSetBatch;
+use crate::core::ipc::typed_keys::{TypedKeyRow, schema_uses_native_capture};
 use crate::error::EngineError;
 use crate::keys::converter_for;
 use crate::zset::int64_diffs;
 
 use helpers::{Closed, Windows, decode, event_times};
+
+#[cfg(test)]
+mod snapshot_tests;
 
 /// Stateful tumbling-window count over event-time.
 ///
@@ -32,6 +36,7 @@ pub struct TumbleCount {
     schema: Option<SchemaRef>,
     converter: Option<RowConverter>,
     windows: Windows,
+    native_keys: Option<BTreeMap<(i64, Vec<u8>), TypedKeyRow>>,
 }
 
 impl TumbleCount {
@@ -92,6 +97,7 @@ impl TumbleCount {
             schema: None,
             converter: None,
             windows: BTreeMap::new(),
+            native_keys: None,
         }
     }
 
@@ -129,6 +135,15 @@ impl TumbleCount {
             Some(_) => Ok(()),
             None => {
                 self.converter = Some(converter_for(&schema, &self.key)?);
+                let key_schema = Arc::new(Schema::new(
+                    self.key
+                        .iter()
+                        .map(|&i| schema.field(i).clone())
+                        .collect::<Vec<_>>(),
+                ));
+                if schema_uses_native_capture(&key_schema) {
+                    self.native_keys = Some(BTreeMap::new());
+                }
                 self.schema = Some(schema);
                 Ok(())
             }
@@ -147,6 +162,13 @@ impl TumbleCount {
             .map(|&index| z.batch.column(index).clone())
             .collect();
         let key_rows = converter.convert_columns(&key_columns)?;
+        let key_schema = Arc::new(Schema::new(
+            self.key
+                .iter()
+                .map(|&i| z.schema().field(i).clone())
+                .collect::<Vec<_>>(),
+        ));
+        let key_batch = RecordBatch::try_new(key_schema, key_columns)?;
         let times = event_times(z.batch.column(self.time_col))?;
         let diffs = int64_diffs(z.diff())?;
         for index in 0..z.len() {
@@ -164,16 +186,31 @@ impl TumbleCount {
             }
             let key = key_rows.row(index).owned();
             let bytes = key.as_ref().to_vec();
-            let bucket = self
-                .windows
+            let existing = self.windows.get(&window_start).and_then(|b| b.get(&bytes));
+            if let Some((_, count)) = existing {
+                let updated = count.checked_add(diff).ok_or_else(|| {
+                    EngineError::Infrastructure("window count overflow".to_string())
+                })?;
+                self.windows
+                    .get_mut(&window_start)
+                    .unwrap()
+                    .get_mut(&bytes)
+                    .unwrap()
+                    .1 = updated;
+                continue;
+            }
+            let native = self
+                .native_keys
+                .as_ref()
+                .map(|_| TypedKeyRow::capture(&key_batch, index))
+                .transpose()?;
+            self.windows
                 .entry(window_start)
                 .or_default()
-                .entry(bytes)
-                .or_insert((key, 0));
-            bucket.1 = bucket
-                .1
-                .checked_add(diff)
-                .ok_or_else(|| EngineError::Infrastructure("window count overflow".to_string()))?;
+                .insert(bytes.clone(), (key, diff));
+            if let (Some(cache), Some(native)) = (&mut self.native_keys, native) {
+                cache.insert((window_start, bytes), native);
+            }
         }
         Ok(())
     }
@@ -189,7 +226,10 @@ impl TumbleCount {
         let mut closed = Vec::new();
         for window_start in ready {
             if let Some(buckets) = self.windows.remove(&window_start) {
-                for (_, (key, count)) in buckets {
+                for (key_bytes, (key, count)) in buckets {
+                    if let Some(cache) = &mut self.native_keys {
+                        cache.remove(&(window_start, key_bytes));
+                    }
                     if count != 0 {
                         closed.push((key, window_start, count));
                     }

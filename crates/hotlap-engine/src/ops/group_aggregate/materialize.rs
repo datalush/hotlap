@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, new_empty_array};
+use arrow::compute::concat;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{Row, RowConverter};
@@ -11,6 +12,7 @@ use hotlap_core::plan::{AggSpec, aggregate_output_type};
 
 use super::columns::{ColumnBuilder, OutputCell};
 use crate::batch::ZSetBatch;
+use crate::core::ipc::typed_keys::TypedKeyRow;
 use crate::error::EngineError;
 
 /// One group whose aggregate row must be retracted and/or inserted.
@@ -29,6 +31,7 @@ pub(crate) fn materialize(
     aggs: &[AggSpec],
     schema: Option<&SchemaRef>,
     converter: Option<&RowConverter>,
+    native_keys: Option<&std::collections::HashMap<Vec<u8>, TypedKeyRow>>,
     changes: &[Change],
 ) -> Result<ZSetBatch, EngineError> {
     let schema =
@@ -40,12 +43,35 @@ pub(crate) fn materialize(
     let converter = converter
         .ok_or_else(|| EngineError::Infrastructure("group converter missing".to_string()))?;
     let emitted = flatten(changes);
-    let mut rows: Vec<Row<'_>> = Vec::with_capacity(emitted.len());
-    let parser = converter.parser();
-    for (bytes, _, _) in &emitted {
-        rows.push(parser.parse(bytes));
-    }
-    let mut columns = converter.convert_rows(rows)?;
+    let mut columns = if key.is_empty() {
+        Vec::new()
+    } else if let Some(native_keys) = native_keys {
+        (0..key.len())
+            .map(|column| {
+                let arrays = emitted
+                    .iter()
+                    .map(|(bytes, _, _)| {
+                        native_keys
+                            .get(*bytes)
+                            .map(|row| row.batch().column(column).as_ref())
+                            .ok_or_else(|| EngineError::Infrastructure("native group key representative missing during output materialization".into()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if arrays.is_empty() {
+                    Ok(new_empty_array(fields.field(column).data_type()))
+                } else {
+                    concat(&arrays).map_err(Into::into)
+                }
+            })
+            .collect::<Result<Vec<ArrayRef>, EngineError>>()?
+    } else {
+        let mut rows: Vec<Row<'_>> = Vec::with_capacity(emitted.len());
+        let parser = converter.parser();
+        for (bytes, _, _) in &emitted {
+            rows.push(parser.parse(bytes));
+        }
+        converter.convert_rows(rows)?
+    };
     let mut builders: Vec<ColumnBuilder> = aggs
         .iter()
         .map(|agg| ColumnBuilder::new(agg, schema))

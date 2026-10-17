@@ -19,11 +19,14 @@ mod snapshot;
 mod validate;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use arrow::array::ArrayRef;
-use arrow::datatypes::SchemaRef;
-use arrow::row::{RowConverter, Rows};
+use arrow::array::{Array, ArrayRef};
+use arrow::datatypes::{Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use arrow::row::{RowConverter, Rows, SortField};
 
+use crate::core::ipc::typed_keys::{TypedKeyRow, schema_uses_native_capture};
 use hotlap_core::plan::AggSpec;
 use hotlap_core::snapshot::{AggValue, GroupEntry};
 
@@ -43,6 +46,7 @@ pub struct GroupAggregate {
     schema: Option<SchemaRef>,
     converter: Option<RowConverter>,
     groups: HashMap<Vec<u8>, GroupEntry>,
+    native_keys: Option<HashMap<Vec<u8>, TypedKeyRow>>,
     /// Query-derived source memo; logical v1 snapshots continue to store only `groups`.
     maintained_cut: Option<maintained::MaintainedGroupCut>,
     #[cfg(test)]
@@ -265,6 +269,31 @@ impl GroupAggregate {
                 crate::error::EngineError::Infrastructure("memory report overflow".into())
             })?;
         }
+        let mut native_estimate = 0usize;
+        if let Some(native_keys) = &self.native_keys {
+            for (key, row) in native_keys {
+                payload =
+                    crate::core::memory::checked_add(payload, key.len(), "native key payload")?;
+                capacity = crate::core::memory::checked_add(
+                    capacity,
+                    key.capacity(),
+                    "native key capacity",
+                )?;
+                for column in row.batch().columns() {
+                    payload = crate::core::memory::checked_add(
+                        payload,
+                        column.get_array_memory_size(),
+                        "native array payload",
+                    )?;
+                }
+            }
+            native_estimate = native_keys
+                .capacity()
+                .checked_mul(std::mem::size_of::<(Vec<u8>, TypedKeyRow)>())
+                .ok_or_else(|| {
+                    crate::error::EngineError::Infrastructure("native key estimate overflow".into())
+                })?;
+        }
         for entry in self.groups.values() {
             accumulator_capacity = accumulator_capacity
                 .checked_add(crate::core::memory::checked_capacity_bytes(
@@ -341,6 +370,10 @@ impl GroupAggregate {
                 )>())
                 .ok_or_else(|| {
                     crate::error::EngineError::Infrastructure("memory report overflow".into())
+                })?
+                .checked_add(native_estimate)
+                .ok_or_else(|| {
+                    crate::error::EngineError::Infrastructure("memory report overflow".into())
                 })?,
             minmax_entries,
             minmax_estimate,
@@ -355,6 +388,7 @@ impl GroupAggregate {
             schema: None,
             converter: None,
             groups: HashMap::new(),
+            native_keys: None,
             maintained_cut: None,
             #[cfg(test)]
             work: 0,
@@ -369,6 +403,32 @@ impl GroupAggregate {
         // failed `apply` leaves the prior state exactly as it was.
         validate::validate_delta(&self.groups, &self.aggs, &z.schema(), z, &key_rows)?;
         let (keys, mut previous) = self.record_keys(&key_rows, z.len())?;
+        let mut native_additions = HashMap::new();
+        if self.native_keys.is_some() {
+            let key_columns: Vec<ArrayRef> = self
+                .key
+                .iter()
+                .map(|&i| z.batch.column(i).clone())
+                .collect();
+            let key_schema = Arc::new(Schema::new(
+                self.key
+                    .iter()
+                    .map(|&i| z.schema().field(i).clone())
+                    .collect::<Vec<_>>(),
+            ));
+            let key_batch = RecordBatch::try_new(key_schema, key_columns)?;
+            let diffs = int64_diffs(z.diff())?;
+            for row in 0..z.len() {
+                let canonical = key_rows.row(row).as_ref().to_vec();
+                if diffs.value(row) != 0
+                    && !self.groups.contains_key(&canonical)
+                    && !native_additions.contains_key(&canonical)
+                {
+                    native_additions.insert(canonical, TypedKeyRow::capture(&key_batch, row)?);
+                }
+            }
+            return self.apply_native_staged(z, &key_rows, keys, previous, native_additions);
+        }
         #[cfg(test)]
         {
             self.work = keys.len() as u64;
@@ -380,7 +440,18 @@ impl GroupAggregate {
                 changes.push(change);
             }
         }
-        self.materialize(&changes)
+        if let Some(cache) = &mut self.native_keys {
+            for (key, representative) in native_additions {
+                if self.groups.contains_key(&key) {
+                    cache.insert(key, representative);
+                }
+            }
+        }
+        let output = self.materialize(&changes);
+        if let Some(cache) = &mut self.native_keys {
+            cache.retain(|key, _| self.groups.contains_key(key));
+        }
+        output
     }
 
     /// Number of keys touched by the last `apply` (test instrumentation only).
@@ -393,7 +464,7 @@ impl GroupAggregate {
     fn ensure_schema(&mut self, z: &ZSetBatch) -> Result<(), EngineError> {
         let schema = z.schema();
         let width = schema.fields().len();
-        if self.key.is_empty() || self.key.iter().any(|&index| index >= width) {
+        if self.key.iter().any(|&index| index >= width) {
             return Err(EngineError::Unsupported(
                 "group key out of range".to_string(),
             ));
@@ -405,7 +476,20 @@ impl GroupAggregate {
             )),
             Some(_) => Ok(()),
             None => {
-                self.converter = Some(converter_for(&schema, &self.key)?);
+                self.converter = Some(if self.key.is_empty() {
+                    RowConverter::new(vec![SortField::new(arrow::datatypes::DataType::UInt8)])?
+                } else {
+                    converter_for(&schema, &self.key)?
+                });
+                let key_schema = Arc::new(Schema::new(
+                    self.key
+                        .iter()
+                        .map(|&i| schema.field(i).clone())
+                        .collect::<Vec<_>>(),
+                ));
+                if schema_uses_native_capture(&key_schema) {
+                    self.native_keys = Some(HashMap::new());
+                }
                 self.schema = Some(schema);
                 Ok(())
             }
@@ -423,6 +507,14 @@ impl GroupAggregate {
             .iter()
             .map(|&index| z.batch.column(index).clone())
             .collect();
+        if self.key.is_empty() {
+            return Ok(
+                converter
+                    .convert_columns(&[
+                        Arc::new(arrow::array::UInt8Array::from(vec![0; z.len()])) as ArrayRef,
+                    ])?,
+            );
+        }
         Ok(converter.convert_columns(&columns)?)
     }
 
@@ -446,6 +538,96 @@ impl GroupAggregate {
         Ok(())
     }
 
+    /// Stages only touched native-key groups and their exact emitted output before publishing.
+    /// Scalar keys retain the existing in-place fast path and incur no group cloning.
+    fn apply_native_staged(
+        &mut self,
+        z: &ZSetBatch,
+        key_rows: &Rows,
+        keys: Vec<Vec<u8>>,
+        mut previous: Vec<Option<Vec<columns::OutputCell>>>,
+        additions: HashMap<Vec<u8>, TypedKeyRow>,
+    ) -> Result<ZSetBatch, EngineError> {
+        let schema = self
+            .schema
+            .as_ref()
+            .ok_or_else(|| EngineError::Infrastructure("group schema missing".into()))?;
+        let template = empty_entry(&self.aggs, schema)?;
+        let mut staged = HashMap::with_capacity(keys.len());
+        for key in &keys {
+            if let Some(entry) = self.groups.get(key) {
+                staged.insert(key.clone(), entry.clone());
+            }
+        }
+        let diffs = int64_diffs(z.diff())?;
+        for row in 0..z.len() {
+            let diff = diffs.value(row);
+            if diff == 0 {
+                continue;
+            }
+            let key = key_rows.row(row).as_ref().to_vec();
+            let entry = staged.entry(key).or_insert_with(|| template.clone());
+            fold_row(entry, &self.aggs, &z.batch, row, diff)?;
+        }
+
+        let mut changes = Vec::new();
+        for (slot, key) in keys.iter().enumerate() {
+            let current = match staged.get(key) {
+                Some(entry) if entry.rows != 0 => Some(columns::render(&entry.values)?),
+                _ => {
+                    staged.remove(key);
+                    None
+                }
+            };
+            if previous[slot] != current {
+                changes.push(Change {
+                    key: key.clone(),
+                    previous: previous[slot].take(),
+                    current,
+                });
+            }
+        }
+
+        let mut representatives = HashMap::with_capacity(changes.len());
+        let native = self.native_keys.as_ref().expect("native path selected");
+        for change in &changes {
+            let representative = native
+                .get(&change.key)
+                .or_else(|| additions.get(&change.key))
+                .ok_or_else(|| {
+                    EngineError::Infrastructure(
+                        "native group key representative missing during staged output".into(),
+                    )
+                })?;
+            representatives.insert(change.key.clone(), representative.clone());
+        }
+        let output = materialize::materialize(
+            &self.key,
+            &self.aggs,
+            self.schema.as_ref(),
+            self.converter.as_ref(),
+            Some(&representatives),
+            &changes,
+        )?;
+
+        for key in &keys {
+            self.groups.remove(key);
+        }
+        self.groups.extend(staged);
+        let cache = self.native_keys.as_mut().expect("native path selected");
+        for (key, representative) in additions {
+            if self.groups.contains_key(&key) {
+                cache.insert(key, representative);
+            }
+        }
+        cache.retain(|key, _| self.groups.contains_key(key));
+        #[cfg(test)]
+        {
+            self.work = keys.len() as u64;
+        }
+        Ok(output)
+    }
+
     /// Defers to [`materialize`] with this reducer's frozen schema.
     fn materialize(&self, changes: &[Change]) -> Result<ZSetBatch, EngineError> {
         materialize::materialize(
@@ -453,6 +635,7 @@ impl GroupAggregate {
             &self.aggs,
             self.schema.as_ref(),
             self.converter.as_ref(),
+            self.native_keys.as_ref(),
             changes,
         )
     }

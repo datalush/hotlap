@@ -83,7 +83,14 @@ pub(crate) fn consume_changes(
             .map(|&i| arrow::row::SortField::new(schema.field(i).data_type().clone()))
             .collect(),
     )?;
-    let output = materialize(group_key, aggs, Some(&schema), Some(&converter), &changes)?;
+    let output = materialize(
+        group_key,
+        aggs,
+        Some(&schema),
+        Some(&converter),
+        None,
+        &changes,
+    )?;
     Ok(ConsumedGroups {
         changes: final_changes,
         output,

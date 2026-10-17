@@ -19,6 +19,9 @@ use hotlap_core::snapshot::{ENGINE_SNAPSHOT_FORMAT_VERSION, EngineSnapshot, Snap
 use crate::error::EngineError;
 use crate::zset::int64_diffs;
 
+#[path = "typed_keys.rs"]
+pub(crate) mod typed_keys;
+
 /// Encodes a Z-set as an Arrow IPC table plus its diffs.
 pub(crate) fn encode_zset(z: &ZSetBatch) -> Result<SnapshotTable, EngineError> {
     let ipc = encode_table(&z.batch)?;
@@ -72,6 +75,10 @@ fn decode_table(bytes: &[u8]) -> Result<RecordBatch, EngineError> {
         .next()
         .ok_or_else(|| EngineError::Infrastructure("snapshot table has no batch".to_string()))
 }
+
+#[cfg(test)]
+#[path = "typed_keys_tests.rs"]
+mod typed_keys_tests;
 
 /// Magic bytes at the start of every binary frame.
 const FRAME_MAGIC: [u8; 4] = *b"HLP1";

@@ -263,7 +263,7 @@ fn restore_rejects_count_nonnull_history_that_disagrees_with_cached_root_output(
             _ => None,
         })
         .unwrap();
-    group.groups[0].1.values[0] = hotlap_core::snapshot::AggValue::Count(0);
+    group.groups[0].values[0] = hotlap_core::snapshot::AggValue::Count(0);
 
     let mut target = EngineCore::new();
     target.register_input(InputId(9)).unwrap();
@@ -307,10 +307,10 @@ fn restore_rejects_sum_history_that_disagrees_with_cached_root_output() {
         })
         .unwrap();
     assert_eq!(
-        group.groups[0].1.values[0],
+        group.groups[0].values[0],
         hotlap_core::snapshot::AggValue::SumInteger { sum: 20, count: 1 }
     );
-    group.groups[0].1.values[0] = hotlap_core::snapshot::AggValue::SumInteger { sum: 21, count: 1 };
+    group.groups[0].values[0] = hotlap_core::snapshot::AggValue::SumInteger { sum: 21, count: 1 };
 
     let mut target = EngineCore::new();
     target.register_input(InputId(9)).unwrap();
@@ -353,7 +353,10 @@ fn restore_rejects_malformed_scalar_group_key_without_decoding_it() {
             _ => None,
         })
         .unwrap();
-    group.groups[0].0 = vec![1];
+    let hotlap_core::snapshot::TypedKeyPayload::Ipc(bytes) = &mut group.typed_keys else {
+        panic!("expected typed key IPC");
+    };
+    bytes.truncate(bytes.len() - 1);
 
     let mut restored = EngineCore::new();
     assert!(matches!(
@@ -363,7 +366,7 @@ fn restore_rejects_malformed_scalar_group_key_without_decoding_it() {
 }
 
 #[test]
-fn restore_rejects_malformed_later_group_key_field_after_valid_prefix() {
+fn restore_rejects_group_key_stream_truncated_after_schema_and_batch() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("major", DataType::Int64, false),
         Field::new("minor", DataType::Int32, true),
@@ -418,13 +421,173 @@ fn restore_rejects_malformed_later_group_key_field_after_valid_prefix() {
             _ => None,
         })
         .unwrap();
-    group.groups[0].0 = [group.groups[0].0[..9].to_vec(), vec![1]].concat();
+    let hotlap_core::snapshot::TypedKeyPayload::Ipc(bytes) = &mut group.typed_keys else {
+        panic!("expected typed key IPC");
+    };
+    bytes.truncate(bytes.len() - 1);
 
     let mut restored = EngineCore::new();
     assert!(matches!(
         restored.restore(&snapshot),
         Err(crate::error::EngineError::Infrastructure(_))
     ));
+}
+
+#[test]
+fn late_window_key_restore_failure_preserves_populated_multiview_state_and_continuation() {
+    let make_core = || {
+        let mut core = EngineCore::new();
+        core.register_input(InputId(0)).unwrap();
+        core.declare_watermark(
+            InputId(0),
+            hotlap_core::WatermarkSpec {
+                time_col: 1,
+                lag: 100,
+            },
+        )
+        .unwrap();
+        core.build_view(
+            ViewId(0),
+            &Plan::GroupAggregate {
+                input: Box::new(Plan::Source(InputId(0))),
+                key: vec![0],
+                aggs: vec![AggSpec::count()],
+            },
+        )
+        .unwrap();
+        core.build_view(
+            ViewId(1),
+            &Plan::TumbleCount {
+                input: Box::new(Plan::Source(InputId(0))),
+                key: vec![0],
+                time_col: 1,
+                size: 10,
+            },
+        )
+        .unwrap();
+        core.tap_view(ViewId(0)).unwrap();
+        core.tap_view(ViewId(1)).unwrap();
+        core
+    };
+    let target_seed = pairs(&[(4, 1, 1)]);
+    let source_seed = pairs(&[(9, 1, 1), (9, 2, 1)]);
+    let mut target = make_core();
+    target.push(InputId(0), &target_seed).unwrap();
+    let before = target.checkpoint().unwrap();
+    let output_before = [
+        crate::core::ipc::decode_zset(before.views[0].output.as_ref().unwrap()).unwrap(),
+        crate::core::ipc::decode_zset(before.views[1].output.as_ref().unwrap()).unwrap(),
+    ];
+    assert!(
+        before.views[0]
+            .operators
+            .iter()
+            .flatten()
+            .any(|state| matches!(
+                state,
+                hotlap_core::snapshot::OperatorState::Group(group) if !group.groups.is_empty()
+            ))
+    );
+    assert!(
+        before.views[1]
+            .operators
+            .iter()
+            .flatten()
+            .any(|state| matches!(
+                state,
+                hotlap_core::snapshot::OperatorState::Window(window) if !window.open.is_empty()
+            ))
+    );
+
+    let mut source = make_core();
+    source.push(InputId(0), &source_seed).unwrap();
+    let valid_source = source.checkpoint().unwrap();
+    let source_group = valid_source.views[0]
+        .operators
+        .iter()
+        .flatten()
+        .find_map(|state| match state {
+            hotlap_core::snapshot::OperatorState::Group(group) => Some(group),
+            _ => None,
+        })
+        .unwrap();
+    let target_group = before.views[0]
+        .operators
+        .iter()
+        .flatten()
+        .find_map(|state| match state {
+            hotlap_core::snapshot::OperatorState::Group(group) => Some(group),
+            _ => None,
+        })
+        .unwrap();
+    let source_window = valid_source.views[1]
+        .operators
+        .iter()
+        .flatten()
+        .find_map(|state| match state {
+            hotlap_core::snapshot::OperatorState::Window(window) => Some(window),
+            _ => None,
+        })
+        .unwrap();
+    let target_window = before.views[1]
+        .operators
+        .iter()
+        .flatten()
+        .find_map(|state| match state {
+            hotlap_core::snapshot::OperatorState::Window(window) => Some(window),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(
+        source_group, target_group,
+        "earlier Group import must differ"
+    );
+    assert_ne!(
+        source_window, target_window,
+        "later Window state must differ"
+    );
+    assert_ne!(valid_source.views[0].output, before.views[0].output);
+
+    // Establish the candidate's earlier Group and later Window are valid
+    // before introducing corruption only into the later Window payload.
+    let mut valid_restore = make_core();
+    valid_restore.restore(&valid_source).unwrap();
+    assert_eq!(valid_restore.checkpoint().unwrap(), valid_source);
+
+    let mut invalid = valid_source.clone();
+    let window = invalid.views[1]
+        .operators
+        .iter_mut()
+        .flatten()
+        .find_map(|state| match state {
+            hotlap_core::snapshot::OperatorState::Window(window) => Some(window),
+            _ => None,
+        })
+        .unwrap();
+    let hotlap_core::snapshot::TypedKeyPayload::Ipc(bytes) = &mut window.typed_keys else {
+        panic!("expected typed window keys");
+    };
+    bytes.pop();
+    assert_eq!(invalid.views[0], valid_source.views[0]);
+
+    assert!(matches!(
+        target.restore(&invalid),
+        Err(crate::error::EngineError::Infrastructure(_))
+    ));
+    assert_eq!(target.checkpoint().unwrap(), before);
+    assert_same_batch(&target.snapshot(ViewId(0)).unwrap(), &output_before[0]);
+    assert_same_batch(&target.snapshot(ViewId(1)).unwrap(), &output_before[1]);
+
+    // Compare with a separately built known-good engine after the same next input.
+    let mut reference = make_core();
+    reference.push(InputId(0), &target_seed).unwrap();
+    let next = pairs(&[(4, 2, 1)]);
+    target.push(InputId(0), &next).unwrap();
+    reference.push(InputId(0), &next).unwrap();
+    assert_eq!(
+        target.checkpoint().unwrap(),
+        reference.checkpoint().unwrap()
+    );
 }
 
 #[test]
@@ -480,7 +643,7 @@ fn restore_root_project_validates_consolidated_colliding_group_rows() {
             _ => None,
         })
         .unwrap();
-    group.groups[0].1.values[0] = hotlap_core::snapshot::AggValue::Count(2);
+    group.groups[0].values[0] = hotlap_core::snapshot::AggValue::Count(2);
     assert!(EngineCore::new().validate_snapshot(&corrupted).is_err());
 }
 
@@ -533,12 +696,12 @@ fn restore_checks_row_cardinality_without_visible_count_star() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(group.groups[0].1.rows, 1);
+    assert_eq!(group.groups[0].rows, 1);
     assert_eq!(
-        group.groups[0].1.values[0],
+        group.groups[0].values[0],
         hotlap_core::snapshot::AggValue::Count(1)
     );
-    group.groups[0].1.rows = 2;
+    group.groups[0].rows = 2;
 
     let mut restored = EngineCore::new();
     assert!(matches!(
@@ -589,7 +752,7 @@ fn all_null_sum_keeps_row_cardinality_independent_of_nonnull_count() {
         .iter()
         .flatten()
         .find_map(|state| match state {
-            hotlap_core::snapshot::OperatorState::Group(group) => Some(&group.groups[0].1),
+            hotlap_core::snapshot::OperatorState::Group(group) => Some(&group.groups[0]),
             _ => None,
         })
         .unwrap();
@@ -672,15 +835,15 @@ fn restore_rejects_visible_aggregate_output_and_provable_row_corruption() {
             })
             .unwrap();
         match mutate {
-            0 => group.groups[0].1.values[2] = hotlap_core::snapshot::AggValue::Count(1),
+            0 => group.groups[0].values[2] = hotlap_core::snapshot::AggValue::Count(1),
             1 => {
-                group.groups[0].1.values[0] =
+                group.groups[0].values[0] =
                     hotlap_core::snapshot::AggValue::SumInteger { sum: 10, count: 1 }
             }
             2 => group.groups.clear(),
-            3 => group.groups.push((vec![0xff], group.groups[0].1.clone())),
-            4 => group.groups[0].1.values[1] = hotlap_core::snapshot::AggValue::Count(2),
-            _ => group.groups[0].1.rows = 2,
+            3 => group.groups.push(group.groups[0].clone()),
+            4 => group.groups[0].values[1] = hotlap_core::snapshot::AggValue::Count(2),
+            _ => group.groups[0].rows = 2,
         }
         let mut restored = EngineCore::new();
         assert!(
@@ -752,7 +915,7 @@ fn later_invalid_view_is_rejected_before_any_derived_restore_rebuild() {
                         _ => None,
                     })
                     .unwrap();
-                group.groups[0].1.values[0] =
+                group.groups[0].values[0] =
                     hotlap_core::snapshot::AggValue::SumInteger { sum: 1, count: 1 };
             }
         }
@@ -831,9 +994,7 @@ fn restore_preserves_valid_inexact_avg_history_bits() {
         .iter()
         .flatten()
         .find_map(|state| match state {
-            hotlap_core::snapshot::OperatorState::Group(group) => {
-                Some(&group.groups[0].1.values[0])
-            }
+            hotlap_core::snapshot::OperatorState::Group(group) => Some(&group.groups[0].values[0]),
             _ => None,
         })
         .unwrap();
@@ -858,9 +1019,7 @@ fn restore_preserves_valid_inexact_avg_history_bits() {
         .iter()
         .flatten()
         .find_map(|state| match state {
-            hotlap_core::snapshot::OperatorState::Group(group) => {
-                Some(&group.groups[0].1.values[0])
-            }
+            hotlap_core::snapshot::OperatorState::Group(group) => Some(&group.groups[0].values[0]),
             _ => None,
         })
         .unwrap();

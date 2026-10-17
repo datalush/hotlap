@@ -173,18 +173,18 @@ fn avg_sum_history(engine: &EngineCore) -> Option<(u64, i64, i64)> {
                 OperatorState::Group(group) => Some(group),
                 _ => None,
             })?;
-    let entry = &group.groups.first()?.1;
+    let entry = group.groups.first()?;
     let (avg_sum, avg_count) = match &entry.values[0] {
-        AggValue::Avg { sum, count, .. } => (sum.to_bits(), *count),
+        AggValue::Avg { sum, count, .. } => (sum.to_bits(), count),
         _ => panic!("first aggregate is AVG"),
     };
     let (sum, sum_count) = match &entry.values[1] {
-        AggValue::SumFloat { sum, count, .. } => (sum.to_bits(), *count),
+        AggValue::SumFloat { sum, count, .. } => (sum.to_bits(), count),
         _ => panic!("second aggregate is Float SUM"),
     };
     assert_eq!(avg_sum, sum);
     assert_eq!(avg_count, sum_count);
-    Some((avg_sum, avg_count, entry.rows))
+    Some((avg_sum, *avg_count, entry.rows))
 }
 
 fn drain_changes(engine: &mut EngineCore) -> Vec<ZSetBatch> {

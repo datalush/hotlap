@@ -444,6 +444,7 @@ impl CanonicalJoinProbe {
             ],
             Some(&self.output_schema),
             Some(&self.output_converter),
+            None,
             &changes,
         )?;
         self.left.rows.commit_batch_for_test(staged_left_rows);

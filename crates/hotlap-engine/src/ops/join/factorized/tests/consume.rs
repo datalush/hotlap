@@ -106,8 +106,8 @@ fn nullable_updates_match_dense_after_each_insert_retract_remove_and_recreate() 
         (&[Some(4)], &[-1]),
         (&[Some(9)], &[1]),
     ];
-    let mut prior: GroupState = dense.export_state().unwrap();
-    let mut current_groups = group_map(&prior.groups);
+    let prior: GroupState = dense.export_state().unwrap();
+    let mut current_groups = group_map_from_state(&prior);
     for (epoch, (values, weights)) in transitions.into_iter().enumerate() {
         let delta_left = nullable(values, weights);
         let mut joined_values = Vec::new();
@@ -167,17 +167,14 @@ fn nullable_updates_match_dense_after_each_insert_retract_remove_and_recreate() 
                 current_groups.remove(&key);
             }
         }
-        prior = GroupState {
-            schema: None,
-            groups: groups_vec(&current_groups),
-        };
     }
 
     let final_state = dense.export_state().unwrap();
-    assert_eq!(prior.groups, final_state.groups);
-    assert_eq!(prior.groups.len(), 1, "recreated group remains live");
-    assert_eq!(prior.groups[0].1.rows, 2);
-    let count_expr = match &prior.groups[0].1.values[1] {
+    assert_eq!(current_groups, group_map_from_state(&final_state));
+    assert_eq!(current_groups.len(), 1, "recreated group remains live");
+    let entry = current_groups.values().next().unwrap();
+    assert_eq!(entry.rows, 2);
+    let count_expr = match &entry.values[1] {
         AggValue::Count(count) => *count,
         other => panic!("unexpected COUNT(expr) state: {other:?}"),
     };
@@ -216,7 +213,7 @@ fn simultaneous_side_deltas_match_dense_including_cross_term() {
         state: OldState {
             left: &left,
             right: &right,
-            groups: &group_map(&prior.groups),
+            groups: &group_map_from_state(&prior),
         },
         consumer: ConsumerCaps::FactorizedAggregates,
     }) {
@@ -291,7 +288,7 @@ fn projected_group_subset_keeps_untouched_group_in_snapshot_and_output_keys() {
         state: OldState {
             left: &left,
             right: &right,
-            groups: &group_map(&prior.groups),
+            groups: &group_map_from_state(&prior),
         },
         consumer: ConsumerCaps::FactorizedAggregates,
     }) {
@@ -312,7 +309,7 @@ fn projected_group_subset_keeps_untouched_group_in_snapshot_and_output_keys() {
         "only touched group is retained as prior"
     );
     assert_eq!(prepared.prior_groups[0].0, super::simple_key(7));
-    let mut candidate = group_map(&prior.groups);
+    let mut candidate = group_map_from_state(&prior);
     for (key, value) in consumed.changes {
         if let Some(value) = value {
             candidate.insert(key, value);
@@ -320,7 +317,10 @@ fn projected_group_subset_keeps_untouched_group_in_snapshot_and_output_keys() {
             candidate.remove(&key);
         }
     }
-    assert_eq!(groups_vec(&candidate), dense.export_state().unwrap().groups);
+    assert_eq!(
+        candidate,
+        group_map_from_state(&dense.export_state().unwrap())
+    );
     assert_eq!(candidate.len(), 2, "untouched group 8 remains in candidate");
     assert!(candidate.contains_key(&super::simple_key(8)));
 }

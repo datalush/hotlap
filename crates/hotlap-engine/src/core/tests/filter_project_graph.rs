@@ -240,7 +240,7 @@ fn float_group_history(core: &EngineCore) -> (u64, u64) {
             _ => None,
         })
         .unwrap();
-    let values = &group.groups[0].1.values;
+    let values = &group.groups[0].values;
     let sum = match values[0] {
         AggValue::SumFloat { sum, .. } => sum.to_bits(),
         ref other => panic!("expected float SUM, got {other:?}"),

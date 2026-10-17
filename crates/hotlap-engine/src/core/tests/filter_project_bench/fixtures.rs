@@ -557,7 +557,7 @@ impl CaseSpec {
                 _ => None,
             })
             .flat_map(|group| group.groups.iter())
-            .map(|(_, entry)| {
+            .map(|entry| {
                 let sum = match entry.values[1] {
                     AggValue::SumFloat { sum, .. } => sum.to_bits(),
                     ref other => panic!("expected float SUM, got {other:?}"),
