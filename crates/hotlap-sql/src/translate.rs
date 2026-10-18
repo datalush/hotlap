@@ -68,7 +68,14 @@ pub fn to_kernel_plan(plan: &LogicalPlan, sources: &SourceBindings) -> Result<Pl
 /// silently dropped.
 fn project(p: &Projection, sources: &SourceBindings) -> Result<Plan, SqlError> {
     if let LogicalPlan::Aggregate(a) = p.input.as_ref() {
-        ensure_identity_projection(&p.expr, &a.schema)?;
+        let expected = aggregate_output_indices(a);
+        ensure_identity_projection(
+            &p.expr,
+            &a.schema,
+            &expected,
+            &a.aggr_expr,
+            a.group_expr.len(),
+        )?;
         return to_kernel_plan(&p.input, sources);
     }
     let input = to_kernel_plan(&p.input, sources)?;
@@ -77,6 +84,20 @@ fn project(p: &Projection, sources: &SourceBindings) -> Result<Plan, SqlError> {
         input: Box::new(input),
         cols,
     })
+}
+
+/// Map the kernel's normalized aggregate output order back to DataFusion's
+/// aggregate schema positions. Window group expressions are consumed by the
+/// window operator and therefore do not appear as output columns.
+fn aggregate_output_indices(a: &Aggregate) -> Vec<usize> {
+    let mut indices = a
+        .group_expr
+        .iter()
+        .enumerate()
+        .filter_map(|(index, expr)| matches!(expr, Expr::Column(_)).then_some(index))
+        .collect::<Vec<_>>();
+    indices.extend(a.group_expr.len()..a.schema.fields().len());
+    indices
 }
 
 fn translate_aggregate(a: &Aggregate, sources: &SourceBindings) -> Result<Plan, SqlError> {

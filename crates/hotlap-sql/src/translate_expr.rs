@@ -34,21 +34,46 @@ pub(crate) fn projection_indices(
 pub(crate) fn ensure_identity_projection(
     exprs: &[Expr],
     schema: &DFSchema,
+    expected_indices: &[usize],
+    aggregate_exprs: &[Expr],
+    group_expr_count: usize,
 ) -> Result<(), SqlError> {
-    for expr in exprs {
-        let col = match expr {
+    if exprs.len() != expected_indices.len() {
+        return Err(SqlError::Unsupported(
+            "aggregate projection must include every output column in order".into(),
+        ));
+    }
+    for (expr, expected) in exprs.iter().zip(expected_indices) {
+        let col = match unalias(expr) {
             Expr::Column(c) => c,
-            Expr::Alias(a) => match a.expr.as_ref() {
-                Expr::Column(c) => c,
-                other => return Err(unsupported("identity projection", other)),
-            },
+            aggregate
+                if expected >= &group_expr_count
+                    && aggregate_exprs
+                        .get(expected - group_expr_count)
+                        .map(|expr| unalias(expr) == aggregate)
+                        == Some(true) =>
+            {
+                continue;
+            }
             other => return Err(unsupported("identity projection", other)),
         };
-        schema
+        let actual = schema
             .index_of_column(col)
             .map_err(|e| SqlError::Unsupported(format!("unknown column `{col}`: {e}")))?;
+        if actual != *expected {
+            return Err(SqlError::Unsupported(
+                "aggregate projection must include every output column in order".into(),
+            ));
+        }
     }
     Ok(())
+}
+
+fn unalias(mut expr: &Expr) -> &Expr {
+    while let Expr::Alias(alias) = expr {
+        expr = alias.expr.as_ref();
+    }
+    expr
 }
 
 /// Is this scalar function a tumbling-window call?

@@ -82,6 +82,23 @@ async fn resolves_composite_join_key() {
 }
 
 #[tokio::test]
+async fn accepts_identity_projection_over_qualified_join_aggregate() {
+    let ctx = ctx_with_src();
+    register_empty_table(&ctx, "other");
+    let bindings = two_bindings();
+    let df = ctx
+        .sql("SELECT a.k, count(*) FROM src a JOIN other b ON a.k=b.k GROUP BY a.k")
+        .await
+        .unwrap();
+    let plan = to_kernel_plan(df.logical_plan(), &bindings).unwrap();
+    let Plan::GroupAggregate { input, key, .. } = plan else {
+        panic!("expected grouped aggregate")
+    };
+    assert_eq!(key, vec![0]);
+    assert!(matches!(*input, Plan::Join { .. }));
+}
+
+#[tokio::test]
 async fn rejects_projection_column_alias() {
     let ctx = ctx_with_src();
     let bindings = SourceBindings::from([("src".into(), InputId(7))]);
