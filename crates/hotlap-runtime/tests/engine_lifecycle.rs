@@ -53,6 +53,38 @@ fn start_snapshot_shutdown() {
 }
 
 #[test]
+fn source_error_before_first_push_rejects_engine_snapshot() {
+    let handle = EngineHandle::start(pipeline(
+        Arc::new(FailingSource { schema: schema() }),
+        vec![(
+            "c".into(),
+            Plan::GroupAggregate {
+                input: Box::new(Plan::Source(InputId(0))),
+                key: vec![0],
+                aggs: vec![AggSpec::count()],
+            },
+        )],
+    ))
+    .unwrap();
+    let snap = handle.snapshot_handle();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handle.last_error().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!snap.is_built());
+    assert!(handle.last_error().unwrap().is_some());
+    let error = match snap.snapshot("c") {
+        Ok(_) => panic!("recorded source failure must reject the view snapshot"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("fluss error: boom"),
+        "got {error}"
+    );
+    handle.shutdown().unwrap_err();
+}
+
+#[test]
 fn snapshot_handle_reads_a_built_view() {
     let handle = EngineHandle::start(pipeline(
         Arc::new(OneBatchSource { schema: schema() }),

@@ -8,6 +8,7 @@ use hotlap::{Plan, ZSetBatch};
 use tokio::sync::oneshot;
 
 use crate::runtime::checkpoint::{CheckpointState, Checkpointer};
+use crate::runtime::engine::EngineShared;
 use crate::runtime::pipeline::record_error;
 use crate::runtime::sources::Sources;
 use hotlap_connectors::error::ConnectorError;
@@ -41,20 +42,22 @@ pub enum Command {
 /// checkpoint and view-build commands are rejected and ingestion stops, because
 /// aborting the sinks did not roll the engine or the source offsets back. Reads
 /// and shutdown stay available so the caller can still inspect and stop the
-/// engine. A failed checkpoint sets `failed` before it replies, so the caller
-/// cannot poll a source through the race.
+/// engine. An unbuilt snapshot after an ingestion error fails with the recorded
+/// error; already-built outputs remain readable. A failed checkpoint sets
+/// `failed` before it replies, so the caller cannot poll a source through the
+/// race.
 pub(crate) async fn handle(
     cmd: Option<Command>,
     hotlap: &mut Hotlap,
     sources: &Sources,
     checkpointer: &mut Option<Checkpointer>,
     failed: &mut bool,
-    close_clean: &AtomicBool,
-    checkpoint_error: &Mutex<Option<String>>,
+    shared: &EngineShared,
 ) -> bool {
     match cmd {
         Some(Command::Snapshot { view, reply }) => {
-            let _ = reply.send(hotlap.snapshot(&view).map_err(map_err));
+            let result = snapshot(hotlap, &view, &shared.last_error, &shared.built);
+            let _ = reply.send(result);
             false
         }
         Some(Command::LateDropped { input, reply }) => {
@@ -68,11 +71,11 @@ pub(crate) async fn handle(
             };
             let inconsistent = result.is_err() && checkpointer.as_ref().is_some_and(inconsistent);
             if inconsistent {
-                close_clean.store(false, Ordering::SeqCst);
+                shared.close_clean.store(false, Ordering::SeqCst);
                 if !*failed {
                     *failed = true;
                     if let Err(error) = &result
-                        && let Ok(mut slot) = checkpoint_error.lock()
+                        && let Ok(mut slot) = shared.checkpoint_error.lock()
                     {
                         *slot = Some(error.to_string());
                     }
@@ -95,6 +98,24 @@ pub(crate) async fn handle(
         }
         None => true,
     }
+}
+
+fn snapshot(
+    hotlap: &mut Hotlap,
+    view: &str,
+    last_error: &Mutex<Option<String>>,
+    built: &AtomicBool,
+) -> Result<ZSetBatch, ConnectorError> {
+    if !built.load(Ordering::SeqCst) {
+        let error = last_error
+            .lock()
+            .map_err(|_| ConnectorError::Infrastructure("engine error state poisoned".into()))?
+            .clone();
+        if let Some(error) = error {
+            return Err(ConnectorError::Infrastructure(error));
+        }
+    }
+    hotlap.snapshot(view).map_err(map_err)
 }
 
 /// Run a periodic checkpoint; returns whether it left the state inconsistent.

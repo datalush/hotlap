@@ -119,8 +119,7 @@ async fn handle(
         &pipeline.sources,
         &mut engine.checkpointer,
         failed,
-        &shared.close_clean,
-        &shared.checkpoint_error,
+        shared,
     )
     .await
 }

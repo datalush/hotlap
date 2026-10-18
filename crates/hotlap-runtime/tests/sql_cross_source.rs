@@ -13,6 +13,7 @@ mod sql_source;
 
 use std::sync::Arc;
 
+use hotlap_connectors::ConnectorError;
 use hotlap_runtime::{FlussSinkFactory, QueryResult, Session, SessionConfig, SqlSession};
 
 use factory::{CrossSourceFactory, SourceSpec};
@@ -193,4 +194,35 @@ fn fresh_start_reads_empty_before_the_first_push() {
         "the raw snapshot must be empty before any push"
     );
     session.shutdown().unwrap();
+}
+
+#[test]
+fn source_error_before_first_push_fails_mv_snapshot_and_query() {
+    let factory = CrossSourceFactory::new();
+    factory.declare("a", SourceSpec::new(schema_a(), 1));
+    let mut session =
+        Session::open(SessionConfig::new().with_source_factory(factory.clone())).unwrap();
+    session.sql(CREATE_A).unwrap();
+    session
+        .sql("CREATE MATERIALIZED VIEW v AS SELECT k FROM a;")
+        .unwrap();
+    session.sql("START;").unwrap();
+    factory.senders("a")[0]
+        .send(Err(ConnectorError::Fluss("source boom".into())))
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Err(error) = session.snapshot("v") {
+            assert!(error.to_string().contains("source boom"), "got {error}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "source failure was not surfaced"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(session.sql("SELECT k FROM v").is_err());
+    session.shutdown().unwrap_err();
 }
