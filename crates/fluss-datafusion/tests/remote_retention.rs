@@ -37,6 +37,56 @@ use short_sts_proxy::ShortStsProxy;
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
+fn profile_cleanup_stops_cluster_before_deleting_s3_prefix() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    struct Cluster(Arc<Mutex<Vec<&'static str>>>);
+    impl Drop for Cluster {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("cluster_stopped");
+        }
+    }
+
+    let result = finish_profile(
+        Cluster(Arc::clone(&events)),
+        Ok::<TestResult<()>, Box<dyn std::any::Any + Send>>(Err("original profile failure".into())),
+        || {
+            events.lock().unwrap().push("s3_cleaned");
+            Err("cleanup failure".into())
+        },
+    );
+
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("original profile failure"));
+    assert!(error.contains("cleanup failure"));
+    assert_eq!(*events.lock().unwrap(), ["cluster_stopped", "s3_cleaned"]);
+}
+
+fn finish_profile<T, C>(
+    cluster: C,
+    result: Result<TestResult<T>, Box<dyn std::any::Any + Send>>,
+    cleanup: impl FnOnce() -> TestResult<()>,
+) -> TestResult<T> {
+    drop(cluster);
+    let cleanup = cleanup();
+    match result {
+        Ok(Ok(value)) => cleanup.map(|()| value),
+        Ok(Err(error)) => match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(format!(
+                "profile failed: {error}; S3 cleanup also failed: {cleanup_error}"
+            )
+            .into()),
+        },
+        Err(panic) => {
+            if let Err(cleanup_error) = cleanup {
+                eprintln!("S3 cleanup failed while handling profile panic: {cleanup_error}");
+            }
+            std::panic::resume_unwind(panic)
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires Docker plus a compatible FLUSS_IMAGE and FLUSS_VERSION"]
 fn datafusion_reads_remote_and_rejects_lost_retention() -> TestResult<()> {
     std::env::var("FLUSS_IMAGE")?;
@@ -814,7 +864,14 @@ fn datafusion_resource_pressure_rustfs() -> TestResult<()> {
     std::env::var("FLUSS_IMAGE")?;
     std::env::var("FLUSS_VERSION")?;
     let profile = PressureProfile::from_env()?;
+    eprintln!(
+        "pressure phase=resolved rows={} warmup_secs={} measure_secs={}",
+        profile.rows,
+        profile.warmup.as_secs(),
+        profile.measure.as_secs()
+    );
     let (mut conf, mut test_objects) = rustfs_profile()?;
+    eprintln!("pressure phase=rustfs_bucket_ready");
     // Large enough to offload a compressible dataset without creating a
     // separate object for every record.
     conf.insert("log.segment.file-size".into(), "64kb".into());
@@ -826,28 +883,35 @@ fn datafusion_resource_pressure_rustfs() -> TestResult<()> {
             .build()?
             .block_on(async {
                 let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-                let mut builder = FlussTestingClusterBuilder::new_with_cluster_conf(
-                    format!("datafusion-pressure-{suffix}"),
-                    &conf,
-                )
-                .with_port(9523);
+                let cluster_name = format!("datafusion-pressure-{}-{suffix}", std::process::id());
+                let mut builder =
+                    FlussTestingClusterBuilder::new_with_cluster_conf(&cluster_name, &conf)
+                        .with_port(9523);
+                eprintln!("pressure phase=cluster_build_start");
                 let cluster = builder.build().await;
+                eprintln!(
+                    "pressure phase=cluster_build_complete bootstrap={}",
+                    cluster.plaintext_bootstrap_servers()
+                );
+                let cluster = cluster;
+                struct OwnedProfileCluster(Option<fluss_test_cluster::FlussTestingCluster>);
+                impl Drop for OwnedProfileCluster {
+                    fn drop(&mut self) {
+                        if let Some(cluster) = self.0.take() {
+                            cluster.stop();
+                        }
+                    }
+                }
+                let owned_cluster = OwnedProfileCluster(Some(cluster));
                 let result = std::panic::AssertUnwindSafe(check_resource_pressure(
-                    &cluster,
+                    owned_cluster.0.as_ref().expect("owned cluster"),
                     profile,
                     &snapshotter,
                 ))
                 .catch_unwind()
                 .await;
-                cluster.stop();
-                let cleanup = test_objects.cleanup();
-                match result {
-                    Ok(result) => {
-                        result?;
-                        cleanup
-                    }
-                    Err(panic) => std::panic::resume_unwind(panic),
-                }
+                eprintln!("pressure phase=profile_complete");
+                finish_profile(owned_cluster, result, || test_objects.cleanup())
             })
     })
 }
