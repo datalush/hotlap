@@ -2,6 +2,8 @@
 //! Optional isolated-lab integration: run with FLUSS_* from ../lab/.env.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,13 +25,216 @@ use fluss::metadata::{
     PartitionSpec, Schema, TableBucket, TableDescriptor, TablePath,
 };
 use fluss::row::GenericRow;
-use fluss::rpc::message::OffsetSpec;
+use fluss::rpc::{FlussError, message::OffsetSpec};
 use fluss_datafusion::{FlussCatalog, FlussKvTable, FlussLogTable, LogReadOptions, LogStart};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 const DATABASE: &str = "datafusion_tests";
 const SCAN_TIMEOUT: Duration = Duration::from_secs(45);
+
+async fn wait_for_bucket_leaders(
+    connection: &Arc<FlussConnection>,
+    path: &TablePath,
+) -> TestResult<()> {
+    let admin = connection.get_admin()?;
+    let info = admin.get_table_info(path).await?;
+    let buckets = (0..info.get_num_buckets()).collect::<Vec<_>>();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match admin
+                .list_offsets(path, &buckets, OffsetSpec::Earliest)
+                .await
+            {
+                Ok(offsets) if offsets.len() == buckets.len() => return Ok(()),
+                Ok(offsets) => {
+                    return Err(format!("incomplete earliest offsets: {offsets:?}").into());
+                }
+                Err(error) if error.api_error() == Some(FlussError::NotLeaderOrFollower) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(Box::new(error) as Box<dyn std::error::Error>),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "timed out waiting for all table bucket leaders")?
+}
+
+async fn run_with_owned_tables<T>(
+    connection: &Arc<FlussConnection>,
+    paths: &[TablePath],
+    work: impl Future<Output = TestResult<T>>,
+) -> TestResult<T> {
+    let result = AssertUnwindSafe(work).catch_unwind().await;
+    let admin = connection.get_admin()?;
+    let mut cleanup_errors = Vec::new();
+    for path in paths {
+        if let Err(error) = admin.drop_table(path, true).await {
+            cleanup_errors.push(format!("drop {} failed: {error}", path.table()));
+        }
+    }
+    let cleanup = (!cleanup_errors.is_empty()).then(|| cleanup_errors.join("; "));
+    match result {
+        Ok(Ok(value)) => match cleanup {
+            Some(error) => Err(error.into()),
+            None => Ok(value),
+        },
+        Ok(Err(error)) => Err(match cleanup {
+            Some(cleanup) => format!("primary failure: {error}; cleanup failure: {cleanup}").into(),
+            None => error,
+        }),
+        Err(payload) => {
+            let panic = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "non-string panic payload".into());
+            Err(match cleanup {
+                Some(cleanup) => {
+                    format!("fixture panic: {panic}; cleanup failure: {cleanup}").into()
+                }
+                None => format!("fixture panic: {panic}").into(),
+            })
+        }
+    }
+}
+
+fn parse_count_output(output: &str) -> Option<u64> {
+    let rows = output
+        .lines()
+        .filter_map(|line| {
+            let cells = line
+                .trim()
+                .trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            (cells.len() == 1 && cells[0].parse::<u64>().is_ok()).then(|| cells[0].parse().unwrap())
+        })
+        .collect::<Vec<_>>();
+    if rows.len() == 1 {
+        rows.first().copied()
+    } else {
+        None
+    }
+}
+
+fn has_expected_count(output: &str, expected: u64) -> bool {
+    parse_count_output(output) == Some(expected)
+}
+
+fn native_query_command(binary: String, database: &str, table: &str, bootstrap: String) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .args([database, table, "log", "SELECT COUNT(*) FROM fluss_source"])
+        .env("FLUSS_BOOTSTRAP", bootstrap)
+        .env("DATAFUSION_POOL_MIB", "16")
+        .env("DATAFUSION_TARGET_PARTITIONS", "2");
+    command
+}
+
+#[test]
+fn cli_count_parser_requires_exact_single_numeric_result() {
+    assert!(has_expected_count("+---+\n| 9 |\n+---+", 9));
+    assert!(!has_expected_count("+---+\n| 19 |\n+---+", 9));
+    assert!(!has_expected_count("+---+\n| 90 |\n+---+", 9));
+    assert_eq!(parse_count_output("+---+\n| 9 |\n| 19 |\n+---+"), None);
+}
+
+#[test]
+fn native_query_child_does_not_override_parent_security_environment() {
+    let command = native_query_command(
+        "native_query".into(),
+        "db",
+        "table",
+        "localhost:9123".into(),
+    );
+    let explicit_env = command.get_envs().collect::<Vec<_>>();
+    assert!(!explicit_env.iter().any(|(key, _)| {
+        ["FLUSS_CA_FILE", "FLUSS_USER", "FLUSS_PASSWORD"]
+            .iter()
+            .any(|security| key == security)
+    }));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Fluss fixture; verifies panic cleanup of its own table"]
+async fn owned_table_cleanup_runs_after_fixture_panic() -> TestResult<()> {
+    let connection = connect().await?;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let path = TablePath::new(DATABASE, format!("cleanup_{suffix}"));
+    connection
+        .get_admin()?
+        .create_table(
+            &path,
+            &TableDescriptor::builder()
+                .schema(Schema::builder().column("id", DataTypes::int()).build()?)
+                .distributed_by(Some(1), vec!["id".into()])
+                .build()?,
+            false,
+        )
+        .await?;
+    let result: TestResult<()> =
+        run_with_owned_tables(&connection, std::slice::from_ref(&path), async {
+            panic!("intentional fixture panic")
+        })
+        .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("intentional fixture panic")
+    );
+    assert!(connection.get_admin()?.get_table_info(&path).await.is_err());
+    connection.close(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
+fn test_config(bootstrap: &str, plaintext: bool, security_env_present: bool) -> TestResult<Config> {
+    if plaintext {
+        let local = bootstrap
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|addr| addr.ip().is_loopback())
+            || bootstrap.split_once(':').is_some_and(|(host, port)| {
+                host == "localhost" && port.parse::<u16>().is_ok_and(|port| port != 0)
+            });
+        if !local {
+            return Err("plaintext test mode only permits loopback bootstrap endpoints".into());
+        }
+        if security_env_present {
+            return Err("plaintext test mode rejects TLS/SASL environment variables".into());
+        }
+        return Ok(Config {
+            bootstrap_servers: bootstrap.into(),
+            ..Config::default()
+        });
+    }
+    Ok(Config {
+        bootstrap_servers: bootstrap.into(),
+        security_ssl_enabled: true,
+        security_ssl_ca_file: Some(std::env::var("FLUSS_CA_FILE")?),
+        security_protocol: "sasl".into(),
+        security_sasl_username: std::env::var("FLUSS_USER")?,
+        security_sasl_password: std::env::var("FLUSS_PASSWORD")?,
+        ..Config::default()
+    })
+}
+
+#[test]
+fn local_plaintext_config_is_loopback_only_and_unambiguous() {
+    assert!(test_config("127.0.0.1:9123", true, false).is_ok());
+    assert!(test_config("[::1]:9123", true, false).is_ok());
+    assert!(test_config("localhost:9123", true, false).is_ok());
+    assert!(test_config("127.0.0.1.attacker:9123", true, false).is_err());
+    assert!(test_config("fluss.example:9123", true, false).is_err());
+    assert!(test_config("[2001:db8::1]:9123", true, false).is_err());
+    assert!(test_config("127.0.0.1:9123", true, true).is_err());
+    // TLS/SASL mode is valid for remote endpoints; it requires ambient
+    // credentials, so only assert the endpoint policy in plaintext mode above.
+}
 
 #[tokio::test]
 #[ignore = "requires native-sni and FLUSS_* credentials; creates one isolated log"]
@@ -50,7 +255,8 @@ async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<
             false,
         )
         .await?;
-    let result: TestResult<()> = async {
+    let result = run_with_owned_tables(&connection, std::slice::from_ref(&path), async {
+        wait_for_bucket_leaders(&connection, &path).await?;
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
         let ctx = SessionContext::new_with_config_rt(
             SessionConfig::new()
@@ -76,12 +282,18 @@ async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<
         let source = source_plan(&plan);
         assert!(source.boundedness().is_unbounded());
         let mut stream = source.execute(0, Arc::new(query.task_ctx()))?;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(900), stream.next())
-                .await
-                .is_err(),
-            "no new records must not end the stream"
-        );
+        match tokio::time::timeout(Duration::from_millis(900), stream.next()).await {
+            Err(_) => {}
+            Ok(None) => return Err("idle continuous stream returned EOF".into()),
+            Ok(Some(Err(error))) => {
+                return Err(format!("idle continuous stream errored: {error:?}").into());
+            }
+            Ok(Some(Ok(batch))) => {
+                return Err(
+                    format!("idle continuous stream produced {} rows", batch.num_rows()).into(),
+                );
+            }
+        }
         let fluss_datafusion::LogProgress::Initialized { positions, .. } = observed.try_recv()?
         else {
             panic!("idle streaming execution must publish its initial assignment");
@@ -313,11 +525,9 @@ async fn streaming_log_waits_for_appends_and_releases_on_cancel() -> TestResult<
         drop(filtered_stream);
         check_continuous_pressure(&connection, &path).await?;
         Ok(())
-    }
+    })
     .await;
-    let cleanup = admin.drop_table(&path, true).await;
     result?;
-    cleanup?;
     connection.close(Duration::from_secs(5)).await?;
     Ok(())
 }
@@ -521,16 +731,16 @@ async fn streaming_partition_topology_change_fails_explicitly() -> TestResult<()
 }
 
 async fn connect() -> TestResult<Arc<FlussConnection>> {
+    let plaintext = std::env::var("FLUSS_TEST_PLAINTEXT").as_deref() == Ok("1");
+    let security_env_present = ["FLUSS_CA_FILE", "FLUSS_USER", "FLUSS_PASSWORD"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some());
     let connection = Arc::new(
-        FlussConnection::new(Config {
-            bootstrap_servers: std::env::var("FLUSS_BOOTSTRAP")?,
-            security_ssl_enabled: true,
-            security_ssl_ca_file: Some(std::env::var("FLUSS_CA_FILE")?),
-            security_protocol: "sasl".into(),
-            security_sasl_username: std::env::var("FLUSS_USER")?,
-            security_sasl_password: std::env::var("FLUSS_PASSWORD")?,
-            ..Config::default()
-        })
+        FlussConnection::new(test_config(
+            &std::env::var("FLUSS_BOOTSTRAP")?,
+            plaintext,
+            security_env_present,
+        )?)
         .await?,
     );
     connection
@@ -635,6 +845,35 @@ async fn bounded_log_and_kv_sql_against_native_sni() -> TestResult<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires owned plaintext loopback Fluss and FLUSS_NATIVE_QUERY_BIN"]
+async fn release_native_query_returns_seeded_log_count() -> TestResult<()> {
+    let connection = connect().await?;
+    let (log_path, kv_path) = create_known_tables(&connection).await?;
+    let result = run_with_owned_tables(&connection, &[log_path.clone(), kv_path.clone()], async {
+        let binary = std::env::var("FLUSS_NATIVE_QUERY_BIN")?;
+        let output = native_query_command(
+            binary,
+            DATABASE,
+            log_path.table(),
+            std::env::var("FLUSS_BOOTSTRAP")?,
+        )
+        .output()?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "native_query failed: {stderr}");
+        assert!(
+            has_expected_count(&stdout, 9),
+            "unexpected native_query output: {stdout}"
+        );
+        Ok(())
+    })
+    .await;
+    result?;
+    connection.close(Duration::from_secs(5)).await?;
+    Ok(())
+}
+
 async fn create_known_tables(
     connection: &Arc<FlussConnection>,
 ) -> TestResult<(TablePath, TablePath)> {
@@ -668,6 +907,17 @@ async fn create_known_tables(
     if let Err(error) = admin.create_table(&kv, &kv_descriptor, false).await {
         admin.drop_table(&log, true).await?;
         return Err(error.into());
+    }
+    if let Err(error) = async {
+        wait_for_bucket_leaders(connection, &log).await?;
+        wait_for_bucket_leaders(connection, &kv).await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await
+    {
+        let _ = admin.drop_table(&log, true).await;
+        let _ = admin.drop_table(&kv, true).await;
+        return Err(error);
     }
     let write_result: TestResult<()> = async {
         let table = connection.get_table(&log).await?;
@@ -2202,6 +2452,13 @@ async fn create_empty_log(connection: &Arc<FlussConnection>) -> TestResult<Table
         .get_admin()?
         .create_table(&path, &descriptor, false)
         .await?;
+    if let Err(error) = wait_for_bucket_leaders(connection, &path).await {
+        let cleanup = connection.get_admin()?.drop_table(&path, true).await;
+        return Err(match cleanup {
+            Ok(()) => error,
+            Err(cleanup) => format!("readiness failed: {error}; cleanup failed: {cleanup}").into(),
+        });
+    }
     Ok(path)
 }
 
