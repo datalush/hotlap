@@ -15,6 +15,7 @@ pub struct SpySource {
     resumed: Arc<AtomicU32>,
     reads: Arc<AtomicU32>,
     offset: Arc<Mutex<Option<i64>>>,
+    read_starts: Arc<Mutex<Vec<i64>>>,
 }
 
 impl SpySource {
@@ -25,6 +26,7 @@ impl SpySource {
             resumed: Arc::new(AtomicU32::new(0)),
             reads: Arc::new(AtomicU32::new(0)),
             offset: Arc::new(Mutex::new(None)),
+            read_starts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -43,6 +45,12 @@ impl SpySource {
     pub fn offset(&self) -> Option<i64> {
         *self.offset.lock().unwrap()
     }
+
+    /// Split starts actually handed to the source reader.
+    #[allow(dead_code)] // Shared by integration-test targets; only redrive-failure asserts it.
+    pub fn read_starts(&self) -> Vec<i64> {
+        self.read_starts.lock().unwrap().clone()
+    }
 }
 
 impl Source for SpySource {
@@ -60,6 +68,7 @@ impl Source for SpySource {
 
     fn read(&self, split: &Split) -> Result<SourceStream, ConnectorError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        self.read_starts.lock().unwrap().push(split.start);
         self.inner.read(split)
     }
 

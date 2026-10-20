@@ -5,6 +5,7 @@ mod fixture;
 #[path = "common/view_identity_pipeline.rs"]
 pub mod support;
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use arrow::array::Int64Array;
@@ -15,8 +16,8 @@ use hotlap_runtime::runtime::handle::EngineHandle;
 use hotlap_runtime::runtime::sink::{SharedSink, SinkSync};
 
 use fixture::{
-    pipeline, pipeline_retaining, ready_redrive_sink, redrive_sink, seeded_compatible_registries,
-    seeded_registries,
+    SourceBoundaryGate, pipeline, pipeline_retaining_gated, ready_redrive_sink, redrive_sink,
+    seeded_compatible_registries, seeded_registries,
 };
 use support::{SharedBackend, rows};
 
@@ -68,6 +69,10 @@ fn compatible_fallback_is_discarded_and_replayed_after_redrive_error() {
 #[test]
 fn replay_safe_unrestorable_pending_discards_and_replays_only_after_fallback_validation() {
     let (backend, dataset) = seeded_compatible_registries();
+    let fallback =
+        hotlap_engine::decode_snapshot(&backend.get(b"checkpoint/1/engine").unwrap().unwrap())
+            .unwrap();
+    assert!(fallback.views[0].pending.is_some());
     corrupt_pending_output(&backend);
     let (sink, remote) = ready_redrive_sink();
     let mut direct = Checkpointer::new(Box::new(backend.clone()), 1).with_sinks(vec![
@@ -80,11 +85,17 @@ fn replay_safe_unrestorable_pending_discards_and_replays_only_after_fallback_val
     assert_eq!(remote.lock().unwrap().staged, vec![(1, 1)]);
     assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
     assert!(backend.get(b"checkpoint/2/commit").unwrap().is_some());
-    let (pipeline, spy) = pipeline_retaining(&backend, dataset, Some(sink), 1);
+    let (pipeline, spy, gate) = pipeline_retaining_gated(&backend, dataset, sink.clone(), 1);
 
     let handle = EngineHandle::start(pipeline).expect("safe replay from full valid fallback");
+    let _release_on_unwind = ReleaseGateOnDrop(gate.clone());
+    gate.wait_until_paused();
+    sink.wait_for_completed_write();
 
-    assert_eq!(remote.lock().unwrap().staged, vec![(1, 1)]);
+    assert_eq!(spy.read_starts(), vec![3]);
+    // The fallback checkpoint carries its undrained tapped delta. Replaying it
+    // is valid only after the corrupt pending checkpoint has been discarded.
+    assert_eq!(remote.lock().unwrap().staged, vec![(1, 1), (1, 2)]);
     assert_eq!(remote.lock().unwrap().committed, Vec::<(i64, i64)>::new());
     assert!(backend.get(b"checkpoint/2/valid").unwrap().is_none());
     assert!(backend.get(b"checkpoint/1/valid").unwrap().is_some());
@@ -92,7 +103,20 @@ fn replay_safe_unrestorable_pending_discards_and_replays_only_after_fallback_val
     assert!(backend.get(b"checkpoint/2/engine").unwrap().is_none());
     assert_snapshot(&handle, "a", 1);
     assert_eq!(spy.offset(), Some(3));
+    let staged_before_eof = remote.lock().unwrap().staged.clone();
+    gate.release();
+    gate.wait_until_exhausted();
+    assert_eq!(remote.lock().unwrap().staged, staged_before_eof);
+    assert!(backend.get(b"checkpoint/2/valid").unwrap().is_none());
     handle.shutdown().unwrap();
+}
+
+struct ReleaseGateOnDrop(Arc<SourceBoundaryGate>);
+
+impl Drop for ReleaseGateOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 fn corrupt_pending_output(backend: &SharedBackend) {
