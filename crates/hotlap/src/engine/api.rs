@@ -80,6 +80,19 @@ impl Hotlap {
             .map_err(|error| HotlapError(format!("{error}")))
     }
 
+    /// Retain replay history up to both `events` and optional accounted bytes.
+    /// The byte budget covers known Arrow buffer capacities and queue storage;
+    /// allocator and metadata overhead are not an exact heap/RSS bound.
+    pub fn set_input_retention_bytes(
+        &mut self,
+        events: usize,
+        bytes: Option<usize>,
+    ) -> Result<(), HotlapError> {
+        self.core
+            .set_input_retention_bytes(events, bytes)
+            .map_err(|error| HotlapError(format!("{error}")))
+    }
+
     /// Compile `plan` into a new view registered under `name`.
     ///
     /// After the first push this succeeds only when input retention covers the

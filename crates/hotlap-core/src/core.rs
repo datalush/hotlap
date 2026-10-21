@@ -35,6 +35,24 @@ pub trait IncrementalCore {
     /// [`build_view`](Self::build_view) rejected.
     fn set_input_retention(&mut self, events: usize) -> Result<(), CoreError>;
 
+    /// Also bound retained replay-history accounting by known bytes. The charge
+    /// is reported Arrow buffer capacity plus the retained event-queue estimate;
+    /// it is not a total heap/RSS bound. Allocator and schema/batch metadata, and
+    /// any custom-owner payload not represented by Arrow's reported capacity,
+    /// are outside this accounting. `None` preserves event-count-only behavior.
+    fn set_input_retention_bytes(
+        &mut self,
+        events: usize,
+        bytes: Option<usize>,
+    ) -> Result<(), CoreError> {
+        if bytes.is_some() {
+            return Err(CoreError::Unsupported(
+                "core does not support byte-bounded input retention".into(),
+            ));
+        }
+        self.set_input_retention(events)
+    }
+
     /// Declare a source's watermark. Only before the first push, and after
     /// [`register_input`](Self::register_input) of that source.
     fn declare_watermark(&mut self, input: InputId, spec: WatermarkSpec) -> Result<(), CoreError>;

@@ -67,7 +67,31 @@ impl IncrementalCore for EngineCore {
                 "input retention must keep at least one delta".into(),
             ));
         }
-        self.retention = super::retention::InputRetention::new(events);
+        self.retention = super::retention::InputRetention::new(events, None);
+        Ok(())
+    }
+
+    /// Configure optional replay-history retention limits.
+    ///
+    /// `bytes` limits accounted bytes: reported Arrow buffer capacities plus
+    /// the retained event-queue allocation estimate. It is not a total heap or
+    /// RSS bound: custom-buffer owner payloads not represented by Arrow's
+    /// reported capacity, allocator overhead, and batch/schema metadata are
+    /// outside this accounting. `None` preserves event-count-only behavior.
+    fn set_input_retention_bytes(
+        &mut self,
+        events: usize,
+        bytes: Option<usize>,
+    ) -> Result<(), CoreError> {
+        if self.frozen {
+            return Err(CoreError::Unsupported("engine already running".into()));
+        }
+        if events == 0 {
+            return Err(CoreError::Unsupported(
+                "input retention must keep at least one delta".into(),
+            ));
+        }
+        self.retention = super::retention::InputRetention::new(events, bytes);
         Ok(())
     }
 

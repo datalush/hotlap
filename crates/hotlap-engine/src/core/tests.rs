@@ -1497,6 +1497,72 @@ fn memory_report_counts_arrow_buffers_held_by_input_retention() {
 }
 
 #[test]
+fn byte_budget_truncates_only_replay_history_and_keeps_live_view_current() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.set_input_retention_bytes(8, Some(0)).unwrap();
+    core.build_view(ViewId(0), &Plan::Source(InputId(0)))
+        .unwrap();
+    core.push(InputId(0), &zset(&[(41, 1)])).unwrap();
+
+    assert_eq!(output_rows(&core, ViewId(0)), 1);
+    core.push(InputId(0), &zset(&[(41, -1)])).unwrap();
+    assert_eq!(output_rows(&core, ViewId(0)), 0);
+    assert!(
+        matches!(core.build_view(ViewId(1), &Plan::Source(InputId(0))), Err(hotlap_core::CoreError::Unsupported(message)) if message.contains("insufficient input retention"))
+    );
+}
+
+#[test]
+fn zero_byte_budget_releases_empty_event_queue_capacity() {
+    for budget in [0, 1, 63, 512] {
+        let mut core = EngineCore::new();
+        core.register_input(InputId(0)).unwrap();
+        core.set_input_retention_bytes(8, Some(budget)).unwrap();
+        core.push(InputId(0), &zset(&[(41, 1)])).unwrap();
+
+        assert!(
+            core.retention
+                .accounted_bytes()
+                .is_some_and(|used| used <= budget),
+            "final history accounting must fit {budget} bytes"
+        );
+    }
+}
+
+#[test]
+fn restore_releases_byte_bounded_replay_queue_capacity() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.set_input_retention_bytes(8, Some(4096)).unwrap();
+    core.build_view(ViewId(0), &Plan::Source(InputId(0)))
+        .unwrap();
+    core.push(InputId(0), &zset(&[(41, 1)])).unwrap();
+    let checkpoint = core.checkpoint().unwrap();
+
+    core.restore(&checkpoint).unwrap();
+
+    assert_eq!(core.retention.accounted_bytes(), Some(0));
+    assert!(
+        core.build_view(ViewId(1), &Plan::Source(InputId(0)))
+            .is_err()
+    );
+}
+
+#[test]
+fn unset_byte_budget_keeps_full_replay_history() {
+    let mut core = EngineCore::new();
+    core.register_input(InputId(0)).unwrap();
+    core.set_input_retention_bytes(2, None).unwrap();
+    core.push(InputId(0), &zset(&[(10, 1)])).unwrap();
+    core.push(InputId(0), &zset(&[(11, 1)])).unwrap();
+
+    core.build_view(ViewId(0), &Plan::Source(InputId(0)))
+        .unwrap();
+    assert_eq!(output_rows(&core, ViewId(0)), 2);
+}
+
+#[test]
 fn view_output_state_does_not_grow_with_history() {
     let mut core = EngineCore::new();
     core.register_input(InputId(0)).unwrap();
