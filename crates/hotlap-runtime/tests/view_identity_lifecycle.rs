@@ -154,6 +154,83 @@ async fn run_with_complete(backend: &SharedBackend) {
 }
 
 #[tokio::test]
+async fn late_view_source_name_collision_does_not_create_phantom_engine_view() {
+    let backend = SharedBackend::default();
+    let mut session = SqlSession::open_with_factories(
+        Arc::new(CountingFactory {
+            reads: Arc::new(AtomicU32::new(0)),
+        }),
+        Arc::new(FlussSinkFactory),
+    )
+    .with_input_retention(16)
+    .with_checkpoint(spec(&backend));
+    session.sql(SOURCE).await.unwrap();
+    session.sql(VIEW).await.unwrap();
+    session.sql("START;").await.unwrap();
+    assert_eq!(wait_ints(&mut session, "mv", &[1]).await, vec![1]);
+    wait_registered(&backend, "mv").await;
+
+    for (name, sql) in [
+        ("src", "CREATE MATERIALIZED VIEW src AS SELECT k FROM src;"),
+        ("SRC", "CREATE MATERIALIZED VIEW SRC AS SELECT k FROM src;"),
+        (
+            "missing.mv",
+            "CREATE MATERIALIZED VIEW missing.mv AS SELECT k FROM src;",
+        ),
+    ] {
+        let before = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+            .newest_valid()
+            .unwrap()
+            .expect("checkpoint for mv");
+        let before_names: Vec<_> = before
+            .sources
+            .views
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert_eq!(before_names, vec!["mv"]);
+        let error = session.sql(sql).await.err();
+        assert!(error.is_some(), "{name} registration should fail");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+            .newest_valid()
+            .unwrap()
+            .unwrap();
+        let after_names: Vec<_> = after
+            .sources
+            .views
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert_eq!(
+            after_names, before_names,
+            "{name} failure changed checkpoint registry"
+        );
+    }
+
+    session
+        .sql("CREATE MATERIALIZED VIEW late AS SELECT k FROM src WHERE k = 2;")
+        .await
+        .unwrap();
+    assert_eq!(wait_ints(&mut session, "late", &[2]).await, vec![2]);
+    wait_registered(&backend, "late").await;
+    let checkpoint = Checkpointer::new(Box::new(backend.clone()), DEFAULT_RETAIN)
+        .newest_valid()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        checkpoint
+            .sources
+            .views
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mv", "late"]
+    );
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_late_view_must_be_redeclared_identical_on_restart() {
     let backend = SharedBackend::default();
     tokio::time::timeout(Duration::from_secs(30), async {

@@ -164,6 +164,9 @@ impl SqlSession {
         if self.catalog.view(name).is_some() {
             return Err(SqlError::Catalog(format!("view already exists: {name}")));
         }
+        if self.ctx.table_exist(name).map_err(to_engine)? {
+            return Err(SqlError::Catalog(format!("table already exists: {name}")));
+        }
         // Gate on the session's own config: the engine's frozen flag is a race
         // with source ingestion, so it cannot decide this deterministically.
         if self.retention.is_none() {
