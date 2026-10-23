@@ -17,6 +17,7 @@
 
 use crate::bucketing::BucketingFunction;
 use crate::client::metadata::Metadata;
+use crate::client::table::{PreparedLogBatch, RecoverableWriteMode};
 use crate::client::write::IdempotenceManager;
 use crate::client::write::broadcast;
 use crate::client::write::bucket_assigner::{
@@ -28,8 +29,9 @@ use crate::cluster::Cluster;
 use crate::config::Config;
 use crate::config::NoKeyAssigner;
 use crate::error::{Error, FlussError, Result};
-use crate::metadata::{PhysicalTablePath, TableInfo};
+use crate::metadata::{PhysicalTablePath, TableBucket, TableInfo, TablePath};
 use crate::metrics::WriterMetrics;
+use crate::rpc::message::ProduceLogRequest;
 use crate::{BucketId, PartitionId};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -128,6 +130,70 @@ impl WriterClient {
             acks.parse::<i16>().map_err(|e| Error::IllegalArgument {
                 message: format!("invalid writer ack '{acks}': {e}"),
             })
+        }
+    }
+
+    pub(crate) async fn resolve_partition_id(
+        &self,
+        physical_path: &PhysicalTablePath,
+    ) -> Result<Option<i64>> {
+        self.metadata
+            .check_and_update_partition_metadata(physical_path)
+            .await
+    }
+
+    pub(crate) async fn send_prepared_log_batch(
+        &self,
+        table_path: &TablePath,
+        batch: &PreparedLogBatch,
+        mode: RecoverableWriteMode,
+    ) -> Result<crate::proto::ProduceLogResponse> {
+        self.check_open()?;
+        let bucket = TableBucket::new_with_partition(
+            batch.table_id(),
+            batch.partition_id(),
+            batch.bucket_id(),
+        );
+        let leader = self
+            .metadata
+            .leader_for(table_path, &bucket)
+            .await?
+            .ok_or_else(|| Error::IllegalArgument {
+                message: format!("No known leader for recoverable batch bucket {bucket}"),
+            })?;
+        let connection = self.metadata.get_connection(&leader).await?;
+        // The writer can be closed while metadata and connection lookup are awaiting. Recheck
+        // immediately before the irreversible request dispatch.
+        self.check_open()?;
+        let request = ProduceLogRequest::new_prepared(
+            batch.table_id(),
+            batch.partition_id(),
+            batch.bucket_id(),
+            batch.records().clone(),
+            mode.as_protocol_value(),
+        );
+        connection.request(request).await
+    }
+
+    pub(crate) fn routing_bucket_count(
+        &self,
+        physical_path: &Arc<PhysicalTablePath>,
+        table_info: &TableInfo,
+    ) -> Result<i32> {
+        let cluster = self.metadata.get_cluster();
+        let current = cluster.get_table(physical_path.get_table_path())?;
+        if current.is_partitioned() {
+            match cluster.get_partition_id(physical_path) {
+                Some(id) => cluster.routing_bucket_count(current.table_id, id),
+                None if current.bucket_count_epoch == 0 => Ok(current.get_num_buckets()),
+                None => Err(Error::invalid_table(format!(
+                    "Partition metadata for {} is unavailable after bucket rescale",
+                    physical_path
+                ))),
+            }
+        } else {
+            let _ = table_info;
+            Ok(current.get_num_buckets())
         }
     }
 
@@ -407,5 +473,29 @@ mod lifecycle_tests {
         .await
         .unwrap();
         assert!(client.accumulate.is_closed());
+    }
+
+    #[tokio::test]
+    async fn prepared_send_on_aborted_writer_fails_before_metadata_or_network_dispatch() {
+        let metadata = Arc::new(Metadata::new_for_test(Arc::new(Cluster::default())));
+        let client = WriterClient::new(Config::default(), metadata).unwrap();
+        client.abort();
+
+        let (_, mut records) = crate::test_utils::build_append_only_batch(&[(7, "durable")]);
+        records[32..40].copy_from_slice(&42_i64.to_le_bytes());
+        records[40..44].copy_from_slice(&3_i32.to_le_bytes());
+        let checksum = crc32c::crc32c(&records[25..]);
+        records[21..25].copy_from_slice(&checksum.to_le_bytes());
+        let batch = PreparedLogBatch::new(123, None, 0, 42, 3, Bytes::from(records)).unwrap();
+
+        let error = client
+            .send_prepared_log_batch(
+                &crate::metadata::TablePath::new("fluss", "closed"),
+                &batch,
+                RecoverableWriteMode::NewSend,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::WriterClosed { .. }));
     }
 }

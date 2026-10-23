@@ -121,6 +121,7 @@ pub struct FlussTestingClusterBuilder {
     sasl_users: Vec<(String, String)>,
     coordinator_host_port: u16,
     plain_client_port: Option<u16>,
+    tablet_advertised_client_port: Option<u16>,
     image: String,
     image_tag: String,
 }
@@ -152,6 +153,12 @@ impl FlussTestingClusterBuilder {
         self
     }
 
+    /// Overrides the tablet server's advertised CLIENT port for host-side RPC proxies in tests.
+    pub fn with_tablet_advertised_client_port(mut self, port: u16) -> Self {
+        self.tablet_advertised_client_port = Some(port);
+        self
+    }
+
     pub fn new_with_cluster_conf(
         testing_name: impl Into<String>,
         conf: &HashMap<String, String>,
@@ -176,6 +183,7 @@ impl FlussTestingClusterBuilder {
             sasl_users: Vec::new(),
             coordinator_host_port: 9123,
             plain_client_port: None,
+            tablet_advertised_client_port: None,
             // runtime env overrides the compile-time default (server-compat CI lane)
             image: std::env::var("FLUSS_IMAGE").unwrap_or_else(|_| FLUSS_IMAGE.to_string()),
             image_tag: std::env::var("FLUSS_VERSION").unwrap_or_else(|_| FLUSS_VERSION.to_string()),
@@ -423,9 +431,12 @@ impl FlussTestingClusterBuilder {
                 container_name, container_name, port, container_name, plain_port,
             );
             let plain_expose_host_port = plain_port + 1 + server_id;
+            let advertised_client_port = self
+                .tablet_advertised_client_port
+                .unwrap_or(expose_host_port);
             let advertised_listeners = format!(
                 "CLIENT://localhost:{}, PLAIN_CLIENT://localhost:{}",
-                expose_host_port, plain_expose_host_port
+                advertised_client_port, plain_expose_host_port
             );
             tablet_server_confs.insert("bind.listeners", bind_listeners);
             tablet_server_confs.insert("advertised.listeners", advertised_listeners);
@@ -434,7 +445,10 @@ impl FlussTestingClusterBuilder {
                 "INTERNAL://{}:0, CLIENT://{}:{}",
                 container_name, container_name, port,
             );
-            let advertised_listeners = format!("CLIENT://localhost:{}", expose_host_port);
+            let advertised_client_port = self
+                .tablet_advertised_client_port
+                .unwrap_or(expose_host_port);
+            let advertised_listeners = format!("CLIENT://localhost:{}", advertised_client_port);
             tablet_server_confs.insert("bind.listeners", bind_listeners);
             tablet_server_confs.insert("advertised.listeners", advertised_listeners);
         }

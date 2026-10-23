@@ -583,6 +583,7 @@ where
         R::ResponseBody: ReadType<Cursor<Vec<u8>>>,
     {
         let api_version = self.resolve_api_version(R::API_KEY)?;
+        msg.check_version(api_version)?;
         let request_id = self.request_id.fetch_add(1, Ordering::SeqCst) & 0x7FFFFFFF;
         let header = RequestHeader {
             request_api_key: R::API_KEY,
@@ -1329,7 +1330,7 @@ mod tests {
             negotiated
                 .highest_available_version(ApiKey::ProduceLog)
                 .unwrap(),
-            ApiVersion(1)
+            ApiVersion(2)
         );
 
         // Disjoint range → error
@@ -1470,5 +1471,146 @@ mod tests {
             validate_server_type(&ServerType::CoordinatorServer, Some(99),),
             Err(Error::InvalidServerType { .. })
         ));
+    }
+
+    use crate::client::RecoverableWriteMode;
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_tcp_frame(stream: &mut TcpStream) -> Vec<u8> {
+        let length = stream.read_i32().await.unwrap();
+        let mut frame = vec![0; usize::try_from(length).unwrap()];
+        stream.read_exact(&mut frame).await.unwrap();
+        frame
+    }
+
+    async fn write_tcp_response(stream: &mut TcpStream, request_id: i32, body: &[u8]) {
+        let mut response = Vec::with_capacity(5 + body.len());
+        response.push(0);
+        response.extend_from_slice(&request_id.to_be_bytes());
+        response.extend_from_slice(body);
+        stream.write_i32(response.len() as i32).await.unwrap();
+        stream.write_all(&response).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    async fn serve_api_versions(stream: &mut TcpStream, produce_log_max: i32) {
+        use prost::Message;
+
+        let request = read_tcp_frame(stream).await;
+        assert_eq!(i16::from_be_bytes([request[0], request[1]]), 1000);
+        let request_id = i32::from_be_bytes(request[4..8].try_into().unwrap());
+        let response = crate::proto::ApiVersionsResponse {
+            api_versions: vec![PbApiVersion {
+                api_key: 1014,
+                min_version: 0,
+                max_version: produce_log_max,
+            }],
+            server_type: Some(ServerType::TabletServer.to_type_id()),
+        };
+        write_tcp_response(stream, request_id, &response.encode_to_vec()).await;
+    }
+
+    fn test_tablet_node(port: u16) -> ServerNode {
+        ServerNode::new(
+            1,
+            "127.0.0.1".to_string(),
+            u32::from(port),
+            ServerType::TabletServer,
+        )
+    }
+
+    fn prepared_request(mode: RecoverableWriteMode) -> crate::rpc::message::ProduceLogRequest {
+        crate::rpc::message::ProduceLogRequest::new_prepared(
+            1,
+            None,
+            0,
+            bytes::Bytes::from_static(b"prepared-record-bytes"),
+            mode.as_protocol_value(),
+        )
+    }
+
+    #[tokio::test]
+    async fn initial_v1_peer_receives_no_prepared_produce_log_frame() {
+        let _test_guard = test_lock().lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            serve_api_versions(&mut stream, 1).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_tcp_frame(&mut stream))
+                    .await
+                    .is_err(),
+                "v1 peer received a request after API negotiation"
+            );
+        });
+
+        let client = RpcClient::new();
+        let connection = client
+            .get_connection(&test_tablet_node(port))
+            .await
+            .unwrap();
+        let error = connection
+            .request(prepared_request(RecoverableWriteMode::NewSend))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::UnsupportedVersion { .. }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_v1_connection_receives_no_prepared_retry_frame() {
+        use prost::Message;
+
+        let _test_guard = test_lock().lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            serve_api_versions(&mut first, 2).await;
+            let request = read_tcp_frame(&mut first).await;
+            assert_eq!(i16::from_be_bytes([request[0], request[1]]), 1014);
+            let request_id = i32::from_be_bytes(request[4..8].try_into().unwrap());
+            write_tcp_response(
+                &mut first,
+                request_id,
+                &crate::proto::ProduceLogResponse::default().encode_to_vec(),
+            )
+            .await;
+            drop(first);
+
+            let (mut replacement, _) = listener.accept().await.unwrap();
+            serve_api_versions(&mut replacement, 1).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_tcp_frame(&mut replacement))
+                    .await
+                    .is_err(),
+                "replacement v1 connection received a prepared retry frame"
+            );
+        });
+
+        let client = RpcClient::new();
+        let node = test_tablet_node(port);
+        let first = client.get_connection(&node).await.unwrap();
+        first
+            .request(prepared_request(RecoverableWriteMode::NewSend))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !first.is_poisoned() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the first connection should observe the server close");
+
+        let replacement = client.get_connection(&node).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &replacement));
+        let error = replacement
+            .request(prepared_request(RecoverableWriteMode::Retry))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::UnsupportedVersion { .. }));
+        server.await.unwrap();
     }
 }

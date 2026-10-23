@@ -136,12 +136,26 @@ pub trait RequestBody {
     type ResponseBody;
 
     const API_KEY: ApiKey;
+
+    fn check_version(
+        &self,
+        _version: crate::rpc::api_version::ApiVersion,
+    ) -> crate::error::Result<()> {
+        Ok(())
+    }
 }
 
 impl<T: RequestBody> RequestBody for &T {
     type ResponseBody = T::ResponseBody;
 
     const API_KEY: ApiKey = T::API_KEY;
+
+    fn check_version(
+        &self,
+        version: crate::rpc::api_version::ApiVersion,
+    ) -> crate::error::Result<()> {
+        (**self).check_version(version)
+    }
 }
 
 pub trait WriteType<W>: Sized

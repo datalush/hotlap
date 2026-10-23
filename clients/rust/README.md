@@ -26,6 +26,35 @@ See [development](DEVELOPMENT.md), the [Hotlap README](../../README.md) and
 The integration uses the client by `path`; local changes are not automatically
 published to crates.io or transferred upstream.
 
+## Selective recoverable log-write backport
+
+The prepared recoverable log-batch API and ProduceLog v2 `recovery_mode` wire
+field are selectively backported from Fluss develop at
+`5f87385b4426e79dfed2cc4484dc30df5a458e38`. This is not a full SDK sync: the
+Hotlap SDK base and protocol schema remain authoritative for all unrelated APIs.
+In particular, Hotlap-owned accumulator admission/flush behavior in
+`crates/fluss/src/client/write/accumulator.rs`, sender retry/resource-lifetime
+changes in `sender.rs`, and native writer lifecycle/memory-accounting paths in
+`writer_client.rs` are retained rather than replaced; feature additions there
+are additive. The embedded SDK's resolved Arrow version remains 59.3.x.
+
+`PreparedLogBatch` lets callers persist and replay an immutable batch envelope;
+it does not wire that state into Hotlap runtime checkpoints, provide 2PC, or
+guarantee exactly-once behavior across arbitrary sinks. Callers must follow the
+API's NewSend/Retry contract and persist the prepared bytes and acknowledgment
+state themselves.
+
+The opt-in server tests exercise restart-style restore/retry, unknown-writer
+failure, and a real dropped ProduceLog ACK followed by retry. Run them against a
+current-source Fluss image that supports ProduceLog v2 (not the default 0.9.x
+compatibility image):
+
+```sh
+FLUSS_IMAGE=<image> FLUSS_VERSION=<tag> CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=8 \
+  cargo test --manifest-path clients/rust/Cargo.toml -p fluss-rs \
+  --test prepared_log_batch --features recoverable_integration_tests -- --test-threads=1
+```
+
 ## Native examples
 
 From this directory, inspect available client examples with:

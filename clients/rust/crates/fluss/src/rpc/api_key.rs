@@ -129,7 +129,7 @@ impl ApiKey {
             | ApiKey::ListRemoteLogManifests
             | ApiKey::ListKvSnapshots => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(0))),
             // ProduceLog v1 adds historical partition context to requests and responses.
-            ApiKey::ProduceLog => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(1))),
+            ApiKey::ProduceLog => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(2))),
             // PutKv v2 adds the storage backpressure error code; v3 adds historical partition
             // context to requests and responses.
             ApiKey::PutKv => Some(ApiVersionRange::new(ApiVersion(0), ApiVersion(3))),
